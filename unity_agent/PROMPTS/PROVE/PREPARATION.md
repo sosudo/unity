@@ -21,9 +21,9 @@ Topologically sort all chunks by their dependency structure, derived from Lean's
 - For each chunk: its identifier, its layer, its dependencies, the chunk ↔ declaration mapping, and where to find its specification in `semiformal/`
 - Parallelism structure: chunks within the same layer may be formalized in parallel; layers must be formalized sequentially
 
-**Forum stubs**
+**Forum threads**
 
-For each chunk, create `forum/chunk-<id>.md` with a header identifying the chunk and its assigned declaration(s). These files serve as shared communication spaces for formalization agents working on the same chunk.
+For each chunk, call `forum_create_thread(thread_id="chunk-<id>", title=<declaration-name>)` to create a forum thread for formalization agents working on that chunk. Also create a global thread: `forum_create_thread(thread_id="global", title="Global Discussion")` for cross-chunk communication. Agents may create additional threads as needed.
 
 **PLAN.md**
 
@@ -43,4 +43,4 @@ You may spawn subagents if you deem it truly necessary.
 
 **Commits**
 
-Once `ORDER.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`. Once the forum stubs are created, commit them with a message prefixed by `PREPARATION:`. Once `PLAN.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`.
+Once `ORDER.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`. Once `PLAN.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`.

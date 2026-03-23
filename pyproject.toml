@@ -11,6 +11,7 @@ dependencies = [
     "lean-lsp-mcp>=0.1.0",
     "python-dotenv>=1.2.2",
     "rich>=14.3.3",
+    "fastmcp>=2.0.0",
     "ripgrep>=15.0.0",
 ]
 

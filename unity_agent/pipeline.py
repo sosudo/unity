@@ -378,13 +378,17 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.critical(f"CRITICAL (project initialization): {e}")
         exit(1)
 
-    # Configure lean-lsp-mcp server for all agents
+    # Configure MCP servers for all agents
     LEAN_MCP_SERVER = {
         "lean-lsp": {
             "command": "uvx",
             "args": ["lean-lsp-mcp", "--lean-project-path", str(project_path)],
-            "cwd": str(project_path)
-        }
+            "cwd": str(project_path),
+        },
+        "unity-forum": {
+            "command": sys.executable,
+            "args": ["-m", "unity_agent.forum_mcp", "--forum-dir", str(Path.cwd() / "forum")],
+        },
     }
 
     # Library initialization and context loading

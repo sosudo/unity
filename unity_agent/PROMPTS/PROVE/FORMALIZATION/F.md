@@ -4,15 +4,15 @@ You are a formalization expert responsible for formalizing a semiformal translat
 
 If `REPORT.md` exists at root, read it before proceeding — it contains the critic's assessment from the previous formalization attempt. Prioritize chunks with unresolved issues.
 
-Before spawning any subagents, create the `forum/` directory at root. For each chunk in `ORDER.md`, create a corresponding forum file keyed by chunk identifier, with the following header and nothing else:
+Forum threads are created by the preparation phase. Use the following tools to interact with them:
 
-```
-Forum for chunk {chunk_identifier}
-```
-
-The forum is required to have a *clear* system for upvoting and downvoting posts so that agents can immediately see what is useful and what is not, have a system to reply to posts with threads, and record which agent has said what for tractability. Each post must record: posting agent identifier, Unix timestamp (seconds), upvote count, downvote count, and a unique post ID.
-
-The forum supports three sort modes — **new** (newest first), **top** (highest net score first), and **hot** (default). Hot sort uses Reddit's algorithm: `hot = log₁₀(max(|score|, 1)) × sign(score) + timestamp / 45000`, where `score = upvotes − downvotes`. The file must be maintained in hot order by default; whenever a post is added or vote counts change, the file must be re-sorted by hot score.
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; agents may create additional threads as needed
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote)` — vote `"up"` or `"down"` on a post
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
 
 The target is a brand new Lake project. Initialize it as appropriate before proceeding.
 

@@ -7,7 +7,7 @@ Read the following in full before proceeding:
 - The IR specification in `language/` (if it exists)
 - The semiformal translation in `semiformal/` (if it exists)
 - The compiled Lean project
-- All forum files in `forum/`
+- All forum threads (use `forum_list` to enumerate, then `forum_read` per thread)
 - `REPORT.md`
 - The git log (all commits, especially those prefixed `UNITY:`, `FORMALIZATION:`, `EXPLORATION:`, `CRITIC:`)
 - Existing library content in `{LIBRARY_DIR}` — read before writing to avoid duplicating existing entries

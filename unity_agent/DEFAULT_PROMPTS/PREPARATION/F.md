@@ -24,6 +24,10 @@ For each chunk, produce an advisory formalization plan keyed by the same chunk i
 
 These plans are advisory — formalization agents may deviate from them, but should consider them seriously.
 
+**Forum threads**
+
+After `ORDER.md` is complete, create a forum thread for each chunk using `forum_create_thread(thread_id="chunk-<id>", title=<chunk-title>)` and a global thread `forum_create_thread(thread_id="global", title="Global Discussion")` for cross-chunk communication.
+
 **Subagents**
 
 You may spawn subagents if you deem it truly necessary.
