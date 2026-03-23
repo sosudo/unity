@@ -2,6 +2,7 @@
 
 import os
 import sys
+import json
 import logging
 import subprocess
 from pathlib import Path
@@ -150,7 +151,56 @@ def _load_library_subagents() -> dict:
     return result
 
 
-async def run_pipeline(source: str, project_dir: str, context: bool):
+async def _infer_flags() -> tuple[str | None, str | None, bool]:
+    """Run a lightweight inference agent to detect source, project, and prove from CWD."""
+    cwd_env = Path.cwd() / ".env"
+    package_env = Path(__file__).parent.parent / ".env"
+    load_dotenv(dotenv_path=cwd_env)
+    load_dotenv(dotenv_path=package_env, override=False)
+
+    infer_file = Path(".unity_infer.json")
+    infer_file.unlink(missing_ok=True)
+
+    with open(_get_prompts_dir() / "INFERENCE.md") as f:
+        infer_prompt = f.read()
+
+    async for _ in query(
+        prompt="Infer the source, project, and prove flag for the current working directory.",
+        options=ClaudeAgentOptions(
+            tools=["Read", "Glob", "Grep", "Write", "Bash"],
+            allowed_tools=["Read", "Glob", "Grep", "Write", "Bash"],
+            agents={},
+            system_prompt=infer_prompt,
+            permission_mode="bypassPermissions",
+            continue_conversation=False,
+            disallowed_tools=[],
+            model="sonnet",
+            fallback_model="haiku",
+            env={
+                "ANTHROPIC_BASE_URL": os.getenv("ANTHROPIC_BASE_URL"),
+                "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
+                "ANTHROPIC_AUTH_TOKEN": os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+            },
+            extra_args={},
+        ),
+    ):
+        pass
+
+    if not infer_file.exists():
+        return None, None, False
+    try:
+        data = json.loads(infer_file.read_text())
+        infer_file.unlink(missing_ok=True)
+        return data.get("source"), data.get("project"), bool(data.get("prove", False))
+    except Exception:
+        infer_file.unlink(missing_ok=True)
+        return None, None, False
+
+
+async def run_pipeline(source: str | None, project_dir: str, context: bool, prove: bool = False):
     """Run the full autoformalization pipeline."""
     global _console
     PROJECT_DIR = project_dir
@@ -272,8 +322,23 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
             exit(1)
 
         # Select prompts directory
-        PROMPTS_DIR = _get_teams_dir() if parse_bool(claude_code_experimental_agent_teams) else _get_prompts_dir()
+        _teams = parse_bool(claude_code_experimental_agent_teams)
+        PROMPTS_DIR = _get_teams_dir() if _teams else _get_prompts_dir()
+        PROVE_PROMPTS_DIR = PROMPTS_DIR / "PROVE"
+        PROVE_SUBAGENTS_DIR = _get_subagents_dir() / "PROVE"
+        # Active dirs: prove mode swaps generation/semiformalization/formalization/critic
+        ACTIVE_PROMPTS_DIR = PROVE_PROMPTS_DIR if prove else PROMPTS_DIR
+        ACTIVE_SUBAGENTS_DIR = PROVE_SUBAGENTS_DIR if prove else _get_subagents_dir()
         logging.info(f"Prompts directory: {PROMPTS_DIR}")
+
+        # Prove-mode conflict checks
+        if prove and source is None and not context:
+            logging.critical("CRITICAL: --prove without --source requires --context/-c")
+            exit(1)
+
+        if prove and source is None and not exploration:
+            logging.critical("CRITICAL: --prove without --source requires EXPLORATION=true")
+            exit(1)
 
         # Set permissions
 
@@ -333,12 +398,390 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
             return prompt
         return prompt + "\n\n---\n\n" + library_context
 
+    # ── Path 2: prove mode, no source ─────────────────────────────────────────
+    # Flow: exploration → generation → semiformalization (TT) → preparation → loop
+    if prove and source is None:
+
+        # Exploration phase
+        _console.rule("[bold blue]Exploration Phase[/bold blue]")
+        try:
+            with open(ACTIVE_PROMPTS_DIR / "EXPLORATION.md", "r") as f:
+                EXPLORATION_PROMPT = with_library(f.read())
+            with open(ACTIVE_SUBAGENTS_DIR / "EXPLORATION/EXPLORER.md", "r") as f:
+                EXPLORER_SUBAGENT = f.read()
+
+            async for message in query(
+                prompt=f"Survey the Lean project at {project_path} for declarations needing proofs, then gather mathematical content for each.",
+                options=ClaudeAgentOptions(
+                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    agents={
+                        "explorer": AgentDefinition(
+                            description="Explorer subagent. Capable of searching the web and gathering mathematical content for a specific Lean declaration needing a proof.",
+                            prompt=EXPLORER_SUBAGENT,
+                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                        ),
+                        **LIBRARY_SUBAGENTS
+                    },
+                    system_prompt=EXPLORATION_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    permission_mode=PERMISSIONS,
+                    continue_conversation=False,
+                    max_budget_usd=exploration_budget,
+                    disallowed_tools=[],
+                    enable_file_checkpointing=True,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env={
+                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                    },
+                    extra_args={},
+                ),
+            ):
+                _log_agent_message(message)
+
+            logging.info("Exploration phase completed successfully!")
+        except Exception as e:
+            logging.critical(f"CRITICAL (exploration phase): {e}")
+            exit(1)
+
+        # Generation phase
+        _console.rule("[bold blue]Generation Phase[/bold blue]")
+        try:
+            with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
+                GENERATION_PROMPT = with_library(f.read())
+            with open(_get_subagents_dir() / "GENERATION/GENERATOR.md", "r") as f:
+                GENERATOR_SUBAGENT = f.read()
+
+            async for message in query(
+                prompt=f"Generate the specification language for the gathered mathematical content in `gathered/`.",
+                options=ClaudeAgentOptions(
+                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    agents={
+                        "generator": AgentDefinition(
+                            description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
+                            prompt=GENERATOR_SUBAGENT,
+                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                        ),
+                        **LIBRARY_SUBAGENTS
+                    },
+                    system_prompt=GENERATION_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    permission_mode=PERMISSIONS,
+                    continue_conversation=False,
+                    max_budget_usd=generation_budget,
+                    disallowed_tools=[],
+                    enable_file_checkpointing=True,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env={
+                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                    },
+                    extra_args={},
+                ),
+            ):
+                _log_agent_message(message)
+
+            logging.info("Generation phase completed successfully!")
+        except Exception as e:
+            logging.critical(f"CRITICAL (generation phase): {e}")
+            exit(1)
+
+        # Semiformalization phase (always TT: autofix + context, required for Path 2)
+        _console.rule("[bold blue]Semiformalization Phase[/bold blue]")
+        try:
+            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+                SEMIFORMALIZATION_PROMPT = with_library(f.read())
+            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+                SEMIFORMALIZER_SUBAGENT = f.read()
+
+            async for message in query(
+                prompt=f"Semiformalize the gathered content in `gathered/` using the specification language in `language/`. The Lean project is {project_path}.",
+                options=ClaudeAgentOptions(
+                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    agents={
+                        "semiformalizer": AgentDefinition(
+                            description="Semiformalizer subagent. Capable of producing faithful semiformal translations of gathered mathematical content into the IR specification language located in `language/`.",
+                            prompt=SEMIFORMALIZER_SUBAGENT,
+                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                        ),
+                        **LIBRARY_SUBAGENTS
+                    },
+                    system_prompt=SEMIFORMALIZATION_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    permission_mode=PERMISSIONS,
+                    continue_conversation=False,
+                    max_budget_usd=semiformalization_budget,
+                    disallowed_tools=[],
+                    enable_file_checkpointing=True,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env={
+                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                    },
+                    extra_args={},
+                ),
+            ):
+                _log_agent_message(message)
+
+            logging.info("Semiformalization phase completed successfully!")
+        except Exception as e:
+            logging.critical(f"CRITICAL (semiformalization phase): {e}")
+            exit(1)
+
+        # Preparation phase
+        _console.rule("[bold blue]Preparation Phase[/bold blue]")
+        try:
+            with open(ACTIVE_PROMPTS_DIR / "PREPARATION.md", "r") as f:
+                PREPARATION_PROMPT = with_library(f.read())
+
+            async for message in query(
+                prompt=f"Prepare to formalize the declarations in {project_path}. Chunk by declaration, track dependencies, and create forums.",
+                options=ClaudeAgentOptions(
+                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    agents={**LIBRARY_SUBAGENTS},
+                    system_prompt=PREPARATION_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    permission_mode=PERMISSIONS,
+                    continue_conversation=False,
+                    max_budget_usd=preparation_budget,
+                    disallowed_tools=[],
+                    enable_file_checkpointing=True,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env={
+                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                    },
+                    extra_args={},
+                ),
+            ):
+                _log_agent_message(message)
+
+            logging.info("Preparation phase completed successfully!")
+        except Exception as e:
+            logging.critical(f"CRITICAL (preparation phase): {e}")
+            exit(1)
+
+        iteration = 0
+        while True:
+
+            # Formalization phase (always T variant: existing project always present)
+            _console.rule("[bold blue]Formalization Phase[/bold blue]")
+            try:
+                with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
+                    FORMALIZATION_PROMPT = with_library(f.read())
+                with open(_get_subagents_dir() / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
+                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
+                    PROOFFORMALIZER_SUBAGENT = f.read()
+
+                async for message in query(
+                    prompt=f"Formalize the declarations in {project_path}.",
+                    options=ClaudeAgentOptions(
+                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        agents={
+                            "declaration-formalizer": AgentDefinition(
+                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            ),
+                            "proof-formalizer": AgentDefinition(
+                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                                prompt=PROOFFORMALIZER_SUBAGENT,
+                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=FORMALIZATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        permission_mode=PERMISSIONS,
+                        continue_conversation=False,
+                        max_budget_usd=formalization_budget,
+                        disallowed_tools=[],
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env={
+                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                        },
+                        extra_args={},
+                    ),
+                ):
+                    _log_agent_message(message)
+
+                logging.info("Formalization phase completed successfully!")
+            except Exception as e:
+                logging.critical(f"CRITICAL (formalization phase): {e}")
+                exit(1)
+
+            # Retrospective phase
+            _console.rule("[bold blue]Retrospective Phase[/bold blue]")
+            try:
+                with open(PROMPTS_DIR / "RETROSPECTIVE.md", "r") as f:
+                    RETROSPECTIVE_PROMPT = f.read().format(
+                        SOURCE_PATH="(no source — proof completion mode)",
+                        LIBRARY_DIR=str(_get_library_dir()),
+                        PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
+                        SUBAGENTS_DIR=str(_get_subagents_dir()),
+                        DEFAULT_SUBAGENTS_DIR=str(_get_default_subagents_dir()),
+                    )
+                async for message in query(
+                    prompt=f"Run the retrospective for the unity proof formalization of {project_path}.",
+                    options=ClaudeAgentOptions(
+                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        agents={**LIBRARY_SUBAGENTS},
+                        system_prompt=RETROSPECTIVE_PROMPT,
+                        permission_mode=PERMISSIONS,
+                        continue_conversation=False,
+                        disallowed_tools=[],
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env={
+                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                        },
+                        extra_args={},
+                    ),
+                ):
+                    _log_agent_message(message)
+                logging.info("Retrospective phase completed successfully!")
+            except Exception as e:
+                logging.error(f"ERROR (retrospective phase): {e}")
+
+            library_context = _load_library_context()
+
+            # Critic phase (always T variant)
+            _console.rule("[bold blue]Critic Phase[/bold blue]")
+            try:
+                with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
+                    CRITIC_PROMPT = with_library(f.read())
+                with open(_get_subagents_dir() / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
+                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                with open(_get_subagents_dir() / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
+                    PROOFFORMALIZER_SUBAGENT = f.read()
+
+                async for message in query(
+                    prompt=f"Critique {project_path} given semiformalization `semiformal/` and specification language `language/`.",
+                    options=ClaudeAgentOptions(
+                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        agents={
+                            "declaration-formalizer": AgentDefinition(
+                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            ),
+                            "proof-formalizer": AgentDefinition(
+                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                                prompt=PROOFFORMALIZER_SUBAGENT,
+                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=CRITIC_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        permission_mode=PERMISSIONS,
+                        continue_conversation=False,
+                        max_budget_usd=critic_budget,
+                        disallowed_tools=[],
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env={
+                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
+                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
+                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
+                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
+                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
+                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+                        },
+                        extra_args={},
+                    ),
+                ):
+                    _log_agent_message(message)
+                logging.info("Critic phase completed successfully!")
+            except Exception as e:
+                logging.critical(f"CRITICAL (critic phase): {e}")
+                exit(1)
+
+            # Loop status check
+            try:
+                report_text = Path("REPORT.md").read_text()
+                if "**Status:** COMPLETE" in report_text:
+                    logging.info("Critic declared formalization complete.")
+                    break
+                elif max_critic_iterations is not None and iteration + 1 >= max_critic_iterations:
+                    logging.warning(f"Reached maximum iterations ({max_critic_iterations}) — stopping loop.")
+                    break
+                else:
+                    iteration += 1
+                    logging.info(f"Critic requested revision — starting iteration {iteration + 1}...")
+            except FileNotFoundError:
+                logging.warning("No REPORT.md found after critic phase — stopping loop.")
+                break
+
+        _console.rule("[bold blue]Summary[/bold blue]")
+        try:
+            from rich.markdown import Markdown
+            _console.print(Markdown(Path("REPORT.md").read_text()))
+        except FileNotFoundError:
+            logging.warning("No REPORT.md found — critic may not have completed.")
+        except Exception as e:
+            logging.error(f"ERROR (summarization): {e}")
+
+        logging.info("Unity has completed!")
+        return 0
+
+    # ── Path 1 / normal mode ──────────────────────────────────────────────────
+
     # Generation phase
     
     _console.rule("[bold blue]Generation Phase[/bold blue]")
     try:
         # Load generation phase system prompt and generator subagent prompt
-        with open(PROMPTS_DIR / "GENERATION.md", "r") as f:
+        with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
             GENERATION_PROMPT = with_library(f.read())
         with open(_get_subagents_dir() / "GENERATION/GENERATOR.md", "r") as f:
             GENERATOR_SUBAGENT = f.read()
@@ -391,9 +834,9 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
     if not autofix and not context:
         try:
             # Load semiformalization phase system prompt and semiformalizer subagent prompt
-            with open(PROMPTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
+            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
                 SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(_get_subagents_dir() / "SEMIFORMALIZATION/FF.md", "r") as f:
+            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
                 SEMIFORMALIZER_SUBAGENT = f.read()
             
             async for message in query(
@@ -439,9 +882,9 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
     elif autofix and not context:
         try:
             # Load semiformalization phase system prompt and semiformalizer subagent prompt
-            with open(PROMPTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
+            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
                 SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(_get_subagents_dir() / "SEMIFORMALIZATION/TF.md", "r") as f:
+            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
                 SEMIFORMALIZER_SUBAGENT = f.read()
             
             async for message in query(
@@ -487,9 +930,9 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
     elif autofix and context:
         try:
             # Load semiformalization phase system prompt and semiformalizer subagent prompt
-            with open(PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
                 SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(_get_subagents_dir() / "SEMIFORMALIZATION/TT.md", "r") as f:
+            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
                 SEMIFORMALIZER_SUBAGENT = f.read()
             
             async for message in query(
@@ -890,11 +1333,11 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
         if not context and iteration == 0:
             try:
                 # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(PROMPTS_DIR / "FORMALIZATION/F.md", "r") as f:
+                with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/F.md", "r") as f:
                     FORMALIZATION_PROMPT = with_library(f.read())
                 with open(_get_subagents_dir() / "FORMALIZATION/DECLARATIONFORMALIZER/F.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_get_subagents_dir() / "FORMALIZATION/PROOFFORMALIZER/F.md", "r") as f:
+                with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/F.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
             
                 async for message in query(
@@ -945,11 +1388,11 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
         elif context or iteration > 0:
             try:
                 # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
+                with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
                     FORMALIZATION_PROMPT = with_library(f.read())
                 with open(_get_subagents_dir() / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_get_subagents_dir() / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
+                with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
             
                 async for message in query(
@@ -1008,7 +1451,7 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
         if not context and iteration == 0:
             try:
                 # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(PROMPTS_DIR / "CRITIC.md", "r") as f:
+                with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
                     CRITIC_PROMPT = with_library(f.read())
                 with open(_get_subagents_dir() / "CRITIC/DECLARATIONFORMALIZER/F.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
@@ -1063,7 +1506,7 @@ async def run_pipeline(source: str, project_dir: str, context: bool):
         elif context or iteration > 0:
             try:
                 # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(PROMPTS_DIR / "CRITIC.md", "r") as f:
+                with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
                     CRITIC_PROMPT = with_library(f.read())
                 with open(_get_subagents_dir() / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
