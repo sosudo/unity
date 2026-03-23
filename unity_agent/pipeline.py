@@ -2,6 +2,8 @@
 
 import atexit
 import os
+import re
+import shutil
 import sys
 import json
 import logging
@@ -10,10 +12,21 @@ from pathlib import Path
 
 from rich.console import Console
 from rich.logging import RichHandler
+from rich.markdown import Markdown
 from dotenv import load_dotenv
 from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage, AgentDefinition, TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage
 
 _console: Console | None = None
+
+# Package-relative directory constants (fixed at import time)
+_PKG = Path(__file__).parent
+_PROMPTS_DIR = _PKG / "PROMPTS"
+_TEAMS_DIR = _PKG / "TEAMS"
+_SUBAGENTS_DIR = _PKG / "SUBAGENTS"
+_DEFAULT_PROMPTS_DIR = _PKG / "DEFAULT_PROMPTS"
+_DEFAULT_SUBAGENTS_DIR = _PKG / "DEFAULT_SUBAGENTS"
+
+_ALL_TOOLS = ["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
 
 
 def _log_agent_message(message) -> None:
@@ -52,33 +65,6 @@ def _is_lean_repo(path: Path) -> bool:
     )
 
 
-def _get_prompts_dir() -> Path:
-    """Get the PROMPTS directory relative to this package."""
-    return Path(__file__).parent / "PROMPTS"
-
-
-def _get_teams_dir() -> Path:
-    """Get the TEAMS directory relative to this package."""
-    return Path(__file__).parent / "TEAMS"
-
-
-def _get_subagents_dir() -> Path:
-    """Get the SUBAGENTS directory relative to this package."""
-    return Path(__file__).parent / "SUBAGENTS"
-
-
-def _get_default_prompts_dir() -> Path:
-    return Path(__file__).parent / "DEFAULT_PROMPTS"
-
-
-def _get_default_subagents_dir() -> Path:
-    return Path(__file__).parent / "DEFAULT_SUBAGENTS"
-
-
-def _get_default_teams_dir() -> Path:
-    return Path(__file__).parent / "DEFAULT_TEAMS"
-
-
 def _get_library_dir() -> Path:
     return Path.home() / ".unity" / "library"
 
@@ -98,8 +84,6 @@ def _init_library() -> None:
 
 def _seed_default_library() -> None:
     """Copy bundled DEFAULT_LIBRARY and scripts to ~/.unity/ if not already present."""
-    import shutil
-
     package_root = Path(__file__).parent
 
     # Seed reference docs and any other DEFAULT_LIBRARY content
@@ -133,8 +117,6 @@ def _load_library_context() -> str:
     Returns an empty string if no library or project note files exist.
     Agents use the Read tool to access individual files on demand.
     """
-    import re
-
     def first_heading(path: Path) -> str:
         """Return the first markdown heading in a file as a one-line description."""
         try:
@@ -182,7 +164,6 @@ LIBRARY_SUBAGENTS: dict = {}
 
 def _load_library_subagents() -> dict:
     """Parse ~/.unity/library/subagents/*.md into AgentDefinition objects."""
-    import re
     result = {}
     subagents_dir = _get_library_dir() / "subagents"
     for md_file in sorted(subagents_dir.glob("*.md")):
@@ -215,7 +196,7 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
     infer_file = Path(".unity_infer.json")
     infer_file.unlink(missing_ok=True)
 
-    with open(_get_prompts_dir() / "INFERENCE.md") as f:
+    with open(_PROMPTS_DIR / "INFERENCE.md") as f:
         infer_prompt = f.read()
 
     async for _ in query(
@@ -226,8 +207,7 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
             agents={},
             system_prompt=infer_prompt,
             permission_mode="bypassPermissions",
-            continue_conversation=False,
-            disallowed_tools=[],
+
             model="sonnet",
             fallback_model="haiku",
             env={
@@ -238,7 +218,7 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
                 "ANTHROPIC_DEFAULT_SONNET_MODEL": os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
                 "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
             },
-            extra_args={},
+
         ),
     ):
         pass
@@ -344,10 +324,22 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         anthropic_default_sonnet_model = os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL")
         anthropic_default_haiku_model = os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL")
         claude_code_experimental_agent_teams = os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-        
+
+        # Build env dict once for all agent query() calls; omit unset/empty values
+        # so child agents fall back to their own credential resolution.
+        _agent_env = {k: v for k, v in {
+            "ANTHROPIC_BASE_URL": anthropic_base_url,
+            "ANTHROPIC_API_KEY": anthropic_api_key,
+            "ANTHROPIC_AUTH_TOKEN": anthropic_auth_token,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": anthropic_default_opus_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": anthropic_default_sonnet_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": anthropic_default_haiku_model,
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": claude_code_experimental_agent_teams,
+        }.items() if v}
+
         # Print environment
         logging.info("Environment:")
-        logging.info(f"SAVE_SPECIFICTION: {save_spec}")
+        logging.info(f"SAVE_SPECIFICATION: {save_spec}")
         logging.info(f"NO_BYPASS: {no_bypass}")
         logging.info(f"GENERATION_BUDGET: {generation_budget}")
         logging.info(f"VALIDATION_BUDGET: {validation_budget}")
@@ -386,12 +378,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         # Select prompts directory
         _teams = parse_bool(claude_code_experimental_agent_teams)
-        PROMPTS_DIR = _get_teams_dir() if _teams else _get_prompts_dir()
+        PROMPTS_DIR = _TEAMS_DIR if _teams else _PROMPTS_DIR
         PROVE_PROMPTS_DIR = PROMPTS_DIR / "PROVE"
-        PROVE_SUBAGENTS_DIR = _get_subagents_dir() / "PROVE"
+        PROVE_SUBAGENTS_DIR = _SUBAGENTS_DIR / "PROVE"
         # Active dirs: prove mode swaps generation/semiformalization/formalization/critic
         ACTIVE_PROMPTS_DIR = PROVE_PROMPTS_DIR if prove else PROMPTS_DIR
-        ACTIVE_SUBAGENTS_DIR = PROVE_SUBAGENTS_DIR if prove else _get_subagents_dir()
+        ACTIVE_SUBAGENTS_DIR = PROVE_SUBAGENTS_DIR if prove else _SUBAGENTS_DIR
         logging.info(f"Prompts directory: {PROMPTS_DIR}")
 
         # Prove-mode conflict checks
@@ -476,7 +468,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     # Register recursive-unity subagent when depth allows further recursion
     if depth > 0:
         child_depth = depth - 1
-        with open(_get_subagents_dir() / "RECURSIVE/UNITY.md") as f:
+        with open(_SUBAGENTS_DIR / "RECURSIVE/UNITY.md") as f:
             recursive_prompt = f.read().format(depth=depth, child_depth=child_depth)
         LIBRARY_SUBAGENTS["recursive-unity"] = AgentDefinition(
             description=f"Spawns a child unity pipeline run for a self-contained subtask too large or complex for a single-context pass. Child runs at --depth {child_depth}.",
@@ -506,35 +498,26 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             async for message in query(
                 prompt=f"Survey the Lean project at {project_path} for declarations needing proofs, then gather mathematical content for each.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={
                         "explorer": AgentDefinition(
                             description="Explorer subagent. Capable of searching the web and gathering mathematical content for a specific Lean declaration needing a proof.",
                             prompt=EXPLORER_SUBAGENT,
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            tools=_ALL_TOOLS
                         ),
                         **LIBRARY_SUBAGENTS
                     },
                     system_prompt=EXPLORATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=exploration_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -549,41 +532,32 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         try:
             with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
                 GENERATION_PROMPT = with_library(f.read())
-            with open(_get_subagents_dir() / "GENERATION/GENERATOR.md", "r") as f:
+            with open(_SUBAGENTS_DIR / "GENERATION/GENERATOR.md", "r") as f:
                 GENERATOR_SUBAGENT = f.read()
 
             async for message in query(
                 prompt=f"Generate the specification language for the gathered mathematical content in `gathered/`.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={
                         "generator": AgentDefinition(
                             description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
                             prompt=GENERATOR_SUBAGENT,
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            tools=_ALL_TOOLS
                         ),
                         **LIBRARY_SUBAGENTS
                     },
                     system_prompt=GENERATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=generation_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -608,22 +582,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     system_prompt=VALIDATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=validation_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="sonnet",
                     fallback_model="haiku",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -654,35 +619,26 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             async for message in query(
                 prompt=f"Semiformalize the gathered content in `gathered/` using the specification language in `language/`. The Lean project is {project_path}.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={
                         "semiformalizer": AgentDefinition(
                             description="Semiformalizer subagent. Capable of producing faithful semiformal translations of gathered mathematical content into the IR specification language located in `language/`.",
                             prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            tools=_ALL_TOOLS
                         ),
                         **LIBRARY_SUBAGENTS
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=semiformalization_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -701,28 +657,19 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             async for message in query(
                 prompt=f"Prepare to formalize the declarations in {project_path}. Chunk by declaration, track dependencies, and create forums.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={**LIBRARY_SUBAGENTS},
                     system_prompt=PREPARATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=preparation_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -740,7 +687,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             try:
                 with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
                     FORMALIZATION_PROMPT = with_library(f.read())
-                with open(_get_subagents_dir() / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
                 with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
@@ -748,40 +695,31 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 async for message in query(
                     prompt=f"Formalize the declarations in {project_path}.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={
                             "declaration-formalizer": AgentDefinition(
                                 description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
                                 prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             "proof-formalizer": AgentDefinition(
                                 description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
                                 prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=formalization_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -799,32 +737,23 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         SOURCE_PATH="(no source — proof completion mode)",
                         LIBRARY_DIR=str(_get_library_dir()),
                         PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
-                        SUBAGENTS_DIR=str(_get_subagents_dir()),
-                        DEFAULT_SUBAGENTS_DIR=str(_get_default_subagents_dir()),
+                        SUBAGENTS_DIR=str(_SUBAGENTS_DIR),
+                        DEFAULT_SUBAGENTS_DIR=str(_DEFAULT_SUBAGENTS_DIR),
                     ))
                 async for message in query(
                     prompt=f"Run the retrospective for the unity proof formalization of {project_path}.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=RETROSPECTIVE_PROMPT,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -839,48 +768,39 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             try:
                 with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
                     CRITIC_PROMPT = with_library(f.read())
-                with open(_get_subagents_dir() / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_get_subagents_dir() / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
 
                 async for message in query(
                     prompt=f"Critique {project_path} given semiformalization `semiformal/` and specification language `language/`.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={
                             "declaration-formalizer": AgentDefinition(
                                 description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
                                 prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             "proof-formalizer": AgentDefinition(
                                 description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
                                 prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=CRITIC_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=critic_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -907,7 +827,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         _console.rule("[bold blue]Summary[/bold blue]")
         try:
-            from rich.markdown import Markdown
+
             _console.print(Markdown(Path("REPORT.md").read_text()))
         except FileNotFoundError:
             logging.warning("No REPORT.md found — critic may not have completed.")
@@ -926,41 +846,32 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         # Load generation phase system prompt and generator subagent prompt
         with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
             GENERATION_PROMPT = with_library(f.read())
-        with open(_get_subagents_dir() / "GENERATION/GENERATOR.md", "r") as f:
+        with open(_SUBAGENTS_DIR / "GENERATION/GENERATOR.md", "r") as f:
             GENERATOR_SUBAGENT = f.read()
         
         async for message in query(
             prompt=f"Generate the specification language for {source}.",
             options=ClaudeAgentOptions(
-                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                tools=_ALL_TOOLS,
+                allowed_tools=_ALL_TOOLS,
                 agents={
                     "generator": AgentDefinition(
                         description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
                         prompt=GENERATOR_SUBAGENT,
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                        tools=_ALL_TOOLS
                     ),
                     **LIBRARY_SUBAGENTS
                 },
                 system_prompt=GENERATION_PROMPT,
                 mcp_servers=LEAN_MCP_SERVER,
                 permission_mode=PERMISSIONS,
-                continue_conversation=False,
                 max_budget_usd=generation_budget,
-                disallowed_tools=[],
+    
                 enable_file_checkpointing=True,
                 model="opus",
                 fallback_model="sonnet",
-                env={
-                    "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                    "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                    "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                    "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                },
-                extra_args={},
+                env=_agent_env,
+    
             ),
         ):
             _log_agent_message(message)
@@ -987,22 +898,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 system_prompt=VALIDATION_PROMPT,
                 mcp_servers=LEAN_MCP_SERVER,
                 permission_mode=PERMISSIONS,
-                continue_conversation=False,
                 max_budget_usd=validation_budget,
-                disallowed_tools=[],
+    
                 enable_file_checkpointing=True,
                 model="sonnet",
                 fallback_model="haiku",
-                env={
-                    "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                    "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                    "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                    "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                    "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                    "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                },
-                extra_args={},
+                env=_agent_env,
+    
             ),
         ):
             _log_agent_message(message)
@@ -1038,35 +940,26 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             async for message in query(
                 prompt=f"Semiformalize {source} as specified by the language.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={
                         "semiformalizer": AgentDefinition(
                             description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
                             prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            tools=_ALL_TOOLS
                         ),
                         **LIBRARY_SUBAGENTS
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=semiformalization_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -1086,35 +979,26 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             async for message in query(
                 prompt=f"Semiformalize {source} as specified by the language.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={
                         "semiformalizer": AgentDefinition(
                             description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
                             prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            tools=_ALL_TOOLS
                         ),
                         **LIBRARY_SUBAGENTS
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=semiformalization_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -1134,35 +1018,26 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             async for message in query(
                 prompt=f"Semiformalize {source} as specified by the language. The Lean project is {project_path}.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={
                         "semiformalizer": AgentDefinition(
                             description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
                             prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                            tools=_ALL_TOOLS
                         ),
                         **LIBRARY_SUBAGENTS
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
                     max_budget_usd=semiformalization_budget,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -1187,55 +1062,46 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
                     with open(PROMPTS_DIR / "EXPLORATION/FF.md", "r") as f:
                         EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORER/F.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/F.md", "r") as f:
                         EXPLORER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
                         SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
                         EXPLORATIONGENERATOR_SUBAGENT = f.read()
                 
                     async for message in query(
                         prompt=f"Explore `semiformal/` given specification language `language/` and source {source}.",
                         options=ClaudeAgentOptions(
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
                             agents={
                                 "explorer": AgentDefinition(
                                     description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
                                     prompt=EXPLORER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "semiformalizer": AgentDefinition(
                                     description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
                                     prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "exploration-generator": AgentDefinition(
                                     description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
                                     prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 **LIBRARY_SUBAGENTS
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
                             permission_mode=PERMISSIONS,
-                            continue_conversation=False,
                             max_budget_usd=exploration_budget,
-                            disallowed_tools=[],
+                
                             enable_file_checkpointing=True,
                             model="opus",
                             fallback_model="sonnet",
-                            env={
-                                "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                                "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                                "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                                "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                                "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                                "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                            },
-                            extra_args={},
+                            env=_agent_env,
+                
                         ),
                     ):
                         _log_agent_message(message)
@@ -1249,55 +1115,46 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
                     with open(PROMPTS_DIR / "EXPLORATION/FT.md", "r") as f:
                         EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORER/T.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/T.md", "r") as f:
                         EXPLORER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
                         SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
                         EXPLORATIONGENERATOR_SUBAGENT = f.read()
                 
                     async for message in query(
                         prompt=f"Explore `semiformal/` given specification language `language/` and source {source}. The Lean project is {project_path}.",
                         options=ClaudeAgentOptions(
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
                             agents={
                                 "explorer": AgentDefinition(
                                     description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
                                     prompt=EXPLORER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "semiformalizer": AgentDefinition(
                                     description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
                                     prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "exploration-generator": AgentDefinition(
                                     description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
                                     prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 **LIBRARY_SUBAGENTS
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
                             permission_mode=PERMISSIONS,
-                            continue_conversation=False,
                             max_budget_usd=exploration_budget,
-                            disallowed_tools=[],
+                
                             enable_file_checkpointing=True,
                             model="opus",
                             fallback_model="sonnet",
-                            env={
-                                "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                                "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                                "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                                "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                                "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                                "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                            },
-                            extra_args={},
+                            env=_agent_env,
+                
                         ),
                     ):
                         _log_agent_message(message)
@@ -1311,55 +1168,46 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
                     with open(PROMPTS_DIR / "EXPLORATION/TF.md", "r") as f:
                         EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORER/F.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/F.md", "r") as f:
                         EXPLORER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
                         SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
                         EXPLORATIONGENERATOR_SUBAGENT = f.read()
                 
                     async for message in query(
                         prompt=f"Explore `semiformal/` given specification language `language/` and source {source}.",
                         options=ClaudeAgentOptions(
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
                             agents={
                                 "explorer": AgentDefinition(
                                     description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
                                     prompt=EXPLORER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "semiformalizer": AgentDefinition(
                                     description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
                                     prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "exploration-generator": AgentDefinition(
                                     description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
                                     prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 **LIBRARY_SUBAGENTS
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
                             permission_mode=PERMISSIONS,
-                            continue_conversation=False,
                             max_budget_usd=exploration_budget,
-                            disallowed_tools=[],
+                
                             enable_file_checkpointing=True,
                             model="opus",
                             fallback_model="sonnet",
-                            env={
-                                "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                                "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                                "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                                "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                                "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                                "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                            },
-                            extra_args={},
+                            env=_agent_env,
+                
                         ),
                     ):
                         _log_agent_message(message)
@@ -1373,55 +1221,46 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
                     with open(PROMPTS_DIR / "EXPLORATION/TT.md", "r") as f:
                         EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORER/T.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/T.md", "r") as f:
                         EXPLORER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
                         SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_get_subagents_dir() / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
                         EXPLORATIONGENERATOR_SUBAGENT = f.read()
                 
                     async for message in query(
                         prompt=f"Explore `semiformal/` given specification language `language/` and source {source}. The Lean project is {project_path}.",
                         options=ClaudeAgentOptions(
-                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
                             agents={
                                 "explorer": AgentDefinition(
                                     description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
                                     prompt=EXPLORER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "semiformalizer": AgentDefinition(
                                     description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
                                     prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 "exploration-generator": AgentDefinition(
                                     description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
                                     prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                    tools=_ALL_TOOLS
                                 ),
                                 **LIBRARY_SUBAGENTS
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
                             permission_mode=PERMISSIONS,
-                            continue_conversation=False,
                             max_budget_usd=exploration_budget,
-                            disallowed_tools=[],
+                
                             enable_file_checkpointing=True,
                             model="opus",
                             fallback_model="sonnet",
-                            env={
-                                "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                                "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                                "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                                "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                                "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                                "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                            },
-                            extra_args={},
+                            env=_agent_env,
+                
                         ),
                     ):
                         _log_agent_message(message)
@@ -1449,28 +1288,19 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 async for message in query(
                     prompt=f"Prepare to formalize {source}.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=PREPARATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=preparation_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -1488,28 +1318,19 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 async for message in query(
                     prompt=f"Prepare to formalize {source}. The Lean project is {project_path}.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=PREPARATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=preparation_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -1531,7 +1352,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
                 with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/F.md", "r") as f:
                     FORMALIZATION_PROMPT = with_library(f.read())
-                with open(_get_subagents_dir() / "FORMALIZATION/DECLARATIONFORMALIZER/F.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/F.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
                 with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/F.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
@@ -1539,40 +1360,31 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 async for message in query(
                     prompt=f"Formalize {source} into {project_path}.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={
                             "declaration-formalizer": AgentDefinition(
                                 description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
                                 prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             "proof-formalizer": AgentDefinition(
                                 description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
                                 prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=formalization_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -1586,7 +1398,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
                 with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
                     FORMALIZATION_PROMPT = with_library(f.read())
-                with open(_get_subagents_dir() / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
                 with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
@@ -1594,40 +1406,31 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 async for message in query(
                     prompt=f"Formalize {source} into {project_path}.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={
                             "declaration-formalizer": AgentDefinition(
                                 description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
                                 prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             "proof-formalizer": AgentDefinition(
                                 description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
                                 prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=formalization_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -1649,48 +1452,39 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
                 with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
                     CRITIC_PROMPT = with_library(f.read())
-                with open(_get_subagents_dir() / "CRITIC/DECLARATIONFORMALIZER/F.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/F.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_get_subagents_dir() / "CRITIC/PROOFFORMALIZER/F.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/F.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
             
                 async for message in query(
                     prompt=f"Critique {project_path} given source {source}, semiformalization `semiformal/`, and specification language `language/`.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={
                             "declaration-formalizer": AgentDefinition(
                                 description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
                                 prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             "proof-formalizer": AgentDefinition(
                                 description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
                                 prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=CRITIC_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=critic_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -1704,48 +1498,39 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
                 with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
                     CRITIC_PROMPT = with_library(f.read())
-                with open(_get_subagents_dir() / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_get_subagents_dir() / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
+                with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
             
                 async for message in query(
                     prompt=f"Critique {project_path} given source {source}, semiformalization `semiformal/`, and specification language `language/`.",
                     options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
                         agents={
                             "declaration-formalizer": AgentDefinition(
                                 description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
                                 prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             "proof-formalizer": AgentDefinition(
                                 description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
                                 prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"]
+                                tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=CRITIC_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         permission_mode=PERMISSIONS,
-                        continue_conversation=False,
                         max_budget_usd=critic_budget,
-                        disallowed_tools=[],
+            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
-                        env={
-                            "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                            "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                            "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                            "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                            "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                            "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                        },
-                        extra_args={},
+                        env=_agent_env,
+            
                     ),
                 ):
                     _log_agent_message(message)
@@ -1767,33 +1552,24 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     SOURCE_PATH=source,
                     LIBRARY_DIR=str(_get_library_dir()),
                     PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
-                    SUBAGENTS_DIR=str(_get_subagents_dir()),
-                    DEFAULT_SUBAGENTS_DIR=str(_get_default_subagents_dir()),
+                    SUBAGENTS_DIR=str(_SUBAGENTS_DIR),
+                    DEFAULT_SUBAGENTS_DIR=str(_DEFAULT_SUBAGENTS_DIR),
                 ))
 
             async for message in query(
                 prompt=f"Run the retrospective for the unity formalization of {source}.",
                 options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "WebSearch", "WebFetch", "Agent", "Skill"],
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
                     agents={**LIBRARY_SUBAGENTS},
                     system_prompt=RETROSPECTIVE_PROMPT,
                     permission_mode=PERMISSIONS,
-                    continue_conversation=False,
-                    disallowed_tools=[],
+        
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
-                    env={
-                        "ANTHROPIC_BASE_URL":os.getenv("ANTHROPIC_BASE_URL"),
-                        "ANTHROPIC_API_KEY":os.getenv("ANTHROPIC_API_KEY"),
-                        "ANTHROPIC_AUTH_TOKEN":os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                        "ANTHROPIC_DEFAULT_OPUS_MODEL":os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                        "ANTHROPIC_DEFAULT_SONNET_MODEL":os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                        "ANTHROPIC_DEFAULT_HAIKU_MODEL":os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-                        "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS":os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
-                    },
-                    extra_args={},
+                    env=_agent_env,
+        
                 ),
             ):
                 _log_agent_message(message)
@@ -1828,11 +1604,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     try:    
         if not save_spec:
             spec_dir = Path("language")
-            subprocess.run(["rm", "-rf", str(spec_dir)], check=True)
-        
+            if spec_dir.exists():
+                shutil.rmtree(spec_dir)
+
         if not save_semiformalization:
             semiformal_dir = Path("semiformal")
-            subprocess.run(["rm", "-rf", str(semiformal_dir)], check=True)
+            if semiformal_dir.exists():
+                shutil.rmtree(semiformal_dir)
     except Exception as e:
         logging.error(f"ERROR (clean up): {e}")
         
@@ -1840,7 +1618,6 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         
     _console.rule("[bold blue]Summary[/bold blue]")
     try:
-        from rich.markdown import Markdown
         _console.print(Markdown(Path("REPORT.md").read_text()))
     except FileNotFoundError:
         logging.warning("No REPORT.md found — critic may not have completed.")
