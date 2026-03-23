@@ -200,7 +200,7 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
         return None, None, False
 
 
-async def run_pipeline(source: str | None, project_dir: str, context: bool, prove: bool = False):
+async def run_pipeline(source: str | None, project_dir: str, context: bool, prove: bool = False, depth: int = 1, output_dir: str | None = None):
     """Run the full autoformalization pipeline."""
     global _console
     PROJECT_DIR = project_dir
@@ -260,6 +260,11 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             force=True,
         )
 
+        if output_dir is not None:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            os.chdir(output_dir)
+
+        logging.info(f"DEPTH: {depth}")
         logging.info("Loading environment...")
         
         # Set environment
@@ -391,6 +396,18 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info("Library context loaded.")
     if LIBRARY_SUBAGENTS:
         logging.info(f"Loaded {len(LIBRARY_SUBAGENTS)} library subagent(s): {', '.join(LIBRARY_SUBAGENTS)}")
+
+    # Register recursive-unity subagent when depth allows further recursion
+    if depth > 0:
+        child_depth = depth - 1
+        with open(_get_subagents_dir() / "RECURSIVE/UNITY.md") as f:
+            recursive_prompt = f.read().format(depth=depth, child_depth=child_depth)
+        LIBRARY_SUBAGENTS["recursive-unity"] = AgentDefinition(
+            description=f"Spawns a child unity pipeline run for a self-contained subtask too large or complex for a single-context pass. Child runs at --depth {child_depth}.",
+            prompt=recursive_prompt,
+            tools=["Bash", "Read", "Glob", "Grep", "Write"],
+        )
+        logging.info(f"Recursive unity subagent registered (child depth: {child_depth})")
 
     def with_library(prompt: str) -> str:
         """Append library context to a prompt if any exists."""
@@ -652,13 +669,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             _console.rule("[bold blue]Retrospective Phase[/bold blue]")
             try:
                 with open(PROMPTS_DIR / "RETROSPECTIVE.md", "r") as f:
-                    RETROSPECTIVE_PROMPT = f.read().format(
+                    RETROSPECTIVE_PROMPT = with_library(f.read().format(
                         SOURCE_PATH="(no source — proof completion mode)",
                         LIBRARY_DIR=str(_get_library_dir()),
                         PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
                         SUBAGENTS_DIR=str(_get_subagents_dir()),
                         DEFAULT_SUBAGENTS_DIR=str(_get_default_subagents_dir()),
-                    )
+                    ))
                 async for message in query(
                     prompt=f"Run the retrospective for the unity proof formalization of {project_path}.",
                     options=ClaudeAgentOptions(
@@ -1567,13 +1584,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         _console.rule("[bold blue]Retrospective Phase[/bold blue]")
         try:
             with open(PROMPTS_DIR / "RETROSPECTIVE.md", "r") as f:
-                RETROSPECTIVE_PROMPT = f.read().format(
+                RETROSPECTIVE_PROMPT = with_library(f.read().format(
                     SOURCE_PATH=source,
                     LIBRARY_DIR=str(_get_library_dir()),
                     PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
                     SUBAGENTS_DIR=str(_get_subagents_dir()),
                     DEFAULT_SUBAGENTS_DIR=str(_get_default_subagents_dir()),
-                )
+                ))
 
             async for message in query(
                 prompt=f"Run the retrospective for the unity formalization of {source}.",

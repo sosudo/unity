@@ -37,8 +37,20 @@ from .pipeline import run_pipeline, _get_library_dir, _infer_flags
         "Without --source: fill in sorrys in an existing project (requires --context)."
     )
 )
+@click.option(
+    "--depth",
+    default=1,
+    type=int,
+    help="Maximum recursion depth available to agents for child unity calls (0 = no recursion allowed)"
+)
+@click.option(
+    "--output-dir",
+    default=None,
+    type=click.Path(dir_okay=True),
+    help="Output directory for this unity run; unity will chdir here before running (used when spawned as a child)"
+)
 @click.pass_context
-async def main(ctx, source, project, context, prove):
+async def main(ctx, source, project, context, prove, depth, output_dir):
     """Unity Agent - Autoformalization pipeline for Lean theorem proving.
 
     Run the pipeline:
@@ -89,7 +101,7 @@ async def main(ctx, source, project, context, prove):
                     param_hint="'--source' / '-s'"
                 )
 
-        exit_code = await run_pipeline(source, project, context, prove)
+        exit_code = await run_pipeline(source, project, context, prove, depth, output_dir)
         sys.exit(exit_code if exit_code else 0)
 
 
