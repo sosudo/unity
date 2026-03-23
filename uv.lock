@@ -321,6 +321,22 @@ wheels = [
 ]
 
 [[package]]
+name = "fastapi"
+version = "0.135.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "annotated-doc" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "typing-inspection" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c4/73/5903c4b13beae98618d64eb9870c3fac4f605523dd0312ca5c80dadbd5b9/fastapi-0.135.2.tar.gz", hash = "sha256:88a832095359755527b7f63bb4c6bc9edb8329a026189eed83d6c1afcf419d56", size = 395833, upload-time = "2026-03-23T14:12:41.697Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8f/ea/18f6d0457f9efb2fc6fa594857f92810cadb03024975726db6546b3d6fcf/fastapi-0.135.2-py3-none-any.whl", hash = "sha256:0af0447d541867e8db2a6a25c23a8c4bd80e2394ac5529bd87501bbb9e240ca5", size = 117407, upload-time = "2026-03-23T14:12:43.284Z" },
+]
+
+[[package]]
 name = "fastmcp"
 version = "3.1.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1192,11 +1208,13 @@ dependencies = [
     { name = "asyncclick" },
     { name = "claude-agent-sdk" },
     { name = "click" },
+    { name = "fastapi" },
     { name = "fastmcp" },
     { name = "lean-lsp-mcp" },
     { name = "python-dotenv" },
     { name = "rich" },
     { name = "ripgrep" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
@@ -1204,11 +1222,13 @@ requires-dist = [
     { name = "asyncclick", specifier = ">=8.3.0.7" },
     { name = "claude-agent-sdk", specifier = ">=0.1.48" },
     { name = "click", specifier = ">=8.3.1" },
+    { name = "fastapi", specifier = ">=0.115.0" },
     { name = "fastmcp", specifier = ">=2.0.0" },
     { name = "lean-lsp-mcp", specifier = ">=0.1.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "rich", specifier = ">=14.3.3" },
     { name = "ripgrep", specifier = ">=15.0.0" },
+    { name = "uvicorn", specifier = ">=0.30.0" },
 ]
 
 [[package]]

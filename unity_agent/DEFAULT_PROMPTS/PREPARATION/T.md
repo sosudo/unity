@@ -28,6 +28,32 @@ These plans are advisory — formalization agents may deviate from them, but sho
 
 After `ORDER.md` is complete, create a forum thread for each chunk using `forum_create_thread(thread_id="chunk-<id>", title=<chunk-title>)` and a global thread `forum_create_thread(thread_id="global", title="Global Discussion")` for cross-chunk communication.
 
+**dag.json**
+
+After `ORDER.md` is complete, write `dag.json` at the repository root with the following structure:
+
+```json
+{
+  "chunks": [
+    {
+      "id": "chunk-1",
+      "title": "MyTheorem",
+      "type": "theorem",
+      "declarations": ["MyTheorem"],
+      "summary": "one-sentence description of what this chunk proves or defines",
+      "dependencies": ["chunk-2"],
+      "lean_file": "MyProject/Foo.lean",
+      "lean_decl_lines": [10, 25]
+    }
+  ]
+}
+```
+
+- `type`: one of `theorem`, `lemma`, `definition`, `instance`, `structure`, `class`, `axiom`, `other`
+- `lean_file`: path to the Lean file containing this declaration, relative to the working directory (cwd where unity was run)
+- `lean_decl_lines`: `[start_line, end_line]` (1-indexed, inclusive) covering the full declaration including its proof body; use `null` if not determinable
+- `dependencies`: list of chunk IDs this chunk depends on, derived from the dependency graph
+
 **Subagents**
 
 You may spawn subagents if you deem it truly necessary.

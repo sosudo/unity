@@ -1,5 +1,6 @@
 """Main autoformalization pipeline for Unity Agent."""
 
+import atexit
 import os
 import sys
 import json
@@ -281,6 +282,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         exploration = parse_bool(os.getenv("EXPLORATION"))
         recurse = parse_bool(os.getenv("RECURSE"))
         max_critic_iterations = parse_int(os.getenv("MAX_CRITIC_ITERATIONS"))
+        forum_port = parse_int(os.getenv("FORUM_PORT")) or 8080
         anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
         anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         anthropic_auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
@@ -305,6 +307,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info(f"AUTOFIX: {autofix}")
         logging.info(f"EXPLORATION: {exploration}")
         logging.info(f"RECURSE: {recurse}")
+        logging.info(f"FORUM_PORT: {forum_port}")
         logging.info(f"ANTHROPIC_BASE_URL: {anthropic_base_url}")
         logging.info(f"ANTHROPIC_API_KEY: {anthropic_api_key}")
         logging.info(f"ANTHROPIC_AUTH_TOKEN: {anthropic_auth_token}")
@@ -390,6 +393,20 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             "args": ["-m", "unity_agent.forum_mcp", "--forum-dir", str(Path.cwd() / "forum")],
         },
     }
+
+    # Start forum web UI
+    forum_dir = Path.cwd() / "forum"
+    forum_dir.mkdir(exist_ok=True)
+    _forum_web = subprocess.Popen(
+        [sys.executable, "-m", "unity_agent.forum_web",
+         "--forum-dir", str(forum_dir),
+         "--root-dir", str(Path.cwd()),
+         "--port", str(forum_port)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(_forum_web.terminate)
+    logging.info(f"Forum web UI: http://localhost:{forum_port}")
 
     # Library initialization and context loading
     _init_library()

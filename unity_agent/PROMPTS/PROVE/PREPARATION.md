@@ -25,6 +25,32 @@ Topologically sort all chunks by their dependency structure, derived from Lean's
 
 For each chunk, call `forum_create_thread(thread_id="chunk-<id>", title=<declaration-name>)` to create a forum thread for formalization agents working on that chunk. Also create a global thread: `forum_create_thread(thread_id="global", title="Global Discussion")` for cross-chunk communication. Agents may create additional threads as needed.
 
+**dag.json**
+
+After `ORDER.md` is complete, write `dag.json` at the repository root with the following structure:
+
+```json
+{
+  "chunks": [
+    {
+      "id": "chunk-1",
+      "title": "MyTheorem",
+      "type": "theorem",
+      "declarations": ["MyTheorem"],
+      "summary": "one-sentence description of what this chunk proves or defines",
+      "dependencies": ["chunk-2"],
+      "lean_file": "MyProject/Foo.lean",
+      "lean_decl_lines": [10, 25]
+    }
+  ]
+}
+```
+
+- `type`: one of `theorem`, `lemma`, `definition`, `instance`, `structure`, `class`, `axiom`, `other`
+- `lean_file`: path to the Lean file containing this declaration, relative to the working directory (cwd where unity was run)
+- `lean_decl_lines`: `[start_line, end_line]` (1-indexed, inclusive) covering the full declaration including its proof body
+- `dependencies`: list of chunk IDs this chunk depends on, derived from Lean's import/reference graph
+
 **PLAN.md**
 
 For each chunk, produce an advisory proof plan keyed by the same chunk identifiers used in `ORDER.md`. Each plan should include:
