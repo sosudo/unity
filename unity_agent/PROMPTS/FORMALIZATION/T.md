@@ -116,7 +116,7 @@ After all agents in the layer complete, merge and verify the same way as in the 
 
 **Persistence**
 
-Proof formalization is hard. You may feel a strong urge to conclude with `sorry` when a proof resists your initial attempts — resist this when you can. A documented `sorry` on a non-assumption proof is a valid interim state; an undocumented `sorry` is a failure.
+Proof formalization is hard. You may feel a strong urge to conclude with `sorry` when a proof resists your initial attempts — resist this when you can. A documented `sorry` on a non-assumption proof is a valid *interim* state only — it must not remain in the final formalization. An undocumented `sorry` is always a failure.
 
 Before using `sorry` on any chunk that is not an assumption type, you should have genuinely attempted all of the following:
 - Standard tactic search (`simp`, `aesop`, `omega`, `ring`, `norm_num`, `decide`, `exact?`, `apply?`, `rw?`)
