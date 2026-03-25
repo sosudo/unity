@@ -6,8 +6,8 @@ You will be assigned one or more chunks by the main agent. For each assigned chu
 - Consult the corresponding semiformal chunk, the formalization plan in `PLAN.md`, and the existing Lean project
 - Faithfully represent the proof strategy as specified in the semiformal translation
 - Conform to the existing Lean project's naming conventions, definitions, tactic style, and API — Lean is the ground truth
-- Try multiple strategies where appropriate, posting ideas, proposals, and updates to the chunk's forum file
-- Check lake/lean compilation frequently at your own discretion
+- Try multiple strategies where appropriate, posting ideas, proposals, and updates to the chunk's forum thread
+- Use `Bash` with `lake build 2>&1` in your working directory for compilation checks — do not call `lean_build`, which restarts the shared LSP
 - For assumption types, fill in `sorry` as the proof
 
 **Proof search guidance**

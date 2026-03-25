@@ -8,8 +8,8 @@ You will be assigned one or more chunks by the main agent. For each assigned chu
 - If the chunk's `gathered/` entry is marked `novel: true` (no external mathematical content found), prove from first principles — any valid proof is acceptable
 - You may freely use Mathlib lemmas, external constructions, or gathered sources as part of a proof
 - Conform to the existing Lean project's naming conventions, definitions, tactic style, and API — Lean is the ground truth
-- Try multiple strategies where appropriate, posting ideas, proposals, and updates to the chunk's forum file
-- Check lake/lean compilation frequently at your own discretion
+- Try multiple strategies where appropriate, posting ideas, proposals, and updates to the chunk's forum thread
+- Use `Bash` with `lake build 2>&1` in your working directory for compilation checks — do not call `lean_build`, which restarts the shared LSP
 - For assumption types, prove however you need to if possible; use `sorry` only if a proof cannot be found
 
 **Proof search guidance**

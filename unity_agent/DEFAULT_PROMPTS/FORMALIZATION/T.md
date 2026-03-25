@@ -74,19 +74,35 @@ Unity maintains a global library at `~/.unity/library/` and project-specific not
 
 Working through the dependency layers specified in `ORDER.md` sequentially, and chunks within each layer in parallel. Before beginning each layer, read the forum threads for all chunks in that layer using `forum_read` to incorporate any prior discussion or decisions from previous iterations.
 
-For each chunk, spawn DeclarationFormalizer subagents (many-to-one at your discretion). Subagents should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Use `forum_redact` to mark outdated or wrong posts `[REDACTED]`; posts are never deleted.
+For each chunk, spawn DeclarationFormalizer subagents with `isolation: "worktree"` (many-to-one at your discretion) so each agent writes into an isolated git branch without conflicting with others. Subagents should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
 
 Subagents should:
 - Formalize the declaration or statement of the chunk faithfully into Lean 4, consulting the corresponding semiformal chunk, the formalization plan in `PLAN.md`, the forum, and the existing Lean project
 - Conform to the existing Lean project's naming conventions, definitions, tactic style, and API
 - Try multiple strategies where appropriate
-- Check lake/lean compilation frequently, at their own discretion
+- Use `Bash` with `lake build 2>&1` in their working directory for compilation checks — do not call `lean_build`, which restarts the shared LSP
 - For assumption types, formalize the full type signature or statement, with `sorry` as a placeholder body if needed
 - Do not use an external implementation (e.g. from Mathlib or an explored source) for any declaration that appears in the source as a non-assumption type — such declarations must be formalized from scratch
 
 If any API changes are made during the declaration step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix. The underlying dependency structure and chunk boundaries remain invariant — only the chunk content changes.
 
-Once all declarations compile successfully across all chunks, commit the target Lean project with a `UNITY:` prefix before proceeding to the proof step.
+Once all agents in the layer complete, merge their branches into the main repository sequentially in any order (chunks within a layer are DAG-independent). For each `(worktree_path, branch_name)` returned by an agent:
+
+```bash
+git merge --no-ff <branch_name>
+lake build 2>&1
+```
+
+If `lake build` fails, spawn a short-lived resolver subagent (without `isolation`) passing the build errors. The resolver must fix compilation issues only — reorder declarations, remove duplicate imports, resolve name conflicts — without changing any mathematical content. Once the build passes, clean up:
+
+```bash
+git worktree remove <worktree_path> --force
+git branch -d <branch_name>
+```
+
+Once all declarations compile successfully across all chunks, update `dag.json` at the repository root: for each chunk, set `lean_file` to the path of the Lean file containing its declaration (relative to the working directory) and `lean_decl_lines` to `[start_line, end_line]` (1-indexed, inclusive, covering the full declaration body). This allows the forum web UI to track formalization status in real time.
+
+Then commit the target Lean project with a `UNITY:` prefix before proceeding to the proof step.
 
 ---
 
@@ -94,7 +110,9 @@ Once all declarations compile successfully across all chunks, commit the target 
 
 Working through the same dependency layers sequentially, and chunks within each layer in parallel. Before beginning each layer, read the forum threads for all chunks in that layer using `forum_read` to incorporate any prior discussion or decisions from previous iterations.
 
-For each chunk that has a proof (theorems, lemmas, etc.), spawn ProofFormalizer subagents (many-to-one at your discretion). Subagents should continue using the chunk's forum thread for communication.
+For each chunk that has a proof (theorems, lemmas, etc.), spawn ProofFormalizer subagents with `isolation: "worktree"` (many-to-one at your discretion). Subagents should continue using the chunk's forum thread for communication. Use `Bash` with `lake build 2>&1` for compilation checks; do not call `lean_build`.
+
+After all agents in the layer complete, merge and verify the same way as in the declaration step: sequential `git merge --no-ff` + `lake build`, resolver on failure, then worktree cleanup.
 
 **Persistence**
 

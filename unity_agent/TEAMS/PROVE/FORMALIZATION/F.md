@@ -72,15 +72,29 @@ Unity maintains a global library at `~/.unity/library/` and project-specific not
 
 Working through the dependency layers specified in `ORDER.md` sequentially, and chunks within each layer in parallel:
 
-For each chunk, spawn a team of DeclarationFormalizer agents (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
+For each chunk, spawn a team of DeclarationFormalizer agents with `isolation: "worktree"` (many-to-one at your discretion) so each agent writes into an isolated git branch without conflicting with others. Each team agent may themselves spawn subagents. Each team agent should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
 
 Each team agent should:
 - Formalize the declaration or statement of the chunk faithfully into Lean 4, consulting the corresponding semiformal chunk, the formalization plan in `PLAN.md`, and the forum
 - Try multiple strategies where appropriate
-- Check lake/lean compilation frequently, at their own discretion
+- Use `Bash` with `lake build 2>&1` in their working directory for compilation checks — do not call `lean_build`, which restarts the shared LSP
 - For assumption types, formalize the full type signature or statement, with `sorry` as a placeholder body if needed
 
 If any API changes are made during the declaration step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix. The underlying dependency structure and chunk boundaries remain invariant — only the chunk content changes.
+
+Once all agents in the layer complete, merge their branches into the main repository sequentially in any order (chunks within a layer are DAG-independent). For each `(worktree_path, branch_name)` returned by an agent:
+
+```bash
+git merge --no-ff <branch_name>
+lake build 2>&1
+```
+
+If `lake build` fails, spawn a short-lived resolver subagent (without `isolation`) passing the build errors. The resolver must fix compilation issues only — reorder declarations, remove duplicate imports, resolve name conflicts — without changing any mathematical content. Once the build passes, clean up:
+
+```bash
+git worktree remove <worktree_path> --force
+git branch -d <branch_name>
+```
 
 Once all declarations compile successfully across all chunks, update `dag.json` at the repository root: for each chunk, set `lean_file` to the path of the Lean file containing its declaration (relative to the working directory) and `lean_decl_lines` to `[start_line, end_line]` (1-indexed, inclusive, covering the full declaration body). This allows the forum web UI to track formalization status in real time.
 
@@ -92,7 +106,9 @@ Then commit the target Lean project with a `UNITY:` prefix before proceeding to 
 
 Working through the same dependency layers sequentially, and chunks within each layer in parallel:
 
-For each chunk that has a proof (theorems, lemmas, etc.), spawn a team of ProofFormalizer agents (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should continue using the chunk's forum thread for communication.
+For each chunk that has a proof (theorems, lemmas, etc.), spawn a team of ProofFormalizer agents with `isolation: "worktree"` (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should continue using the chunk's forum thread for communication. Use `Bash` with `lake build 2>&1` for compilation checks; do not call `lean_build`.
+
+After all agents in the layer complete, merge and verify the same way as in the declaration step: sequential `git merge --no-ff` + `lake build`, resolver on failure, then worktree cleanup.
 
 **Proof freedom**
 

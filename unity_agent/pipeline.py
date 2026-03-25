@@ -470,10 +470,33 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             },
         }
 
+    import re as _re
+
+    _KILL_PATTERN = _re.compile(
+        r"\b(pkill|killall|kill\s+-[0-9]+|kill\s+-SIG\w+)\b.*\b(claude|unity.agent|unity_agent)\b"
+        r"|\b(pkill|killall)\b.*\b(claude|unity.agent|unity_agent)\b",
+        _re.IGNORECASE,
+    )
+
+    def _self_kill_guard_hook(hook_input: dict, _context: object) -> dict:
+        command = hook_input.get("tool_input", {}).get("command", "")
+        if _KILL_PATTERN.search(command):
+            return {
+                "continue_": False,
+                "stopReason": (
+                    "[BLOCKED] Agents may not kill the Unity pipeline process. "
+                    "To stop a background agent, post to the forum instead."
+                ),
+            }
+        return {"continue_": True}
+
     FORUM_HOOKS = {
+        "PreToolUse": [
+            HookMatcher(matcher="Bash", hooks=[_self_kill_guard_hook])
+        ],
         "PostToolUse": [
             HookMatcher(matcher="forum_post|forum_vote", hooks=[_forum_reward_hook])
-        ]
+        ],
     }
 
     # Start forum web UI
