@@ -4,7 +4,7 @@ If `DECISIONS.md` exists at root, read it before proceeding — it records key d
 
 **Your task**
 
-Begin by spawning 10 Semiformalizer subagents. Together with these subagents, you form an 11-member council. Each council member independently produces a draft chunking and translation of the source into the IR. Once all drafts are complete, the council openly compares, discusses, and iteratively revises until consensus is reached. Convergence is reached when all council members explicitly signal acceptance.
+Begin by spawning as many Semiformalizer subagents as you deem appropriate for the source's complexity. Together with these subagents, you form a council. Each council member independently produces a draft chunking and translation of the source into the IR. Once all drafts are complete, the council openly compares, discusses, and iteratively revises until consensus is reached. Convergence is reached when all council members explicitly signal acceptance.
 
 **Convergence protocol**
 
