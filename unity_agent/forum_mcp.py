@@ -25,6 +25,10 @@ def _thread_path(thread_id: str) -> Path:
     return FORUM_DIR / f"{thread_id}.json"
 
 
+def _balances_path() -> Path:
+    return FORUM_DIR / "balances.json"
+
+
 def _load(thread_id: str) -> dict:
     path = _thread_path(thread_id)
     if not path.exists():
@@ -35,6 +39,78 @@ def _load(thread_id: str) -> dict:
 def _save(data: dict) -> None:
     FORUM_DIR.mkdir(parents=True, exist_ok=True)
     _thread_path(data["thread_id"]).write_text(json.dumps(data, indent=2))
+
+
+def _load_balances() -> dict:
+    path = _balances_path()
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_balances(balances: dict) -> None:
+    FORUM_DIR.mkdir(parents=True, exist_ok=True)
+    _balances_path().write_text(json.dumps(balances, indent=2))
+
+
+def _credit(author: str, delta: float, event: str, thread_id: str, excerpt: str = "") -> dict:
+    """Credit delta to author's balance, append history entry. Returns updated author record."""
+    balances = _load_balances()
+    if author not in balances:
+        balances[author] = {"balance": 0.0, "history": [], "notifications": []}
+    rec = balances[author]
+    rec["balance"] = round(rec["balance"] + delta, 2)
+    rec["history"].append({
+        "event": event,
+        "delta": delta,
+        "balance_after": rec["balance"],
+        "thread_id": thread_id,
+        "excerpt": excerpt,
+        "timestamp": int(time.time()),
+    })
+    _save_balances(balances)
+    return rec
+
+
+def _push_notification(author: str, delta: float, event: str, thread_id: str, post_id: str, excerpt: str) -> None:
+    """Queue a ±1 notification for author (received vote). Balance is credited here."""
+    balances = _load_balances()
+    if author not in balances:
+        balances[author] = {"balance": 0.0, "history": [], "notifications": []}
+    rec = balances[author]
+    rec["balance"] = round(rec["balance"] + delta, 2)
+    rec["history"].append({
+        "event": event,
+        "delta": delta,
+        "balance_after": rec["balance"],
+        "thread_id": thread_id,
+        "post_id": post_id,
+        "excerpt": excerpt,
+        "timestamp": int(time.time()),
+    })
+    rec["notifications"].append({
+        "delta": delta,
+        "event": event,
+        "thread_id": thread_id,
+        "post_id": post_id,
+        "excerpt": excerpt,
+        "balance_after": rec["balance"],
+    })
+    _save_balances(balances)
+
+
+def _drain_notifications(author: str) -> list:
+    """Pop and return all pending notifications for author."""
+    balances = _load_balances()
+    if author not in balances:
+        return []
+    notifications = balances[author].get("notifications", [])
+    balances[author]["notifications"] = []
+    _save_balances(balances)
+    return notifications
 
 
 def _hot(post: dict) -> float:
@@ -86,7 +162,9 @@ def forum_post(
     """Post a message to a forum thread.
 
     Returns the new post's metadata: post_id, author, timestamp, upvotes,
-    downvotes, reply_to. Use post_id to vote on or redact this post later.
+    downvotes, reply_to, icrl_balance, and any pending icrl_notifications
+    (vote feedback received since your last post). Use post_id to vote on
+    or redact this post later.
     """
     data = _load(thread_id)
     post = {
@@ -101,14 +179,22 @@ def forum_post(
     }
     data["posts"].append(post)
     _save(data)
-    return {k: v for k, v in post.items()}
+    rec = _credit(author, 0.5, "forum_post", thread_id, content[:100])
+    notifications = _drain_notifications(author)
+    result = {k: v for k, v in post.items()}
+    result["icrl_balance"] = rec["balance"]
+    result["icrl_delta"] = +0.5
+    if notifications:
+        result["icrl_notifications"] = notifications
+    return result
 
 
 @mcp.tool()
-def forum_vote(thread_id: str, post_id: str, vote: str) -> dict:
-    """Vote on a post. vote must be 'up' or 'down'.
+def forum_vote(thread_id: str, post_id: str, vote: str, voter: str = "unknown") -> dict:
+    """Vote on a post. vote must be 'up' or 'down'. voter should be your agent name.
 
-    Returns updated upvote and downvote counts for the post.
+    Credits +0.5 to voter and ±1 to the post author (delivered via their next
+    forum_post response). Returns updated vote counts and voter's icrl_balance.
     """
     if vote not in ("up", "down"):
         raise ValueError("vote must be 'up' or 'down'")
@@ -120,7 +206,19 @@ def forum_vote(thread_id: str, post_id: str, vote: str) -> dict:
             else:
                 post["downvotes"] += 1
             _save(data)
-            return {"post_id": post_id, "upvotes": post["upvotes"], "downvotes": post["downvotes"]}
+            excerpt = post["content"][:100]
+            author = post["author"]
+            delta = +1.0 if vote == "up" else -1.0
+            event = "received_upvote" if vote == "up" else "received_downvote"
+            _push_notification(author, delta, event, thread_id, post_id, excerpt)
+            rec = _credit(voter, 0.5, f"forum_vote_{vote}", thread_id)
+            return {
+                "post_id": post_id,
+                "upvotes": post["upvotes"],
+                "downvotes": post["downvotes"],
+                "icrl_balance": rec["balance"],
+                "icrl_delta": +0.5,
+            }
     raise ValueError(f"Post '{post_id}' not found in thread '{thread_id}'.")
 
 
@@ -165,6 +263,25 @@ def forum_read(thread_id: str, sort: str = "hot") -> dict:
 
 
 @mcp.tool()
+def forum_check_balance(author: str) -> dict:
+    """Check your ICRL balance and full trajectory.
+
+    Returns current balance, full history of reward events (posts, votes cast,
+    votes received), and any pending notifications not yet delivered via forum_post.
+    """
+    balances = _load_balances()
+    if author not in balances:
+        return {"author": author, "balance": 0.0, "history": [], "notifications": []}
+    rec = balances[author]
+    return {
+        "author": author,
+        "balance": rec["balance"],
+        "history": rec["history"],
+        "pending_notifications": rec.get("notifications", []),
+    }
+
+
+@mcp.tool()
 def forum_list() -> list:
     """List all forum threads with summary metadata.
 
@@ -173,6 +290,8 @@ def forum_list() -> list:
     FORUM_DIR.mkdir(parents=True, exist_ok=True)
     threads = []
     for path in sorted(FORUM_DIR.glob("*.json")):
+        if path.name == "balances.json":
+            continue
         try:
             data = json.loads(path.read_text())
             last_activity = max(
@@ -188,6 +307,15 @@ def forum_list() -> list:
             })
         except Exception:
             continue
+    # Append ICRL leaderboard summary
+    balances = _load_balances()
+    if balances:
+        leaderboard = sorted(
+            [{"author": a, "balance": r["balance"]} for a, r in balances.items()],
+            key=lambda x: x["balance"],
+            reverse=True,
+        )
+        threads.append({"thread_id": "_leaderboard", "leaderboard": leaderboard})
     return threads
 
 

@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.logging import RichHandler
 from rich.markdown import Markdown
 from dotenv import load_dotenv
-from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage, AgentDefinition, TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage
+from claude_agent_sdk import query, ClaudeAgentOptions, AssistantMessage, ResultMessage, AgentDefinition, TaskStartedMessage, TaskProgressMessage, TaskNotificationMessage, HookMatcher
 
 _console: Console | None = None
 
@@ -443,6 +443,39 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         },
     }
 
+    # ICRL hook: reward agents for forum participation and surface vote feedback
+    _balances_path = Path.cwd() / "forum" / "balances.json"
+
+    def _forum_reward_hook(hook_input: dict, context: object) -> dict:
+        tool_name = hook_input.get("tool_name", "")
+        tool_input = hook_input.get("tool_input", {})
+        if tool_name == "forum_post":
+            actor = tool_input.get("author", "unknown")
+            action = "forum_post +0.5"
+        elif tool_name == "forum_vote":
+            actor = tool_input.get("voter", "unknown")
+            action = "forum_vote +0.5"
+        else:
+            return {"continue_": True}
+        try:
+            balances = json.loads(_balances_path.read_text())
+            balance = balances.get(actor, {}).get("balance", 0.0)
+        except Exception:
+            balance = 0.0
+        return {
+            "continue_": True,
+            "hookSpecificOutput": {
+                "hookEventName": "PostToolUse",
+                "additionalContext": f"[ICRL] {action} — {actor} balance: {balance:.1f}",
+            },
+        }
+
+    FORUM_HOOKS = {
+        "PostToolUse": [
+            HookMatcher(matcher="forum_post|forum_vote", hooks=[_forum_reward_hook])
+        ]
+    }
+
     # Start forum web UI
     forum_dir = Path.cwd() / "forum"
     forum_dir.mkdir(exist_ok=True)
@@ -512,6 +545,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     },
                     system_prompt=EXPLORATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=exploration_budget,
         
@@ -559,6 +593,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=GENERATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=generation_budget,
 
@@ -590,6 +625,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=VALIDATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=validation_budget,
 
@@ -647,6 +683,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=semiformalization_budget,
         
@@ -678,6 +715,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     agents={**LIBRARY_SUBAGENTS},
                     system_prompt=PREPARATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=preparation_budget,
         
@@ -728,6 +766,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
             
@@ -809,6 +848,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=CRITIC_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=critic_budget,
             
@@ -888,6 +928,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     },
                     system_prompt=GENERATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=generation_budget,
 
@@ -919,6 +960,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     agents={**LIBRARY_SUBAGENTS},
                     system_prompt=VALIDATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=validation_budget,
 
@@ -979,6 +1021,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=semiformalization_budget,
         
@@ -1018,6 +1061,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=semiformalization_budget,
         
@@ -1057,6 +1101,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     },
                     system_prompt=SEMIFORMALIZATION_PROMPT,
                     mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
                     max_budget_usd=semiformalization_budget,
         
@@ -1121,6 +1166,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
                             permission_mode=PERMISSIONS,
                             max_budget_usd=exploration_budget,
                 
@@ -1174,6 +1220,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
                             permission_mode=PERMISSIONS,
                             max_budget_usd=exploration_budget,
                 
@@ -1227,6 +1274,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
                             permission_mode=PERMISSIONS,
                             max_budget_usd=exploration_budget,
                 
@@ -1280,6 +1328,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             },
                             system_prompt=EXPLORATION_PROMPT,
                             mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
                             permission_mode=PERMISSIONS,
                             max_budget_usd=exploration_budget,
                 
@@ -1320,6 +1369,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=PREPARATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=preparation_budget,
             
@@ -1350,6 +1400,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=PREPARATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=preparation_budget,
             
@@ -1404,6 +1455,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
             
@@ -1450,6 +1502,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
             
@@ -1504,6 +1557,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=CRITIC_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=critic_budget,
             
@@ -1550,6 +1604,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         },
                         system_prompt=CRITIC_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=critic_budget,
             
