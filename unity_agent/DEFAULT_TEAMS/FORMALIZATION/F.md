@@ -5,15 +5,17 @@ If a `blueprint/` directory or `blueprint.xml` is present in the project root, c
 
 If `REPORT.md` exists at root, read it before proceeding — it contains the critic's assessment from the previous formalization attempt. Prioritize chunks with unresolved issues.
 
-Before spawning any team agents, create the `forum/` directory at root. For each chunk in `ORDER.md`, create a corresponding forum file keyed by chunk identifier, with the following header and nothing else:
+If `DECISIONS.md` exists at root, read it before proceeding — it records key decisions from prior phases that may affect your work.
 
-```
-Forum for chunk {chunk_identifier}
-```
+Forum threads are created by the preparation phase. Use the following tools to interact with them:
 
-The forum is required to have a *clear* system for upvoting and downvoting posts so that agents can immediately see what is useful and what is not, have a system to reply to posts with threads, and record which agent has said what for tractability. Each post must record: posting agent identifier, Unix timestamp (seconds), upvote count, downvote count, and a unique post ID.
-
-The forum supports three sort modes — **new** (newest first), **top** (highest net score first), and **hot** (default). Hot sort uses Reddit's algorithm: `hot = log₁₀(max(|score|, 1)) × sign(score) + timestamp / 45000`, where `score = upvotes − downvotes`. The file must be maintained in hot order by default; whenever a post is added or vote counts change, the file must be re-sorted by hot score.
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; agents may create additional threads as needed
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
 
 The target is a brand new Lake project. Initialize it as appropriate before proceeding.
 
@@ -42,7 +44,7 @@ The following tools are available via the Lean LSP MCP server:
 - `lean_profile_proof` — Profile a theorem for per-line timing. Slow — avoid on heartbeat-limited proofs.
 
 *Lemma search*
-- `lean_local_search` — Fast local search to verify declarations exist in the project and mathlib cache. **Always use this before relying on any lemma name.**
+- `lean_local_search` — Fast local search to verify declarations exist in the project and mathlib cache. **Prefer using this to verify lemma names before relying on them.**
 - `lean_leansearch` — Natural language search on Mathlib via leansearch.net.
 - `lean_loogle` — Type signature search on Mathlib via loogle.lean-lang.org.
 - `lean_leanfinder` — Semantic search by mathematical meaning via Lean Finder.
@@ -56,7 +58,7 @@ The following tools are available via the Lean LSP MCP server:
 
 `lean_leansearch`, `lean_loogle`, `lean_leanfinder`, `lean_state_search`, and `lean_hammer_premise` always query the *latest* version of Mathlib. If the project's Lean or Mathlib version differs, returned declaration names or signatures may not exist or may have a different API in this project.
 
-Before using any lemma name returned by these tools, verify it exists using `lean_local_search`. If it does not match, use `Grep` (ripgrep) to search through the mathlib cache (`.lake/packages/mathlib/`) and the existing Lean project for the correct name or a compatible equivalent.
+Before relying on any lemma name returned by these tools, consider verifying it exists using `lean_local_search`. If it does not match, use `Grep` (ripgrep) to search through the mathlib cache (`.lake/packages/mathlib/`) and the existing Lean project for the correct name or a compatible equivalent.
 
 **Library**
 
@@ -70,9 +72,9 @@ Unity maintains a global library at `~/.unity/library/` and project-specific not
 
 **Declaration Step**
 
-Working through the dependency layers specified in `ORDER.md` sequentially, and chunks within each layer in parallel:
+Working through the dependency layers specified in `ORDER.md` sequentially, and chunks within each layer in parallel. Before beginning each layer, read the forum threads for all chunks in that layer using `forum_read` to incorporate any prior discussion or decisions from previous iterations.
 
-For each chunk, create a team of DeclarationFormalizer agents (many-to-one at your discretion). Team agents may themselves spawn subagents. Each team agent should use the chunk's forum file as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
+For each chunk, spawn a team of DeclarationFormalizer agents (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Use `forum_redact` to mark outdated or wrong posts `[REDACTED]`; posts are never deleted.
 
 Each team agent should:
 - Formalize the declaration or statement of the chunk faithfully into Lean 4, consulting the corresponding semiformal chunk, the formalization plan in `PLAN.md`, and the forum
@@ -83,28 +85,30 @@ Each team agent should:
 
 If any API changes are made during the declaration step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix. The underlying dependency structure and chunk boundaries remain invariant — only the chunk content changes.
 
-Once all declarations compile successfully across all chunks, commit the target Lean project with a `UNITY:` prefix before proceeding to the proof step.
+Once all declarations compile successfully across all chunks, update `dag.json` at the repository root: for each chunk, set `lean_file` to the path of the Lean file containing its declaration (relative to the working directory) and `lean_decl_lines` to `[start_line, end_line]` (1-indexed, inclusive, covering the full declaration body). This allows the forum web UI to track formalization status in real time.
+
+Then commit the target Lean project with a `UNITY:` prefix before proceeding to the proof step.
 
 ---
 
 **Proof Step**
 
-Working through the same dependency layers sequentially, and chunks within each layer in parallel:
+Working through the same dependency layers sequentially, and chunks within each layer in parallel. Before beginning each layer, read the forum threads for all chunks in that layer using `forum_read` to incorporate any prior discussion or decisions from previous iterations.
 
-For each chunk that has a proof (theorems, lemmas, etc.), create a team of ProofFormalizer agents (many-to-one at your discretion). Team agents may themselves spawn subagents. Each team agent should continue using the chunk's forum file for communication.
+For each chunk that has a proof (theorems, lemmas, etc.), spawn a team of ProofFormalizer agents (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should continue using the chunk's forum thread for communication.
 
 **Persistence**
 
-Proof formalization is hard. You may feel a strong urge to conclude with `sorry` when a proof resists your initial attempts — this is a trained behavior to override. A `sorry` on a non-assumption proof is not a completion; it is a failure.
+Proof formalization is hard. You may feel a strong urge to conclude with `sorry` when a proof resists your initial attempts — resist this when you can. A documented `sorry` on a non-assumption proof is a valid interim state; an undocumented `sorry` is a failure.
 
-Before using `sorry` on any chunk that is not an assumption type, you must have genuinely attempted all of the following:
+Before using `sorry` on any chunk that is not an assumption type, you should have genuinely attempted all of the following:
 - Standard tactic search (`simp`, `aesop`, `omega`, `ring`, `norm_num`, `decide`, `exact?`, `apply?`, `rw?`)
 - Decomposition into intermediate lemmas or helper definitions
 - Alternative proof strategies drawn from the semiformal chunk and `PLAN.md`
 - Mathlib search for applicable lemmas or constructions
 - Posting to the forum and incorporating suggestions from other agents
 
-Only after all of the above have been exhausted may `sorry` be used as a last resort. When it is, the agent must post to the forum a record of every approach tried and why each failed.
+If all of the above have been exhausted, `sorry` is acceptable as a last resort. When it is used, the agent must post to the forum a record of every approach tried and why each failed.
 
 Each team agent should:
 - Formalize the proof of the chunk faithfully into Lean 4, consulting the corresponding semiformal chunk, the formalization plan in `PLAN.md`, and the forum
@@ -116,3 +120,13 @@ Each team agent should:
 If any API changes are made during the proof step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix.
 
 Once all proofs compile successfully across all chunks, commit the target Lean project with a `UNITY:` prefix.
+
+**recursive-unity**
+
+If a `recursive-unity` subagent is available, you may delegate a self-contained subtask to a full child Unity pipeline run. Examples of when this is appropriate in this phase:
+- A chunk's proof depends on a substantial external result (e.g., a theorem from a cited paper) that was left as an assumption type during exploration — rather than attempting to prove it inline, delegate the full source to `recursive-unity` so it receives its own semiformalization and formalization cycle.
+- A cluster of assumption-type chunks forms a self-contained sub-theory (its own definitions, lemmas, and proofs) that would be better handled as an independent formalization task than worked on piecemeal within the current proof step.
+
+**Commits**
+
+Before completing this phase, append a brief entry to `DECISIONS.md` at root (create if absent) recording any key non-obvious decisions made and their rationale.

@@ -33,7 +33,7 @@ Only after all of the above have been exhausted may `sorry` be used as a last re
 
 **Forum**
 
-Use the chunk's forum file in `forum/` as a shared communication space with other subagents working on the same chunk. Post ideas, design decisions, and updates in the style of a Reddit thread. Never delete posts — mark outdated or incorrect posts with `[REDACTED]` in place of their content.
+Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_check_balance`, `forum_redact`) to interact with the chunk's forum thread — never write to `forum/` files directly. Post ideas, design decisions, and updates in the style of a Reddit thread. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
 
 **API changes**
 

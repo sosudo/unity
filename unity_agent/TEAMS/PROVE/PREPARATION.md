@@ -4,7 +4,7 @@ If `REPORT.md` exists at root, read it before proceeding — it contains the cri
 
 **Your task**
 
-Produce `ORDER.md`, `PLAN.md`, and per-chunk forum stubs in `semiformal/`. Work in this order: chunk assignment → `ORDER.md` → forums → `PLAN.md`.
+Produce `ORDER.md`, `PLAN.md`, and per-chunk forum threads. Work in this order: chunk assignment → `ORDER.md` → forums → `PLAN.md`.
 
 **Chunk assignment**
 
@@ -21,9 +21,35 @@ Topologically sort all chunks by their dependency structure, derived from Lean's
 - For each chunk: its identifier, its layer, its dependencies, the chunk ↔ declaration mapping, and where to find its specification in `semiformal/`
 - Parallelism structure: chunks within the same layer may be formalized in parallel; layers must be formalized sequentially
 
-**Forum stubs**
+**Forum threads**
 
-For each chunk, create `forum/chunk-<id>.md` with a header identifying the chunk and its assigned declaration(s). These files serve as shared communication spaces for formalization agents working on the same chunk.
+For each chunk, call `forum_create_thread(thread_id="chunk-<id>", title=<declaration-name>)` to create a forum thread for formalization agents working on that chunk. Also create a global thread: `forum_create_thread(thread_id="global", title="Global Discussion")` for cross-chunk communication. Agents may create additional threads as needed.
+
+**dag.json**
+
+After `ORDER.md` is complete, write `dag.json` at the repository root with the following structure:
+
+```json
+{
+  "chunks": [
+    {
+      "id": "chunk-1",
+      "title": "MyTheorem",
+      "type": "theorem",
+      "declarations": ["MyTheorem"],
+      "summary": "one-sentence description of what this chunk proves or defines",
+      "dependencies": ["chunk-2"],
+      "lean_file": "MyProject/Foo.lean",
+      "lean_decl_lines": [10, 25]
+    }
+  ]
+}
+```
+
+- `type`: one of `theorem`, `lemma`, `definition`, `instance`, `structure`, `class`, `axiom`, `other`
+- `lean_file`: path to the Lean file containing this declaration, relative to the working directory (cwd where unity was run)
+- `lean_decl_lines`: `[start_line, end_line]` (1-indexed, inclusive) covering the full declaration including its proof body
+- `dependencies`: list of chunk IDs this chunk depends on, derived from Lean's import/reference graph
 
 **PLAN.md**
 
@@ -35,8 +61,12 @@ For each chunk, produce an advisory proof plan keyed by the same chunk identifie
 - Whether the declaration is novel (no external content found) and what that implies for proof strategy
 - Potential pitfalls or difficulties
 
-These plans are advisory — formalization agents may deviate from them, but should consider them seriously. Team agents may themselves spawn subagents.
+These plans are advisory — formalization agents may deviate from them, but should consider them seriously.
+
+**Team**
+
+You may create a team if you deem it truly necessary. Team agents may themselves spawn subagents.
 
 **Commits**
 
-Once `ORDER.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`. Once the forum stubs are created, commit them with a message prefixed by `PREPARATION:`. Once `PLAN.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`.
+Once `ORDER.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`. Once `PLAN.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`.

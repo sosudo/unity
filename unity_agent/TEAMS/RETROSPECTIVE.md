@@ -7,8 +7,9 @@ Read the following in full before proceeding:
 - The IR specification in `language/` (if it exists)
 - The semiformal translation in `semiformal/` (if it exists)
 - The compiled Lean project
-- All forum files in `forum/`
+- All forum threads (use `forum_list` to enumerate, then `forum_read` per thread)
 - `REPORT.md`
+- `DECISIONS.md` (if it exists) — records key decisions from all prior phases
 - The git log (all commits, especially those prefixed `UNITY:`, `FORMALIZATION:`, `EXPLORATION:`, `CRITIC:`)
 - Existing library content in `{LIBRARY_DIR}` — read before writing to avoid duplicating existing entries
 - Helper scripts at `~/.unity/scripts/` — available for analyzing sorry patterns, axiom usage, and import minimization
@@ -93,7 +94,7 @@ tools: Read,Write,Edit,Bash,Glob,Grep,WebSearch,WebFetch,Agent,Skill
 {{Full subagent system prompt here}}
 ```
 
-These files are automatically loaded by the pipeline on future runs and made available to formalization and exploration agents. Team agents may themselves spawn subagents.
+These files are automatically loaded by the pipeline on future runs and made available to formalization and exploration agents.
 
 **7. Project notes**
 
@@ -114,6 +115,8 @@ Only record what is genuinely reusable or informative. A tactic entry is worth r
 ---
 
 **Commits**
+
+Before committing, append a brief entry to `DECISIONS.md` at root (create if absent) recording any key non-obvious observations about the run and their implications for future iterations.
 
 If you edited any files in `{SUBAGENTS_DIR}/`, commit those changes with a message prefixed `RETROSPECTIVE:`. Do not commit project notes or library files — those are outside the git repository.
 

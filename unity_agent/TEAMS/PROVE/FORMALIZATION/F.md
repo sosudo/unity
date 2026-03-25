@@ -5,15 +5,15 @@ If a `blueprint/` directory or `blueprint.xml` is present in the project root, c
 
 If `REPORT.md` exists at root, read it before proceeding — it contains the critic's assessment from the previous formalization attempt. Prioritize chunks with unresolved issues.
 
-Before spawning any subagents, create the `forum/` directory at root. For each chunk in `ORDER.md`, create a corresponding forum file keyed by chunk identifier, with the following header and nothing else:
+Forum threads are created by the preparation phase. Use the following tools to interact with them:
 
-```
-Forum for chunk {chunk_identifier}
-```
-
-The forum is required to have a *clear* system for upvoting and downvoting posts so that agents can immediately see what is useful and what is not, have a system to reply to posts with threads, and record which agent has said what for tractability. Each post must record: posting agent identifier, Unix timestamp (seconds), upvote count, downvote count, and a unique post ID.
-
-The forum supports three sort modes — **new** (newest first), **top** (highest net score first), and **hot** (default). Hot sort uses Reddit's algorithm: `hot = log₁₀(max(|score|, 1)) × sign(score) + timestamp / 45000`, where `score = upvotes − downvotes`. The file must be maintained in hot order by default; whenever a post is added or vote counts change, the file must be re-sorted by hot score.
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; agents may create additional threads as needed
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
 
 The target is a brand new Lake project. Initialize it as appropriate before proceeding.
 
@@ -72,18 +72,19 @@ Unity maintains a global library at `~/.unity/library/` and project-specific not
 
 Working through the dependency layers specified in `ORDER.md` sequentially, and chunks within each layer in parallel:
 
-For each chunk, create a team of DeclarationFormalizer agents (many-to-one at your discretion). Each team agent should use the chunk's forum file as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
+For each chunk, spawn a team of DeclarationFormalizer agents (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
 
 Each team agent should:
 - Formalize the declaration or statement of the chunk faithfully into Lean 4, consulting the corresponding semiformal chunk, the formalization plan in `PLAN.md`, and the forum
 - Try multiple strategies where appropriate
 - Check lake/lean compilation frequently, at their own discretion
 - For assumption types, formalize the full type signature or statement, with `sorry` as a placeholder body if needed
-- Do not use an external implementation (e.g. from Mathlib or an explored source) for any declaration that appears in the source as a non-assumption type — such declarations must be formalized from scratch
 
 If any API changes are made during the declaration step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix. The underlying dependency structure and chunk boundaries remain invariant — only the chunk content changes.
 
-Once all declarations compile successfully across all chunks, commit the target Lean project with a `UNITY:` prefix before proceeding to the proof step.
+Once all declarations compile successfully across all chunks, update `dag.json` at the repository root: for each chunk, set `lean_file` to the path of the Lean file containing its declaration (relative to the working directory) and `lean_decl_lines` to `[start_line, end_line]` (1-indexed, inclusive, covering the full declaration body). This allows the forum web UI to track formalization status in real time.
+
+Then commit the target Lean project with a `UNITY:` prefix before proceeding to the proof step.
 
 ---
 
@@ -91,7 +92,7 @@ Once all declarations compile successfully across all chunks, commit the target 
 
 Working through the same dependency layers sequentially, and chunks within each layer in parallel:
 
-For each chunk that has a proof (theorems, lemmas, etc.), create a team of ProofFormalizer agents (many-to-one at your discretion). Each team agent should continue using the chunk's forum file for communication.
+For each chunk that has a proof (theorems, lemmas, etc.), spawn a team of ProofFormalizer agents (many-to-one at your discretion). Each team agent may themselves spawn subagents. Each team agent should continue using the chunk's forum thread for communication.
 
 **Proof freedom**
 
@@ -125,7 +126,6 @@ Each team agent should:
 - Try multiple strategies where appropriate
 - Check lake/lean compilation frequently, at their own discretion
 - For assumption types, prove however you need to if possible; use `sorry` only if a proof cannot be found
-- Do not use an external implementation (e.g. from Mathlib or an explored source) for any declaration that appears in the source as a non-assumption type — such declarations must be formalized from scratch
 
 If any API changes are made during the proof step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix.
 
