@@ -7,6 +7,7 @@ Reads forum/*.json and dag.json directly. Started automatically by the pipeline.
 """
 
 import argparse
+import asyncio
 import json
 import math
 import re
@@ -16,11 +17,15 @@ from pathlib import Path
 import uvicorn
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from watchfiles import awatch
 
 app = FastAPI(title="unity-forum")
 FORUM_DIR: Path = Path("forum")
 ROOT_DIR: Path = Path(".")
+
+_GRAPH_PALETTE = [
+    "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
+    "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
+]
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -50,15 +55,32 @@ def _load_thread(thread_id: str) -> dict | None:
         return None
 
 
+_DEFAULT_DIMENSIONS = [
+    "correctness", "faithfulness", "style_alignment",
+    "priority", "confidence", "feasibility",
+]
+
+
+def _load_config() -> dict:
+    path = FORUM_DIR / "config.json"
+    if not path.exists():
+        return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
+    try:
+        cfg = json.loads(path.read_text())
+        if not cfg.get("dimensions", {}).get("active"):
+            cfg.setdefault("dimensions", {})["active"] = list(_DEFAULT_DIMENSIONS)
+        return cfg
+    except Exception:
+        return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
+
+
 _SORRY_RE = re.compile(r'\bsorry\b')
 _ONLY_SORRY_RE = re.compile(r':=\s*sorry\s*$|by\s*\n?\s*sorry\s*$', re.MULTILINE)
 
 
 def _chunk_status(chunk: dict) -> str:
-    """Derive chunk status from the filesystem."""
     lean_file = chunk.get("lean_file")
     lines_range = chunk.get("lean_decl_lines")
-
     if lean_file and lines_range:
         path = ROOT_DIR / lean_file
         if path.exists():
@@ -75,8 +97,6 @@ def _chunk_status(chunk: dict) -> str:
                     return "blue"
             except Exception:
                 pass
-
-    # Declaration not yet in Lean file — check for recent forum activity (yellow)
     thread_path = FORUM_DIR / f"{chunk.get('id', '')}.json"
     if thread_path.exists():
         try:
@@ -85,7 +105,6 @@ def _chunk_status(chunk: dict) -> str:
                 return "yellow"
         except Exception:
             pass
-
     return "grey"
 
 
@@ -93,9 +112,10 @@ def _chunk_status(chunk: dict) -> str:
 
 @app.get("/api/threads")
 def list_threads():
+    """Returns threads, active dimensions, pending proposals, tags, and leaderboard."""
     threads = []
     for path in sorted(FORUM_DIR.glob("*.json")):
-        if path.name == "balances.json":
+        if path.name in ("balances.json", "config.json"):
             continue
         try:
             data = json.loads(path.read_text())
@@ -103,13 +123,40 @@ def list_threads():
             threads.append({
                 "thread_id": data["thread_id"],
                 "title": data["title"],
-                "description": data["description"],
+                "description": data.get("description", ""),
                 "post_count": len(data["posts"]),
                 "last_activity": last,
+                "pinned": data["thread_id"] == "_dimensions",
             })
         except Exception:
             continue
-    return JSONResponse(threads)
+    # Pinned first, then by last_activity
+    threads.sort(key=lambda t: (not t["pinned"], -t["last_activity"]))
+    config = _load_config()
+    balances_path = FORUM_DIR / "balances.json"
+    leaderboard = []
+    if balances_path.exists():
+        try:
+            balances = json.loads(balances_path.read_text())
+            leaderboard = sorted(
+                [{"author": a, "balance": r["balance"]} for a, r in balances.items()],
+                key=lambda x: x["balance"], reverse=True,
+            )
+        except Exception:
+            pass
+    return JSONResponse({
+        "threads": threads,
+        "active_dimensions": config["dimensions"]["active"],
+        "pending_dimensions": {
+            name: {"description": p["description"], "proposed_by": p["proposed_by"]}
+            for name, p in config["dimensions"]["pending"].items()
+        },
+        "tags": {
+            name: {"description": t["description"], "post_count": len(t["post_ids"])}
+            for name, t in config.get("tags", {}).items()
+        },
+        "leaderboard": leaderboard,
+    })
 
 
 @app.get("/api/threads/{thread_id}")
@@ -121,12 +168,86 @@ def get_thread(thread_id: str, sort: str = "hot"):
     for p in posts:
         p.setdefault("upvotes", 0)
         p.setdefault("downvotes", 0)
+        p.setdefault("votes_by_dimension", {})
+        p.setdefault("tags", [])
+        if not isinstance(p.get("reply_to"), list):
+            p["reply_to"] = [p["reply_to"]] if p.get("reply_to") else []
+    config = _load_config()
     return JSONResponse({
         "thread_id": data["thread_id"],
         "title": data["title"],
-        "description": data["description"],
+        "description": data.get("description", ""),
         "post_count": len(posts),
+        "active_dimensions": config["dimensions"]["active"],
         "posts": _sorted_posts(posts, sort),
+    })
+
+
+@app.get("/api/graph")
+def get_graph():
+    """All posts as nodes + reply edges. Used by the graph view."""
+    thread_colors: dict[str, str] = {}
+    nodes = []
+    edges = []
+    for path in sorted(FORUM_DIR.glob("*.json")):
+        if path.name in ("balances.json", "config.json"):
+            continue
+        try:
+            data = json.loads(path.read_text())
+            tid = data["thread_id"]
+            if tid not in thread_colors:
+                thread_colors[tid] = _GRAPH_PALETTE[len(thread_colors) % len(_GRAPH_PALETTE)]
+            color = thread_colors[tid]
+            for post in data["posts"]:
+                reply_to = post.get("reply_to") or []
+                if not isinstance(reply_to, list):
+                    reply_to = [reply_to] if reply_to else []
+                nodes.append({
+                    "id": post["post_id"],
+                    "author": post.get("author", "?"),
+                    "content_preview": post.get("content", "")[:200],
+                    "thread_id": tid,
+                    "thread_title": data["title"],
+                    "color": color,
+                    "upvotes": post.get("upvotes", 0),
+                    "downvotes": post.get("downvotes", 0),
+                    "votes_by_dimension": post.get("votes_by_dimension", {}),
+                    "tags": post.get("tags", []),
+                    "timestamp": post["timestamp"],
+                    "redacted": post.get("redacted", False),
+                })
+                for parent_id in reply_to:
+                    edges.append({"id": post["post_id"] + "__" + parent_id,
+                                  "source": post["post_id"], "target": parent_id})
+        except Exception:
+            continue
+    return JSONResponse({"nodes": nodes, "edges": edges, "thread_colors": thread_colors})
+
+
+@app.get("/api/tags/{name}")
+def get_tag(name: str):
+    config = _load_config()
+    tags = config.get("tags", {})
+    if name not in tags:
+        return JSONResponse({"error": "tag not found"}, status_code=404)
+    tag = tags[name]
+    post_ids = set(tag["post_ids"])
+    posts = []
+    for path in sorted(FORUM_DIR.glob("*.json")):
+        if path.name in ("balances.json", "config.json"):
+            continue
+        try:
+            data = json.loads(path.read_text())
+            for post in data["posts"]:
+                if post["post_id"] in post_ids:
+                    posts.append({**post, "thread_id": data["thread_id"], "thread_title": data["title"]})
+        except Exception:
+            continue
+    return JSONResponse({
+        "tag": name,
+        "description": tag["description"],
+        "created_by": tag["created_by"],
+        "posts": sorted(posts, key=_hot, reverse=True),
     })
 
 
@@ -139,10 +260,7 @@ def get_dag():
         dag = json.loads(dag_file.read_text())
     except Exception:
         return JSONResponse({"error": "failed to parse dag.json"}, status_code=500)
-    chunks = [
-        {**c, "status": _chunk_status(c)}
-        for c in dag.get("chunks", [])
-    ]
+    chunks = [{**c, "status": _chunk_status(c)} for c in dag.get("chunks", [])]
     return JSONResponse({"chunks": chunks})
 
 
@@ -150,12 +268,22 @@ def get_dag():
 async def events():
     async def generate():
         yield "data: connected\n\n"
-        watch_paths = [str(FORUM_DIR)]
-        dag_file = ROOT_DIR / "dag.json"
-        if dag_file.exists():
-            watch_paths.append(str(dag_file.parent))
-        async for _ in awatch(*watch_paths):
-            yield "data: update\n\n"
+        last_mtime = 0.0
+        while True:
+            await asyncio.sleep(1)
+            try:
+                mtime = max(
+                    (p.stat().st_mtime for p in FORUM_DIR.glob("*.json")),
+                    default=0.0,
+                )
+                dag_file = ROOT_DIR / "dag.json"
+                if dag_file.exists():
+                    mtime = max(mtime, dag_file.stat().st_mtime)
+                if mtime > last_mtime:
+                    last_mtime = mtime
+                    yield "data: update\n\n"
+            except Exception:
+                pass
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -177,6 +305,7 @@ FORUM_HTML = """\
 body { font-family: monospace; font-size: 13px; background: #fff; color: #000; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #000; flex-shrink: 0; }
 header h1 { font-size: 13px; font-weight: bold; letter-spacing: 0.08em; }
+nav { display: flex; gap: 12px; }
 nav a { font-size: 12px; color: #000; text-decoration: none; border-bottom: 1px solid #000; }
 nav a:hover { opacity: 0.6; }
 .controls { display: flex; align-items: center; gap: 16px; }
@@ -186,18 +315,25 @@ nav a:hover { opacity: 0.6; }
 .sort-tabs button:first-child { margin-left: 0; }
 .sort-tabs button.active { background: #000; color: #fff; border-color: #000; }
 main { display: flex; flex: 1; overflow: hidden; }
-#sidebar { width: 180px; border-right: 1px solid #000; overflow-y: auto; flex-shrink: 0; }
+#sidebar { width: 190px; border-right: 1px solid #000; overflow-y: auto; flex-shrink: 0; }
+.sidebar-section { font-size: 10px; letter-spacing: 0.08em; color: #999; padding: 8px 12px 4px; text-transform: uppercase; border-bottom: 1px solid #f0f0f0; }
 .thread-item { display: flex; justify-content: space-between; align-items: baseline; padding: 7px 12px; cursor: pointer; border-bottom: 1px solid #f0f0f0; gap: 8px; }
 .thread-item:hover { background: #f8f8f8; }
 .thread-item.active { background: #000; color: #fff; }
 .thread-item.active .count { color: #aaa; }
+.thread-item.pinned { background: #f0f4ff; border-left: 3px solid #2255cc; }
+.thread-item.pinned.active { background: #2255cc; }
 .thread-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .count { font-size: 11px; color: #999; flex-shrink: 0; }
+.tag-sidebar-item { display: flex; justify-content: space-between; padding: 5px 12px; cursor: pointer; border-bottom: 1px solid #f8f8f8; font-size: 11px; color: #555; }
+.tag-sidebar-item:hover { background: #f8f8f8; }
 #panel { flex: 1; overflow-y: auto; padding: 20px 24px; }
 .thread-title { font-weight: bold; margin-bottom: 4px; }
-.thread-desc { color: #666; font-size: 12px; margin-bottom: 20px; }
+.thread-desc { color: #666; font-size: 12px; margin-bottom: 8px; }
+.dim-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
+.dim-chip { font-size: 10px; background: #f0f4ff; color: #2255cc; padding: 1px 6px; border-radius: 10px; }
 .post { margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid #ebebeb; }
-.post-meta { display: flex; align-items: baseline; gap: 12px; margin-bottom: 5px; font-size: 11px; color: #888; }
+.post-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 5px; font-size: 11px; color: #888; }
 .post-author { font-weight: bold; color: #000; font-size: 12px; }
 .post-content { line-height: 1.6; font-size: 13px; }
 .post-content p { margin-bottom: 0.6em; }
@@ -213,6 +349,13 @@ main { display: flex; flex: 1; overflow: hidden; }
 .post-id-link:hover { color: #888; }
 .reply-to-link { color: #aaa; font-size: 11px; text-decoration: none; }
 .reply-to-link:hover { color: #555; }
+.post-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
+.tag-chip { font-size: 10px; background: #fff8e6; color: #a06000; border: 1px solid #e8d090; padding: 1px 6px; border-radius: 10px; cursor: pointer; }
+.tag-chip:hover { background: #ffe8a0; }
+.dim-inline { font-size: 10px; color: #aaa; white-space: nowrap; }
+.dim-inline-name { color: #bbb; margin-right: 1px; }
+.dim-inline .up { color: #2d7a2d; }
+.dim-inline .down { color: #c02020; }
 .reply { margin-left: 20px; border-left: 2px solid #e8e8e8; padding-left: 14px; border-bottom: none; margin-bottom: 10px; padding-bottom: 0; }
 #placeholder { color: #aaa; padding: 20px 0; }
 </style>
@@ -221,7 +364,10 @@ main { display: flex; flex: 1; overflow: hidden; }
 <header>
   <h1>unity forum</h1>
   <div class="controls">
-    <nav><a href="/dag">dag &rarr;</a></nav>
+    <nav>
+      <a href="/graph">graph &rarr;</a>
+      <a href="/dag">dag &rarr;</a>
+    </nav>
     <span id="status">connecting...</span>
     <div class="sort-tabs">
       <button class="active" data-sort="hot">hot</button>
@@ -242,7 +388,7 @@ function renderContent(text) {
   return html.replace(/@([\\w][\\w-]*)/g, '<span class="mention">@$1</span>');
 }
 
-let currentThread = null, currentSort = 'hot';
+let currentThread = null, currentSort = 'hot', activeDimensions = [];
 
 document.querySelectorAll('.sort-tabs button').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -261,34 +407,74 @@ function reltime(ts) {
 
 async function loadSidebar() {
   const res = await fetch('/api/threads'); if (!res.ok) return;
-  const threads = await res.json();
+  const data = await res.json();
+  activeDimensions = data.active_dimensions || [];
   const el = document.getElementById('sidebar'); el.innerHTML = '';
-  threads.forEach(t => {
-    const div = document.createElement('div');
-    div.className = 'thread-item' + (t.thread_id === currentThread ? ' active' : '');
-    div.dataset.id = t.thread_id;
-    div.innerHTML = '<span class="thread-name">'+esc(t.thread_id)+'</span><span class="count">'+t.post_count+'</span>';
-    div.addEventListener('click', () => loadThread(t.thread_id));
-    el.appendChild(div);
-  });
-  if (!currentThread && threads.length > 0) loadThread(threads[0].thread_id);
+
+  if (data.threads.length) {
+    el.innerHTML += '<div class="sidebar-section">threads</div>';
+    data.threads.forEach(t => {
+      const div = document.createElement('div');
+      const cls = ['thread-item', t.thread_id === currentThread ? 'active' : '', t.pinned ? 'pinned' : ''].filter(Boolean).join(' ');
+      div.className = cls;
+      div.dataset.id = t.thread_id;
+      div.innerHTML = '<span class="thread-name">'+(t.pinned ? '&#9650; ' : '')+esc(t.thread_id)+'</span><span class="count">'+t.post_count+'</span>';
+      div.addEventListener('click', () => loadThread(t.thread_id));
+      el.appendChild(div);
+    });
+  }
+
+  const tagNames = Object.keys(data.tags || {});
+  if (tagNames.length) {
+    const sec = document.createElement('div');
+    sec.className = 'sidebar-section'; sec.textContent = 'tags';
+    el.appendChild(sec);
+    tagNames.forEach(name => {
+      const div = document.createElement('div');
+      div.className = 'tag-sidebar-item';
+      div.innerHTML = '<span>#'+esc(name)+'</span><span>'+data.tags[name].post_count+'</span>';
+      div.addEventListener('click', () => loadTagView(name));
+      el.appendChild(div);
+    });
+  }
+
+  if (!currentThread && data.threads.length) loadThread(data.threads[0].thread_id);
+}
+
+function renderDimBreakdown(vbd) {
+  if (!activeDimensions.length) return '';
+  return activeDimensions.map(dim => {
+    const counts = (vbd||{})[dim] || {up:0, down:0};
+    const net = (counts.up||0) - (counts.down||0);
+    return '<span class="dim-inline"><span class="dim-inline-name">'+esc(dim)+'</span>'
+      +' <span class="up">&#8593;'+(counts.up||0)+'</span>'
+      +'<span class="down">&#8595;'+(counts.down||0)+'</span>'
+      +'</span>';
+  }).join('');
 }
 
 function renderPost(p, depth) {
-  const score = p.upvotes - p.downvotes;
-  const replyLink = p.reply_to
-    ? '<a class="reply-to-link" href="#post-'+p.reply_to+'">&#8629; #'+p.reply_to+'</a>'
-    : '';
+  const score = (p.upvotes||0) - (p.downvotes||0);
+  const replyLinks = (p.reply_to||[]).map(id =>
+    '<a class="reply-to-link" href="#post-'+id+'">&#8629; #'+id+'</a>'
+  ).join(' ');
+  const tags = (p.tags||[]).map(t =>
+    '<span class="tag-chip" onclick="loadTagView(&#39;'+esc(t)+'&#39;)">'+esc(t)+'</span>'
+  ).join('');
   const content = p.redacted
     ? '<div class="post-content">'+esc(p.content)+'</div>'
     : '<div class="post-content">'+renderContent(p.content)+'</div>';
+  const dimBreak = renderDimBreakdown(p.votes_by_dimension);
+  const tagsHtml = tags ? '<div class="post-tags">'+tags+'</div>' : '';
   return '<div class="post'+(depth>0?' reply':'')+(p.redacted?' redacted':'')+'" id="post-'+p.post_id+'">'
     +'<div class="post-meta"><span class="post-author">'+esc(p.author)+'</span>'
-    +replyLink
-    +'<span>&#8593;'+p.upvotes+' &#8595;'+p.downvotes+' ('+(score>=0?'+':'')+score+')</span>'
+    +replyLinks
+    +'<span>&#8593;'+(p.upvotes||0)+' &#8595;'+(p.downvotes||0)+' ('+(score>=0?'+':'')+score+')</span>'
+    +dimBreak
     +'<span>'+reltime(p.timestamp)+' ago</span>'
     +'<a class="post-id-link" href="#post-'+p.post_id+'">#'+p.post_id+'</a></div>'
     +content
+    +tagsHtml
     +(p._replies||[]).map(r=>renderPost(r,depth+1)).join('')+'</div>';
 }
 
@@ -300,23 +486,298 @@ async function loadThread(id) {
   const data = await res.json();
   const byId = {}, roots = [];
   data.posts.forEach(p => { byId[p.post_id] = p; p._replies = []; });
-  data.posts.forEach(p => { if (p.reply_to && byId[p.reply_to]) byId[p.reply_to]._replies.push(p); else roots.push(p); });
+  data.posts.forEach(p => {
+    const parents = p.reply_to || [];
+    const firstKnown = parents.find(pid => byId[pid]);
+    if (firstKnown) byId[firstKnown]._replies.push(p);
+    else roots.push(p);
+  });
+  activeDimensions = data.active_dimensions || [];
   const panel = document.getElementById('panel');
   panel.innerHTML = '<div class="thread-title">'+esc(data.title)+'</div>'
     +(data.description?'<div class="thread-desc">'+esc(data.description)+'</div>':'')
     +(roots.length===0?'<div id="placeholder">no posts yet</div>':roots.map(p=>renderPost(p,0)).join(''));
+  if (location.hash) {
+    const el = document.querySelector(location.hash);
+    if (el) el.scrollIntoView({ behavior: 'smooth' });
+  }
 }
 
-function connect() {
-  const es = new EventSource('/api/events');
-  es.onopen = () => { document.getElementById('status').textContent = 'live'; };
-  es.onmessage = () => { loadSidebar(); if (currentThread) loadThread(currentThread); };
-  es.onerror = () => { document.getElementById('status').textContent = 'reconnecting...'; es.close(); setTimeout(connect, 3000); };
+async function loadTagView(name) {
+  currentThread = null;
+  document.querySelectorAll('.thread-item').forEach(el => el.classList.remove('active'));
+  const res = await fetch('/api/tags/'+encodeURIComponent(name));
+  if (!res.ok) return;
+  const data = await res.json();
+  const panel = document.getElementById('panel');
+  panel.innerHTML = '<div class="thread-title">#'+esc(data.tag)+'</div>'
+    +(data.description?'<div class="thread-desc">'+esc(data.description)+'</div>':'')
+    +(data.posts.length===0?'<div id="placeholder">no posts tagged</div>'
+      : data.posts.map(p => renderPost({...p, reply_to: p.reply_to||[]}, 0)).join(''));
 }
 
 const hash = location.hash.slice(1);
 if (hash) { currentThread = hash; }
-loadSidebar(); connect();
+loadSidebar();
+document.getElementById('status').textContent = 'live';
+setInterval(() => { loadSidebar(); if (currentThread) loadThread(currentThread); }, 2000);
+</script>
+</body>
+</html>
+"""
+
+
+# ── Graph HTML ────────────────────────────────────────────────────────────────
+
+GRAPH_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>unity graph</title>
+<meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: monospace; font-size: 13px; background: #fff; color: #000; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #000; flex-shrink: 0; }
+header h1 { font-size: 13px; font-weight: bold; letter-spacing: 0.08em; }
+nav { display: flex; gap: 12px; }
+nav a { font-size: 12px; color: #000; text-decoration: none; border-bottom: 1px solid #000; }
+nav a:hover { opacity: 0.6; }
+.controls { display: flex; align-items: center; gap: 12px; }
+#status { font-size: 11px; color: #999; }
+.color-tabs { display: flex; }
+.color-tabs button { background: none; border: 1px solid #ccc; cursor: pointer; font: inherit; font-size: 12px; padding: 2px 10px; margin-left: -1px; }
+.color-tabs button:first-child { margin-left: 0; }
+.color-tabs button.active { background: #000; color: #fff; border-color: #000; }
+main { display: flex; flex: 1; overflow: hidden; position: relative; }
+#cy { flex: 1; }
+#info-panel { width: 300px; border-left: 1px solid #000; overflow-y: auto; padding: 16px; flex-shrink: 0; display: none; }
+#info-panel.visible { display: block; }
+#info-close { float: right; cursor: pointer; font-size: 16px; line-height: 1; }
+#info-close:hover { opacity: 0.5; }
+.info-field { margin-bottom: 10px; }
+.info-label { font-size: 10px; color: #999; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; }
+.info-value { line-height: 1.5; }
+.info-value.md { font-size: 12px; }
+.info-value.md p { margin-bottom: 0.4em; }
+.info-value.md code { background: #f0f0f0; padding: 1px 3px; font-size: 11px; }
+.info-value.md pre { background: #f6f6f6; padding: 6px 8px; overflow-x: auto; font-size: 11px; margin: 0.3em 0; }
+.info-value.md pre code { background: none; padding: 0; }
+.info-link { color: #000; text-decoration: underline; }
+.tag-chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.tag-chip { font-size: 10px; background: #fff8e6; color: #a06000; border: 1px solid #e8d090; padding: 1px 6px; border-radius: 10px; }
+.dim-row { display: flex; gap: 8px; font-size: 11px; margin-bottom: 2px; }
+.dim-name { color: #555; min-width: 110px; }
+.dim-up { color: #2d7a2d; }
+.dim-down { color: #c02020; }
+#legend { position: absolute; bottom: 12px; left: 12px; background: rgba(255,255,255,0.95); border: 1px solid #ddd; padding: 8px 12px; font-size: 11px; max-width: 180px; pointer-events: none; }
+#legend-title { font-weight: bold; margin-bottom: 4px; color: #555; }
+.legend-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; overflow: hidden; }
+.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+.legend-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>unity graph</h1>
+  <div class="controls">
+    <nav>
+      <a href="/">&larr; forum</a>
+      <a href="/dag">dag &rarr;</a>
+    </nav>
+    <span id="status">loading...</span>
+    <div class="color-tabs">
+      <button class="active" data-mode="thread">by thread</button>
+      <button data-mode="tag">by tag</button>
+    </div>
+  </div>
+</header>
+<main>
+  <div id="cy"></div>
+  <div id="info-panel">
+    <span id="info-close" onclick="closePanel()">&#x2715;</span>
+    <div id="info-content"></div>
+  </div>
+  <div id="legend"><div id="legend-title">threads</div><div id="legend-rows"></div></div>
+</main>
+<script>
+marked.use({ breaks: true, gfm: true });
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function reltime(ts) {
+  const d = Math.floor(Date.now()/1000 - ts);
+  if (d < 60) return d+'s'; if (d < 3600) return Math.floor(d/60)+'m';
+  if (d < 86400) return Math.floor(d/3600)+'h'; return Math.floor(d/86400)+'d';
+}
+
+const TAG_PALETTE = ['#e07b39','#7b61c4','#2d9e6b','#c4416a','#3d7fc4','#9e882d','#4ab0b0','#c46e2d'];
+let cy = null, colorMode = 'thread', graphData = null, tagColors = {};
+
+document.querySelectorAll('.color-tabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    colorMode = btn.dataset.mode;
+    document.querySelectorAll('.color-tabs button').forEach(b => b.classList.toggle('active', b === btn));
+    if (graphData) recolor();
+  });
+});
+
+function buildTagColors(nodes) {
+  tagColors = {};
+  nodes.forEach(n => (n.tags||[]).forEach(t => {
+    if (!(t in tagColors)) tagColors[t] = TAG_PALETTE[Object.keys(tagColors).length % TAG_PALETTE.length];
+  }));
+}
+
+function nodeColor(n) {
+  if (colorMode === 'tag') {
+    const firstTag = (n.tags||[])[0];
+    return firstTag ? (tagColors[firstTag]||'#cccccc') : '#dddddd';
+  }
+  return n.color || '#cccccc';
+}
+
+function buildLegend() {
+  const title = document.getElementById('legend-title');
+  const rows = document.getElementById('legend-rows');
+  rows.innerHTML = '';
+  if (colorMode === 'thread') {
+    title.textContent = 'threads';
+    Object.entries(graphData.thread_colors).forEach(([tid, col]) => {
+      rows.innerHTML += '<div class="legend-row"><span class="legend-dot" style="background:'+col+'"></span><span class="legend-label">'+esc(tid)+'</span></div>';
+    });
+  } else {
+    title.textContent = 'tags';
+    if (!Object.keys(tagColors).length) {
+      rows.innerHTML = '<div style="color:#aaa">no tags yet</div>';
+    } else {
+      Object.entries(tagColors).forEach(([tag, col]) => {
+        rows.innerHTML += '<div class="legend-row"><span class="legend-dot" style="background:'+col+'"></span><span class="legend-label">#'+esc(tag)+'</span></div>';
+      });
+      rows.innerHTML += '<div class="legend-row"><span class="legend-dot" style="background:#dddddd"></span><span class="legend-label">untagged</span></div>';
+    }
+  }
+}
+
+function recolor() {
+  if (!cy) return;
+  const nodeMap = {};
+  graphData.nodes.forEach(n => { nodeMap[n.id] = n; });
+  cy.nodes().forEach(node => {
+    const n = nodeMap[node.id()];
+    if (!n) return;
+    const col = nodeColor(n);
+    node.style('background-color', col);
+  });
+  buildLegend();
+}
+
+function buildGraph(data) {
+  graphData = data;
+  buildTagColors(data.nodes);
+  const nodeIds = new Set(data.nodes.map(n => n.id));
+  const elements = [];
+  data.nodes.forEach(n => {
+    elements.push({ data: {
+      id: n.id,
+      label: (n.redacted ? '[REDACTED]' : n.content_preview.substring(0,20)).replace(/\\n/g,' '),
+      author: n.author,
+      thread_id: n.thread_id,
+      bgColor: nodeColor(n),
+    }});
+  });
+  data.edges.forEach(e => {
+    if (nodeIds.has(e.source) && nodeIds.has(e.target)) {
+      elements.push({ data: { id: e.id, source: e.source, target: e.target }});
+    }
+  });
+
+  if (cy) cy.destroy();
+  cy = cytoscape({
+    container: document.getElementById('cy'),
+    elements,
+    style: [
+      { selector: 'node', style: {
+        'background-color': 'data(bgColor)',
+        'border-color': '#00000044',
+        'border-width': 1,
+        'label': 'data(label)',
+        'font-family': 'monospace',
+        'font-size': 9,
+        'text-valign': 'center',
+        'text-halign': 'center',
+        'text-wrap': 'ellipsis',
+        'text-max-width': 68,
+        'width': 76,
+        'height': 24,
+        'shape': 'roundrectangle',
+        'color': '#000',
+        'min-zoomed-font-size': 6,
+      }},
+      { selector: 'node:selected', style: { 'border-width': 2.5, 'border-color': '#000', 'border-opacity': 1 }},
+      { selector: 'node:active', style: { 'overlay-opacity': 0.1 }},
+      { selector: 'node[?redacted]', style: { 'opacity': 0.4 }},
+      { selector: 'edge', style: {
+        'curve-style': 'bezier',
+        'target-arrow-shape': 'triangle',
+        'target-arrow-color': '#bbb',
+        'line-color': '#bbb',
+        'arrow-scale': 0.7,
+        'width': 1,
+      }},
+    ],
+    layout: { name: 'cose', animate: false, nodeRepulsion: 4096, idealEdgeLength: 60, gravity: 1, padding: 40 },
+  });
+
+  cy.on('tap', 'node', e => { e.stopPropagation(); showPanel(e.target.id()); });
+  cy.on('tap', e => { if (e.target === cy) closePanel(); });
+  cy.on('mouseover', 'node', e => { e.target.style('border-width', 2); });
+  cy.on('mouseout', 'node', e => { e.target.style('border-width', e.target.selected() ? 2.5 : 1); });
+  buildLegend();
+  document.getElementById('status').textContent = data.nodes.length+' posts';
+}
+
+const nodeDataMap = {};
+function showPanel(id) {
+  if (!graphData) return;
+  const n = graphData.nodes.find(x => x.id === id);
+  if (!n) return;
+  nodeDataMap[id] = n;
+  const score = n.upvotes - n.downvotes;
+  const dimRows = Object.entries(n.votes_by_dimension||{}).map(([dim, c]) => {
+    const net = (c.up||0)-(c.down||0);
+    return '<div class="dim-row"><span class="dim-name">'+esc(dim)+'</span>'
+      +'<span class="dim-up">&#8593;'+(c.up||0)+'</span> '
+      +'<span class="dim-down">&#8595;'+(c.down||0)+'</span> '
+      +'('+(net>=0?'+':'')+net+')</div>';
+  }).join('');
+  const tags = (n.tags||[]).map(t=>'<span class="tag-chip">#'+esc(t)+'</span>').join('');
+  const contentHtml = n.redacted ? '<em style="color:#bbb">[redacted]</em>' : marked.parse(n.content_preview+(n.content_preview.length>=200?'…':''));
+  document.getElementById('info-content').innerHTML =
+    '<div class="info-field"><div class="info-label">author</div><div class="info-value">'+esc(n.author)+'</div></div>'
+    +'<div class="info-field"><div class="info-label">thread</div><div class="info-value">'+esc(n.thread_title)+' <span style="color:#aaa">('+esc(n.thread_id)+')</span></div></div>'
+    +'<div class="info-field"><div class="info-label">'+reltime(n.timestamp)+' ago &middot; &#8593;'+n.upvotes+' &#8595;'+n.downvotes+' ('+(score>=0?'+':'')+score+')</div></div>'
+    +(dimRows?'<div class="info-field"><div class="info-label">by dimension</div>'+dimRows+'</div>':'')
+    +(tags?'<div class="info-field"><div class="info-label">tags</div><div class="tag-chips">'+tags+'</div></div>':'')
+    +'<div class="info-field"><div class="info-label">content</div><div class="info-value md">'+contentHtml+'</div></div>'
+    +'<div class="info-field"><a class="info-link" href="/#post-'+esc(n.id)+'" target="_blank">view in forum &rarr;</a></div>';
+  document.getElementById('info-panel').classList.add('visible');
+}
+
+function closePanel() {
+  document.getElementById('info-panel').classList.remove('visible');
+  if (cy) cy.$(':selected').unselect();
+}
+
+async function load() {
+  const res = await fetch('/api/graph');
+  if (!res.ok) { document.getElementById('status').textContent = 'error'; return; }
+  const data = await res.json();
+  buildGraph(data);
+}
+
+load();
+setInterval(load, 2000);
 </script>
 </body>
 </html>
@@ -336,20 +797,14 @@ DAG_HTML = """\
 body { font-family: monospace; font-size: 13px; background: #fff; color: #000; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
 header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #000; flex-shrink: 0; }
 header h1 { font-size: 13px; font-weight: bold; letter-spacing: 0.08em; }
+nav { display: flex; gap: 12px; }
 nav a { font-size: 12px; color: #000; text-decoration: none; border-bottom: 1px solid #000; }
 nav a:hover { opacity: 0.6; }
 .controls { display: flex; align-items: center; gap: 16px; }
 #status { font-size: 11px; color: #999; }
 main { display: flex; flex: 1; overflow: hidden; position: relative; }
 #cy { flex: 1; }
-#info-panel {
-  width: 280px;
-  border-left: 1px solid #000;
-  overflow-y: auto;
-  padding: 16px;
-  flex-shrink: 0;
-  display: none;
-}
+#info-panel { width: 280px; border-left: 1px solid #000; overflow-y: auto; padding: 16px; flex-shrink: 0; display: none; }
 #info-panel.visible { display: block; }
 #info-close { float: right; cursor: pointer; font-size: 16px; line-height: 1; }
 #info-close:hover { opacity: 0.5; }
@@ -367,7 +822,10 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
 <header>
   <h1>unity dag</h1>
   <div class="controls">
-    <nav><a href="/">&larr; forum</a></nav>
+    <nav>
+      <a href="/">&larr; forum</a>
+      <a href="/graph">graph &rarr;</a>
+    </nav>
     <span id="status">connecting...</span>
   </div>
 </header>
@@ -400,15 +858,13 @@ const STATUS_COLOR = {
   red:    { bg: '#f8c8c8', border: '#c02020' },
 };
 
-let cy = null;
-let chunks = {};
+let cy = null, chunks = {};
 
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 function buildGraph(data) {
   chunks = {};
   data.chunks.forEach(c => { chunks[c.id] = c; });
-
   const elements = [];
   data.chunks.forEach(c => {
     const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
@@ -423,50 +879,25 @@ function buildGraph(data) {
       elements.push({ data: { id: dep+'->'+c.id, source: dep, target: c.id }});
     });
   });
-
   if (cy) cy.destroy();
   cy = cytoscape({
     container: document.getElementById('cy'),
     elements,
     style: [
-      {
-        selector: 'node',
-        style: {
-          'background-color': 'data(bgColor)',
-          'border-color': 'data(borderColor)',
-          'border-width': 1.5,
-          'label': 'data(label)',
-          'font-family': 'monospace',
-          'font-size': '11px',
-          'text-valign': 'center',
-          'text-halign': 'center',
-          'text-wrap': 'wrap',
-          'width': 'label',
-          'height': 'label',
-          'padding': '10px',
-          'shape': 'roundrectangle',
-          'color': '#000',
-        }
-      },
-      {
-        selector: 'node:selected',
-        style: { 'border-width': 2.5, 'border-color': '#000' }
-      },
-      {
-        selector: 'edge',
-        style: {
-          'curve-style': 'bezier',
-          'target-arrow-shape': 'triangle',
-          'target-arrow-color': '#bbb',
-          'line-color': '#bbb',
-          'arrow-scale': 0.8,
-          'width': 1,
-        }
-      },
+      { selector: 'node', style: {
+        'background-color': 'data(bgColor)', 'border-color': 'data(borderColor)', 'border-width': 1.5,
+        'label': 'data(label)', 'font-family': 'monospace', 'font-size': '11px',
+        'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
+        'width': 'label', 'height': 'label', 'padding': '10px', 'shape': 'roundrectangle', 'color': '#000',
+      }},
+      { selector: 'node:selected', style: { 'border-width': 2.5, 'border-color': '#000' }},
+      { selector: 'edge', style: {
+        'curve-style': 'bezier', 'target-arrow-shape': 'triangle',
+        'target-arrow-color': '#bbb', 'line-color': '#bbb', 'arrow-scale': 0.8, 'width': 1,
+      }},
     ],
     layout: { name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 70, padding: 30 },
   });
-
   cy.on('tap', 'node', e => showPanel(e.target.id()));
   cy.on('tap', e => { if (e.target === cy) closePanel(); });
 }
@@ -474,14 +905,12 @@ function buildGraph(data) {
 function updateColors(data) {
   if (!cy) return;
   data.chunks.forEach(c => {
-    const node = cy.getElementById(c.id);
-    if (!node.length) return;
+    const node = cy.getElementById(c.id); if (!node.length) return;
     const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
     node.style({ 'background-color': col.bg, 'border-color': col.border });
     node.data({ status: c.status, bgColor: col.bg, borderColor: col.border });
     chunks[c.id] = c;
   });
-  // refresh open panel if needed
   if (openId) showPanel(openId);
 }
 
@@ -540,6 +969,11 @@ loadDag(true); connect();
 @app.get("/", response_class=HTMLResponse)
 def forum():
     return FORUM_HTML
+
+
+@app.get("/graph", response_class=HTMLResponse)
+def graph():
+    return GRAPH_HTML
 
 
 @app.get("/dag", response_class=HTMLResponse)

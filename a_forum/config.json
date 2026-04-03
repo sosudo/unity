@@ -1,0 +1,13 @@
+{
+  "dimensions": {
+    "active": [
+      "correctness",
+      "clarity",
+      "completeness",
+      "rigor",
+      "originality"
+    ],
+    "pending": {}
+  },
+  "tags": {}
+}
