@@ -28,6 +28,16 @@ These assess whether the IR is well-designed for its purpose, not just well-form
 
 8. **IR expressiveness**: The IR is expressive enough to faithfully represent the source's mathematical content — quantifier structure, binding scope, proof step decomposition, named intermediate claims, assumption types. Flag any source content that the IR grammar appears unable to capture.
 
+**JSON schema checks** (run only if `language/chunks/` exists)
+
+9. **Proof field presence**: Every chunk with `type` of `theorem` or `lemma` has a `proof` field. Every chunk with any other type does not. Record any violations.
+
+10. **Dependency referential integrity**: Every ID listed in any chunk's `dependencies` array exists as another chunk file in `language/chunks/`. Record any dangling references.
+
+11. **No top-level statement/proof splits**: No chunk has `type` of `"statement"` or `"proof"`. These are only valid as `sub_chunks` entries within a `proof` field. Record any violations.
+
+---
+
 **Output**
 
 Write `VALIDATION_REPORT.md` at root with:

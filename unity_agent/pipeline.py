@@ -186,6 +186,76 @@ def _load_library_subagents() -> dict:
     return result
 
 
+def _toposort_chunks(language_dir: Path) -> None:
+    """Read chunk JSONs from language/chunks/, run Kahn's toposort, write dag.json."""
+    chunks_dir = language_dir / "chunks"
+    if not chunks_dir.exists():
+        logging.info("No language/chunks/ directory — skipping toposort.")
+        return
+
+    chunks = []
+    for f in sorted(chunks_dir.glob("*.json")):
+        try:
+            chunks.append(json.loads(f.read_text()))
+        except Exception as e:
+            logging.warning(f"Could not parse chunk file {f}: {e}")
+
+    if not chunks:
+        logging.info("No chunk JSON files found — skipping toposort.")
+        return
+
+    chunk_ids = {c["id"] for c in chunks}
+    in_degree: dict[str, int] = {c["id"]: 0 for c in chunks}
+    dependents: dict[str, list[str]] = {c["id"]: [] for c in chunks}
+
+    for c in chunks:
+        for dep in c.get("dependencies", []):
+            if dep in chunk_ids:
+                in_degree[c["id"]] += 1
+                dependents[dep].append(c["id"])
+
+    layers: list[list[str]] = []
+    ready = sorted(cid for cid in chunk_ids if in_degree[cid] == 0)
+
+    while ready:
+        layers.append(ready)
+        nxt: list[str] = []
+        for cid in ready:
+            for child in dependents[cid]:
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    nxt.append(child)
+        ready = sorted(nxt)
+
+    remaining = {cid for cid, deg in in_degree.items() if deg > 0}
+    if remaining:
+        logging.warning(f"Cycle detected in chunk dependency graph involving: {remaining}. Appending as final layer.")
+        layers.append(sorted(remaining))
+
+    layer_of = {cid: i for i, layer in enumerate(layers) for cid in layer}
+    chunk_index = {c["id"]: c for c in chunks}
+
+    dag_chunks = []
+    for layer_idx, layer in enumerate(layers):
+        for cid in layer:
+            c = chunk_index[cid]
+            dag_chunks.append({
+                "id": cid,
+                "layer": layer_idx,
+                "type": c.get("type", "other"),
+                "title": c.get("title", cid),
+                "summary": c.get("summary", ""),
+                "dependencies": c.get("dependencies", []),
+                "lean_file": None,
+                "lean_decl_lines": None,
+                "status": "pending",
+            })
+
+    dag = {"layers": layers, "chunks": dag_chunks}
+    Path("dag.json").write_text(json.dumps(dag, indent=2))
+    logging.info(f"dag.json written: {len(chunks)} chunks across {len(layers)} layers.")
+
+
 async def _infer_flags() -> tuple[str | None, str | None, bool]:
     """Run a lightweight inference agent to detect source, project, and prove from CWD."""
     cwd_env = Path.cwd() / ".env"
@@ -723,36 +793,11 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             logging.critical(f"CRITICAL (semiformalization phase): {e}")
             exit(1)
 
-        # Preparation phase
-        _console.rule("[bold blue]Preparation Phase[/bold blue]")
+        # Build DAG from chunk JSON files
         try:
-            with open(ACTIVE_PROMPTS_DIR / "PREPARATION.md", "r") as f:
-                PREPARATION_PROMPT = with_library(f.read())
-
-            async for message in query(
-                prompt=f"Prepare to formalize the declarations in {project_path}. Chunk by declaration, track dependencies, and create forums.",
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={**LIBRARY_SUBAGENTS},
-                    system_prompt=PREPARATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=preparation_budget,
-        
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-        
-                ),
-            ):
-                _log_agent_message(message)
-
-            logging.info("Preparation phase completed successfully!")
+            _toposort_chunks(Path("language"))
         except Exception as e:
-            logging.critical(f"CRITICAL (preparation phase): {e}")
+            logging.critical(f"CRITICAL (toposort): {e}")
             exit(1)
 
         iteration = 0
@@ -1187,7 +1232,14 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     else:
         logging.critical("CRITICAL (semiformalization phase): cannot have context without autofix enabled")
         exit(1)
-        
+
+    # Build DAG from chunk JSON files (runs once, before formalization loop)
+    try:
+        _toposort_chunks(Path("language"))
+    except Exception as e:
+        logging.critical(f"CRITICAL (toposort): {e}")
+        exit(1)
+
     iteration = 0
     while True:
 
@@ -1416,77 +1468,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 exit(1)
         else:
             logging.info("Exploration phase skipped.")
-        
-        # Preparation phase
-    
-        _console.rule("[bold blue]Preparation Phase[/bold blue]")
-    
-        if not context and iteration == 0:
-            try:
-                # Load preparation phase system prompt
-                with open(PROMPTS_DIR / "PREPARATION/F.md", "r") as f:
-                    PREPARATION_PROMPT = with_library(f.read())
-            
-                async for message in query(
-                    prompt=f"Prepare to formalize {source}.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={**LIBRARY_SUBAGENTS},
-                        system_prompt=PREPARATION_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=preparation_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
-                    ),
-                ):
-                    _log_agent_message(message)
-                    
-                logging.info("Preparation phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (preparation phase): {e}")
-                exit(1)
-        elif context or iteration > 0:
-            try:
-                # Load preparation phase system prompt
-                with open(PROMPTS_DIR / "PREPARATION/T.md", "r") as f:
-                    PREPARATION_PROMPT = with_library(f.read())
-            
-                async for message in query(
-                    prompt=f"Prepare to formalize {source}. The Lean project is {project_path}.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={**LIBRARY_SUBAGENTS},
-                        system_prompt=PREPARATION_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=preparation_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
-                    ),
-                ):
-                    _log_agent_message(message)
-                    
-                logging.info("Preparation phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (preparation phase): {e}")
-                exit(1)
-        else:
-            logging.critical("CRITICAL (preparation phase): reached unreachable code")
-            exit(1)
-        
+
         # Formalization phase
     
         _console.rule("[bold blue]Formalization Phase[/bold blue]")

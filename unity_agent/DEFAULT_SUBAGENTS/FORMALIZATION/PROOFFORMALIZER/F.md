@@ -24,7 +24,7 @@ For goals that resist automation, decompose with `have` to name intermediate res
 Proof formalization is hard. `sorry` on a non-assumption proof is not a completion; it is a failure. Before using `sorry`, you must have genuinely attempted:
 - Standard tactic search (`simp`, `aesop`, `omega`, `ring`, `norm_num`, `decide`, `exact?`, `apply?`, `rw?`)
 - Decomposition into intermediate lemmas or helper definitions
-- Alternative proof strategies drawn from the semiformal chunk and `PLAN.md`
+- Alternative proof strategies drawn from the semiformal chunk and the forum
 - Mathlib search for applicable lemmas or constructions
 - Posting to the forum and incorporating suggestions from other agents
 
@@ -37,6 +37,10 @@ Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_check_
 **API changes**
 
 If you make any API changes, report them to the main agent immediately so `semiformal/` can be updated accordingly.
+
+**Chunk status update**
+
+After completing each chunk, update its JSON file in `semiformal/chunks/` (if it exists): set `lean_declaration.file` to the Lean file path (relative to working directory) and `lean_declaration.line` to the start line of the proof, and set `status` to `"complete"` if all sub-chunks are proven, or `"sorry"` if any remain unproven.
 
 **Output**
 

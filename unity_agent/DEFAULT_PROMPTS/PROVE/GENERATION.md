@@ -63,6 +63,36 @@ The following are non-exhaustive design considerations you may find useful:
 
 ---
 
+**Chunk Output Format**
+
+Write all IR chunks as JSON files to `language/chunks/{id}.json`, one file per chunk. Also write `language/chunk-schema.json` containing the schema below. When creating chunks from `gathered/`, populate `mathlib_refs` from any Mathlib equivalents recorded in `gathered/<declaration>/summary.md`.
+
+Schema:
+```json
+{
+  "id": "chunk-2-1",
+  "type": "lemma",
+  "title": "MyLemma",
+  "summary": "One-sentence description of the mathematical content.",
+  "content": "Full semiformal content of the statement/definition.",
+  "dependencies": ["chunk-0-1", "chunk-0-3"],
+  "proof": {
+    "strategy": "",
+    "sub_chunks": []
+  },
+  "status": "pending",
+  "lean_declaration": {"file": null, "line": null},
+  "mathlib_refs": []
+}
+```
+
+Field notes:
+- `id`: unique string, e.g. `chunk-{layer}-{index}` or a descriptive slug
+- `type`: one of `theorem`, `lemma`, `definition`, `instance`, `structure`, `class`, `axiom`, `other`
+- `title`: short name used in forum threads and DAG visualizations
+- `proof`: **required for `theorem` and `lemma`; omit entirely for all other types**. `proof.strategy` and `proof.sub_chunks` are populated by the semiformalization phase — leave empty at generation time
+- `status`, `lean_declaration`: always set to the values shown above at generation time
+
 **Mathlib Context**
 
 If `mathlib-context.md` exists at root, read it before designing the IR. It records per-declaration Mathlib coverage from a pre-scan of the source. Use it to inform chunk structure and declaration feasibility:

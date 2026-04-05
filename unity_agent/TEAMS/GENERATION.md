@@ -66,6 +66,41 @@ The following are non-exhaustive design considerations you may find useful:
 
 ---
 
+**Chunk Output Format**
+
+Write all IR chunks as JSON files to `language/chunks/{id}.json`, one file per chunk. Also write `language/chunk-schema.json` containing the schema below. Do not use any other output format for chunks.
+
+Schema:
+```json
+{
+  "id": "chunk-2-1",
+  "type": "lemma",
+  "title": "MyLemma",
+  "summary": "One-sentence description of the mathematical content.",
+  "content": "Full semiformal content of the statement/definition.",
+  "dependencies": ["chunk-0-1", "chunk-0-3"],
+  "proof": {
+    "strategy": "",
+    "sub_chunks": [
+      {"id": "sub-2-1-a", "content": "...", "dependencies": []},
+      {"id": "sub-2-1-b", "content": "...", "dependencies": ["sub-2-1-a"]}
+    ]
+  },
+  "status": "pending",
+  "lean_declaration": {"file": null, "line": null},
+  "mathlib_refs": []
+}
+```
+
+Field notes:
+- `id`: unique string, e.g. `chunk-{layer}-{index}` or a descriptive slug
+- `type`: one of `theorem`, `lemma`, `definition`, `instance`, `structure`, `class`, `axiom`, `other`
+- `title`: short name used in forum threads and DAG visualizations
+- `proof`: **required for `theorem` and `lemma`; omit entirely for all other types**
+- `proof.strategy` and `proof.sub_chunks`: leave empty at generation time — the semiformalization phase populates them
+- `proof.sub_chunks`: sub-chunking is for meaningful proof-step granularity only — case splits, induction arms, key lemma applications, major sub-goals. Never sub-chunk for trivial steps or arbitrary line splits. Statement and proof are always one top-level chunk; sub-chunks live exclusively inside `proof`
+- `status`, `lean_declaration`, `mathlib_refs`: always set to the values shown above at generation time
+
 **Mathlib Context**
 
 If `mathlib-context.md` exists at root, read it before designing the IR. It records per-claim Mathlib coverage from a pre-scan of the source. Use it to inform both chunk structure and proof scaffolding:
