@@ -613,6 +613,8 @@ function reltime(ts) {
 
 const TAG_PALETTE = ['#e07b39','#7b61c4','#2d9e6b','#c4416a','#3d7fc4','#9e882d','#4ab0b0','#c46e2d'];
 let cy = null, colorMode = 'thread', graphData = null, tagColors = {};
+let nodePositions = {};  // id -> {x,y}, persisted across reloads
+let lastDataSig = '';    // "nodeCount,edgeCount" — skip rebuild when unchanged
 
 document.querySelectorAll('.color-tabs button').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -672,20 +674,115 @@ function recolor() {
   buildLegend();
 }
 
+// Spring simulation on the thread-level graph.
+// Inter-thread edge count -> attraction; ideal distance ∝ 1/√count so heavily
+// connected threads end up closer. Unconnected threads only repel each other.
+// Returns { threadId: {x, y} } for every thread present in data.
+function computeThreadLayout(data) {
+  const allThreadIds = [...new Set(data.nodes.map(n => n.thread_id))];
+  if (allThreadIds.length === 0) return {};
+
+  // Count cross-thread edges
+  const nodeThread = {};
+  data.nodes.forEach(n => { nodeThread[n.id] = n.thread_id; });
+  const interCount = {};
+  data.edges.forEach(e => {
+    const t1 = nodeThread[e.source], t2 = nodeThread[e.target];
+    if (t1 && t2 && t1 !== t2) {
+      const key = [t1, t2].sort().join('\\x00');
+      interCount[key] = (interCount[key] || 0) + 1;
+    }
+  });
+
+  // Initialise on a circle
+  const pos = {};
+  allThreadIds.forEach((tid, i) => {
+    const a = (2 * Math.PI * i) / allThreadIds.length;
+    pos[tid] = { x: Math.cos(a) * 400 + 400, y: Math.sin(a) * 400 + 300 };
+  });
+
+  // 300 relaxation steps
+  const BASE_DIST = 450;
+  for (let iter = 0; iter < 300; iter++) {
+    const f = {};
+    allThreadIds.forEach(t => { f[t] = { x: 0, y: 0 }; });
+
+    // Attraction: inter-thread edges pull threads together
+    Object.entries(interCount).forEach(([key, cnt]) => {
+      const sep = key.split('\\x00');
+      const t1 = sep[0], t2 = sep[1];
+      const dx = pos[t2].x - pos[t1].x, dy = pos[t2].y - pos[t1].y;
+      const dist = Math.sqrt(dx*dx + dy*dy) || 1;
+      const ideal = BASE_DIST / Math.sqrt(cnt);   // more edges → shorter ideal
+      const k = 0.02 * (dist - ideal) / dist;
+      f[t1].x += k*dx; f[t1].y += k*dy;
+      f[t2].x -= k*dx; f[t2].y -= k*dy;
+    });
+
+    // Repulsion: all thread pairs push apart
+    for (let i = 0; i < allThreadIds.length; i++) {
+      for (let j = i + 1; j < allThreadIds.length; j++) {
+        const t1 = allThreadIds[i], t2 = allThreadIds[j];
+        const dx = pos[t2].x - pos[t1].x, dy = pos[t2].y - pos[t1].y;
+        const d2 = dx*dx + dy*dy || 1, d = Math.sqrt(d2);
+        const rep = 25000 / (d2 * d);
+        f[t1].x -= rep*dx; f[t1].y -= rep*dy;
+        f[t2].x += rep*dx; f[t2].y += rep*dy;
+      }
+    }
+
+    allThreadIds.forEach(t => { pos[t].x += f[t].x; pos[t].y += f[t].y; });
+  }
+
+  return pos;
+}
+
 function buildGraph(data) {
   graphData = data;
   buildTagColors(data.nodes);
   const nodeIds = new Set(data.nodes.map(n => n.id));
   const elements = [];
+
+  // Centroid of already-placed nodes per thread (for existing threads)
+  const threadCentroids = {};
   data.nodes.forEach(n => {
-    elements.push({ data: {
+    if (nodePositions[n.id]) {
+      const c = threadCentroids[n.thread_id] || (threadCentroids[n.thread_id] = { x: 0, y: 0, count: 0 });
+      c.x += nodePositions[n.id].x; c.y += nodePositions[n.id].y; c.count++;
+    }
+  });
+  Object.values(threadCentroids).forEach(c => { c.x /= c.count; c.y /= c.count; });
+
+  // For brand-new threads (no saved nodes), use the inter-thread spring layout
+  // so heavily cross-linked threads start near each other
+  const allThreadIds = [...new Set(data.nodes.map(n => n.thread_id))];
+  const hasNewThreads = allThreadIds.some(t => !threadCentroids[t]);
+  if (hasNewThreads) {
+    const springPos = computeThreadLayout(data);
+    allThreadIds.forEach(tid => {
+      if (!threadCentroids[tid] && springPos[tid]) threadCentroids[tid] = springPos[tid];
+    });
+  }
+
+  data.nodes.forEach(n => {
+    const elem = { data: {
       id: n.id,
       label: (n.redacted ? '[REDACTED]' : n.content_preview.substring(0,20)).replace(/\\n/g,' '),
       author: n.author,
       thread_id: n.thread_id,
       bgColor: nodeColor(n),
-    }});
+    }};
+    if (nodePositions[n.id]) {
+      // Existing node: restore exact position so it doesn't move
+      elem.position = nodePositions[n.id];
+    } else {
+      // New node: start near its thread centroid so cose keeps it in the cluster
+      const c = threadCentroids[n.thread_id];
+      elem.position = { x: c.x + (Math.random() - 0.5) * 80, y: c.y + (Math.random() - 0.5) * 80 };
+    }
+    elements.push(elem);
   });
+
   data.edges.forEach(e => {
     if (nodeIds.has(e.source) && nodeIds.has(e.target)) {
       elements.push({ data: { id: e.id, source: e.source, target: e.target }});
@@ -726,7 +823,13 @@ function buildGraph(data) {
         'width': 1,
       }},
     ],
-    layout: { name: 'cose', animate: false, nodeRepulsion: 4096, idealEdgeLength: 60, gravity: 1, padding: 40 },
+    // randomize: false + pre-set positions = existing nodes barely move, new ones land near their thread
+    layout: { name: 'cose', animate: false, nodeRepulsion: 4096, idealEdgeLength: 60, gravity: 1, padding: 40, randomize: false },
+  });
+
+  // Persist final positions so next rebuild preserves them
+  cy.nodes().forEach(node => {
+    nodePositions[node.id()] = { x: node.position('x'), y: node.position('y') };
   });
 
   cy.on('tap', 'node', e => { e.stopPropagation(); showPanel(e.target.id()); });
@@ -773,6 +876,9 @@ async function load() {
   const res = await fetch('/api/graph');
   if (!res.ok) { document.getElementById('status').textContent = 'error'; return; }
   const data = await res.json();
+  const sig = data.nodes.length + ',' + data.edges.length;
+  if (sig === lastDataSig) return;  // nothing changed, don't rebuild
+  lastDataSig = sig;
   buildGraph(data);
 }
 
