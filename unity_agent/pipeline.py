@@ -256,6 +256,55 @@ def _toposort_chunks(language_dir: Path) -> None:
     logging.info(f"dag.json written: {len(chunks)} chunks across {len(layers)} layers.")
 
 
+def _create_worktree(chunk_id: str, project_path: Path) -> Path:
+    """Create a git worktree for chunk_id alongside the project; return its path."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", chunk_id)
+    worktree_path = project_path.parent / ".worktrees" / safe_id
+    worktree_path.parent.mkdir(parents=True, exist_ok=True)
+    _run(["git", "worktree", "add", "-b", f"worktree/{safe_id}", str(worktree_path)], cwd=project_path)
+    return worktree_path
+
+
+def _symlink_lake_cache(worktree_path: Path, project_path: Path) -> None:
+    """Symlink .lake/packages/ from main project into worktree to share the Mathlib cache."""
+    packages_src = project_path / ".lake" / "packages"
+    if not packages_src.exists():
+        return
+    lake_dir = worktree_path / ".lake"
+    lake_dir.mkdir(exist_ok=True)
+    packages_link = lake_dir / "packages"
+    if not packages_link.exists():
+        packages_link.symlink_to(packages_src.resolve())
+
+
+def _merge_worktree(worktree_path: Path, project_path: Path, chunk_id: str) -> None:
+    """Squash-merge the worktree branch into the main project."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", chunk_id)
+    try:
+        _run(["git", "merge", "--squash", f"worktree/{safe_id}"], cwd=project_path)
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"git merge --squash for chunk {chunk_id} failed: {e}")
+        return
+    result = subprocess.run(["git", "diff", "--cached", "--quiet"], cwd=project_path)
+    if result.returncode != 0:
+        _run(["git", "commit", "-m", f"formalize: merge worktree for chunk {chunk_id}"], cwd=project_path)
+    else:
+        logging.info(f"Worktree for chunk {chunk_id} had no changes to merge.")
+
+
+def _cleanup_worktree(worktree_path: Path, project_path: Path, chunk_id: str) -> None:
+    """Remove the git worktree and its branch."""
+    safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", chunk_id)
+    try:
+        _run(["git", "worktree", "remove", "--force", str(worktree_path)], cwd=project_path)
+    except subprocess.CalledProcessError:
+        logging.warning(f"Could not remove worktree {worktree_path}.")
+    try:
+        _run(["git", "branch", "-D", f"worktree/{safe_id}"], cwd=project_path)
+    except subprocess.CalledProcessError:
+        logging.warning(f"Could not delete branch worktree/{safe_id}.")
+
+
 async def _infer_flags() -> tuple[str | None, str | None, bool]:
     """Run a lightweight inference agent to detect source, project, and prove from CWD."""
     cwd_env = Path.cwd() / ".env"
@@ -813,38 +862,62 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
 
-                async for message in query(
-                    prompt=f"Formalize the declarations in {project_path}.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={
-                            "declaration-formalizer": AgentDefinition(
-                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            "proof-formalizer": AgentDefinition(
-                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                                prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            **LIBRARY_SUBAGENTS
-                        },
-                        system_prompt=FORMALIZATION_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=formalization_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
+                dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
+                dag_layers = dag_data.get("layers", [])
+                worktree_assignments: dict[str, str] = {}
+                for layer in dag_layers:
+                    for cid in layer:
+                        wt = _create_worktree(cid, project_path)
+                        _symlink_lake_cache(wt, project_path)
+                        worktree_assignments[cid] = str(wt)
+
+                _formalization_agents = {
+                    "declaration-formalizer": AgentDefinition(
+                        description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                        prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                        tools=_ALL_TOOLS
                     ),
-                ):
-                    _log_agent_message(message)
+                    "proof-formalizer": AgentDefinition(
+                        description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                        prompt=PROOFFORMALIZER_SUBAGENT,
+                        tools=_ALL_TOOLS
+                    ),
+                    **LIBRARY_SUBAGENTS
+                }
+                _formalization_kwargs = dict(
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
+                    agents=_formalization_agents,
+                    system_prompt=FORMALIZATION_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
+                    permission_mode=PERMISSIONS,
+                    max_budget_usd=formalization_budget,
+                    enable_file_checkpointing=True,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env=_agent_env,
+                )
+
+                if dag_layers and worktree_assignments:
+                    for layer_idx, layer_ids in enumerate(dag_layers):
+                        layer_assignments = {cid: worktree_assignments[cid] for cid in layer_ids if cid in worktree_assignments}
+                        layer_prompt = (
+                            f"Formalize the declarations in {project_path}. "
+                            f"Process DAG layer {layer_idx} chunks: {layer_ids}. "
+                            f"Worktree assignments: {json.dumps(layer_assignments)}"
+                        )
+                        async for message in query(prompt=layer_prompt, options=ClaudeAgentOptions(**_formalization_kwargs)):
+                            _log_agent_message(message)
+                        for cid in layer_ids:
+                            if cid in worktree_assignments:
+                                _merge_worktree(Path(worktree_assignments[cid]), project_path, cid)
+                    _run(["lake", "build"], cwd=project_path)
+                    for cid, wt in worktree_assignments.items():
+                        _cleanup_worktree(Path(wt), project_path, cid)
+                else:
+                    async for message in query(prompt=f"Formalize the declarations in {project_path}.", options=ClaudeAgentOptions(**_formalization_kwargs)):
+                        _log_agent_message(message)
 
                 logging.info("Formalization phase completed successfully!")
             except Exception as e:
@@ -1529,40 +1602,64 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     DECLARATIONFORMALIZER_SUBAGENT = f.read()
                 with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
                     PROOFFORMALIZER_SUBAGENT = f.read()
-            
-                async for message in query(
-                    prompt=f"Formalize {source} into {project_path}.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={
-                            "declaration-formalizer": AgentDefinition(
-                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            "proof-formalizer": AgentDefinition(
-                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                                prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            **LIBRARY_SUBAGENTS
-                        },
-                        system_prompt=FORMALIZATION_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=formalization_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
+
+                dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
+                dag_layers = dag_data.get("layers", [])
+                worktree_assignments: dict[str, str] = {}
+                for layer in dag_layers:
+                    for cid in layer:
+                        wt = _create_worktree(cid, project_path)
+                        _symlink_lake_cache(wt, project_path)
+                        worktree_assignments[cid] = str(wt)
+
+                _formalization_agents = {
+                    "declaration-formalizer": AgentDefinition(
+                        description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                        prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                        tools=_ALL_TOOLS
                     ),
-                ):
-                    _log_agent_message(message)
-                    
+                    "proof-formalizer": AgentDefinition(
+                        description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                        prompt=PROOFFORMALIZER_SUBAGENT,
+                        tools=_ALL_TOOLS
+                    ),
+                    **LIBRARY_SUBAGENTS
+                }
+                _formalization_kwargs = dict(
+                    tools=_ALL_TOOLS,
+                    allowed_tools=_ALL_TOOLS,
+                    agents=_formalization_agents,
+                    system_prompt=FORMALIZATION_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
+                    permission_mode=PERMISSIONS,
+                    max_budget_usd=formalization_budget,
+                    enable_file_checkpointing=True,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env=_agent_env,
+                )
+
+                if dag_layers and worktree_assignments:
+                    for layer_idx, layer_ids in enumerate(dag_layers):
+                        layer_assignments = {cid: worktree_assignments[cid] for cid in layer_ids if cid in worktree_assignments}
+                        layer_prompt = (
+                            f"Formalize {source} into {project_path}. "
+                            f"Process DAG layer {layer_idx} chunks: {layer_ids}. "
+                            f"Worktree assignments: {json.dumps(layer_assignments)}"
+                        )
+                        async for message in query(prompt=layer_prompt, options=ClaudeAgentOptions(**_formalization_kwargs)):
+                            _log_agent_message(message)
+                        for cid in layer_ids:
+                            if cid in worktree_assignments:
+                                _merge_worktree(Path(worktree_assignments[cid]), project_path, cid)
+                    _run(["lake", "build"], cwd=project_path)
+                    for cid, wt in worktree_assignments.items():
+                        _cleanup_worktree(Path(wt), project_path, cid)
+                else:
+                    async for message in query(prompt=f"Formalize {source} into {project_path}.", options=ClaudeAgentOptions(**_formalization_kwargs)):
+                        _log_agent_message(message)
+
                 logging.info("Formalization phase completed successfully!")
             except Exception as e:
                 logging.critical(f"CRITICAL (formalization phase): {e}")
