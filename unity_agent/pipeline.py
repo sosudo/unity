@@ -963,6 +963,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 logging.warning("No VALIDATION_REPORT.md found — proceeding anyway.")
                 break
 
+        # Build DAG from chunk JSON files before semiformalization
+        try:
+            _toposort_chunks(Path("language"))
+        except Exception as e:
+            logging.critical(f"CRITICAL (toposort): {e}")
+            exit(1)
+
         # Semiformalization phase (always TT: autofix + context, required for Path 2)
         _console.rule("[bold blue]Semiformalization Phase[/bold blue]")
         while True:
@@ -1005,13 +1012,6 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 break
             except Exception as e:
                 await _invoke_resolver("semiformalization", e)
-
-        # Build DAG from chunk JSON files
-        try:
-            _toposort_chunks(Path("language"))
-        except Exception as e:
-            logging.critical(f"CRITICAL (toposort): {e}")
-            exit(1)
 
         iteration = 0
         while True:
@@ -1353,6 +1353,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             logging.warning("No VALIDATION_REPORT.md found — proceeding anyway.")
             break
 
+    # Build DAG from chunk JSON files before semiformalization
+    try:
+        _toposort_chunks(Path("language"))
+    except Exception as e:
+        logging.critical(f"CRITICAL (toposort): {e}")
+        exit(1)
+
     # Semiformalization phase
 
     _console.rule("[bold blue]Semiformalization Phase[/bold blue]")
@@ -1484,13 +1491,6 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 await _invoke_resolver("semiformalization", e)
     else:
         logging.critical("CRITICAL (semiformalization phase): cannot have context without autofix enabled")
-        exit(1)
-
-    # Build DAG from chunk JSON files (runs once, before formalization loop)
-    try:
-        _toposort_chunks(Path("language"))
-    except Exception as e:
-        logging.critical(f"CRITICAL (toposort): {e}")
         exit(1)
 
     iteration = 0

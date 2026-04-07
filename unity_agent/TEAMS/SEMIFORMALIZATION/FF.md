@@ -47,7 +47,9 @@ If a `recursive-unity` subagent is available, you may delegate a self-contained 
 
 **Output**
 
-Once consensus is reached and alignment checks pass, write the agreed translation to `semiformal/`. If `language/chunks/` exists, write each chunk as a JSON file to `semiformal/chunks/{id}.json`, updating the chunk's `proof.strategy` field with a paragraph describing the overall proof strategy, and `proof.sub_chunks` with one entry per meaningful proof step (case split, induction arm, key lemma application, or major sub-goal — not trivial steps). Leave `status`, `lean_declaration`, and `mathlib_refs` at their generation-time values. Otherwise, follow the IR spec's file structure; if none defined, default to one file per chunk.
+If `dag.json` exists at root, read it before starting. Process chunks in topological layer order — complete all chunks in layer N before moving to layer N+1. Chunks within the same layer may be distributed across council members and worked on in parallel.
+
+Once consensus is reached and alignment checks pass, write the agreed translation to `semiformal/`. If `language/chunks/` exists, write each chunk as a JSON file to `semiformal/chunks/{id}.json`, updating the chunk's `content` field with the full semiformal translation of the statement/definition, `proof.strategy` with a paragraph describing the overall proof strategy, and `proof.sub_chunks` with one entry per meaningful proof step (case split, induction arm, key lemma application, or major sub-goal — not trivial steps). Leave `status`, `lean_declaration`, and `mathlib_refs` at their generation-time values. Otherwise, follow the IR spec's file structure; if none defined, default to one file per chunk.
 
 Before completing this phase, append a brief entry to `DECISIONS.md` at root (create if absent) recording any key non-obvious decisions made by the council and their rationale.
 
