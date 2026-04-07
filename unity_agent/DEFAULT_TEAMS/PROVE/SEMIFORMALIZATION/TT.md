@@ -40,7 +40,7 @@ These are heuristic checks. If alignment is insufficient, continue iterating.
 
 **Output**
 
-Once consensus is reached and alignment checks pass, write the agreed translation to `semiformal/`. Follow the IR spec's file structure for splitting output across files. If the IR spec defines no file structure, default to one file per chunk.
+Once consensus is reached and alignment checks pass, write the agreed translation to `semiformal/`. If `language/chunks/` exists, write each chunk as a JSON file to `semiformal/chunks/{id}.json`, updating `proof.strategy` and `proof.sub_chunks` with the semiformal proof content. Leave `status`, `lean_declaration`, and `mathlib_refs` at their generation-time values. Otherwise, follow the IR spec's file structure; if none defined, default to one file per chunk.
 
 Then run:
 ```
@@ -48,3 +48,5 @@ cd semiformal
 git add .
 git commit -m "semiformalization phase completed"
 ```
+
+**IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

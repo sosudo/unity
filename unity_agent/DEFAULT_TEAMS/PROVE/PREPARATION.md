@@ -70,3 +70,5 @@ You may create a team if you deem it truly necessary. Team agents may themselves
 **Commits**
 
 Once `ORDER.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`. Once `PLAN.md` is complete, commit it to `semiformal/` with a message prefixed by `PREPARATION:`.
+
+**IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

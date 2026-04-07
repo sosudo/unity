@@ -47,3 +47,5 @@ At the end of `REPORT.md`, include exactly one of the following status lines:
 - `**Status:** NEEDS_REVISION` — unresolved issues remain that require re-exploration and re-formalization.
 
 Before completing this phase, append a brief entry to `DECISIONS.md` at root (create if absent) recording any key non-obvious decisions made and their rationale.
+
+**IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

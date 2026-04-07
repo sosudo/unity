@@ -1,5 +1,6 @@
 """Main autoformalization pipeline for Unity Agent."""
 
+import asyncio
 import atexit
 import os
 import re
@@ -57,6 +58,25 @@ def _log_agent_message(message) -> None:
 
 def _run(cmd, cwd=None):
     subprocess.run(cmd, cwd=cwd, check=True)
+
+
+_RATE_LIMIT_PATTERN = re.compile(
+    r"rate.?limit|429|too many requests|overloaded|retry.after",
+    re.IGNORECASE,
+)
+
+
+def _commit_phase(phase_name: str, metadata: dict | None = None) -> None:
+    """Commit current state with a parseable phase boundary message."""
+    meta_str = " ".join(f"{k}={v}" for k, v in (metadata or {}).items())
+    msg = f"PHASE:{phase_name} status=complete"
+    if meta_str:
+        msg += f" {meta_str}"
+    try:
+        subprocess.run(["git", "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "commit", "-m", msg, "--allow-empty"], check=True, capture_output=True)
+    except subprocess.CalledProcessError:
+        pass
 
 
 def _is_lean_repo(path: Path) -> bool:
@@ -305,6 +325,30 @@ def _cleanup_worktree(worktree_path: Path, project_path: Path, chunk_id: str) ->
         logging.warning(f"Could not delete branch worktree/{safe_id}.")
 
 
+async def _warm_lean_lsp(project_path: Path) -> None:
+    """Pre-warm the Lean LSP by opening a trivial file, loading OLEANs into the OS page cache."""
+    def _do_warmup():
+        try:
+            from leanclient import LeanLSPClient
+        except ImportError:
+            return
+        warmup_file = project_path / ".unity_lsp_warmup.lean"
+        try:
+            warmup_file.write_text("import Mathlib\n\n#check Nat.add_comm\n")
+            client = LeanLSPClient(str(project_path), initial_build=False)
+            try:
+                client.get_diagnostics(str(warmup_file), inactivity_timeout=120.0)
+            finally:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+        finally:
+            warmup_file.unlink(missing_ok=True)
+
+    await asyncio.to_thread(_do_warmup)
+
+
 async def _infer_flags() -> tuple[str | None, str | None, bool]:
     """Run a lightweight inference agent to detect source, project, and prove from CWD."""
     cwd_env = Path.cwd() / ".env"
@@ -362,7 +406,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     def parse_bool(val: str | None) -> bool:
         """Parse string env var to boolean."""
         return val is not None and val.lower() in ("true", "1", "yes")
-    
+
     def parse_float(val: str | None) -> float | None:
         """Parse string env var to float, or None if not set/empty."""
         if not val or val.lower() == "none":
@@ -419,7 +463,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         logging.info(f"DEPTH: {depth}")
         logging.info("Loading environment...")
-        
+
         # Set environment
         save_spec = parse_bool(os.getenv("SAVE_SPECIFICATION"))
         no_bypass = parse_bool(os.getenv("NO_BYPASS"))
@@ -485,12 +529,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info(f"ANTHROPIC_DEFAULT_SONNET_MODEL: {anthropic_default_sonnet_model}")
         logging.info(f"ANTHROPIC_DEFAULT_HAIKU_MODEL: {anthropic_default_haiku_model}")
         logging.info(f"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: {claude_code_experimental_agent_teams}")
-        
+
         # Check for conflicts
         if not autofix and context:
             logging.critical("CRITICAL: cannot have context without autofix enabled")
             exit(1)
-            
+
         if not exploration and recurse:
             logging.critical("CRITICAL: cannot have recurse without exploration enabled")
             exit(1)
@@ -524,12 +568,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             PERMISSIONS="acceptEdits"
         else:
             PERMISSIONS="bypassPermissions"
-        
+
         logging.info("Environment loaded successfully!")
     except Exception as e:
         logging.critical(f"CRITICAL (environment loading): {e}")
         exit(1)
-        
+
     # Lean project initialization
 
     logging.info("Initializing Lean project...")
@@ -543,13 +587,19 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         elif not _is_lean_repo(project_path):
             _run(["lake", "init", project_path.name, "math"], cwd=project_path)
 
-        _run(["lake", "exe", "cache", "get"], cwd=project_path)
-        _run(["lake", "update"], cwd=project_path)
-        
         logging.info("Lean project initialized successfully!")
     except Exception as e:
         logging.critical(f"CRITICAL (project initialization): {e}")
         exit(1)
+
+    async def _lake_init():
+        """Fetch Mathlib cache and update dependencies (runs in background thread)."""
+        await asyncio.to_thread(_run, ["lake", "exe", "cache", "get"], project_path)
+        await asyncio.to_thread(_run, ["lake", "update"], project_path)
+
+    _lake_init_task = asyncio.create_task(_lake_init())
+    await asyncio.sleep(0)  # yield so the lake init thread starts before synchronous setup
+    logging.info("lake cache + update running in background...")
 
     # Configure MCP servers for all agents
     LEAN_MCP_SERVER = {
@@ -659,84 +709,143 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             return prompt
         return prompt + "\n\n---\n\n" + library_context
 
+    # Resolver infrastructure
+    _retries: dict[str, int] = {}
+
+    async def _invoke_resolver(phase_name: str, error: Exception, ctx: dict | None = None) -> None:
+        """Classify error and either sleep (rate limit) or spawn resolver agent, then return for retry."""
+        max_retries = parse_int(os.getenv("RESOLVER_MAX_RETRIES"))
+        _retries[phase_name] = _retries.get(phase_name, 0) + 1
+        if max_retries is not None and _retries[phase_name] > max_retries:
+            logging.critical(
+                f"CRITICAL: resolver retry budget exhausted for phase '{phase_name}' "
+                f"after {max_retries} attempt(s)."
+            )
+            exit(1)
+
+        err_str = str(error)
+        logging.warning(
+            f"Resolver invoked for phase '{phase_name}' "
+            f"(attempt {_retries[phase_name]}): {err_str[:300]}"
+        )
+
+        if _RATE_LIMIT_PATTERN.search(err_str):
+            wait = 60
+            m = re.search(r"retry.after\s+(\d+)", err_str, re.IGNORECASE)
+            if not m:
+                m = re.search(r"reset.in\s+(\d+)", err_str, re.IGNORECASE)
+            if m:
+                wait = int(m.group(1))
+            logging.warning(f"Rate limit detected — sleeping {wait}s before retry.")
+            await asyncio.sleep(wait)
+            return
+
+        # Non-rate-limit: spawn resolver agent
+        last_checkpoint = "unknown"
+        try:
+            result = subprocess.run(
+                ["git", "log", "--oneline", "--grep=PHASE:.*status=complete", "-1"],
+                capture_output=True, text=True,
+            )
+            if result.stdout.strip():
+                last_checkpoint = result.stdout.strip().split()[0]
+        except Exception:
+            pass
+
+        chunk_summary = "(dag.json not found or unreadable)"
+        try:
+            dag = json.loads(Path("dag.json").read_text())
+            chunks = dag.get("chunks", [])
+            if chunks:
+                chunk_summary = json.dumps(
+                    [{"id": c["id"], "status": c.get("status", "unknown")} for c in chunks],
+                    indent=2,
+                )
+        except Exception:
+            pass
+
+        with open(_PROMPTS_DIR / "RESOLVER.md") as f:
+            resolver_prompt = f.read()
+
+        resolver_input = (
+            f"## Error Report\n\n"
+            f"**Phase:** {phase_name}\n"
+            f"**Error:** {err_str}\n"
+            f"**Last clean checkpoint:** {last_checkpoint}\n\n"
+            f"## Chunk Statuses\n\n```json\n{chunk_summary}\n```\n"
+        )
+        if ctx:
+            resolver_input += (
+                f"\n## Additional Context\n\n"
+                f"```json\n{json.dumps(ctx, indent=2, default=str)}\n```\n"
+            )
+
+        async for message in query(
+            prompt=resolver_input,
+            options=ClaudeAgentOptions(
+                tools=_ALL_TOOLS,
+                allowed_tools=_ALL_TOOLS,
+                system_prompt=resolver_prompt,
+                permission_mode="bypassPermissions",
+                model="sonnet",
+                fallback_model="haiku",
+                env=_agent_env,
+            ),
+        ):
+            _log_agent_message(message)
+
+        logging.info(f"Resolver completed for phase '{phase_name}' — retrying.")
+
+    # Ensure lake cache + update finished before any agent phase starts
+    try:
+        await _lake_init_task
+        logging.info("lake cache + update completed.")
+    except Exception as e:
+        logging.critical(f"CRITICAL (lake init): {e}")
+        exit(1)
+
+    _lsp_warmup_task = asyncio.create_task(_warm_lean_lsp(project_path))
+    await asyncio.sleep(0)  # yield so the warmup thread starts immediately
+    logging.info("Lean LSP warming up in background...")
+
+    # Await LSP warmup before any agent phase touches the LSP
+    try:
+        await _lsp_warmup_task
+        logging.info("Lean LSP warmup completed.")
+    except Exception as e:
+        logging.warning(f"Lean LSP warmup failed (non-fatal): {e}")
+
     # ── Path 2: prove mode, no source ─────────────────────────────────────────
     # Flow: exploration → generation → semiformalization (TT) → preparation → loop
     if prove and source is None:
 
         # Exploration phase
         _console.rule("[bold blue]Exploration Phase[/bold blue]")
-        try:
-            with open(ACTIVE_PROMPTS_DIR / "EXPLORATION.md", "r") as f:
-                EXPLORATION_PROMPT = with_library(f.read())
-            with open(ACTIVE_SUBAGENTS_DIR / "EXPLORATION/EXPLORER.md", "r") as f:
-                EXPLORER_SUBAGENT = f.read()
-
-            async for message in query(
-                prompt=f"Survey the Lean project at {project_path} for declarations needing proofs, then gather mathematical content for each.",
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "explorer": AgentDefinition(
-                            description="Explorer subagent. Capable of searching the web and gathering mathematical content for a specific Lean declaration needing a proof.",
-                            prompt=EXPLORER_SUBAGENT,
-                            tools=_ALL_TOOLS
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=EXPLORATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=exploration_budget,
-        
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-        
-                ),
-            ):
-                _log_agent_message(message)
-
-            logging.info("Exploration phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (exploration phase): {e}")
-            exit(1)
-
-        # Generation + Validation loop
-        validation_iteration = 0
         while True:
-            # Generation phase
-            _console.rule("[bold blue]Generation Phase[/bold blue]")
             try:
-                with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
-                    GENERATION_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "GENERATION/GENERATOR.md", "r") as f:
-                    GENERATOR_SUBAGENT = f.read()
-
-                generation_prompt = "Generate the specification language for the gathered mathematical content in `gathered/`."
-                if validation_iteration > 0:
-                    generation_prompt += " VALIDATION_REPORT.md contains feedback from the previous validation attempt — use it to refine the specification."
+                with open(ACTIVE_PROMPTS_DIR / "EXPLORATION.md", "r") as f:
+                    EXPLORATION_PROMPT = with_library(f.read())
+                with open(ACTIVE_SUBAGENTS_DIR / "EXPLORATION/EXPLORER.md", "r") as f:
+                    EXPLORER_SUBAGENT = f.read()
 
                 async for message in query(
-                    prompt=generation_prompt,
+                    prompt=f"Survey the Lean project at {project_path} for declarations needing proofs, then gather mathematical content for each.",
                     options=ClaudeAgentOptions(
                         tools=_ALL_TOOLS,
                         allowed_tools=_ALL_TOOLS,
                         agents={
-                            "generator": AgentDefinition(
-                                description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
-                                prompt=GENERATOR_SUBAGENT,
+                            "explorer": AgentDefinition(
+                                description="Explorer subagent. Capable of searching the web and gathering mathematical content for a specific Lean declaration needing a proof.",
+                                prompt=EXPLORER_SUBAGENT,
                                 tools=_ALL_TOOLS
                             ),
                             **LIBRARY_SUBAGENTS
                         },
-                        system_prompt=GENERATION_PROMPT,
+                        system_prompt=EXPLORATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
-                        max_budget_usd=generation_budget,
+                        max_budget_usd=exploration_budget,
 
                         enable_file_checkpointing=True,
                         model="opus",
@@ -747,44 +856,97 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 ):
                     _log_agent_message(message)
 
-                logging.info("Generation phase completed successfully!")
+                logging.info("Exploration phase completed successfully!")
+                _commit_phase("exploration")
+                break
             except Exception as e:
-                logging.critical(f"CRITICAL (generation phase): {e}")
-                exit(1)
+                await _invoke_resolver("exploration", e)
+
+        # Generation + Validation loop
+        validation_iteration = 0
+        while True:
+            # Generation phase
+            _console.rule("[bold blue]Generation Phase[/bold blue]")
+            while True:
+                try:
+                    with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
+                        GENERATION_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "GENERATION/GENERATOR.md", "r") as f:
+                        GENERATOR_SUBAGENT = f.read()
+
+                    generation_prompt = "Generate the specification language for the gathered mathematical content in `gathered/`."
+                    if validation_iteration > 0:
+                        generation_prompt += " VALIDATION_REPORT.md contains feedback from the previous validation attempt — use it to refine the specification."
+
+                    async for message in query(
+                        prompt=generation_prompt,
+                        options=ClaudeAgentOptions(
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
+                            agents={
+                                "generator": AgentDefinition(
+                                    description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
+                                    prompt=GENERATOR_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                **LIBRARY_SUBAGENTS
+                            },
+                            system_prompt=GENERATION_PROMPT,
+                            mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
+                            permission_mode=PERMISSIONS,
+                            max_budget_usd=generation_budget,
+
+                            enable_file_checkpointing=True,
+                            model="opus",
+                            fallback_model="sonnet",
+                            env=_agent_env,
+
+                        ),
+                    ):
+                        _log_agent_message(message)
+
+                    logging.info("Generation phase completed successfully!")
+                    _commit_phase("generation")
+                    break
+                except Exception as e:
+                    await _invoke_resolver("generation", e)
 
             # Validation phase
             _console.rule("[bold blue]Validation Phase[/bold blue]")
-            try:
-                with open(ACTIVE_PROMPTS_DIR / "VALIDATION.md", "r") as f:
-                    VALIDATION_PROMPT = with_library(f.read())
+            while True:
+                try:
+                    with open(ACTIVE_PROMPTS_DIR / "VALIDATION.md", "r") as f:
+                        VALIDATION_PROMPT = with_library(f.read())
 
-                async for message in query(
-                    prompt=f"Validate the IR specification generated for the gathered content in `gathered/`.",
-                    options=ClaudeAgentOptions(
-                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
-                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
-                        agents={**LIBRARY_SUBAGENTS},
-                        system_prompt=VALIDATION_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=validation_budget,
+                    async for message in query(
+                        prompt=f"Validate the IR specification generated for the gathered content in `gathered/`.",
+                        options=ClaudeAgentOptions(
+                            tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
+                            allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
+                            agents={**LIBRARY_SUBAGENTS},
+                            system_prompt=VALIDATION_PROMPT,
+                            mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
+                            permission_mode=PERMISSIONS,
+                            max_budget_usd=validation_budget,
 
-                        enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
-                        env=_agent_env,
+                            enable_file_checkpointing=True,
+                            model="sonnet",
+                            fallback_model="haiku",
+                            env=_agent_env,
 
-                    ),
-                ):
-                    _log_agent_message(message)
+                        ),
+                    ):
+                        _log_agent_message(message)
 
-                logging.info("Validation phase completed successfully!")
-            except SystemExit:
-                raise
-            except Exception as e:
-                logging.critical(f"CRITICAL (validation phase): {e}")
-                exit(1)
+                    logging.info("Validation phase completed successfully!")
+                    _commit_phase("validation")
+                    break
+                except SystemExit:
+                    raise
+                except Exception as e:
+                    await _invoke_resolver("validation", e)
 
             # Validation loop status check
             try:
@@ -803,44 +965,46 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         # Semiformalization phase (always TT: autofix + context, required for Path 2)
         _console.rule("[bold blue]Semiformalization Phase[/bold blue]")
-        try:
-            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
-                SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
-                SEMIFORMALIZER_SUBAGENT = f.read()
+        while True:
+            try:
+                with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+                    SEMIFORMALIZATION_PROMPT = with_library(f.read())
+                with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+                    SEMIFORMALIZER_SUBAGENT = f.read()
 
-            async for message in query(
-                prompt=f"Semiformalize the gathered content in `gathered/` using the specification language in `language/`. The Lean project is {project_path}.",
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "semiformalizer": AgentDefinition(
-                            description="Semiformalizer subagent. Capable of producing faithful semiformal translations of gathered mathematical content into the IR specification language located in `language/`.",
-                            prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=_ALL_TOOLS
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=SEMIFORMALIZATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=semiformalization_budget,
-        
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-        
-                ),
-            ):
-                _log_agent_message(message)
+                async for message in query(
+                    prompt=f"Semiformalize the gathered content in `gathered/` using the specification language in `language/`. The Lean project is {project_path}.",
+                    options=ClaudeAgentOptions(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents={
+                            "semiformalizer": AgentDefinition(
+                                description="Semiformalizer subagent. Capable of producing faithful semiformal translations of gathered mathematical content into the IR specification language located in `language/`.",
+                                prompt=SEMIFORMALIZER_SUBAGENT,
+                                tools=_ALL_TOOLS
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=SEMIFORMALIZATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=semiformalization_budget,
 
-            logging.info("Semiformalization phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (semiformalization phase): {e}")
-            exit(1)
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env=_agent_env,
+
+                    ),
+                ):
+                    _log_agent_message(message)
+
+                logging.info("Semiformalization phase completed successfully!")
+                _commit_phase("semiformalization")
+                break
+            except Exception as e:
+                await _invoke_resolver("semiformalization", e)
 
         # Build DAG from chunk JSON files
         try:
@@ -854,75 +1018,77 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
             # Formalization phase (always T variant: existing project always present)
             _console.rule("[bold blue]Formalization Phase[/bold blue]")
-            try:
-                with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
-                    FORMALIZATION_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
-                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
-                    PROOFFORMALIZER_SUBAGENT = f.read()
+            while True:
+                try:
+                    with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
+                        FORMALIZATION_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
+                        DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                    with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
+                        PROOFFORMALIZER_SUBAGENT = f.read()
 
-                dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
-                dag_layers = dag_data.get("layers", [])
-                worktree_assignments: dict[str, str] = {}
-                for layer in dag_layers:
-                    for cid in layer:
-                        wt = _create_worktree(cid, project_path)
-                        _symlink_lake_cache(wt, project_path)
-                        worktree_assignments[cid] = str(wt)
+                    dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
+                    dag_layers = dag_data.get("layers", [])
+                    worktree_assignments: dict[str, str] = {}
+                    for layer in dag_layers:
+                        for cid in layer:
+                            wt = _create_worktree(cid, project_path)
+                            _symlink_lake_cache(wt, project_path)
+                            worktree_assignments[cid] = str(wt)
 
-                _formalization_agents = {
-                    "declaration-formalizer": AgentDefinition(
-                        description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                        prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                        tools=_ALL_TOOLS
-                    ),
-                    "proof-formalizer": AgentDefinition(
-                        description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                        prompt=PROOFFORMALIZER_SUBAGENT,
-                        tools=_ALL_TOOLS
-                    ),
-                    **LIBRARY_SUBAGENTS
-                }
-                _formalization_kwargs = dict(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents=_formalization_agents,
-                    system_prompt=FORMALIZATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=formalization_budget,
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-                )
+                    _formalization_agents = {
+                        "declaration-formalizer": AgentDefinition(
+                            description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                            prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                            tools=_ALL_TOOLS
+                        ),
+                        "proof-formalizer": AgentDefinition(
+                            description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                            prompt=PROOFFORMALIZER_SUBAGENT,
+                            tools=_ALL_TOOLS
+                        ),
+                        **LIBRARY_SUBAGENTS
+                    }
+                    _formalization_kwargs = dict(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents=_formalization_agents,
+                        system_prompt=FORMALIZATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=formalization_budget,
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env=_agent_env,
+                    )
 
-                if dag_layers and worktree_assignments:
-                    for layer_idx, layer_ids in enumerate(dag_layers):
-                        layer_assignments = {cid: worktree_assignments[cid] for cid in layer_ids if cid in worktree_assignments}
-                        layer_prompt = (
-                            f"Formalize the declarations in {project_path}. "
-                            f"Process DAG layer {layer_idx} chunks: {layer_ids}. "
-                            f"Worktree assignments: {json.dumps(layer_assignments)}"
-                        )
-                        async for message in query(prompt=layer_prompt, options=ClaudeAgentOptions(**_formalization_kwargs)):
+                    if dag_layers and worktree_assignments:
+                        for layer_idx, layer_ids in enumerate(dag_layers):
+                            layer_assignments = {cid: worktree_assignments[cid] for cid in layer_ids if cid in worktree_assignments}
+                            layer_prompt = (
+                                f"Formalize the declarations in {project_path}. "
+                                f"Process DAG layer {layer_idx} chunks: {layer_ids}. "
+                                f"Worktree assignments: {json.dumps(layer_assignments)}"
+                            )
+                            async for message in query(prompt=layer_prompt, options=ClaudeAgentOptions(**_formalization_kwargs)):
+                                _log_agent_message(message)
+                            for cid in layer_ids:
+                                if cid in worktree_assignments:
+                                    _merge_worktree(Path(worktree_assignments[cid]), project_path, cid)
+                        _run(["lake", "build"], cwd=project_path)
+                        for cid, wt in worktree_assignments.items():
+                            _cleanup_worktree(Path(wt), project_path, cid)
+                    else:
+                        async for message in query(prompt=f"Formalize the declarations in {project_path}.", options=ClaudeAgentOptions(**_formalization_kwargs)):
                             _log_agent_message(message)
-                        for cid in layer_ids:
-                            if cid in worktree_assignments:
-                                _merge_worktree(Path(worktree_assignments[cid]), project_path, cid)
-                    _run(["lake", "build"], cwd=project_path)
-                    for cid, wt in worktree_assignments.items():
-                        _cleanup_worktree(Path(wt), project_path, cid)
-                else:
-                    async for message in query(prompt=f"Formalize the declarations in {project_path}.", options=ClaudeAgentOptions(**_formalization_kwargs)):
-                        _log_agent_message(message)
 
-                logging.info("Formalization phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (formalization phase): {e}")
-                exit(1)
+                    logging.info("Formalization phase completed successfully!")
+                    _commit_phase("formalization", {"iteration": iteration})
+                    break
+                except Exception as e:
+                    await _invoke_resolver("formalization", e)
 
             # Retrospective phase
             _console.rule("[bold blue]Retrospective Phase[/bold blue]")
@@ -943,12 +1109,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=RETROSPECTIVE_PROMPT,
                         permission_mode=PERMISSIONS,
-            
+
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
                         env=_agent_env,
-            
+
                     ),
                 ):
                     _log_agent_message(message)
@@ -960,50 +1126,52 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
             # Critic phase (always T variant)
             _console.rule("[bold blue]Critic Phase[/bold blue]")
-            try:
-                with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
-                    CRITIC_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
-                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
-                    PROOFFORMALIZER_SUBAGENT = f.read()
+            while True:
+                try:
+                    with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
+                        CRITIC_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
+                        DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                    with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
+                        PROOFFORMALIZER_SUBAGENT = f.read()
 
-                async for message in query(
-                    prompt=f"Critique {project_path} given semiformalization `semiformal/` and specification language `language/`.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={
-                            "declaration-formalizer": AgentDefinition(
-                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            "proof-formalizer": AgentDefinition(
-                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                                prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            **LIBRARY_SUBAGENTS
-                        },
-                        system_prompt=CRITIC_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=critic_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
-                    ),
-                ):
-                    _log_agent_message(message)
-                logging.info("Critic phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (critic phase): {e}")
-                exit(1)
+                    async for message in query(
+                        prompt=f"Critique {project_path} given semiformalization `semiformal/` and specification language `language/`.",
+                        options=ClaudeAgentOptions(
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
+                            agents={
+                                "declaration-formalizer": AgentDefinition(
+                                    description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                                    prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                "proof-formalizer": AgentDefinition(
+                                    description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                                    prompt=PROOFFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                **LIBRARY_SUBAGENTS
+                            },
+                            system_prompt=CRITIC_PROMPT,
+                            mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
+                            permission_mode=PERMISSIONS,
+                            max_budget_usd=critic_budget,
+
+                            enable_file_checkpointing=True,
+                            model="opus",
+                            fallback_model="sonnet",
+                            env=_agent_env,
+
+                        ),
+                    ):
+                        _log_agent_message(message)
+                    logging.info("Critic phase completed successfully!")
+                    _commit_phase("critic", {"iteration": iteration})
+                    break
+                except Exception as e:
+                    await _invoke_resolver("critic", e)
 
             # Loop status check
             try:
@@ -1038,46 +1206,48 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     # Source scan phase
     if source is not None:
         _console.rule("[bold blue]Source Scan Phase[/bold blue]")
-        try:
-            with open(_PROMPTS_DIR / "SOURCE_SCAN.md", "r") as f:
-                SOURCE_SCAN_PROMPT = with_library(f.read())
-            with open(_SUBAGENTS_DIR / "SOURCE_SCAN/SCANNER.md", "r") as f:
-                SCANNER_SUBAGENT = f.read()
+        while True:
+            try:
+                with open(_PROMPTS_DIR / "SOURCE_SCAN.md", "r") as f:
+                    SOURCE_SCAN_PROMPT = with_library(f.read())
+                with open(_SUBAGENTS_DIR / "SOURCE_SCAN/SCANNER.md", "r") as f:
+                    SCANNER_SUBAGENT = f.read()
 
-            scan_prompt = f"Scan {source} for mathematical claims and search Mathlib for each."
-            if context:
-                scan_prompt += f" An existing Lean project is present at {project_path} — also inventory its current Mathlib imports."
+                scan_prompt = f"Scan {source} for mathematical claims and search Mathlib for each."
+                if context:
+                    scan_prompt += f" An existing Lean project is present at {project_path} — also inventory its current Mathlib imports."
 
-            async for message in query(
-                prompt=scan_prompt,
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "scanner": AgentDefinition(
-                            description="Scanner subagent. Searches Mathlib for declarations relevant to a given mathematical claim.",
-                            prompt=SCANNER_SUBAGENT,
-                            tools=["Read", "WebSearch", "WebFetch"],
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=SOURCE_SCAN_PROMPT,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=source_scan_budget,
+                async for message in query(
+                    prompt=scan_prompt,
+                    options=ClaudeAgentOptions(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents={
+                            "scanner": AgentDefinition(
+                                description="Scanner subagent. Searches Mathlib for declarations relevant to a given mathematical claim.",
+                                prompt=SCANNER_SUBAGENT,
+                                tools=["Read", "WebSearch", "WebFetch"],
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=SOURCE_SCAN_PROMPT,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=source_scan_budget,
 
-                    enable_file_checkpointing=True,
-                    model="sonnet",
-                    fallback_model="haiku",
-                    env=_agent_env,
+                        enable_file_checkpointing=True,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_agent_env,
 
-                ),
-            ):
-                _log_agent_message(message)
+                    ),
+                ):
+                    _log_agent_message(message)
 
-            logging.info("Source scan phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (source scan phase): {e}")
-            exit(1)
+                logging.info("Source scan phase completed successfully!")
+                _commit_phase("source-scan")
+                break
+            except Exception as e:
+                await _invoke_resolver("source-scan", e)
 
     # Generation + Validation loop
 
@@ -1086,83 +1256,87 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         # Generation phase
         _console.rule("[bold blue]Generation Phase[/bold blue]")
-        try:
-            # Load generation phase system prompt and generator subagent prompt
-            with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
-                GENERATION_PROMPT = with_library(f.read())
-            with open(_SUBAGENTS_DIR / "GENERATION/GENERATOR.md", "r") as f:
-                GENERATOR_SUBAGENT = f.read()
+        while True:
+            try:
+                # Load generation phase system prompt and generator subagent prompt
+                with open(ACTIVE_PROMPTS_DIR / "GENERATION.md", "r") as f:
+                    GENERATION_PROMPT = with_library(f.read())
+                with open(_SUBAGENTS_DIR / "GENERATION/GENERATOR.md", "r") as f:
+                    GENERATOR_SUBAGENT = f.read()
 
-            generation_prompt = f"Generate the specification language for {source}."
-            if validation_iteration > 0:
-                generation_prompt += " VALIDATION_REPORT.md contains feedback from the previous validation attempt — use it to refine the specification."
+                generation_prompt = f"Generate the specification language for {source}."
+                if validation_iteration > 0:
+                    generation_prompt += " VALIDATION_REPORT.md contains feedback from the previous validation attempt — use it to refine the specification."
 
-            async for message in query(
-                prompt=generation_prompt,
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "generator": AgentDefinition(
-                            description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
-                            prompt=GENERATOR_SUBAGENT,
-                            tools=_ALL_TOOLS
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=GENERATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=generation_budget,
+                async for message in query(
+                    prompt=generation_prompt,
+                    options=ClaudeAgentOptions(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents={
+                            "generator": AgentDefinition(
+                                description="Generator subagent. Capable of assisting in the design of a semiformal specification language for a given source.",
+                                prompt=GENERATOR_SUBAGENT,
+                                tools=_ALL_TOOLS
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=GENERATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=generation_budget,
 
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env=_agent_env,
 
-                ),
-            ):
-                _log_agent_message(message)
+                    ),
+                ):
+                    _log_agent_message(message)
 
-            logging.info("Generation phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (generation phase): {e}")
-            exit(1)
+                logging.info("Generation phase completed successfully!")
+                _commit_phase("generation")
+                break
+            except Exception as e:
+                await _invoke_resolver("generation", e)
 
         # Validation phase
         _console.rule("[bold blue]Validation Phase[/bold blue]")
-        try:
-            with open(ACTIVE_PROMPTS_DIR / "VALIDATION.md", "r") as f:
-                VALIDATION_PROMPT = with_library(f.read())
+        while True:
+            try:
+                with open(ACTIVE_PROMPTS_DIR / "VALIDATION.md", "r") as f:
+                    VALIDATION_PROMPT = with_library(f.read())
 
-            async for message in query(
-                prompt=f"Validate the IR specification generated for {source}.",
-                options=ClaudeAgentOptions(
-                    tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
-                    allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
-                    agents={**LIBRARY_SUBAGENTS},
-                    system_prompt=VALIDATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=validation_budget,
+                async for message in query(
+                    prompt=f"Validate the IR specification generated for {source}.",
+                    options=ClaudeAgentOptions(
+                        tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
+                        allowed_tools=["Read", "Write", "Edit", "Bash", "Glob", "Grep", "Agent", "Skill"],
+                        agents={**LIBRARY_SUBAGENTS},
+                        system_prompt=VALIDATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=validation_budget,
 
-                    enable_file_checkpointing=True,
-                    model="sonnet",
-                    fallback_model="haiku",
-                    env=_agent_env,
+                        enable_file_checkpointing=True,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_agent_env,
 
-                ),
-            ):
-                _log_agent_message(message)
+                    ),
+                ):
+                    _log_agent_message(message)
 
-            logging.info("Validation phase completed successfully!")
-        except SystemExit:
-            raise
-        except Exception as e:
-            logging.critical(f"CRITICAL (validation phase): {e}")
-            exit(1)
+                logging.info("Validation phase completed successfully!")
+                _commit_phase("validation")
+                break
+            except SystemExit:
+                raise
+            except Exception as e:
+                await _invoke_resolver("validation", e)
 
         # Validation loop status check
         try:
@@ -1180,128 +1354,134 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             break
 
     # Semiformalization phase
-    
+
     _console.rule("[bold blue]Semiformalization Phase[/bold blue]")
     if not autofix and not context:
-        try:
-            # Load semiformalization phase system prompt and semiformalizer subagent prompt
-            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
-                SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
-                SEMIFORMALIZER_SUBAGENT = f.read()
-            
-            async for message in query(
-                prompt=f"Semiformalize {source} as specified by the language.",
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "semiformalizer": AgentDefinition(
-                            description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
-                            prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=_ALL_TOOLS
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=SEMIFORMALIZATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=semiformalization_budget,
-        
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-        
-                ),
-            ):
-                _log_agent_message(message)
-                    
-            logging.info("Semiformalization phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (semiformalization phase): {e}")
-            exit(1)
+        while True:
+            try:
+                # Load semiformalization phase system prompt and semiformalizer subagent prompt
+                with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
+                    SEMIFORMALIZATION_PROMPT = with_library(f.read())
+                with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/FF.md", "r") as f:
+                    SEMIFORMALIZER_SUBAGENT = f.read()
+
+                async for message in query(
+                    prompt=f"Semiformalize {source} as specified by the language.",
+                    options=ClaudeAgentOptions(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents={
+                            "semiformalizer": AgentDefinition(
+                                description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
+                                prompt=SEMIFORMALIZER_SUBAGENT,
+                                tools=_ALL_TOOLS
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=SEMIFORMALIZATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=semiformalization_budget,
+
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env=_agent_env,
+
+                    ),
+                ):
+                    _log_agent_message(message)
+
+                logging.info("Semiformalization phase completed successfully!")
+                _commit_phase("semiformalization")
+                break
+            except Exception as e:
+                await _invoke_resolver("semiformalization", e)
     elif autofix and not context:
-        try:
-            # Load semiformalization phase system prompt and semiformalizer subagent prompt
-            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
-                SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
-                SEMIFORMALIZER_SUBAGENT = f.read()
-            
-            async for message in query(
-                prompt=f"Semiformalize {source} as specified by the language.",
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "semiformalizer": AgentDefinition(
-                            description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
-                            prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=_ALL_TOOLS
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=SEMIFORMALIZATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=semiformalization_budget,
-        
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-        
-                ),
-            ):
-                _log_agent_message(message)
-                    
-            logging.info("Semiformalization phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (semiformalization phase): {e}")
-            exit(1)
+        while True:
+            try:
+                # Load semiformalization phase system prompt and semiformalizer subagent prompt
+                with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
+                    SEMIFORMALIZATION_PROMPT = with_library(f.read())
+                with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TF.md", "r") as f:
+                    SEMIFORMALIZER_SUBAGENT = f.read()
+
+                async for message in query(
+                    prompt=f"Semiformalize {source} as specified by the language.",
+                    options=ClaudeAgentOptions(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents={
+                            "semiformalizer": AgentDefinition(
+                                description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
+                                prompt=SEMIFORMALIZER_SUBAGENT,
+                                tools=_ALL_TOOLS
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=SEMIFORMALIZATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=semiformalization_budget,
+
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env=_agent_env,
+
+                    ),
+                ):
+                    _log_agent_message(message)
+
+                logging.info("Semiformalization phase completed successfully!")
+                _commit_phase("semiformalization")
+                break
+            except Exception as e:
+                await _invoke_resolver("semiformalization", e)
     elif autofix and context:
-        try:
-            # Load semiformalization phase system prompt and semiformalizer subagent prompt
-            with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
-                SEMIFORMALIZATION_PROMPT = with_library(f.read())
-            with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
-                SEMIFORMALIZER_SUBAGENT = f.read()
-            
-            async for message in query(
-                prompt=f"Semiformalize {source} as specified by the language. The Lean project is {project_path}.",
-                options=ClaudeAgentOptions(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents={
-                        "semiformalizer": AgentDefinition(
-                            description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
-                            prompt=SEMIFORMALIZER_SUBAGENT,
-                            tools=_ALL_TOOLS
-                        ),
-                        **LIBRARY_SUBAGENTS
-                    },
-                    system_prompt=SEMIFORMALIZATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=semiformalization_budget,
-        
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-        
-                ),
-            ):
-                _log_agent_message(message)
-                    
-            logging.info("Semiformalization phase completed successfully!")
-        except Exception as e:
-            logging.critical(f"CRITICAL (semiformalization phase): {e}")
-            exit(1)
+        while True:
+            try:
+                # Load semiformalization phase system prompt and semiformalizer subagent prompt
+                with open(ACTIVE_PROMPTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+                    SEMIFORMALIZATION_PROMPT = with_library(f.read())
+                with open(ACTIVE_SUBAGENTS_DIR / "SEMIFORMALIZATION/TT.md", "r") as f:
+                    SEMIFORMALIZER_SUBAGENT = f.read()
+
+                async for message in query(
+                    prompt=f"Semiformalize {source} as specified by the language. The Lean project is {project_path}.",
+                    options=ClaudeAgentOptions(
+                        tools=_ALL_TOOLS,
+                        allowed_tools=_ALL_TOOLS,
+                        agents={
+                            "semiformalizer": AgentDefinition(
+                                description="Semiformalizer subagent. Capable of producing faithful semiformal translations of a source into the IR specification language located in `language/`.",
+                                prompt=SEMIFORMALIZER_SUBAGENT,
+                                tools=_ALL_TOOLS
+                            ),
+                            **LIBRARY_SUBAGENTS
+                        },
+                        system_prompt=SEMIFORMALIZATION_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
+                        permission_mode=PERMISSIONS,
+                        max_budget_usd=semiformalization_budget,
+
+                        enable_file_checkpointing=True,
+                        model="opus",
+                        fallback_model="sonnet",
+                        env=_agent_env,
+
+                    ),
+                ):
+                    _log_agent_message(message)
+
+                logging.info("Semiformalization phase completed successfully!")
+                _commit_phase("semiformalization")
+                break
+            except Exception as e:
+                await _invoke_resolver("semiformalization", e)
     else:
         logging.critical("CRITICAL (semiformalization phase): cannot have context without autofix enabled")
         exit(1)
@@ -1317,225 +1497,233 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     while True:
 
         # Exploration phase
-    
+
         if exploration:
             _console.rule("[bold blue]Exploration Phase[/bold blue]")
             if not recurse and not context:
-                try:
-                    # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
-                    with open(PROMPTS_DIR / "EXPLORATION/FF.md", "r") as f:
-                        EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/F.md", "r") as f:
-                        EXPLORER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
-                        SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
-                        EXPLORATIONGENERATOR_SUBAGENT = f.read()
-                
-                    async for message in query(
-                        prompt=f"Explore `semiformal/` given specification language `language/` and source {source}.",
-                        options=ClaudeAgentOptions(
-                            tools=_ALL_TOOLS,
-                            allowed_tools=_ALL_TOOLS,
-                            agents={
-                                "explorer": AgentDefinition(
-                                    description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
-                                    prompt=EXPLORER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "semiformalizer": AgentDefinition(
-                                    description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
-                                    prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "exploration-generator": AgentDefinition(
-                                    description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
-                                    prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                **LIBRARY_SUBAGENTS
-                            },
-                            system_prompt=EXPLORATION_PROMPT,
-                            mcp_servers=LEAN_MCP_SERVER,
-                            hooks=FORUM_HOOKS,
-                            permission_mode=PERMISSIONS,
-                            max_budget_usd=exploration_budget,
-                
-                            enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
-                
-                        ),
-                    ):
-                        _log_agent_message(message)
-                        
-                    logging.info("Exploration phase completed successfully!")
-                except Exception as e:
-                    logging.critical(f"CRITICAL (exploration phase): {e}")
-                    exit(1)
+                while True:
+                    try:
+                        # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
+                        with open(PROMPTS_DIR / "EXPLORATION/FF.md", "r") as f:
+                            EXPLORATION_PROMPT = with_library(f.read())
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/F.md", "r") as f:
+                            EXPLORER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
+                            SEMIFORMALIZER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                            EXPLORATIONGENERATOR_SUBAGENT = f.read()
+
+                        async for message in query(
+                            prompt=f"Explore `semiformal/` given specification language `language/` and source {source}.",
+                            options=ClaudeAgentOptions(
+                                tools=_ALL_TOOLS,
+                                allowed_tools=_ALL_TOOLS,
+                                agents={
+                                    "explorer": AgentDefinition(
+                                        description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
+                                        prompt=EXPLORER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "semiformalizer": AgentDefinition(
+                                        description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
+                                        prompt=SEMIFORMALIZER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "exploration-generator": AgentDefinition(
+                                        description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
+                                        prompt=EXPLORATIONGENERATOR_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    **LIBRARY_SUBAGENTS
+                                },
+                                system_prompt=EXPLORATION_PROMPT,
+                                mcp_servers=LEAN_MCP_SERVER,
+                                hooks=FORUM_HOOKS,
+                                permission_mode=PERMISSIONS,
+                                max_budget_usd=exploration_budget,
+
+                                enable_file_checkpointing=True,
+                                model="opus",
+                                fallback_model="sonnet",
+                                env=_agent_env,
+
+                            ),
+                        ):
+                            _log_agent_message(message)
+
+                        logging.info("Exploration phase completed successfully!")
+                        _commit_phase("exploration", {"iteration": iteration})
+                        break
+                    except Exception as e:
+                        await _invoke_resolver("exploration", e)
             elif not recurse and context:
-                try:
-                    # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
-                    with open(PROMPTS_DIR / "EXPLORATION/FT.md", "r") as f:
-                        EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/T.md", "r") as f:
-                        EXPLORER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
-                        SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
-                        EXPLORATIONGENERATOR_SUBAGENT = f.read()
-                
-                    async for message in query(
-                        prompt=f"Explore `semiformal/` given specification language `language/` and source {source}. The Lean project is {project_path}.",
-                        options=ClaudeAgentOptions(
-                            tools=_ALL_TOOLS,
-                            allowed_tools=_ALL_TOOLS,
-                            agents={
-                                "explorer": AgentDefinition(
-                                    description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
-                                    prompt=EXPLORER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "semiformalizer": AgentDefinition(
-                                    description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
-                                    prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "exploration-generator": AgentDefinition(
-                                    description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
-                                    prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                **LIBRARY_SUBAGENTS
-                            },
-                            system_prompt=EXPLORATION_PROMPT,
-                            mcp_servers=LEAN_MCP_SERVER,
-                            hooks=FORUM_HOOKS,
-                            permission_mode=PERMISSIONS,
-                            max_budget_usd=exploration_budget,
-                
-                            enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
-                
-                        ),
-                    ):
-                        _log_agent_message(message)
-                        
-                    logging.info("Exploration phase completed successfully!")
-                except Exception as e:
-                    logging.critical(f"CRITICAL (exploration phase): {e}")
-                    exit(1)
+                while True:
+                    try:
+                        # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
+                        with open(PROMPTS_DIR / "EXPLORATION/FT.md", "r") as f:
+                            EXPLORATION_PROMPT = with_library(f.read())
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/T.md", "r") as f:
+                            EXPLORER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
+                            SEMIFORMALIZER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                            EXPLORATIONGENERATOR_SUBAGENT = f.read()
+
+                        async for message in query(
+                            prompt=f"Explore `semiformal/` given specification language `language/` and source {source}. The Lean project is {project_path}.",
+                            options=ClaudeAgentOptions(
+                                tools=_ALL_TOOLS,
+                                allowed_tools=_ALL_TOOLS,
+                                agents={
+                                    "explorer": AgentDefinition(
+                                        description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
+                                        prompt=EXPLORER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "semiformalizer": AgentDefinition(
+                                        description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
+                                        prompt=SEMIFORMALIZER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "exploration-generator": AgentDefinition(
+                                        description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
+                                        prompt=EXPLORATIONGENERATOR_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    **LIBRARY_SUBAGENTS
+                                },
+                                system_prompt=EXPLORATION_PROMPT,
+                                mcp_servers=LEAN_MCP_SERVER,
+                                hooks=FORUM_HOOKS,
+                                permission_mode=PERMISSIONS,
+                                max_budget_usd=exploration_budget,
+
+                                enable_file_checkpointing=True,
+                                model="opus",
+                                fallback_model="sonnet",
+                                env=_agent_env,
+
+                            ),
+                        ):
+                            _log_agent_message(message)
+
+                        logging.info("Exploration phase completed successfully!")
+                        _commit_phase("exploration", {"iteration": iteration})
+                        break
+                    except Exception as e:
+                        await _invoke_resolver("exploration", e)
             elif recurse and not context:
-                try:
-                    # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
-                    with open(PROMPTS_DIR / "EXPLORATION/TF.md", "r") as f:
-                        EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/F.md", "r") as f:
-                        EXPLORER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
-                        SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
-                        EXPLORATIONGENERATOR_SUBAGENT = f.read()
-                
-                    async for message in query(
-                        prompt=f"Explore `semiformal/` given specification language `language/` and source {source}.",
-                        options=ClaudeAgentOptions(
-                            tools=_ALL_TOOLS,
-                            allowed_tools=_ALL_TOOLS,
-                            agents={
-                                "explorer": AgentDefinition(
-                                    description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
-                                    prompt=EXPLORER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "semiformalizer": AgentDefinition(
-                                    description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
-                                    prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "exploration-generator": AgentDefinition(
-                                    description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
-                                    prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                **LIBRARY_SUBAGENTS
-                            },
-                            system_prompt=EXPLORATION_PROMPT,
-                            mcp_servers=LEAN_MCP_SERVER,
-                            hooks=FORUM_HOOKS,
-                            permission_mode=PERMISSIONS,
-                            max_budget_usd=exploration_budget,
-                
-                            enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
-                
-                        ),
-                    ):
-                        _log_agent_message(message)
-                        
-                    logging.info("Exploration phase completed successfully!")
-                except Exception as e:
-                    logging.critical(f"CRITICAL (exploration phase): {e}")
-                    exit(1)
+                while True:
+                    try:
+                        # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
+                        with open(PROMPTS_DIR / "EXPLORATION/TF.md", "r") as f:
+                            EXPLORATION_PROMPT = with_library(f.read())
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/F.md", "r") as f:
+                            EXPLORER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/F.md", "r") as f:
+                            SEMIFORMALIZER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                            EXPLORATIONGENERATOR_SUBAGENT = f.read()
+
+                        async for message in query(
+                            prompt=f"Explore `semiformal/` given specification language `language/` and source {source}.",
+                            options=ClaudeAgentOptions(
+                                tools=_ALL_TOOLS,
+                                allowed_tools=_ALL_TOOLS,
+                                agents={
+                                    "explorer": AgentDefinition(
+                                        description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
+                                        prompt=EXPLORER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "semiformalizer": AgentDefinition(
+                                        description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
+                                        prompt=SEMIFORMALIZER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "exploration-generator": AgentDefinition(
+                                        description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
+                                        prompt=EXPLORATIONGENERATOR_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    **LIBRARY_SUBAGENTS
+                                },
+                                system_prompt=EXPLORATION_PROMPT,
+                                mcp_servers=LEAN_MCP_SERVER,
+                                hooks=FORUM_HOOKS,
+                                permission_mode=PERMISSIONS,
+                                max_budget_usd=exploration_budget,
+
+                                enable_file_checkpointing=True,
+                                model="opus",
+                                fallback_model="sonnet",
+                                env=_agent_env,
+
+                            ),
+                        ):
+                            _log_agent_message(message)
+
+                        logging.info("Exploration phase completed successfully!")
+                        _commit_phase("exploration", {"iteration": iteration})
+                        break
+                    except Exception as e:
+                        await _invoke_resolver("exploration", e)
             elif recurse and context:
-                try:
-                    # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
-                    with open(PROMPTS_DIR / "EXPLORATION/TT.md", "r") as f:
-                        EXPLORATION_PROMPT = with_library(f.read())
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/T.md", "r") as f:
-                        EXPLORER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
-                        SEMIFORMALIZER_SUBAGENT = f.read()
-                    with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
-                        EXPLORATIONGENERATOR_SUBAGENT = f.read()
-                
-                    async for message in query(
-                        prompt=f"Explore `semiformal/` given specification language `language/` and source {source}. The Lean project is {project_path}.",
-                        options=ClaudeAgentOptions(
-                            tools=_ALL_TOOLS,
-                            allowed_tools=_ALL_TOOLS,
-                            agents={
-                                "explorer": AgentDefinition(
-                                    description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
-                                    prompt=EXPLORER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "semiformalizer": AgentDefinition(
-                                    description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
-                                    prompt=SEMIFORMALIZER_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                "exploration-generator": AgentDefinition(
-                                    description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
-                                    prompt=EXPLORATIONGENERATOR_SUBAGENT,
-                                    tools=_ALL_TOOLS
-                                ),
-                                **LIBRARY_SUBAGENTS
-                            },
-                            system_prompt=EXPLORATION_PROMPT,
-                            mcp_servers=LEAN_MCP_SERVER,
-                            hooks=FORUM_HOOKS,
-                            permission_mode=PERMISSIONS,
-                            max_budget_usd=exploration_budget,
-                
-                            enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
-                
-                        ),
-                    ):
-                        _log_agent_message(message)
-                        
-                    logging.info("Exploration phase completed successfully!")
-                except Exception as e:
-                    logging.critical(f"CRITICAL (exploration phase): {e}")
-                    exit(1)
+                while True:
+                    try:
+                        # Load exploration phase system prompt and explorer, semiformalizer, and exploration-generator subagent prompts
+                        with open(PROMPTS_DIR / "EXPLORATION/TT.md", "r") as f:
+                            EXPLORATION_PROMPT = with_library(f.read())
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORER/T.md", "r") as f:
+                            EXPLORER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/SEMIFORMALIZER/T.md", "r") as f:
+                            SEMIFORMALIZER_SUBAGENT = f.read()
+                        with open(_SUBAGENTS_DIR / "EXPLORATION/EXPLORATIONGENERATOR.md", "r") as f:
+                            EXPLORATIONGENERATOR_SUBAGENT = f.read()
+
+                        async for message in query(
+                            prompt=f"Explore `semiformal/` given specification language `language/` and source {source}. The Lean project is {project_path}.",
+                            options=ClaudeAgentOptions(
+                                tools=_ALL_TOOLS,
+                                allowed_tools=_ALL_TOOLS,
+                                agents={
+                                    "explorer": AgentDefinition(
+                                        description="Explorer subagent. Capable of searching the web and gathering sources for a specific assumption type.",
+                                        prompt=EXPLORER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "semiformalizer": AgentDefinition(
+                                        description="Semiformalizer subagent. Capable of semiformalizing gathered sources for specific assumption types into the existing semiformal translation.",
+                                        prompt=SEMIFORMALIZER_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    "exploration-generator": AgentDefinition(
+                                        description="ExplorationGenerator subagent. Capable of extending the IR specification language to accomodate new sources gathered during exploration.",
+                                        prompt=EXPLORATIONGENERATOR_SUBAGENT,
+                                        tools=_ALL_TOOLS
+                                    ),
+                                    **LIBRARY_SUBAGENTS
+                                },
+                                system_prompt=EXPLORATION_PROMPT,
+                                mcp_servers=LEAN_MCP_SERVER,
+                                hooks=FORUM_HOOKS,
+                                permission_mode=PERMISSIONS,
+                                max_budget_usd=exploration_budget,
+
+                                enable_file_checkpointing=True,
+                                model="opus",
+                                fallback_model="sonnet",
+                                env=_agent_env,
+
+                            ),
+                        ):
+                            _log_agent_message(message)
+
+                        logging.info("Exploration phase completed successfully!")
+                        _commit_phase("exploration", {"iteration": iteration})
+                        break
+                    except Exception as e:
+                        await _invoke_resolver("exploration", e)
             else:
                 logging.critical("CRITICAL (exploration phase): reached unreachable code")
                 exit(1)
@@ -1543,233 +1731,241 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             logging.info("Exploration phase skipped.")
 
         # Formalization phase
-    
+
         _console.rule("[bold blue]Formalization Phase[/bold blue]")
-    
+
         if not context and iteration == 0:
-            try:
-                # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/F.md", "r") as f:
-                    FORMALIZATION_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/F.md", "r") as f:
-                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/F.md", "r") as f:
-                    PROOFFORMALIZER_SUBAGENT = f.read()
-            
-                async for message in query(
-                    prompt=f"Formalize {source} into {project_path}.",
-                    options=ClaudeAgentOptions(
+            while True:
+                try:
+                    # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
+                    with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/F.md", "r") as f:
+                        FORMALIZATION_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/F.md", "r") as f:
+                        DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                    with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/F.md", "r") as f:
+                        PROOFFORMALIZER_SUBAGENT = f.read()
+
+                    async for message in query(
+                        prompt=f"Formalize {source} into {project_path}.",
+                        options=ClaudeAgentOptions(
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
+                            agents={
+                                "declaration-formalizer": AgentDefinition(
+                                    description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                                    prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                "proof-formalizer": AgentDefinition(
+                                    description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                                    prompt=PROOFFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                **LIBRARY_SUBAGENTS
+                            },
+                            system_prompt=FORMALIZATION_PROMPT,
+                            mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
+                            permission_mode=PERMISSIONS,
+                            max_budget_usd=formalization_budget,
+
+                            enable_file_checkpointing=True,
+                            model="opus",
+                            fallback_model="sonnet",
+                            env=_agent_env,
+
+                        ),
+                    ):
+                        _log_agent_message(message)
+
+                    logging.info("Formalization phase completed successfully!")
+                    _commit_phase("formalization", {"iteration": iteration})
+                    break
+                except Exception as e:
+                    await _invoke_resolver("formalization", e)
+        elif context or iteration > 0:
+            while True:
+                try:
+                    # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
+                    with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
+                        FORMALIZATION_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
+                        DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                    with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
+                        PROOFFORMALIZER_SUBAGENT = f.read()
+
+                    dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
+                    dag_layers = dag_data.get("layers", [])
+                    worktree_assignments: dict[str, str] = {}
+                    for layer in dag_layers:
+                        for cid in layer:
+                            wt = _create_worktree(cid, project_path)
+                            _symlink_lake_cache(wt, project_path)
+                            worktree_assignments[cid] = str(wt)
+
+                    _formalization_agents = {
+                        "declaration-formalizer": AgentDefinition(
+                            description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                            prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                            tools=_ALL_TOOLS
+                        ),
+                        "proof-formalizer": AgentDefinition(
+                            description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                            prompt=PROOFFORMALIZER_SUBAGENT,
+                            tools=_ALL_TOOLS
+                        ),
+                        **LIBRARY_SUBAGENTS
+                    }
+                    _formalization_kwargs = dict(
                         tools=_ALL_TOOLS,
                         allowed_tools=_ALL_TOOLS,
-                        agents={
-                            "declaration-formalizer": AgentDefinition(
-                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            "proof-formalizer": AgentDefinition(
-                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                                prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            **LIBRARY_SUBAGENTS
-                        },
+                        agents=_formalization_agents,
                         system_prompt=FORMALIZATION_PROMPT,
                         mcp_servers=LEAN_MCP_SERVER,
                         hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
-            
                         enable_file_checkpointing=True,
                         model="opus",
                         fallback_model="sonnet",
                         env=_agent_env,
-            
-                    ),
-                ):
-                    _log_agent_message(message)
-                    
-                logging.info("Formalization phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (formalization phase): {e}")
-                exit(1)
-        elif context or iteration > 0:
-            try:
-                # Load formalization phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(ACTIVE_PROMPTS_DIR / "FORMALIZATION/T.md", "r") as f:
-                    FORMALIZATION_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "FORMALIZATION/DECLARATIONFORMALIZER/T.md", "r") as f:
-                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/T.md", "r") as f:
-                    PROOFFORMALIZER_SUBAGENT = f.read()
+                    )
 
-                dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
-                dag_layers = dag_data.get("layers", [])
-                worktree_assignments: dict[str, str] = {}
-                for layer in dag_layers:
-                    for cid in layer:
-                        wt = _create_worktree(cid, project_path)
-                        _symlink_lake_cache(wt, project_path)
-                        worktree_assignments[cid] = str(wt)
-
-                _formalization_agents = {
-                    "declaration-formalizer": AgentDefinition(
-                        description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                        prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                        tools=_ALL_TOOLS
-                    ),
-                    "proof-formalizer": AgentDefinition(
-                        description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                        prompt=PROOFFORMALIZER_SUBAGENT,
-                        tools=_ALL_TOOLS
-                    ),
-                    **LIBRARY_SUBAGENTS
-                }
-                _formalization_kwargs = dict(
-                    tools=_ALL_TOOLS,
-                    allowed_tools=_ALL_TOOLS,
-                    agents=_formalization_agents,
-                    system_prompt=FORMALIZATION_PROMPT,
-                    mcp_servers=LEAN_MCP_SERVER,
-                    hooks=FORUM_HOOKS,
-                    permission_mode=PERMISSIONS,
-                    max_budget_usd=formalization_budget,
-                    enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
-                )
-
-                if dag_layers and worktree_assignments:
-                    for layer_idx, layer_ids in enumerate(dag_layers):
-                        layer_assignments = {cid: worktree_assignments[cid] for cid in layer_ids if cid in worktree_assignments}
-                        layer_prompt = (
-                            f"Formalize {source} into {project_path}. "
-                            f"Process DAG layer {layer_idx} chunks: {layer_ids}. "
-                            f"Worktree assignments: {json.dumps(layer_assignments)}"
-                        )
-                        async for message in query(prompt=layer_prompt, options=ClaudeAgentOptions(**_formalization_kwargs)):
+                    if dag_layers and worktree_assignments:
+                        for layer_idx, layer_ids in enumerate(dag_layers):
+                            layer_assignments = {cid: worktree_assignments[cid] for cid in layer_ids if cid in worktree_assignments}
+                            layer_prompt = (
+                                f"Formalize {source} into {project_path}. "
+                                f"Process DAG layer {layer_idx} chunks: {layer_ids}. "
+                                f"Worktree assignments: {json.dumps(layer_assignments)}"
+                            )
+                            async for message in query(prompt=layer_prompt, options=ClaudeAgentOptions(**_formalization_kwargs)):
+                                _log_agent_message(message)
+                            for cid in layer_ids:
+                                if cid in worktree_assignments:
+                                    _merge_worktree(Path(worktree_assignments[cid]), project_path, cid)
+                        _run(["lake", "build"], cwd=project_path)
+                        for cid, wt in worktree_assignments.items():
+                            _cleanup_worktree(Path(wt), project_path, cid)
+                    else:
+                        async for message in query(prompt=f"Formalize {source} into {project_path}.", options=ClaudeAgentOptions(**_formalization_kwargs)):
                             _log_agent_message(message)
-                        for cid in layer_ids:
-                            if cid in worktree_assignments:
-                                _merge_worktree(Path(worktree_assignments[cid]), project_path, cid)
-                    _run(["lake", "build"], cwd=project_path)
-                    for cid, wt in worktree_assignments.items():
-                        _cleanup_worktree(Path(wt), project_path, cid)
-                else:
-                    async for message in query(prompt=f"Formalize {source} into {project_path}.", options=ClaudeAgentOptions(**_formalization_kwargs)):
-                        _log_agent_message(message)
 
-                logging.info("Formalization phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (formalization phase): {e}")
-                exit(1)
+                    logging.info("Formalization phase completed successfully!")
+                    _commit_phase("formalization", {"iteration": iteration})
+                    break
+                except Exception as e:
+                    await _invoke_resolver("formalization", e)
         else:
             logging.critical("CRITICAL (formalization phase): reached unreachable code")
             exit(1)
-        
+
         # Critic phase
-    
+
         _console.rule("[bold blue]Critic Phase[/bold blue]")
 
         if not context and iteration == 0:
-            try:
-                # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
-                    CRITIC_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/F.md", "r") as f:
-                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/F.md", "r") as f:
-                    PROOFFORMALIZER_SUBAGENT = f.read()
-            
-                async for message in query(
-                    prompt=f"Critique {project_path} given source {source}, semiformalization `semiformal/`, and specification language `language/`.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={
-                            "declaration-formalizer": AgentDefinition(
-                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            "proof-formalizer": AgentDefinition(
-                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                                prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            **LIBRARY_SUBAGENTS
-                        },
-                        system_prompt=CRITIC_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=critic_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
-                    ),
-                ):
-                    _log_agent_message(message)
-                    
-                logging.info("Critic phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (critic phase): {e}")
-                exit(1)
+            while True:
+                try:
+                    # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
+                    with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
+                        CRITIC_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/F.md", "r") as f:
+                        DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                    with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/F.md", "r") as f:
+                        PROOFFORMALIZER_SUBAGENT = f.read()
+
+                    async for message in query(
+                        prompt=f"Critique {project_path} given source {source}, semiformalization `semiformal/`, and specification language `language/`.",
+                        options=ClaudeAgentOptions(
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
+                            agents={
+                                "declaration-formalizer": AgentDefinition(
+                                    description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                                    prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                "proof-formalizer": AgentDefinition(
+                                    description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                                    prompt=PROOFFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                **LIBRARY_SUBAGENTS
+                            },
+                            system_prompt=CRITIC_PROMPT,
+                            mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
+                            permission_mode=PERMISSIONS,
+                            max_budget_usd=critic_budget,
+
+                            enable_file_checkpointing=True,
+                            model="opus",
+                            fallback_model="sonnet",
+                            env=_agent_env,
+
+                        ),
+                    ):
+                        _log_agent_message(message)
+
+                    logging.info("Critic phase completed successfully!")
+                    _commit_phase("critic", {"iteration": iteration})
+                    break
+                except Exception as e:
+                    await _invoke_resolver("critic", e)
         elif context or iteration > 0:
-            try:
-                # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
-                with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
-                    CRITIC_PROMPT = with_library(f.read())
-                with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
-                    DECLARATIONFORMALIZER_SUBAGENT = f.read()
-                with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
-                    PROOFFORMALIZER_SUBAGENT = f.read()
-            
-                async for message in query(
-                    prompt=f"Critique {project_path} given source {source}, semiformalization `semiformal/`, and specification language `language/`.",
-                    options=ClaudeAgentOptions(
-                        tools=_ALL_TOOLS,
-                        allowed_tools=_ALL_TOOLS,
-                        agents={
-                            "declaration-formalizer": AgentDefinition(
-                                description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
-                                prompt=DECLARATIONFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            "proof-formalizer": AgentDefinition(
-                                description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
-                                prompt=PROOFFORMALIZER_SUBAGENT,
-                                tools=_ALL_TOOLS
-                            ),
-                            **LIBRARY_SUBAGENTS
-                        },
-                        system_prompt=CRITIC_PROMPT,
-                        mcp_servers=LEAN_MCP_SERVER,
-                        hooks=FORUM_HOOKS,
-                        permission_mode=PERMISSIONS,
-                        max_budget_usd=critic_budget,
-            
-                        enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
-            
-                    ),
-                ):
-                    _log_agent_message(message)
-                    
-                logging.info("Critic phase completed successfully!")
-            except Exception as e:
-                logging.critical(f"CRITICAL (critic phase): {e}")
-                exit(1)
+            while True:
+                try:
+                    # Load critic phase system prompt and declaration-formalizer and proof-formalizer subagent prompts
+                    with open(ACTIVE_PROMPTS_DIR / "CRITIC.md", "r") as f:
+                        CRITIC_PROMPT = with_library(f.read())
+                    with open(_SUBAGENTS_DIR / "CRITIC/DECLARATIONFORMALIZER/T.md", "r") as f:
+                        DECLARATIONFORMALIZER_SUBAGENT = f.read()
+                    with open(_SUBAGENTS_DIR / "CRITIC/PROOFFORMALIZER/T.md", "r") as f:
+                        PROOFFORMALIZER_SUBAGENT = f.read()
+
+                    async for message in query(
+                        prompt=f"Critique {project_path} given source {source}, semiformalization `semiformal/`, and specification language `language/`.",
+                        options=ClaudeAgentOptions(
+                            tools=_ALL_TOOLS,
+                            allowed_tools=_ALL_TOOLS,
+                            agents={
+                                "declaration-formalizer": AgentDefinition(
+                                    description="DeclarationFormalizer subagent. Capable of formalizing a declaration or statement of a specific chunk into Lean4.",
+                                    prompt=DECLARATIONFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                "proof-formalizer": AgentDefinition(
+                                    description="ProofFormalizer subagent. Capable of formalizing the proof of a specific chunk into Lean4.",
+                                    prompt=PROOFFORMALIZER_SUBAGENT,
+                                    tools=_ALL_TOOLS
+                                ),
+                                **LIBRARY_SUBAGENTS
+                            },
+                            system_prompt=CRITIC_PROMPT,
+                            mcp_servers=LEAN_MCP_SERVER,
+                            hooks=FORUM_HOOKS,
+                            permission_mode=PERMISSIONS,
+                            max_budget_usd=critic_budget,
+
+                            enable_file_checkpointing=True,
+                            model="opus",
+                            fallback_model="sonnet",
+                            env=_agent_env,
+
+                        ),
+                    ):
+                        _log_agent_message(message)
+
+                    logging.info("Critic phase completed successfully!")
+                    _commit_phase("critic", {"iteration": iteration})
+                    break
+                except Exception as e:
+                    await _invoke_resolver("critic", e)
         else:
             logging.critical("CRITICAL (critic phase): reached unreachable code")
             exit(1)
-        
+
         # Retrospective phase (inside loop — updates .unity/ before next iteration)
 
         _console.rule("[bold blue]Retrospective Phase[/bold blue]")
@@ -1791,12 +1987,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     agents={**LIBRARY_SUBAGENTS},
                     system_prompt=RETROSPECTIVE_PROMPT,
                     permission_mode=PERMISSIONS,
-        
+
                     enable_file_checkpointing=True,
                     model="opus",
                     fallback_model="sonnet",
                     env=_agent_env,
-        
+
                 ),
             ):
                 _log_agent_message(message)
@@ -1827,8 +2023,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     # Cleanup
 
     logging.info("Cleaning up...")
-    
-    try:    
+
+    try:
         if not save_spec:
             spec_dir = Path("language")
             if spec_dir.exists():
@@ -1840,9 +2036,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 shutil.rmtree(semiformal_dir)
     except Exception as e:
         logging.error(f"ERROR (clean up): {e}")
-        
+
     logging.info("Clean up completed successfully!")
-        
+
     _console.rule("[bold blue]Summary[/bold blue]")
     try:
         _console.print(Markdown(Path("REPORT.md").read_text()))

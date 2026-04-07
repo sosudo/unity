@@ -11,7 +11,7 @@ If `DECISIONS.md` exists at root, read it before proceeding — it records key d
 
 1. **Forum threads**: Call `forum_list()` to see which threads already exist. For each chunk in `dag.json`, call `forum_create_thread(thread_id="chunk-<id>", title=<chunk-title>)` — existing threads are preserved with their full post history. Also create `forum_create_thread(thread_id="global", title="Global Discussion")`.
 
-2. **Per-layer plans**: Before spawning declaration formalizers for each layer, generate a brief advisory plan for each chunk in that layer — suggested tactics, relevant Mathlib lemmas, potential pitfalls — and post it to the chunk's forum thread.
+2. **Per-layer plans**: Before spawning declaration formalizers for each layer, generate a brief advisory plan for each chunk in that layer — suggested tactics, relevant Mathlib lemmas, potential pitfalls — and post it to the chunk's forum thread. Plans are advisory; agents may deviate.
 
 Use the following forum tools throughout:
 

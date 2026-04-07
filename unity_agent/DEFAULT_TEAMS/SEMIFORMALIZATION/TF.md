@@ -46,7 +46,7 @@ If a `recursive-unity` subagent is available, you may delegate a self-contained 
 
 **Output**
 
-Once consensus is reached and alignment checks pass, write the agreed translation to `semiformal/`. Follow the IR spec's file structure for splitting output across files. If the IR spec defines no file structure, default to one file per chunk.
+Once consensus is reached and alignment checks pass, write the agreed translation to `semiformal/`. If `language/chunks/` exists, write each chunk as a JSON file to `semiformal/chunks/{id}.json`, updating the chunk's `proof.strategy` field with a paragraph describing the overall proof strategy, and `proof.sub_chunks` with one entry per meaningful proof step (case split, induction arm, key lemma application, or major sub-goal — not trivial steps). Leave `status`, `lean_declaration`, and `mathlib_refs` at their generation-time values. Otherwise, follow the IR spec's file structure; if none defined, default to one file per chunk.
 
 Before completing this phase, append a brief entry to `DECISIONS.md` at root (create if absent) recording any key non-obvious decisions made by the council and their rationale.
 
@@ -56,3 +56,5 @@ cd semiformal/
 git add .
 git commit -m "semiformalization phase completed"
 ```
+
+**IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

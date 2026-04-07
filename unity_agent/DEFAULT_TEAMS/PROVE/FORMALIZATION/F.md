@@ -146,3 +146,5 @@ Each team agent should:
 If any API changes are made during the proof step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix.
 
 Once all proofs compile successfully across all chunks, commit the target Lean project with a `UNITY:` prefix.
+
+**IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

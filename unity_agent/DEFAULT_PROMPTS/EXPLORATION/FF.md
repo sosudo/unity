@@ -71,7 +71,7 @@ If a `recursive-unity` subagent is available, you may delegate a self-contained 
 
 **Mathlib refs**
 
-When an assumption type is successfully resolved to a Mathlib declaration, add its module path to the `mathlib_refs` array of the corresponding chunk JSON in `semiformal/chunks/` (if that directory exists). Update in-place and commit alongside other `semiformal/` changes.
+When an assumption type is successfully resolved to a Mathlib declaration, add its module path (e.g. `Mathlib.Algebra.Group.Basic`) to the `mathlib_refs` array of the corresponding chunk JSON in `semiformal/chunks/` (if that directory exists). Update in-place and commit alongside any other `semiformal/` changes.
 
 **Commits**
 

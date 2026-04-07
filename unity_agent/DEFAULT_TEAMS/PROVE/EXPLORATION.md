@@ -54,3 +54,5 @@ Unity maintains a global library at `~/.unity/library/`. If library files are pr
 **Commits**
 
 After completing `gathered/`, commit with a message prefixed by `EXPLORATION:`.
+
+**IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
