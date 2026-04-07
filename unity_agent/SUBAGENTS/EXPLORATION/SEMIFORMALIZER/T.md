@@ -20,7 +20,11 @@ For dependencies outside the scope of the gathered sources:
 
 **Convergence**
 
-First converge per assumption with other Semiformalizer subagents assigned to the same assumption, then converge globally across all assumptions before writing output.
+First converge per assumption with other Semiformalizer subagents assigned to the same assumption, then converge globally across all assumptions before writing output. Post drafts and convergence signals to the `exploration` thread with author `"EXPLORATION_SEMIFORMALIZER"`. Read `forum_read("exploration")` to see what other subagents have proposed.
+
+**Forum**
+
+Use `forum_post`, `forum_read`, `forum_vote`, `forum_redact`, `forum_list` to coordinate — never write to `forum/` files directly.
 
 **Output**
 

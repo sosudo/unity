@@ -73,6 +73,24 @@ If a `recursive-unity` subagent is available, you may delegate a self-contained 
 
 When an assumption type is successfully resolved to a Mathlib declaration, add its module path to the `mathlib_refs` array of the corresponding chunk JSON in `semiformal/chunks/` (if that directory exists). Update in-place and commit alongside other `semiformal/` changes.
 
+**Forum**
+
+Create a `forum_create_thread(thread_id="exploration", title="Exploration")` thread. Post the outcome of each assumption resolution to this thread with author `"EXPLORATION"` — including what was found, what was formalized, and what was sorried — so formalization agents have visibility. Use the following forum tools:
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
+
 **Commits**
 
 Before completing this phase, append a brief entry to `DECISIONS.md` at root (create if absent) recording any key non-obvious decisions made and their rationale.

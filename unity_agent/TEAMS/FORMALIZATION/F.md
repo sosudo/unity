@@ -16,12 +16,18 @@ If `DECISIONS.md` exists at root, read it before proceeding — it records key d
 Use the following forum tools throughout:
 
 **Forum tools** (Unity Forum MCP server):
-- `forum_create_thread(thread_id, title, description?)` — create a thread; agents may create additional threads as needed
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
 - `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
 - `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
 - `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
 - `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
 - `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
 
 The target is a brand new Lake project. Initialize it as appropriate before proceeding.
 

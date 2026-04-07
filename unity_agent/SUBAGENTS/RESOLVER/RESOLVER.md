@@ -44,3 +44,9 @@ Your job is to diagnose the failure, repair the pipeline state, and leave things
 - If `last clean checkpoint` is a valid hash, you may use `git diff <hash> HEAD` to see what changed since the last good state.
 - Prefer targeted fixes over wholesale resets. Only reset chunks whose output is actually corrupt or missing.
 - You have full tool access: Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, Agent, Skill.
+
+## Forum
+
+Before diagnosing, check forum context — call `forum_list()` to see all threads, then read the relevant chunk or phase thread to understand what decisions were made before the failure. After completing your fix, post your diagnosis and changes to the `resolver` thread with author `"RESOLVER"`.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`, `forum_create_thread`.

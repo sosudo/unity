@@ -26,4 +26,10 @@ You may write files anywhere within `language/` as you deem appropriate. Coordin
 
 You may communicate with the main agent and other Generator subagents freely. You may spawn your own sub-subagents if you deem it necessary.
 
+**Forum**
+
+Post your design recommendations and proposals to the `generation` thread with author `"GENERATOR"` using `forum_post("generation", "GENERATOR", content)`. Read the thread with `forum_read("generation")` before finalizing to ensure consistency with other subagents' proposals. Vote on posts you find most useful with `forum_vote`.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`, `forum_tag`, `forum_get_tag`, `forum_check_balance`.
+
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

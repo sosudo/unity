@@ -28,6 +28,16 @@ For dependencies outside the scope of the source:
 
 **Convergence**
 
-Once your draft is complete, share it with the council. Openly compare, discuss, and iteratively revise with the other council members until convergence is reached. Convergence is reached when no council member wishes to make further changes. There is no maximum iteration count.
+Once your draft is complete, use the forum to coordinate with the council:
+1. Post your complete draft to the `semiformalization` thread with author `"SEMIFORMALIZER"`.
+2. Read the other council members' posts and reply with `reply_to` pointing to their post ID.
+3. Post an `ACCEPT` reply when you agree with the current shared draft, or an `OBJECT` reply with your specific concern when you do not.
+4. Convergence is reached when all council members have posted `ACCEPT` with no outstanding `OBJECT` replies. There is no maximum iteration count.
+
+**Forum**
+
+Use the forum MCP tools to coordinate with other council members — never write to `forum/` files directly. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`
 
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

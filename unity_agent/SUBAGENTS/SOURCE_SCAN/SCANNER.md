@@ -13,4 +13,10 @@ For each claim, report:
 
 **Do not write any files.** Return your findings as plain text to the main agent.
 
+**Forum**
+
+After completing your search, post your findings to the `source-scan` thread with author `"SCANNER"` — one post per claim with match quality, Mathlib names, and caveats. Use `forum_post("source-scan", "SCANNER", content)`. This allows the coordinator to aggregate results in real time without waiting for all subagents to finish.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`.
+
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

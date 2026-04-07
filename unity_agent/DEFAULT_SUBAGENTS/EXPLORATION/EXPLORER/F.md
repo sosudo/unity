@@ -12,6 +12,12 @@ You will be assigned one or more assumption types by the main agent. For each as
 - Prefer primary sources (original papers, official Mathlib/Lean files) over secondary sources
 - For formally published mathematics, arXiv (`https://export.arxiv.org/api/query?search_query=...`) and Semantic Scholar (`https://api.semanticscholar.org/graph/v1/paper/search?query=...`) are useful sources — both free, no API key required.
 
+**Forum**
+
+Post your per-assumption findings to the `exploration` thread with author `"EXPLORER"` using `forum_post("exploration", "EXPLORER", content)` before reporting back — include the assumption, sources found, coverage assessment, and where files were saved. This allows the coordinator to see partial results in real time.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`.
+
 **Output**
 
 Report back to the main agent with:

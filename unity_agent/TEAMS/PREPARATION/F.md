@@ -30,6 +30,20 @@ These plans are advisory — formalization agents may deviate from them, but sho
 
 After `ORDER.md` is complete, call `forum_list()` to see which threads already exist. For each chunk, call `forum_create_thread(thread_id="chunk-<id>", title=<chunk-title>)` — if the thread already exists it will be preserved with its full post history from prior iterations. Also create a global thread `forum_create_thread(thread_id="global", title="Global Discussion")` for cross-chunk communication.
 
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
+
 **dag.json**
 
 After `ORDER.md` is complete, write `dag.json` at the repository root with the following structure:

@@ -13,7 +13,7 @@ You will be assigned one or more chunks and a specific issue to fix by the criti
 
 **Forum**
 
-Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_check_balance`, `forum_redact`) to interact with the chunk's forum thread — never write to `forum/` files directly. Prefix all your posts with `CRITIC:`. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
+Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_redact`, `forum_list`, `forum_tag`, `forum_get_tag`, `forum_check_balance`) to interact with the chunk's forum thread — never write to `forum/` files directly. Prefix all your posts with `CRITIC:`. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
 
 **API changes**
 

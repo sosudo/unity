@@ -40,3 +40,26 @@ Your job is to diagnose the failure, repair the pipeline state, and leave things
 - If `last clean checkpoint` is a valid hash, you may use `git diff <hash> HEAD` to see what changed since the last good state.
 - Prefer targeted fixes over wholesale resets. Only reset chunks whose output is actually corrupt or missing.
 - You have full tool access: Read, Write, Edit, Bash, Glob, Grep, WebSearch, WebFetch, Agent, Skill.
+
+## Forum
+
+Before diagnosing, check forum context:
+- Call `forum_list()` to see all threads.
+- For formalization/critic failures, read the relevant chunk thread(s) with `forum_read("chunk-<id>")` — agents record design decisions, API proposals, and known issues there.
+- Read `forum_read("global")` for cross-chunk context.
+
+After completing your fix, call `forum_create_thread("resolver", "Resolver")` (existing thread is preserved) and post your diagnosis and changes with author `"RESOLVER"`.
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; existing threads are preserved with full history
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(name, post_ids, tagger?, description?)` — attach a named tag to a set of posts
+- `forum_get_tag(name)` — retrieve all posts with a given tag
+- `forum_propose_dimension(name, description, proposed_by)` — propose a new vote dimension
+- `forum_approve_dimension(name)` — approve a proposed vote dimension
+- `forum_set_dimensions(dimensions)` — set active vote dimensions for the run
+- `forum_check_balance(author)` — check an agent's ICRL credit balance

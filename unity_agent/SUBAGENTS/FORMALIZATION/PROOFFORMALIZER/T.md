@@ -41,7 +41,7 @@ Your task assignment includes a `worktree_path` for your chunk. Work exclusively
 
 **Forum**
 
-Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_check_balance`, `forum_redact`) to interact with the chunk's forum thread — never write to `forum/` files directly. Post ideas, design decisions, and updates in the style of a Reddit thread. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
+Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_redact`, `forum_list`, `forum_tag`, `forum_get_tag`, `forum_check_balance`) to interact with the chunk's forum thread — never write to `forum/` files directly. Post ideas, design decisions, and updates in the style of a Reddit thread. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
 
 **API changes**
 

@@ -51,6 +51,24 @@ The following tools are available via the Lean LSP MCP server:
 
 Unity maintains a global library at `~/.unity/library/`. If library files are present, a manifest will be appended below — use the `Read` tool to access any that seem relevant.
 
+**Forum**
+
+Create a `forum_create_thread(thread_id="exploration", title="Exploration")` thread. Post the findings for each declaration to this thread with author `"EXPLORATION"` — what was found in Mathlib, what external sources were gathered, and novelty assessments — so formalization agents have visibility into what's available. Use the following forum tools:
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
+
 **Commits**
 
 After completing `gathered/`, commit with a message prefixed by `EXPLORATION:`.

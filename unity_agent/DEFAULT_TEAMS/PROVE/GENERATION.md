@@ -105,6 +105,24 @@ If `mathlib-context.md` exists at root, read it before designing the IR. It reco
 
 Unity maintains a global library of IR designs from prior runs at `~/.unity/library/ir-patterns/`. If any are present, they will be listed in the manifest appended below — use the `Read` tool to access them. You are not bound by them.
 
+**Forum**
+
+Create a `forum_create_thread(thread_id="generation", title="Generation")` thread to coordinate with your Generator team. Post key IR design decisions to this thread with author `"GENERATOR"` so downstream phases can see the rationale. Use the following forum tools:
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
+
 **Subagents**
 
 You may create a team of Generator agents. Team agents may themselves spawn subagents. to assist with design decisions, deliberate on specific aspects of the source, propose alternative designs, or draft sub-languages which you aggregate. You may only output one final IR specification.

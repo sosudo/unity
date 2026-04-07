@@ -51,6 +51,24 @@ Before completing, append a brief entry to `DECISIONS.md` at root (create if abs
 
 Do not modify `language/`. Your role is verification only.
 
+**Forum**
+
+Call `forum_list()` at the start to check for any prior forum context. Then call `forum_create_thread("validation", "Validation")` and post your check results as you work, with author `"VALIDATION"`. Post each failing or warning check as a separate post so downstream agents can read and filter by topic.
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(name, post_ids, tagger?, description?)` — attach a named tag to a set of posts
+- `forum_get_tag(name)` — retrieve all posts with a given tag
+- `forum_propose_dimension(name, description, proposed_by)` — propose a new vote dimension
+- `forum_approve_dimension(name)` — approve a proposed vote dimension
+- `forum_set_dimensions(dimensions)` — set active vote dimensions for the run
+- `forum_check_balance(author)` — check an agent's ICRL credit balance
+
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
 
 Proceed as instructed.

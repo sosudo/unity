@@ -55,4 +55,25 @@ Unity maintains a global library at `~/.unity/library/`. If library files are pr
 
 After completing `gathered/`, commit with a message prefixed by `EXPLORATION:`.
 
+**Forum**
+
+At the start, call `forum_create_thread("exploration", "Exploration")` (existing threads are preserved). Use this thread throughout:
+- Post each declaration's search outcome with author `"EXPLORATION"`: found in Mathlib, found externally, or marked novel — include the reason.
+- Explorer subagents post their per-declaration findings to this thread with author `"EXPLORER"` before reporting back.
+- Read `forum_read("exploration")` at the start to check for prior context.
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(name, post_ids, tagger?, description?)` — attach a named tag to a set of posts
+- `forum_get_tag(name)` — retrieve all posts with a given tag
+- `forum_propose_dimension(name, description, proposed_by)` — propose a new vote dimension
+- `forum_approve_dimension(name)` — approve a proposed vote dimension
+- `forum_set_dimensions(dimensions)` — set active vote dimensions for the run
+- `forum_check_balance(author)` — check an agent's ICRL credit balance
+
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

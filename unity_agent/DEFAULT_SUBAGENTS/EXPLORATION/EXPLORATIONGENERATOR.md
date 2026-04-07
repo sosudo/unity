@@ -22,4 +22,10 @@ You may write files anywhere within `language/` as you deem appropriate. Coordin
 
 You may communicate with the main agent and other ExplorationGenerator subagents freely. You may spawn your own sub-subagents if you deem it necessary.
 
+**Forum**
+
+Post your IR extension proposals to the `exploration` thread with author `"EXPLORATION_GENERATOR"` using `forum_post("exploration", "EXPLORATION_GENERATOR", content)`. Read `forum_read("exploration")` to stay consistent with other subagents' proposals.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`.
+
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**

@@ -7,7 +7,7 @@ Read the following in full before proceeding:
 - The IR specification in `language/` (if it exists)
 - The semiformal translation in `semiformal/` (if it exists)
 - The compiled Lean project
-- All forum threads (use `forum_list` to enumerate, then `forum_read` per thread)
+- All forum threads (use `forum_list` to enumerate, then `forum_read(thread_id, sort="top")` per thread)
 - `REPORT.md`
 - `DECISIONS.md` (if it exists) — records key decisions from all prior phases
 - The git log (all commits, especially those prefixed `UNITY:`, `FORMALIZATION:`, `EXPLORATION:`, `CRITIC:`)
@@ -113,6 +113,20 @@ These files persist across critic iterations and future runs on this source.
 Only record what is genuinely reusable or informative. A tactic entry is worth recording if the goal shape might recur and the tactic choice was non-obvious. A lemma entry is worth recording if it was hard to discover. A sorry-log entry is worth recording if it hints at a research gap or a non-trivial reason for incompleteness. Do not pad the library with obvious entries.
 
 ---
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
 
 **Commits**
 

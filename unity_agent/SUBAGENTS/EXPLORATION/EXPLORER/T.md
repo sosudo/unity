@@ -13,6 +13,12 @@ You will be assigned one or more assumption types by the main agent. For each as
 - For formally published mathematics, arXiv (`https://export.arxiv.org/api/query?search_query=...`) and Semantic Scholar (`https://api.semanticscholar.org/graph/v1/paper/search?query=...`) are useful sources — both free, no API key required.
 - Cross-reference gathered sources against the existing Lean project — if a source is already fully or partially present in the project, note this in your report to avoid redundant work
 
+**Forum**
+
+Post your per-assumption findings to the `exploration` thread with author `"EXPLORER"` using `forum_post("exploration", "EXPLORER", content)` before reporting back — include the assumption, sources found, coverage assessment, any project overlap, and where files were saved.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`.
+
 **Output**
 
 Report back to the main agent with:

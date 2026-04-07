@@ -786,6 +786,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 tools=_ALL_TOOLS,
                 allowed_tools=_ALL_TOOLS,
                 system_prompt=resolver_prompt,
+                mcp_servers=LEAN_MCP_SERVER,
+                hooks=FORUM_HOOKS,
                 permission_mode="bypassPermissions",
                 model="sonnet",
                 fallback_model="haiku",
@@ -1108,6 +1110,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         allowed_tools=_ALL_TOOLS,
                         agents={**LIBRARY_SUBAGENTS},
                         system_prompt=RETROSPECTIVE_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
 
                         enable_file_checkpointing=True,
@@ -1231,6 +1235,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             **LIBRARY_SUBAGENTS
                         },
                         system_prompt=SOURCE_SCAN_PROMPT,
+                        mcp_servers=LEAN_MCP_SERVER,
+                        hooks=FORUM_HOOKS,
                         permission_mode=PERMISSIONS,
                         max_budget_usd=source_scan_budget,
 
@@ -1986,6 +1992,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     allowed_tools=_ALL_TOOLS,
                     agents={**LIBRARY_SUBAGENTS},
                     system_prompt=RETROSPECTIVE_PROMPT,
+                    mcp_servers=LEAN_MCP_SERVER,
+                    hooks=FORUM_HOOKS,
                     permission_mode=PERMISSIONS,
 
                     enable_file_checkpointing=True,

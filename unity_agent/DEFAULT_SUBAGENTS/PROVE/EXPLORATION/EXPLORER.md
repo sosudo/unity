@@ -14,6 +14,12 @@ Save gathered content to `gathered/<declaration-name>/`:
 - `summary.md` — the declaration signature, what was found, novelty flag, and Mathlib equivalent (if any)
 - Any downloaded or referenced sources as files alongside `summary.md`
 
+**Forum**
+
+Before reporting back, post your findings for each assigned declaration to the `exploration` thread with author `"EXPLORER"`. Use the forum MCP tools — never write to `forum/` files directly. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
+
+Available tools: `forum_post`, `forum_read`, `forum_list`, `forum_vote`, `forum_redact`
+
 **Output**
 
 Report back to the main agent with:

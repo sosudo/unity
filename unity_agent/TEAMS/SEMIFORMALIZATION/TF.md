@@ -4,15 +4,15 @@ If `DECISIONS.md` exists at root, read it before proceeding — it records key d
 
 **Your task**
 
-Begin by creating a team of Semiformalizer agents sized as you deem appropriate for the source's complexity. Together with these agents, you form a council. Team agents may themselves spawn subagents. Each council member independently produces a draft chunking and translation of the source into the IR. Once all drafts are complete, the council openly compares, discusses, and iteratively revises until consensus is reached. Convergence is reached when all council members explicitly signal acceptance.
+Begin by calling `forum_create_thread(thread_id="semiformalization", title="Semiformalization Council")` to set up the council's shared communication thread. Then create a team of Semiformalizer agents sized as you deem appropriate for the source's complexity. Together with these agents, you form a council. Team agents may themselves spawn subagents. Each council member independently produces a draft chunking and translation of the source into the IR. Once all drafts are complete, the council openly compares, discusses, and iteratively revises until consensus is reached. Convergence is reached when all council members explicitly signal acceptance.
 
 **Convergence protocol**
 
-At the end of each discussion round, each council member must post either:
+At the end of each discussion round, each council member must use `forum_post` to post to the `semiformalization` thread either:
 - `ACCEPT` — satisfied with the current draft
 - `OBJECT: <reason>` — wants further changes, with a specific reason
 
-All members posting `ACCEPT` in the same round with no outstanding `OBJECT` posts constitutes convergence.
+All members posting `ACCEPT` in the same round with no outstanding `OBJECT` posts constitutes convergence. Use `forum_read("semiformalization")` to track the current convergence state.
 
 If the coordinator estimates remaining budget is insufficient for another full discussion round, call a final vote: each member posts their preferred resolution for each outstanding issue, the coordinator makes a unilateral decision with documented rationale, and all members acknowledge. Budget-forced convergence must be clearly marked as such in the translation output.
 
@@ -43,6 +43,20 @@ These are heuristic checks. If alignment is insufficient, continue iterating.
 
 If a `recursive-unity` subagent is available, you may delegate a self-contained subtask to a full child Unity pipeline run. Examples of when this is appropriate in this phase:
 - The source contains a self-contained section or appendix proving a substantial background result that is large enough to deserve its own generation and formalization cycle, and whose translation would disproportionately consume the council's attention at the expense of the main source.
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default, Reddit algorithm), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(thread_id, post_id, tag)` — tag a post (e.g. `"decision"`, `"blocker"`, `"resolved"`)
+- `forum_get_tag(thread_id, tag)` — retrieve all posts with a given tag in a thread
+- `forum_propose_dimension(thread_id, name, description)` — propose a new voting dimension
+- `forum_approve_dimension(thread_id, name)` — approve a proposed dimension
+- `forum_set_dimensions(thread_id, post_id, dimensions)` — set dimension scores on a post
+- `forum_check_balance(author)` — check ICRL credit balance for an agent
 
 **Output**
 

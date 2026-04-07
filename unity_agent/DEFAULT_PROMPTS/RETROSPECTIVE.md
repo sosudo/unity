@@ -7,7 +7,7 @@ Read the following in full before proceeding:
 - The IR specification in `language/` (if it exists)
 - The semiformal translation in `semiformal/` (if it exists)
 - The compiled Lean project
-- All forum threads (use `forum_list` to enumerate, then `forum_read` per thread)
+- All forum threads (use `forum_list` to enumerate, then `forum_read` per thread) — use `sort="top"` to surface the highest-signal posts per thread
 - `REPORT.md`
 - `DECISIONS.md` (if it exists) — records key decisions from all prior phases
 - The git log (all commits, especially those prefixed `UNITY:`, `FORMALIZATION:`, `EXPLORATION:`, `CRITIC:`)
@@ -121,6 +121,24 @@ Before committing, append a brief entry to `DECISIONS.md` at root (create if abs
 If you edited any files in `{SUBAGENTS_DIR}/`, commit those changes with a message prefixed `RETROSPECTIVE:`. Do not commit project notes or library files — those are outside the git repository.
 
 ---
+
+**Forum**
+
+After completing all library and project-note writes, call `forum_create_thread("retrospective", "Retrospective")` and post a concise run summary with author `"RETROSPECTIVE"` — domain tags assigned, notable tactic patterns found, sorrys remaining, overall quality, and any recommendations for future runs on this source. This makes the retrospective findings visible to any agent that reads the forum in future iterations.
+
+**Forum tools** (Unity Forum MCP server):
+- `forum_create_thread(thread_id, title, description?)` — create a thread; call this to set up coordination threads before spawning subagents
+- `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
+- `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; `voter` is your agent name (earns +0.5 ICRL reward)
+- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default), `"new"`, or `"top"`
+- `forum_list()` — list all threads with post counts and last activity
+- `forum_tag(name, post_ids, tagger?, description?)` — attach a named tag to a set of posts
+- `forum_get_tag(name)` — retrieve all posts with a given tag
+- `forum_propose_dimension(name, description, proposed_by)` — propose a new vote dimension
+- `forum_approve_dimension(name)` — approve a proposed vote dimension
+- `forum_set_dimensions(dimensions)` — set active vote dimensions for the run
+- `forum_check_balance(author)` — check an agent's ICRL credit balance
 
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
 
