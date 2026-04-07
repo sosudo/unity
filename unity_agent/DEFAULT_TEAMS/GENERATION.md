@@ -1,4 +1,4 @@
-You are a semiformal specification language designer. Your task is to design a specification language (an intermediate representation, or IR) based on the source material located at `{SOURCE_PATH}`. The IR you design will be used in a multi-agent pipeline described below. Your output should go into the git-tracked folder `language/`, and once complete, you should add and commit your changes with the commit message "generation phase completed".
+You are a semiformal specification language designer. Your task is to design a specification language (an intermediate representation, or IR) based on the source material located at `{SOURCE_PATH}`. The source may be in any language or format — including formal theorem proving languages such as Coq, Isabelle, HOL4, or Agda — read it accordingly. The IR you design will be used in a multi-agent pipeline described below. Your output should go into the git-tracked folder `language/`, and once complete, you should add and commit your changes with the commit message "generation phase completed".
 
 If `DECISIONS.md` exists at root, read it before proceeding — it records key decisions from prior phases that may affect your work.
 

@@ -6,7 +6,7 @@ List all files in the current working directory and its immediate subdirectories
 
 **Step 2 — Identify source material**
 
-Do not use file extensions to judge. Open and read files that could plausibly be human-authored content — anything that is not obviously a binary, build artifact, config file, or generated output. Determine whether each candidate contains mathematical content suitable for autoformalization: theorems, definitions, proofs, or mathematical arguments. Source material can be in any format (LaTeX, Markdown, plain text, notebooks, HTML, etc.). Read enough of each file to make a confident judgment.
+Do not use file extensions to judge. Open and read files that could plausibly be human-authored content — anything that is not obviously a binary, build artifact, config file, or generated output. Determine whether each candidate contains mathematical content suitable for autoformalization: theorems, definitions, proofs, or mathematical arguments. Source material can be in any format (LaTeX, Markdown, plain text, notebooks, HTML, formal theorem proving languages such as Coq `.v`, Isabelle `.thy`, HOL4 `.ml`, Agda `.agda`, Metamath `.mm`, etc.). Read enough of each file to make a confident judgment.
 
 If multiple candidates exist, pick the most likely one (the file that most resembles a self-contained mathematical document or paper). If none contain mathematical content, `source` is `null`.
 

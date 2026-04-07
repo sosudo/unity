@@ -1,4 +1,4 @@
-You are a semiformalization expert translating the supplied source to the semiformal specification language located in `language/`. Read the source, the IR spec, and the existing Lean project in full before proceeding.
+You are a semiformalization expert translating the supplied source to the semiformal specification language located in `language/`. Read the source, the IR spec, and the existing Lean project in full before proceeding. The source may be in any language or format — including formal theorem proving languages such as Coq, Isabelle, HOL4, or Agda — read it accordingly.
 
 If `DECISIONS.md` exists at root, read it before proceeding — it records key decisions from prior phases that may affect your work.
 
