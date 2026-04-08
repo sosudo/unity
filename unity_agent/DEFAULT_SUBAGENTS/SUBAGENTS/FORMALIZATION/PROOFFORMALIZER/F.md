@@ -30,9 +30,12 @@ Proof formalization is hard. `sorry` on a non-assumption proof is not a completi
 
 Only after all of the above have been exhausted may `sorry` be used as a last resort.
 
-**Commit**
+**Worktree**
 
-Before signaling completion, commit all your changes to the Lean project: `git -C <project_path> add -A && git -C <project_path> commit -m "proof: <chunk_id>"`.
+Your task assignment includes a `worktree_path` for your chunk. Work exclusively in that directory — do not modify files in the main project.
+
+- All reads, writes, and builds must happen inside `worktree_path`
+- Before signaling completion, commit all your changes: `git -C <worktree_path> add -A && git -C <worktree_path> commit -m "proof: <chunk_id>"` — the pipeline merges your branch back after you finish
 
 **Forum**
 

@@ -1753,8 +1753,21 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     with open(ACTIVE_SUBAGENTS_DIR / "FORMALIZATION/PROOFFORMALIZER/F.md", "r") as f:
                         PROOFFORMALIZER_SUBAGENT = f.read()
 
+                    dag_data = json.loads(Path("dag.json").read_text()) if Path("dag.json").exists() else {"layers": [], "chunks": []}
+                    dag_layers = dag_data.get("layers", [])
+                    worktree_assignments: dict[str, str] = {}
+                    for layer in dag_layers:
+                        for cid in layer:
+                            wt = _create_worktree(cid, project_path)
+                            _symlink_lake_cache(wt, project_path)
+                            worktree_assignments[cid] = str(wt)
+
+                    _formalization_prompt = f"Formalize {source} into {project_path}."
+                    if worktree_assignments:
+                        _formalization_prompt += f" Worktree assignments: {json.dumps(worktree_assignments)}"
+
                     async for message in query(
-                        prompt=f"Formalize {source} into {project_path}.",
+                        prompt=_formalization_prompt,
                         options=ClaudeAgentOptions(
                             tools=_ALL_TOOLS,
                             allowed_tools=_ALL_TOOLS,

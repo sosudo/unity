@@ -30,6 +30,13 @@ Proof formalization is hard. `sorry` on a non-assumption proof is not a completi
 
 Only after all of the above have been exhausted may `sorry` be used as a last resort.
 
+**Worktree**
+
+Your task assignment includes a `worktree_path` for your chunk. Work exclusively in that directory — do not modify files in the main project.
+
+- All reads, writes, and builds must happen inside `worktree_path`
+- Before signaling completion, commit all your changes: `git -C <worktree_path> add -A && git -C <worktree_path> commit -m "proof: <chunk_id>"` — the pipeline merges your branch back after you finish
+
 **Forum**
 
 Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_redact`, `forum_list`, `forum_tag`, `forum_get_tag`, `forum_check_balance`) to interact with the chunk's forum thread — never write to `forum/` files directly. Post ideas, strategies tried, and updates in the style of a Reddit thread. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.

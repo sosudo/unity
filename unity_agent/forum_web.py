@@ -297,76 +297,76 @@ FORUM_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-<title>unity forum</title>
+<title>union</title>
 <meta charset="utf-8">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: monospace; font-size: 13px; background: #fff; color: #000; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #000; flex-shrink: 0; }
-header h1 { font-size: 13px; font-weight: bold; letter-spacing: 0.08em; }
-nav { display: flex; gap: 12px; }
-nav a { font-size: 12px; color: #000; text-decoration: none; border-bottom: 1px solid #000; }
-nav a:hover { opacity: 0.6; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: #fafafa; color: #111; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #e4e4e4; flex-shrink: 0; background: #fafafa; }
+header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.14em; color: #111; }
+nav { display: flex; gap: 16px; }
+nav a { font-size: 12px; color: #888; text-decoration: none; transition: color 0.12s; }
+nav a:hover { color: #111; }
 .controls { display: flex; align-items: center; gap: 16px; }
-#status { font-size: 11px; color: #999; }
-.sort-tabs { display: flex; }
-.sort-tabs button { background: none; border: 1px solid #ccc; cursor: pointer; font: inherit; font-size: 12px; padding: 2px 10px; margin-left: -1px; }
-.sort-tabs button:first-child { margin-left: 0; }
-.sort-tabs button.active { background: #000; color: #fff; border-color: #000; }
+#status { font-size: 11px; color: #bbb; }
+.sort-tabs { display: flex; border: 1px solid #e0e0e0; border-radius: 5px; overflow: hidden; }
+.sort-tabs button { background: none; border: none; border-left: 1px solid #e0e0e0; cursor: pointer; font: inherit; font-size: 12px; padding: 3px 12px; color: #666; transition: all 0.12s; }
+.sort-tabs button:first-child { border-left: none; }
+.sort-tabs button.active { background: #111; color: #fff; }
 main { display: flex; flex: 1; overflow: hidden; }
-#sidebar { width: 190px; border-right: 1px solid #000; overflow-y: auto; flex-shrink: 0; }
-.sidebar-section { font-size: 10px; letter-spacing: 0.08em; color: #999; padding: 8px 12px 4px; text-transform: uppercase; border-bottom: 1px solid #f0f0f0; }
-.thread-item { display: flex; justify-content: space-between; align-items: baseline; padding: 7px 12px; cursor: pointer; border-bottom: 1px solid #f0f0f0; gap: 8px; }
-.thread-item:hover { background: #f8f8f8; }
-.thread-item.active { background: #000; color: #fff; }
-.thread-item.active .count { color: #aaa; }
-.thread-item.pinned { background: #f0f4ff; border-left: 3px solid #2255cc; }
-.thread-item.pinned.active { background: #2255cc; }
+#sidebar { width: 200px; border-right: 1px solid #e4e4e4; overflow-y: auto; flex-shrink: 0; background: #fafafa; }
+.sidebar-section { font-size: 10px; letter-spacing: 0.1em; color: #bbb; padding: 10px 14px 5px; text-transform: uppercase; }
+.thread-item { display: flex; justify-content: space-between; align-items: baseline; padding: 8px 14px; cursor: pointer; border-bottom: 1px solid #f0f0f0; gap: 8px; transition: background 0.1s; }
+.thread-item:hover { background: #f2f2f2; }
+.thread-item.active { background: #111; color: #fff; }
+.thread-item.active .count { color: #888; }
+.thread-item.pinned { background: #f0f4ff; border-left: 3px solid #4070e8; }
+.thread-item.pinned.active { background: #4070e8; }
 .thread-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
-.count { font-size: 11px; color: #999; flex-shrink: 0; }
-.tag-sidebar-item { display: flex; justify-content: space-between; padding: 5px 12px; cursor: pointer; border-bottom: 1px solid #f8f8f8; font-size: 11px; color: #555; }
-.tag-sidebar-item:hover { background: #f8f8f8; }
-#panel { flex: 1; overflow-y: auto; padding: 20px 24px; }
-.thread-title { font-weight: bold; margin-bottom: 4px; }
-.thread-desc { color: #666; font-size: 12px; margin-bottom: 8px; }
+.count { font-size: 11px; color: #bbb; flex-shrink: 0; }
+.tag-sidebar-item { display: flex; justify-content: space-between; padding: 6px 14px; cursor: pointer; border-bottom: 1px solid #f4f4f4; font-size: 11px; color: #666; transition: background 0.1s; }
+.tag-sidebar-item:hover { background: #f2f2f2; }
+#panel { flex: 1; overflow-y: auto; padding: 22px 28px; background: #fff; }
+.thread-title { font-weight: 600; margin-bottom: 4px; font-size: 14px; }
+.thread-desc { color: #777; font-size: 12px; margin-bottom: 10px; }
 .dim-bar { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
-.dim-chip { font-size: 10px; background: #f0f4ff; color: #2255cc; padding: 1px 6px; border-radius: 10px; }
-.post { margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid #ebebeb; }
-.post-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 5px; font-size: 11px; color: #888; }
-.post-author { font-weight: bold; color: #000; font-size: 12px; }
-.post-content { line-height: 1.6; font-size: 13px; }
+.dim-chip { font-size: 10px; background: #eef2ff; color: #4070e8; padding: 2px 8px; border-radius: 10px; }
+.post { margin-bottom: 20px; padding-bottom: 20px; border-bottom: 1px solid #efefef; }
+.post-meta { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; font-size: 11px; color: #999; }
+.post-author { font-weight: 600; color: #111; font-size: 12px; }
+.post-content { line-height: 1.65; font-size: 13px; }
 .post-content p { margin-bottom: 0.6em; }
 .post-content p:last-child { margin-bottom: 0; }
-.post-content pre { background: #f6f6f6; padding: 8px 10px; overflow-x: auto; margin: 0.5em 0; }
-.post-content code { background: #f0f0f0; padding: 1px 4px; font-size: 12px; }
+.post-content pre { background: #f4f4f6; padding: 9px 12px; overflow-x: auto; margin: 0.5em 0; border-radius: 4px; }
+.post-content code { background: #f0f0f2; padding: 1px 5px; font-size: 12px; border-radius: 3px; }
 .post-content pre code { background: none; padding: 0; }
 .post-content ul, .post-content ol { padding-left: 1.4em; margin-bottom: 0.5em; }
-.post-content blockquote { border-left: 3px solid #ddd; margin: 0 0 0.5em; padding-left: 10px; color: #666; }
-.post.redacted .post-content { color: #bbb; font-style: italic; white-space: pre-wrap; }
-.mention { background: #f0f4ff; color: #2255cc; padding: 1px 3px; border-radius: 2px; font-weight: bold; }
-.post-id-link { color: #ccc; font-size: 11px; text-decoration: none; }
-.post-id-link:hover { color: #888; }
-.reply-to-link { color: #aaa; font-size: 11px; text-decoration: none; }
+.post-content blockquote { border-left: 2px solid #e0e0e0; margin: 0 0 0.5em; padding-left: 12px; color: #777; }
+.post.redacted .post-content { color: #ccc; font-style: italic; white-space: pre-wrap; }
+.mention { background: #eef2ff; color: #4070e8; padding: 1px 4px; border-radius: 3px; font-weight: 600; }
+.post-id-link { color: #ddd; font-size: 11px; text-decoration: none; }
+.post-id-link:hover { color: #999; }
+.reply-to-link { color: #bbb; font-size: 11px; text-decoration: none; }
 .reply-to-link:hover { color: #555; }
-.post-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
-.tag-chip { font-size: 10px; background: #fff8e6; color: #a06000; border: 1px solid #e8d090; padding: 1px 6px; border-radius: 10px; cursor: pointer; }
-.tag-chip:hover { background: #ffe8a0; }
-.dim-inline { font-size: 10px; color: #aaa; white-space: nowrap; }
-.dim-inline-name { color: #bbb; margin-right: 1px; }
-.dim-inline .up { color: #2d7a2d; }
-.dim-inline .down { color: #c02020; }
-.reply { margin-left: 20px; border-left: 2px solid #e8e8e8; padding-left: 14px; border-bottom: none; margin-bottom: 10px; padding-bottom: 0; }
-#placeholder { color: #aaa; padding: 20px 0; }
+.post-tags { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+.tag-chip { font-size: 10px; background: #fff8e8; color: #a06000; border: 1px solid #f0dfa0; padding: 2px 7px; border-radius: 10px; cursor: pointer; transition: background 0.1s; }
+.tag-chip:hover { background: #ffeebb; }
+.dim-inline { font-size: 10px; color: #bbb; white-space: nowrap; }
+.dim-inline-name { color: #ccc; margin-right: 1px; }
+.dim-inline .up { color: #16a34a; }
+.dim-inline .down { color: #dc2626; }
+.reply { margin-left: 20px; border-left: 2px solid #eeeeee; padding-left: 14px; border-bottom: none; margin-bottom: 10px; padding-bottom: 0; }
+#placeholder { color: #ccc; padding: 24px 0; }
 </style>
 </head>
 <body>
 <header>
-  <h1>unity forum</h1>
+  <h1>union</h1>
   <div class="controls">
     <nav>
-      <a href="/graph">graph &rarr;</a>
-      <a href="/dag">dag &rarr;</a>
+      <a href="/graph">graph →</a>
+      <a href="/dag">dag →</a>
     </nav>
     <span id="status">connecting...</span>
     <div class="sort-tabs">
@@ -533,59 +533,60 @@ GRAPH_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-<title>unity graph</title>
+<title>union · graph</title>
 <meta charset="utf-8">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: monospace; font-size: 13px; background: #fff; color: #000; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #000; flex-shrink: 0; }
-header h1 { font-size: 13px; font-weight: bold; letter-spacing: 0.08em; }
-nav { display: flex; gap: 12px; }
-nav a { font-size: 12px; color: #000; text-decoration: none; border-bottom: 1px solid #000; }
-nav a:hover { opacity: 0.6; }
-.controls { display: flex; align-items: center; gap: 12px; }
-#status { font-size: 11px; color: #999; }
-.color-tabs { display: flex; }
-.color-tabs button { background: none; border: 1px solid #ccc; cursor: pointer; font: inherit; font-size: 12px; padding: 2px 10px; margin-left: -1px; }
-.color-tabs button:first-child { margin-left: 0; }
-.color-tabs button.active { background: #000; color: #fff; border-color: #000; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: #fafafa; color: #111; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #e4e4e4; flex-shrink: 0; background: #fafafa; }
+header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.14em; }
+nav { display: flex; gap: 16px; }
+nav a { font-size: 12px; color: #888; text-decoration: none; transition: color 0.12s; }
+nav a:hover { color: #111; }
+.controls { display: flex; align-items: center; gap: 14px; }
+#status { font-size: 11px; color: #bbb; }
+.color-tabs { display: flex; border: 1px solid #e0e0e0; border-radius: 5px; overflow: hidden; }
+.color-tabs button { background: none; border: none; border-left: 1px solid #e0e0e0; cursor: pointer; font: inherit; font-size: 12px; padding: 3px 12px; color: #666; transition: all 0.12s; }
+.color-tabs button:first-child { border-left: none; }
+.color-tabs button.active { background: #111; color: #fff; }
 main { display: flex; flex: 1; overflow: hidden; position: relative; }
 #cy { flex: 1; }
-#info-panel { width: 300px; border-left: 1px solid #000; overflow-y: auto; padding: 16px; flex-shrink: 0; display: none; }
+#info-panel { position: absolute; right: 0; top: 0; bottom: 0; width: 300px; border-left: 1px solid #e4e4e4; overflow-y: auto; padding: 18px; background: #fff; display: none; z-index: 10; }
 #info-panel.visible { display: block; }
-#info-close { float: right; cursor: pointer; font-size: 16px; line-height: 1; }
-#info-close:hover { opacity: 0.5; }
-.info-field { margin-bottom: 10px; }
-.info-label { font-size: 10px; color: #999; text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 3px; }
-.info-value { line-height: 1.5; }
+#info-close { float: right; cursor: pointer; font-size: 15px; line-height: 1; color: #bbb; transition: color 0.1s; }
+#info-close:hover { color: #111; }
+.info-field { margin-bottom: 12px; }
+.info-label { font-size: 10px; color: #bbb; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 3px; }
+.info-value { line-height: 1.5; color: #111; }
 .info-value.md { font-size: 12px; }
 .info-value.md p { margin-bottom: 0.4em; }
-.info-value.md code { background: #f0f0f0; padding: 1px 3px; font-size: 11px; }
-.info-value.md pre { background: #f6f6f6; padding: 6px 8px; overflow-x: auto; font-size: 11px; margin: 0.3em 0; }
+.info-value.md code { background: #f0f0f2; padding: 1px 4px; font-size: 11px; border-radius: 3px; }
+.info-value.md pre { background: #f4f4f6; padding: 7px 10px; overflow-x: auto; font-size: 11px; margin: 0.3em 0; border-radius: 4px; }
 .info-value.md pre code { background: none; padding: 0; }
-.info-link { color: #000; text-decoration: underline; }
+.info-link { color: #4070e8; text-decoration: none; }
+.info-link:hover { text-decoration: underline; }
 .tag-chips { display: flex; flex-wrap: wrap; gap: 4px; }
-.tag-chip { font-size: 10px; background: #fff8e6; color: #a06000; border: 1px solid #e8d090; padding: 1px 6px; border-radius: 10px; }
+.tag-chip { font-size: 10px; background: #fff8e8; color: #a06000; border: 1px solid #f0dfa0; padding: 2px 7px; border-radius: 10px; }
 .dim-row { display: flex; gap: 8px; font-size: 11px; margin-bottom: 2px; }
-.dim-name { color: #555; min-width: 110px; }
-.dim-up { color: #2d7a2d; }
-.dim-down { color: #c02020; }
-#legend { position: absolute; bottom: 12px; left: 12px; background: rgba(255,255,255,0.95); border: 1px solid #ddd; padding: 8px 12px; font-size: 11px; max-width: 180px; pointer-events: none; }
-#legend-title { font-weight: bold; margin-bottom: 4px; color: #555; }
-.legend-row { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; overflow: hidden; }
-.legend-dot { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
-.legend-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dim-name { color: #888; min-width: 110px; }
+.dim-up { color: #16a34a; }
+.dim-down { color: #dc2626; }
+#legend { position: absolute; bottom: 14px; left: 14px; background: rgba(255,255,255,0.97); border: 1px solid #e4e4e4; padding: 9px 14px; font-size: 11px; max-width: 190px; pointer-events: none; border-radius: 6px; }
+#legend-title { font-weight: 600; margin-bottom: 5px; color: #999; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; }
+.legend-row { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; overflow: hidden; }
+.legend-dot { width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0; }
+.legend-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #555; }
 </style>
 </head>
 <body>
 <header>
-  <h1>unity graph</h1>
+  <h1>union</h1>
   <div class="controls">
     <nav>
-      <a href="/">&larr; forum</a>
-      <a href="/dag">dag &rarr;</a>
+      <a href="/">← forum</a>
+      <a href="/dag">dag →</a>
     </nav>
     <span id="status">loading...</span>
     <div class="color-tabs">
@@ -796,30 +797,30 @@ function buildGraph(data) {
     style: [
       { selector: 'node', style: {
         'background-color': 'data(bgColor)',
-        'border-color': '#00000044',
+        'border-color': 'rgba(0,0,0,0.13)',
         'border-width': 1,
         'label': 'data(label)',
-        'font-family': 'monospace',
-        'font-size': 9,
+        'font-family': 'ui-monospace, "Cascadia Code", "Fira Code", "Menlo", monospace',
+        'font-size': 10,
         'text-valign': 'center',
         'text-halign': 'center',
         'text-wrap': 'ellipsis',
-        'text-max-width': 68,
-        'width': 76,
-        'height': 24,
+        'text-max-width': 74,
+        'width': 88,
+        'height': 30,
         'shape': 'roundrectangle',
-        'color': '#000',
-        'min-zoomed-font-size': 6,
+        'color': '#111',
+        'min-zoomed-font-size': 7,
       }},
-      { selector: 'node:selected', style: { 'border-width': 2.5, 'border-color': '#000', 'border-opacity': 1 }},
-      { selector: 'node:active', style: { 'overlay-opacity': 0.1 }},
-      { selector: 'node[?redacted]', style: { 'opacity': 0.4 }},
+      { selector: 'node:selected', style: { 'border-width': 2, 'border-color': 'rgba(51,51,51,0.5)' }},
+      { selector: 'node:active', style: { 'overlay-opacity': 0.07 }},
+      { selector: 'node[?redacted]', style: { 'opacity': 0.35 }},
       { selector: 'edge', style: {
         'curve-style': 'bezier',
         'target-arrow-shape': 'triangle',
-        'target-arrow-color': '#bbb',
-        'line-color': '#bbb',
-        'arrow-scale': 0.7,
+        'target-arrow-color': '#ccc',
+        'line-color': '#ccc',
+        'arrow-scale': 0.65,
         'width': 1,
       }},
     ],
@@ -896,41 +897,42 @@ DAG_HTML = """\
 <!DOCTYPE html>
 <html>
 <head>
-<title>unity dag</title>
+<title>union · dag</title>
 <meta charset="utf-8">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: monospace; font-size: 13px; background: #fff; color: #000; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 8px 16px; border-bottom: 1px solid #000; flex-shrink: 0; }
-header h1 { font-size: 13px; font-weight: bold; letter-spacing: 0.08em; }
-nav { display: flex; gap: 12px; }
-nav a { font-size: 12px; color: #000; text-decoration: none; border-bottom: 1px solid #000; }
-nav a:hover { opacity: 0.6; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: #fafafa; color: #111; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #e4e4e4; flex-shrink: 0; background: #fafafa; }
+header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.14em; }
+nav { display: flex; gap: 16px; }
+nav a { font-size: 12px; color: #888; text-decoration: none; transition: color 0.12s; }
+nav a:hover { color: #111; }
 .controls { display: flex; align-items: center; gap: 16px; }
-#status { font-size: 11px; color: #999; }
+#status { font-size: 11px; color: #bbb; }
 main { display: flex; flex: 1; overflow: hidden; position: relative; }
 #cy { flex: 1; }
-#info-panel { width: 280px; border-left: 1px solid #000; overflow-y: auto; padding: 16px; flex-shrink: 0; display: none; }
+#info-panel { position: absolute; right: 0; top: 0; bottom: 0; width: 280px; border-left: 1px solid #e4e4e4; overflow-y: auto; padding: 18px; background: #fff; display: none; z-index: 10; }
 #info-panel.visible { display: block; }
-#info-close { float: right; cursor: pointer; font-size: 16px; line-height: 1; }
-#info-close:hover { opacity: 0.5; }
+#info-close { float: right; cursor: pointer; font-size: 15px; line-height: 1; color: #bbb; transition: color 0.1s; }
+#info-close:hover { color: #111; }
 .info-field { margin-bottom: 12px; }
-.info-label { font-size: 11px; color: #888; margin-bottom: 2px; }
-.info-value { white-space: pre-wrap; line-height: 1.5; }
-.info-link { color: #000; }
-.status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-#legend { position: absolute; bottom: 12px; left: 12px; background: #fff; border: 1px solid #ddd; padding: 8px 12px; font-size: 11px; line-height: 2; pointer-events: none; }
-.legend-row { display: flex; align-items: center; gap: 6px; }
-#waiting { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #aaa; font-size: 13px; }
+.info-label { font-size: 10px; color: #bbb; text-transform: uppercase; letter-spacing: 0.07em; margin-bottom: 3px; }
+.info-value { white-space: pre-wrap; line-height: 1.5; color: #111; }
+.info-link { color: #4070e8; text-decoration: none; }
+.info-link:hover { text-decoration: underline; }
+.status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+#legend { position: absolute; bottom: 14px; left: 14px; background: rgba(255,255,255,0.97); border: 1px solid #e4e4e4; padding: 9px 14px; font-size: 11px; line-height: 2; pointer-events: none; border-radius: 6px; }
+.legend-row { display: flex; align-items: center; gap: 6px; color: #555; }
+#waiting { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%); color: #bbb; font-size: 13px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>unity dag</h1>
+  <h1>union</h1>
   <div class="controls">
     <nav>
-      <a href="/">&larr; forum</a>
-      <a href="/graph">graph &rarr;</a>
+      <a href="/">← forum</a>
+      <a href="/graph">graph →</a>
     </nav>
     <span id="status">connecting...</span>
   </div>
@@ -965,47 +967,61 @@ const STATUS_COLOR = {
 };
 
 let cy = null, chunks = {};
+let nodePositions = {};  // id -> {x,y}, persisted across rebuilds
+let lastSig = '';        // sorted chunk-ids, skip rebuild when unchanged
 
 function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
 
 function buildGraph(data) {
+  if (cy) {
+    cy.nodes().forEach(n => { nodePositions[n.id()] = { x: n.position('x'), y: n.position('y') }; });
+    cy.destroy();
+  }
   chunks = {};
   data.chunks.forEach(c => { chunks[c.id] = c; });
   const elements = [];
   data.chunks.forEach(c => {
     const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
-    elements.push({ data: {
+    const elem = { data: {
       id: c.id,
       label: c.id + (c.title && c.title !== c.id ? '\\n' + c.title.substring(0,24) : ''),
       status: c.status,
       bgColor: col.bg,
       borderColor: col.border,
-    }});
-    (c.dependencies || []).forEach(dep => {
+    }};
+    if (nodePositions[c.id]) elem.position = nodePositions[c.id];
+    elements.push(elem);
+    (c.dependencies?.local || []).forEach(dep => {
       elements.push({ data: { id: dep+'->'+c.id, source: dep, target: c.id }});
     });
   });
-  if (cy) cy.destroy();
+  const allPositionsKnown = data.chunks.length > 0 && data.chunks.every(c => nodePositions[c.id]);
   cy = cytoscape({
     container: document.getElementById('cy'),
     elements,
     style: [
       { selector: 'node', style: {
         'background-color': 'data(bgColor)', 'border-color': 'data(borderColor)', 'border-width': 1.5,
-        'label': 'data(label)', 'font-family': 'monospace', 'font-size': '11px',
+        'label': 'data(label)', 'font-family': 'ui-monospace, "Cascadia Code", "Fira Code", "Menlo", monospace', 'font-size': '11px',
         'text-valign': 'center', 'text-halign': 'center', 'text-wrap': 'wrap',
-        'width': 'label', 'height': 'label', 'padding': '10px', 'shape': 'roundrectangle', 'color': '#000',
+        'width': 'label', 'height': 'label', 'padding': '10px 14px', 'shape': 'roundrectangle', 'color': '#111',
+        'min-zoomed-font-size': 7,
       }},
-      { selector: 'node:selected', style: { 'border-width': 2.5, 'border-color': '#000' }},
+      { selector: 'node:selected', style: { 'border-width': 2.5, 'border-color': 'rgba(51,51,51,0.6)' }},
       { selector: 'edge', style: {
         'curve-style': 'bezier', 'target-arrow-shape': 'triangle',
-        'target-arrow-color': '#bbb', 'line-color': '#bbb', 'arrow-scale': 0.8, 'width': 1,
+        'target-arrow-color': '#ccc', 'line-color': '#ccc', 'arrow-scale': 0.75, 'width': 1,
       }},
     ],
-    layout: { name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 70, padding: 30 },
+    layout: allPositionsKnown
+      ? { name: 'preset' }
+      : { name: 'dagre', rankDir: 'TB', nodeSep: 40, rankSep: 70, padding: 30 },
   });
-  cy.on('tap', 'node', e => showPanel(e.target.id()));
+  cy.nodes().forEach(n => { nodePositions[n.id()] = { x: n.position('x'), y: n.position('y') }; });
+  cy.on('tap', 'node', e => { e.stopPropagation(); showPanel(e.target.id()); });
   cy.on('tap', e => { if (e.target === cy) closePanel(); });
+  cy.on('mouseover', 'node', e => { e.target.style('border-width', 2.5); });
+  cy.on('mouseout', 'node', e => { e.target.style('border-width', e.target.selected() ? 2.5 : 1.5); });
 }
 
 function updateColors(data) {
@@ -1034,7 +1050,7 @@ function showPanel(id) {
     +'<div class="info-field"><div class="info-label">summary</div><div class="info-value">'+esc(c.summary||'—')+'</div></div>'
     +'<div class="info-field"><div class="info-label">status</div><div class="info-value"><span class="status-dot" style="background:'+col.bg+';border:1px solid '+col.border+'"></span>'+esc(statusLabel)+'</div></div>'
     +'<div class="info-field"><div class="info-label">lean file</div><div class="info-value">'+esc(c.lean_file||'—')+(c.lean_decl_lines?' : '+c.lean_decl_lines[0]+'–'+c.lean_decl_lines[1]:'')+'</div></div>'
-    +'<div class="info-field"><div class="info-label">dependencies</div><div class="info-value">'+esc((c.dependencies||[]).join(', ')||'none')+'</div></div>'
+    +'<div class="info-field"><div class="info-label">dependencies</div><div class="info-value">'+esc(((c.dependencies?.local)||[]).join(', ')||'none')+'</div></div>'
     +'<div class="info-field"><div class="info-label">forum</div><div class="info-value"><a class="info-link" href="/#'+esc(c.id)+'" target="_blank">'+esc(c.id)+' &rarr;</a></div></div>';
   document.getElementById('info-panel').classList.add('visible');
 }
@@ -1045,14 +1061,14 @@ function closePanel() {
   if (cy) cy.$(':selected').unselect();
 }
 
-let initialized = false;
 async function loadDag(forceRebuild) {
   const res = await fetch('/api/dag');
   const waiting = document.getElementById('waiting');
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  if (!initialized || forceRebuild) { buildGraph(data); initialized = true; }
+  const sig = (data.chunks||[]).map(c=>c.id).sort().join(',');
+  if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
 }
 

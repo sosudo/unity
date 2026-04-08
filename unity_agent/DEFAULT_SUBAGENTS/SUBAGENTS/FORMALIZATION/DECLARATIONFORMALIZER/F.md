@@ -17,6 +17,13 @@ Use the forum MCP tools (`forum_post`, `forum_read`, `forum_vote`, `forum_redact
 
 If you make any API changes, report them to the main agent immediately so `semiformal/` can be updated accordingly.
 
+**Worktree**
+
+Your task assignment includes a `worktree_path` for your chunk. Work exclusively in that directory — do not modify files in the main project.
+
+- All reads, writes, and builds must happen inside `worktree_path`
+- Before signaling completion, commit all your changes: `git -C <worktree_path> add -A && git -C <worktree_path> commit -m "declaration: <chunk_id>"` — the pipeline merges your branch back after you finish
+
 **Output**
 
 Report back to the main agent with:

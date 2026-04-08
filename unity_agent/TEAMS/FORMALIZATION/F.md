@@ -86,7 +86,7 @@ Unity maintains a global library at `~/.unity/library/` and project-specific not
 
 Working through the dependency layers in `dag.json` (`layers` array) sequentially, and chunks within each layer in parallel. Before beginning each layer, read the forum threads for all chunks in that layer using `forum_read` to incorporate any prior discussion or decisions from previous iterations.
 
-For each chunk, spawn a team of DeclarationFormalizer agents with `isolation: "worktree"` (many-to-one at your discretion) so each agent writes into an isolated git branch without conflicting with others. Each team agent may themselves spawn subagents. Each team agent should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
+For each chunk, spawn a team of DeclarationFormalizer agents (do NOT use `isolation: "worktree"` — the pipeline has already created isolated git worktrees). Pass each agent its assigned `worktree_path` from the `worktree_assignments` provided in your prompt, and instruct it to work exclusively in that directory for all file operations. Each team agent may themselves spawn subagents. Each team agent should use the chunk's forum thread as a shared communication space — posting ideas, design decisions, API proposals, and updates as they work, in the style of a Reddit thread. Forum posts should never be deleted; if a post becomes outdated or wrong, mark it with `[REDACTED]` in place of its content.
 
 Each team agent should:
 - Formalize the declaration or statement of the chunk faithfully into Lean 4, consulting the corresponding semiformal chunk and the forum
@@ -97,10 +97,10 @@ Each team agent should:
 
 If any API changes are made during the declaration step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix. The underlying dependency structure and chunk boundaries remain invariant — only the chunk content changes.
 
-Once all agents in the layer complete, merge their branches into the main repository sequentially in any order (chunks within a layer are DAG-independent). For each `(worktree_path, branch_name)` returned by an agent:
+Once all agents in the layer complete, merge each chunk's branch into the main repository sequentially in any order (chunks within a layer are DAG-independent). For each chunk, use the `worktree_path` from `worktree_assignments` and branch name `worktree/<safe_chunk_id>` (chunk ID with non-alphanumeric characters replaced by `_`):
 
 ```bash
-git merge --no-ff <branch_name>
+git merge --no-ff worktree/<safe_chunk_id>
 lake build 2>&1
 ```
 
@@ -108,7 +108,7 @@ If `lake build` fails, spawn a short-lived resolver subagent (without `isolation
 
 ```bash
 git worktree remove <worktree_path> --force
-git branch -d <branch_name>
+git branch -d worktree/<safe_chunk_id>
 ```
 
 Once all declarations compile successfully across all chunks, update `dag.json` at the repository root: for each chunk, set `lean_file` to the path of the Lean file containing its declaration (relative to the working directory) and `lean_decl_lines` to `[start_line, end_line]` (1-indexed, inclusive, covering the full declaration body). This allows the forum web UI to track formalization status in real time.
@@ -121,7 +121,7 @@ Then commit the target Lean project with a `UNITY:` prefix before proceeding to 
 
 Working through the same dependency layers in `dag.json` sequentially, and chunks within each layer in parallel. Before beginning each layer, read the forum threads for all chunks in that layer using `forum_read` to incorporate any prior discussion or decisions from previous iterations.
 
-For each chunk that has a proof (theorems, lemmas, etc.), spawn a team of ProofFormalizer agents with `isolation: "worktree"` (many-to-one at your discretion). If the chunk JSON includes a `proof.sub_chunks` array, analyze its dependency graph: assign sub-chunks with no mutual dependencies to separate parallel ProofFormalizer subagents; assign sub-chunks that depend on earlier ones only after those complete. Each team agent may themselves spawn subagents. Each team agent should continue using the chunk's forum thread for communication — posting approaches, failed attempts, questions, and discoveries actively. Cross-chunk communication should go through the `global` thread. Use `Bash` with `lake build 2>&1` for compilation checks; do not call `lean_build`.
+For each chunk that has a proof (theorems, lemmas, etc.), spawn a team of ProofFormalizer agents (do NOT use `isolation: "worktree"`). Pass each agent its assigned `worktree_path` from `worktree_assignments` and instruct it to work exclusively there. If the chunk JSON includes a `proof.sub_chunks` array, analyze its dependency graph: assign sub-chunks with no mutual dependencies to separate parallel ProofFormalizer subagents; assign sub-chunks that depend on earlier ones only after those complete. Each team agent may themselves spawn subagents. Each team agent should continue using the chunk's forum thread for communication — posting approaches, failed attempts, questions, and discoveries actively. Cross-chunk communication should go through the `global` thread. Use `Bash` with `lake build 2>&1` for compilation checks; do not call `lean_build`.
 
 After all agents in the layer complete, merge and verify the same way as in the declaration step: sequential `git merge --no-ff` + `lake build`, resolver on failure, then worktree cleanup.
 
