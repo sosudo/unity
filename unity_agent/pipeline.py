@@ -230,9 +230,10 @@ def _toposort_chunks(language_dir: Path) -> None:
 
     for c in chunks:
         for dep in c.get("dependencies", []):
-            if dep in chunk_ids:
+            dep_id = dep["chunk_id"] if isinstance(dep, dict) else dep
+            if dep_id in chunk_ids:
                 in_degree[c["id"]] += 1
-                dependents[dep].append(c["id"])
+                dependents[dep_id].append(c["id"])
 
     layers: list[list[str]] = []
     ready = sorted(cid for cid in chunk_ids if in_degree[cid] == 0)
@@ -265,7 +266,10 @@ def _toposort_chunks(language_dir: Path) -> None:
                 "type": c.get("type", "other"),
                 "title": c.get("title", cid),
                 "summary": c.get("summary", ""),
-                "dependencies": c.get("dependencies", []),
+                "dependencies": [
+                    d["chunk_id"] if isinstance(d, dict) else d
+                    for d in c.get("dependencies", [])
+                ],
                 "lean_file": None,
                 "lean_decl_lines": None,
                 "status": "pending",

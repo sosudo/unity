@@ -991,7 +991,7 @@ function buildGraph(data) {
     }};
     if (nodePositions[c.id]) elem.position = nodePositions[c.id];
     elements.push(elem);
-    (c.dependencies?.local || []).forEach(dep => {
+    (Array.isArray(c.dependencies) ? c.dependencies : (c.dependencies?.local || [])).forEach(dep => {
       elements.push({ data: { id: dep+'->'+c.id, source: dep, target: c.id }});
     });
   });
@@ -1050,7 +1050,7 @@ function showPanel(id) {
     +'<div class="info-field"><div class="info-label">summary</div><div class="info-value">'+esc(c.summary||'—')+'</div></div>'
     +'<div class="info-field"><div class="info-label">status</div><div class="info-value"><span class="status-dot" style="background:'+col.bg+';border:1px solid '+col.border+'"></span>'+esc(statusLabel)+'</div></div>'
     +'<div class="info-field"><div class="info-label">lean file</div><div class="info-value">'+esc(c.lean_file||'—')+(c.lean_decl_lines?' : '+c.lean_decl_lines[0]+'–'+c.lean_decl_lines[1]:'')+'</div></div>'
-    +'<div class="info-field"><div class="info-label">dependencies</div><div class="info-value">'+esc(((c.dependencies?.local)||[]).join(', ')||'none')+'</div></div>'
+    +'<div class="info-field"><div class="info-label">dependencies</div><div class="info-value">'+esc(((Array.isArray(c.dependencies)?c.dependencies:(c.dependencies?.local||[]))).join(', ')||'none')+'</div></div>'
     +'<div class="info-field"><div class="info-label">forum</div><div class="info-value"><a class="info-link" href="/#'+esc(c.id)+'" target="_blank">'+esc(c.id)+' &rarr;</a></div></div>';
   document.getElementById('info-panel').classList.add('visible');
 }
