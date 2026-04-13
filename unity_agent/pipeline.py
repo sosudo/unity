@@ -486,6 +486,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         max_critic_iterations = parse_int(os.getenv("MAX_CRITIC_ITERATIONS"))
         max_validation_iterations = parse_int(os.getenv("MAX_VALIDATION_ITERATIONS"))
         forum_port = parse_int(os.getenv("FORUM_PORT")) or 8080
+        lean_lsp_port = parse_int(os.getenv("LEAN_LSP_PORT")) or 6368
         anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
         anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
         anthropic_auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
@@ -526,6 +527,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info(f"EXPLORATION: {exploration}")
         logging.info(f"RECURSE: {recurse}")
         logging.info(f"FORUM_PORT: {forum_port}")
+        logging.info(f"LEAN_LSP_PORT: {lean_lsp_port}")
         logging.info(f"ANTHROPIC_BASE_URL: {anthropic_base_url}")
         logging.info(f"ANTHROPIC_API_KEY: {anthropic_api_key}")
         logging.info(f"ANTHROPIC_AUTH_TOKEN: {anthropic_auth_token}")
@@ -605,12 +607,42 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     await asyncio.sleep(0)  # yield so the lake init thread starts before synchronous setup
     logging.info("lake cache + update running in background...")
 
+    # Launch lean-lsp-mcp once as a long-lived streamable-http server so every
+    # phase's query() attaches to an already-initialized server instead of
+    # re-spawning uvx lean-lsp-mcp (which races the SDK's initialize timeout
+    # while `lake serve` imports Mathlib).
+    import socket
+    _lean_lsp_proc = subprocess.Popen(
+        ["uvx", "lean-lsp-mcp",
+         "--transport", "streamable-http",
+         "--host", "127.0.0.1",
+         "--port", str(lean_lsp_port),
+         "--lean-project-path", str(project_path)],
+        cwd=str(project_path),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    atexit.register(_lean_lsp_proc.terminate)
+
+    # Wait for the port to accept connections (up to 60s).
+    _lsp_ready = False
+    for _ in range(120):
+        try:
+            with socket.create_connection(("127.0.0.1", lean_lsp_port), timeout=0.5):
+                _lsp_ready = True
+                break
+        except OSError:
+            await asyncio.sleep(0.5)
+    if not _lsp_ready:
+        logging.critical(f"CRITICAL: lean-lsp-mcp failed to bind 127.0.0.1:{lean_lsp_port}")
+        exit(1)
+    logging.info(f"lean-lsp-mcp listening on http://127.0.0.1:{lean_lsp_port}/mcp/")
+
     # Configure MCP servers for all agents
     LEAN_MCP_SERVER = {
         "lean-lsp": {
-            "command": "uvx",
-            "args": ["lean-lsp-mcp", "--lean-project-path", str(project_path)],
-            "cwd": str(project_path),
+            "type": "http",
+            "url": f"http://127.0.0.1:{lean_lsp_port}/mcp/",
         },
         "unity-forum": {
             "command": sys.executable,
