@@ -1,6 +1,6 @@
 [project]
 name = "unity-agent"
-version = "0.2.9"
+version = "0.3.01"
 description = "Autoformalization pipeline for Lean theorem proving"
 readme = "README.md"
 requires-python = ">=3.13"
