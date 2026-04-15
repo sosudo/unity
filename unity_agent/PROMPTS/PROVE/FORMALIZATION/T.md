@@ -111,7 +111,7 @@ Subagents should:
 - Conform to the existing Lean project's naming conventions, definitions, tactic style, and API
 - Try multiple strategies where appropriate
 - Use `Bash` with `lake build 2>&1` in their working directory for compilation checks — do not call `lean_build`, which restarts the shared LSP
-- For assumption types, formalize the full type signature or statement, with `sorry` as a placeholder body if needed
+- For assumption types (chunks with `is_assumption: true` in their semiformal JSON), formalize the full type signature; the proof body may be `sorry`
 
 If any API changes are made during the declaration step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix. The underlying dependency structure and chunk boundaries remain invariant — only the chunk content changes.
 
@@ -159,18 +159,22 @@ rfl → simp → ring → linarith → nlinarith → omega → exact? → apply?
 
 For goals that resist automation, decompose with `have` to name intermediate results before attempting tactics on each sub-goal. Use `lean_multi_attempt` to test several candidates in parallel rather than editing the file repeatedly.
 
-**Persistence**
+**`sorry` policy (strict)**
 
-Proof formalization is hard. You may feel a strong urge to conclude with `sorry` when a proof resists your initial attempts — this is a trained behavior to override. A `sorry` on a non-assumption proof is not a completion; it is a failure.
+`sorry` is legal only when the chunk's `semiformal/chunks/<id>.json` has `is_assumption: true`. For every other chunk, you must produce a complete proof in this phase — **there is no follow-up phase that will fill in placeholders**. A `sorry` left on a non-assumption chunk is a phase failure.
 
-Before using `sorry` on any chunk that is not an assumption type, you must have genuinely attempted all of the following:
+**You may not change the `is_assumption` value for any chunk ever.** This rule has no exceptions: not for chunks that look misclassified, not for chunks that block your progress, not for chunks where you believe GENERATION made a mistake. If you suspect a misclassification, post to the chunk's forum thread and continue with the value as set. Modifying `is_assumption` is a misalignment incident and will be detected.
+
+Before reaching for `sorry`, exhaust every avenue:
 - Standard tactic search (`simp`, `aesop`, `omega`, `ring`, `norm_num`, `decide`, `exact?`, `apply?`, `rw?`)
 - Decomposition into intermediate lemmas or helper definitions
-- Alternative proof strategies (you have full freedom here, subject to conforming with the existing project)
+- Alternative proof strategies drawn from the semiformal chunk and the forum
 - Mathlib search for applicable lemmas or constructions
 - Posting to the forum via `forum_post` and incorporating suggestions from other agents
 
-Only after all of the above have been exhausted may `sorry` be used as a last resort. When it is, the agent must use `forum_post` to record every approach tried and why each failed.
+If after all of the above the chunk is non-assumption and still cannot be proven, post a full failure report to the chunk's forum thread (every approach tried, every lemma checked, every error encountered) and **return without writing `sorry`**. The orchestrator will re-spawn you with more context. Writing `sorry` on a non-assumption chunk short-circuits that recovery loop and is forbidden.
+
+"Expected proof placeholder," "interim state," "assembly pending," "will be filled in later," "awaiting Mathlib" — none of these are valid. There is no later.
 
 Subagents should:
 - Formalize the proof of the chunk using any proof strategy they deem appropriate, consulting the forum, advisory hints in the semiformal chunk, and any gathered content in `gathered/` for this chunk
@@ -178,7 +182,7 @@ Subagents should:
 - Conform to the existing Lean project's naming conventions, definitions, tactic style, and API
 - Try multiple strategies where appropriate
 - Check lake/lean compilation frequently, at their own discretion
-- For assumption types, prove however you need to if possible; use `sorry` only if a proof cannot be found
+- For assumption-type chunks (`is_assumption: true`), `sorry` is acceptable; for all others, return without `sorry` if you cannot prove it
 
 If any API changes are made during the proof step, update `semiformal/` to reflect them and commit with a `FORMALIZATION:` prefix.
 

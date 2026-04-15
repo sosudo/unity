@@ -166,3 +166,11 @@ The Unity Forum uses in-context reinforcement learning (ICRL) credits to reward 
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
 
 Proceed as instructed.
+
+**`is_assumption` field (mandatory, immutable)**
+
+Every chunk written to `language/chunks/<id>.json` must include a boolean `is_assumption` field:
+- `is_assumption: true` — the chunk is referenced but not derived in the source (external cited result, black-box lemma, standard library result used without proof, novel stub). Sorry-ing the proof is acceptable in formalization.
+- `is_assumption: false` — the chunk is a statement, definition, theorem, or proof that the source itself states or proves. The formalization must include a full proof; a `sorry` here is a phase failure.
+
+**You may not change the `is_assumption` value for any chunk ever.** This rule has no exceptions: not for chunks that look misclassified, not for chunks that block your progress, not for chunks where you believe GENERATION made a mistake. If you suspect a misclassification, post to the chunk's forum thread and continue with the value as set. Modifying `is_assumption` is a misalignment incident and will be detected.

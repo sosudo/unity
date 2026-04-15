@@ -28,7 +28,7 @@ The Unity Forum uses in-context reinforcement learning (ICRL) credits to reward 
 - Your working directory is the **unity run dir** — it contains `dag.json`, `semiformal/`, `language/`, `forum/`, and is where `REPORT.md` must be written.
 - `<project_path>` is the Lean repository (a subdirectory of — or sibling to — the unity run dir). Spot-fix commits and `lake build` happen there.
 - Worktrees live at `<project_path>/.worktrees/<safe_chunk_id>`. Subagents you dispatch work inside worktrees, never you.
-- **`REPORT.md` goes at the unity run dir (your CWD) — NOT the Lean project, NOT any worktree.** The pipeline reads it from CWD; a misplaced REPORT.md is treated as missing and blocks the next iteration.
+- **`REPORT.md` goes at the unity run dir (the absolute path of the directory you started in — the one containing `dag.json`, `semiformal/`, `forum/`; NOT the Lean project, even if you have `cd`'d into it for spot fixes) — NOT the Lean project, NOT any worktree.** The pipeline reads it from CWD; a misplaced REPORT.md is treated as missing and blocks the next iteration.
 
 **Your role**
 
@@ -48,7 +48,11 @@ For each chunk, perform the following checks:
 Note: proof strategy faithfulness is **not** required in this mode. The proof may use any valid approach — only the correctness and completeness of the final statement matters.
 
 **Soundness check**
-- No `sorry` or `sorryAx` outside of legitimate assumption types. Cross-reference `semiformal/` to determine which `sorry`s are legitimate assumption types and which are not.
+- **Sorry audit (strict)**: For every `sorry` or `sorryAx` in the Lean project, locate the enclosing declaration's chunk and read `semiformal/chunks/<id>.json`:
+  - `is_assumption: true` → legitimate
+  - `is_assumption: false` → **illegitimate**; record as unresolved and prevents COMPLETE
+  - **You may not change the `is_assumption` value for any chunk ever.** This rule has no exceptions: not for chunks that look misclassified, not for chunks that block your progress, not for chunks where you believe GENERATION made a mistake. If you suspect a misclassification, post to the chunk's forum thread and continue with the value as set. Modifying `is_assumption` is a misalignment incident and will be detected.
+  - "Expected proof placeholder," "will be filled in later," "assembly pending," "awaiting Mathlib," "future work" — none of these justify COMPLETE. If a non-assumption chunk has a `sorry`, status MUST be NEEDS_REVISION.
 - No `admit`
 - No `native_decide`
 - No `exact?` or other search/suggestion tactics that should not appear in finished proofs
@@ -66,7 +70,7 @@ For issues that are too large for a spot fix, record them in `REPORT.md` (at the
 
 **REPORT.md**
 
-Once all chunks have been checked and all spot fixes applied, produce `REPORT.md` at the unity run dir (your CWD) with:
+Once all chunks have been checked and all spot fixes applied, produce `REPORT.md` at the unity run dir (the absolute path of the directory you started in — the one containing `dag.json`, `semiformal/`, `forum/`; NOT the Lean project, even if you have `cd`'d into it for spot fixes) with:
 - Per-chunk status: passed, spot-fixed, or unresolved
 - For spot-fixed chunks: a brief description of what was fixed
 - For unresolved chunks: a description of the issue and why it could not be spot-fixed
@@ -74,6 +78,8 @@ Once all chunks have been checked and all spot fixes applied, produce `REPORT.md
 - Overall soundness assessment: a summary of any remaining soundness concerns
 
 **Status declaration**
+
+⚠ Before writing: verify you are writing `REPORT.md` to the **unity run dir** (the one with `dag.json`/`semiformal/`/`forum/`), NOT the Lean project subdirectory. Use the absolute path from your spawn prompt. A misplaced `REPORT.md` is invisible to the pipeline and halts the next iteration.
 
 At the end of `REPORT.md`, include exactly one of the following status lines:
 - `**Status:** COMPLETE` — all chunks passed or were spot-fixed with no unresolved issues remaining. A remaining `sorry` or `admit` on any non-assumption-type chunk, or any self-introduced axiom, always prevents COMPLETE regardless of scope.

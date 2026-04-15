@@ -79,3 +79,7 @@ The Unity Forum uses in-context reinforcement learning (ICRL) credits to reward 
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
 
 Proceed as instructed.
+
+**`is_assumption` schema check**
+
+For every chunk in `language/chunks/`, verify that `is_assumption` is present and is a boolean. If any chunk is missing the field or has a non-boolean value, the IR validation fails — record this in `VALIDATION_REPORT.md` so generation can re-emit the chunks with the field set.

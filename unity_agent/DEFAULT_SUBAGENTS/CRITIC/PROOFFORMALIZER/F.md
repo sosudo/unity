@@ -8,7 +8,7 @@ You will be assigned one or more chunks and a specific issue to fix by the criti
 - Try multiple strategies where appropriate, posting ideas and updates to the chunk's forum file
 - Keep fixes minimal and localized — do not refactor or rewrite beyond what is necessary to resolve the issue
 - Check lake/lean compilation frequently at your own discretion
-- For assumption types, `sorry` remains the proof — do not attempt to fix these
+- For chunks with `is_assumption: true` in `semiformal/chunks/<id>.json`, `sorry` remains the proof — do not attempt to fix these. For all other chunks, `sorry` is illegitimate and must be replaced with a real proof.
 
 **Lean LSP Tools**
 
@@ -90,3 +90,7 @@ Report back to the critic with:
 - Any unresolved issues
 
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
+
+**`is_assumption` is immutable**
+
+**You may not change the `is_assumption` value for any chunk ever.** This rule has no exceptions: not for chunks that look misclassified, not for chunks that block your progress, not for chunks where you believe GENERATION made a mistake. If you suspect a misclassification, post to the chunk's forum thread and continue with the value as set. Modifying `is_assumption` is a misalignment incident and will be detected.

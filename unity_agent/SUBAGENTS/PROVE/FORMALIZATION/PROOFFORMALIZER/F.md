@@ -7,7 +7,7 @@ You will be assigned one or more chunks by the main agent. For each assigned chu
 - You are not required to mirror the source's proof approach
 - Try multiple strategies where appropriate, posting ideas, proposals, and updates to the chunk's forum thread
 - Use `Bash` with `lake build 2>&1` in your working directory for compilation checks — do not call `lean_build`, which restarts the shared LSP
-- For assumption types, prove however you need to if possible; use `sorry` only if a proof cannot be found
+- For assumption-type chunks (`is_assumption: true`), `sorry` is the proof; for all other chunks, produce a full proof or return without writing `sorry`
 
 **Proof search guidance**
 
@@ -19,16 +19,22 @@ rfl → simp → ring → linarith → nlinarith → omega → exact? → apply?
 
 For goals that resist automation, decompose with `have` to name intermediate results before attempting tactics on each sub-goal. Use `lean_multi_attempt` to test several candidates in parallel rather than editing the file repeatedly.
 
-**Persistence**
+**`sorry` policy (strict)**
 
-Proof formalization is hard. `sorry` on a non-assumption proof is not a completion; it is a failure. Before using `sorry`, you must have genuinely attempted:
+`sorry` is legal only when the chunk's `semiformal/chunks/<id>.json` has `is_assumption: true`. For every other chunk, you must produce a complete proof — **there is no follow-up phase that will fill in placeholders**. A `sorry` left on a non-assumption chunk is a phase failure.
+
+**You may not change the `is_assumption` value for any chunk ever.** This rule has no exceptions: not for chunks that look misclassified, not for chunks that block your progress, not for chunks where you believe GENERATION made a mistake. If you suspect a misclassification, post to the chunk's forum thread and continue with the value as set. Modifying `is_assumption` is a misalignment incident and will be detected.
+
+Before reaching for `sorry` on an assumption-type chunk, exhaust:
 - Standard tactic search (`simp`, `aesop`, `omega`, `ring`, `norm_num`, `decide`, `exact?`, `apply?`, `rw?`)
 - Decomposition into intermediate lemmas or helper definitions
-- Alternative proof strategies (you have full freedom here)
+- Alternative proof strategies drawn from the semiformal chunk and the forum
 - Mathlib search for applicable lemmas or constructions
 - Posting to the forum and incorporating suggestions from other agents
 
-Only after all of the above have been exhausted may `sorry` be used as a last resort.
+If the chunk is non-assumption (`is_assumption: false`) and you cannot prove it after exhausting the above, post a full failure report to the chunk's forum thread (every approach tried, every lemma checked, every error encountered) and **return without writing `sorry`**. The orchestrator will re-spawn you with more context. Writing `sorry` on a non-assumption chunk short-circuits that recovery loop and is forbidden.
+
+"Expected proof placeholder," "interim state," "assembly pending," "will be filled in later," "awaiting Mathlib" — none of these are valid framings. There is no later.
 
 **Worktree**
 
@@ -68,7 +74,7 @@ If you make any API changes, report them to the main agent immediately so `semif
 
 **Chunk status update**
 
-After completing each chunk, update its JSON file at `<unity_run_dir>/semiformal/chunks/<chunk_id>.json` (if it exists). The unity run dir is the folder containing `semiformal/`, `dag.json`, `forum/` — it is **outside** your worktree, so use the absolute path passed in your spawn prompt, not a relative path from your CWD. Set `lean_declaration.file` to the Lean file path relative to the unity run dir (e.g. `myproj/MyProj/Foo.lean`), `lean_declaration.line` to the start line of the proof, and `status` to `"complete"` or `"sorry"`.
+After completing each chunk, update its JSON file at `<unity_run_dir>/semiformal/chunks/<chunk_id>.json` (if it exists). The unity run dir is the folder containing `semiformal/`, `dag.json`, `forum/` — it is **outside** your worktree, so use the absolute path passed in your spawn prompt, not a relative path from your CWD. Set `lean_declaration.file` to the Lean file path relative to the unity run dir (e.g. `myproj/MyProj/Foo.lean`), `lean_declaration.line` to the start line of the proof, and `status` to `"complete"`; `"sorry"` is only permitted when `is_assumption: true` for this chunk.
 
 **Output**
 

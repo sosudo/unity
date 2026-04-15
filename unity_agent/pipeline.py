@@ -734,6 +734,21 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     _main_branch = _detect_main_branch(project_path)
     logging.info(f"Detected Lean project main branch: {_main_branch}")
 
+    def _read_report_md() -> str:
+        """Read REPORT.md from CWD; if missing, recover from <project_path> (critic may have misplaced it)."""
+        cwd_report = Path("REPORT.md")
+        if cwd_report.exists():
+            return cwd_report.read_text()
+        misplaced = project_path / "REPORT.md"
+        if misplaced.exists():
+            logging.warning(
+                f"REPORT.md found at {misplaced} (Lean project) instead of unity run dir — "
+                f"moving to {cwd_report.resolve()}. Critic wrote to the wrong directory."
+            )
+            shutil.move(str(misplaced), str(cwd_report))
+            return cwd_report.read_text()
+        raise FileNotFoundError("REPORT.md")
+
     # lean-lsp-mcp launch is deferred until AFTER `await _lake_init_task` so the
     # lakefile / .lake/packages/ manifest is stable before `lake serve` reads it.
     # See launch block further below.
@@ -1400,7 +1415,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
             # Loop status check
             try:
-                report_text = Path("REPORT.md").read_text()
+                report_text = _read_report_md()
                 if re.search(r"\*\*Status:\*\*\s+COMPLETE", report_text, re.IGNORECASE):
                     logging.info("Critic declared formalization complete.")
                     break
@@ -1417,7 +1432,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         _console.rule("[bold blue]Summary[/bold blue]")
         try:
 
-            _console.print(Markdown(Path("REPORT.md").read_text()))
+            _console.print(Markdown(_read_report_md()))
         except FileNotFoundError:
             logging.warning("No REPORT.md found — critic may not have completed.")
         except Exception as e:
@@ -2321,7 +2336,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         # Critic loop status check
         try:
-            report_text = Path("REPORT.md").read_text()
+            report_text = _read_report_md()
             if re.search(r"\*\*Status:\*\*\s+COMPLETE", report_text, re.IGNORECASE):
                 logging.info("Critic declared formalization complete.")
                 break
@@ -2356,7 +2371,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
     _console.rule("[bold blue]Summary[/bold blue]")
     try:
-        _console.print(Markdown(Path("REPORT.md").read_text()))
+        _console.print(Markdown(_read_report_md()))
     except FileNotFoundError:
         logging.warning("No REPORT.md found — critic may not have completed.")
     except Exception as e:

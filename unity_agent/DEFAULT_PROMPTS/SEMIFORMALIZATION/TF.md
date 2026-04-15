@@ -87,3 +87,7 @@ The Unity Forum uses in-context reinforcement learning (ICRL) credits to reward 
 - `forum_check_balance(author)` — check ICRL credit balance; call at start and end of your task
 
 **IMPORTANT: Do not use pkill, killall, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
+
+**`is_assumption` carry-through (mandatory)**
+
+Every chunk in `semiformal/chunks/<id>.json` must include the `is_assumption: bool` field copied unchanged from `language/chunks/<id>.json`. **You may not change the `is_assumption` value for any chunk ever.** This rule has no exceptions: not for chunks that look misclassified, not for chunks that block your progress, not for chunks where you believe GENERATION made a mistake. If you suspect a misclassification, post to the chunk's forum thread and continue with the value as set. Modifying `is_assumption` is a misalignment incident and will be detected.
