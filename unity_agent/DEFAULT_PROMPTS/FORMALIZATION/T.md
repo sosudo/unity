@@ -146,6 +146,14 @@ For each chunk that has a proof (theorems, lemmas, etc.), spawn one ProofFormali
 
 **You own the merge.** After all subagents in the layer complete, merge and build the same way as in the declaration step: `git merge --squash <branch> && git commit -m "UNITY: merge chunk <id>"` for each chunk, then `lake build 2>&1`. On build failure, emergently choose between inline patching or re-spawning the affected chunk's proof-formalizer with the build error. Do not proceed to the next layer until `lake build` passes. Do not run `git worktree remove` yourself — the pipeline cleans up at end-of-phase.
 
+**Before you return from this phase, verify your own work.** From `<project_path>`, run:
+
+```bash
+git log --oneline | grep "UNITY: merge chunk"
+```
+
+Every chunk id assigned to you in this phase must appear. If any is missing, you have not finished — go merge it now. A subagent that committed inside its worktree but whose chunk is missing from this grep is stranded work, and returning in that state is a phase failure that the post-run audit will flag as a correctness regression.
+
 **`sorry` policy (strict)**
 
 `sorry` is legal only when the chunk's `semiformal/chunks/<id>.json` has `is_assumption: true`. For every other chunk, you must produce a complete proof in this phase — **there is no follow-up phase that will fill in placeholders**. A `sorry` left on a non-assumption chunk is a phase failure.

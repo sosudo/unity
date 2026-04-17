@@ -103,7 +103,7 @@ Field notes:
 - `proof`: **required for `theorem` and `lemma`; omit entirely for all other types**
 - `content`: leave empty at generation time — the semiformalization phase fills this with the full semiformal translation of the statement/definition
 - `proof.strategy` and `proof.sub_chunks`: leave empty at generation time — the semiformalization phase populates them
-- `proof.sub_chunks`: populated by the semiformalization phase at the granularity the source uses — case splits, induction arms, key lemma applications, major sub-goals, **and any non-trivial calculation or algebraic manipulation the source actually writes out.** If the source dedicates space to a computation, it is not "trivial" for the formalizer. Generation should leave this array empty; semiformalization populates it. Do not sub-chunk for arbitrary line splits. Statement and proof are always one top-level chunk; sub-chunks live exclusively inside `proof`
+- `proof.sub_chunks`: sub-chunking is for meaningful proof-step granularity only — case splits, induction arms, key lemma applications, major sub-goals. Never sub-chunk for trivial steps or arbitrary line splits. Statement and proof are always one top-level chunk; sub-chunks live exclusively inside `proof`
 - `status`, `lean_declaration`, `mathlib_refs`: always set to the values shown above at generation time
 
 **Mathlib Context**

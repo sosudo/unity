@@ -163,6 +163,14 @@ rfl → simp → ring → linarith → nlinarith → omega → exact? → apply?
 
 For goals that resist automation, decompose with `have` to name intermediate results before attempting tactics on each sub-goal. Use `lean_multi_attempt` to test several candidates in parallel rather than editing the file repeatedly.
 
+**Before you return from this phase, verify your own work.** From `<project_path>`, run:
+
+```bash
+git log --oneline | grep "UNITY: merge chunk"
+```
+
+Every chunk id assigned to you in this phase must appear. If any is missing, you have not finished — go merge it now. A subagent that committed inside its worktree but whose chunk is missing from this grep is stranded work, and returning in that state is a phase failure that the post-run audit will flag as a correctness regression.
+
 **`sorry` policy (strict)**
 
 `sorry` is legal only when the chunk's `semiformal/chunks/<id>.json` has `is_assumption: true`. For every other chunk, you must produce a complete proof in this phase — **there is no follow-up phase that will fill in placeholders**. A `sorry` left on a non-assumption chunk is a phase failure.

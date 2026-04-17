@@ -1677,7 +1677,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             # Validation loop status check
             try:
                 report_text = Path("VALIDATION_REPORT.md").read_text()
-                if not re.search(r"\*\*Status:\*\*\s+INVALID", report_text, re.IGNORECASE):
+                if not re.search(r"(?:\*\*)?Status:(?:\*\*)?\s+(?:\*\*)?INVALID", report_text, re.IGNORECASE):
                     logging.info("Validation loop: report does not contain INVALID marker — proceeding to semiformalization.")
                     break
                 elif max_validation_iterations is not None and validation_iteration + 1 >= max_validation_iterations:
@@ -2136,7 +2136,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         # Validation loop status check
         try:
             report_text = Path("VALIDATION_REPORT.md").read_text()
-            if not re.search(r"\*\*Status:\*\*\s+INVALID", report_text, re.IGNORECASE):
+            if not re.search(r"(?:\*\*)?Status:(?:\*\*)?\s+(?:\*\*)?INVALID", report_text, re.IGNORECASE):
                 logging.info("Validation loop: report does not contain INVALID marker — proceeding to semiformalization.")
                 break
             elif max_validation_iterations is not None and validation_iteration + 1 >= max_validation_iterations:
