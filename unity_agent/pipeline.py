@@ -679,14 +679,14 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
 
             model="sonnet",
             fallback_model="haiku",
-            env={
-                "ANTHROPIC_BASE_URL": os.getenv("ANTHROPIC_BASE_URL"),
-                "ANTHROPIC_API_KEY": os.getenv("ANTHROPIC_API_KEY"),
-                "ANTHROPIC_AUTH_TOKEN": os.getenv("ANTHROPIC_AUTH_TOKEN"),
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL"),
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL"),
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL"),
-            },
+            env={k: v for k, v in {
+                "ANTHROPIC_BASE_URL": os.getenv("PRIMARY_BASE_URL"),
+                "ANTHROPIC_API_KEY": os.getenv("PRIMARY_API_KEY"),
+                "ANTHROPIC_AUTH_TOKEN": os.getenv("PRIMARY_AUTH_TOKEN"),
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": os.getenv("PRIMARY_MODEL"),
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": os.getenv("PRIMARY_MODEL"),
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": os.getenv("PRIMARY_MODEL"),
+            }.items() if v},
 
         ),
     ):
@@ -791,23 +791,39 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         lean_lsp_port = parse_int(os.getenv("LEAN_LSP_PORT")) or 6368
         claude_code_stream_close_timeout = parse_int(os.getenv("CLAUDE_CODE_STREAM_CLOSE_TIMEOUT")) or 180000
         os.environ["CLAUDE_CODE_STREAM_CLOSE_TIMEOUT"] = str(claude_code_stream_close_timeout)
-        anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
-        anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
-        anthropic_auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
-        anthropic_default_opus_model = os.getenv("ANTHROPIC_DEFAULT_OPUS_MODEL")
-        anthropic_default_sonnet_model = os.getenv("ANTHROPIC_DEFAULT_SONNET_MODEL")
-        anthropic_default_haiku_model = os.getenv("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+        primary_base_url = os.getenv("PRIMARY_BASE_URL")
+        primary_api_key = os.getenv("PRIMARY_API_KEY")
+        primary_auth_token = os.getenv("PRIMARY_AUTH_TOKEN")
+        primary_model = os.getenv("PRIMARY_MODEL")
+        secondary_base_url = os.getenv("SECONDARY_BASE_URL")
+        secondary_api_key = os.getenv("SECONDARY_API_KEY")
+        secondary_auth_token = os.getenv("SECONDARY_AUTH_TOKEN")
+        secondary_model = os.getenv("SECONDARY_MODEL")
         claude_code_experimental_agent_teams = os.getenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
 
-        # Build env dict once for all agent query() calls; omit unset/empty values
-        # so child agents fall back to their own credential resolution.
-        _agent_env = {k: v for k, v in {
-            "ANTHROPIC_BASE_URL": anthropic_base_url,
-            "ANTHROPIC_API_KEY": anthropic_api_key,
-            "ANTHROPIC_AUTH_TOKEN": anthropic_auth_token,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": anthropic_default_opus_model,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": anthropic_default_sonnet_model,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": anthropic_default_haiku_model,
+        # Build per-tier env dicts for agent query() calls. Unset values are omitted
+        # so the SDK falls back to its own credential / model resolution.
+        # Primary-tier queries use model="sonnet" (with fallback_model="haiku"); we pin
+        # all three DEFAULT_*_MODEL slots to PRIMARY_MODEL so stray routing never crosses
+        # tiers. Secondary mirrors the pattern with SECONDARY_MODEL and the secondary
+        # provider's credentials; the escalation phase uses _secondary_env.
+        _primary_env = {k: v for k, v in {
+            "ANTHROPIC_BASE_URL": primary_base_url,
+            "ANTHROPIC_API_KEY": primary_api_key,
+            "ANTHROPIC_AUTH_TOKEN": primary_auth_token,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": primary_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": primary_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": primary_model,
+            "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": claude_code_experimental_agent_teams,
+            "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": str(claude_code_stream_close_timeout),
+        }.items() if v}
+        _secondary_env = {k: v for k, v in {
+            "ANTHROPIC_BASE_URL": secondary_base_url,
+            "ANTHROPIC_API_KEY": secondary_api_key,
+            "ANTHROPIC_AUTH_TOKEN": secondary_auth_token,
+            "ANTHROPIC_DEFAULT_OPUS_MODEL": secondary_model,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": secondary_model,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL": secondary_model,
             "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": claude_code_experimental_agent_teams,
             "CLAUDE_CODE_STREAM_CLOSE_TIMEOUT": str(claude_code_stream_close_timeout),
         }.items() if v}
@@ -834,12 +850,14 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info(f"FORUM_PORT: {forum_port}")
         logging.info(f"LEAN_LSP_PORT: {lean_lsp_port}")
         logging.info(f"CLAUDE_CODE_STREAM_CLOSE_TIMEOUT: {claude_code_stream_close_timeout}")
-        logging.info(f"ANTHROPIC_BASE_URL: {anthropic_base_url}")
-        logging.info(f"ANTHROPIC_API_KEY: {anthropic_api_key}")
-        logging.info(f"ANTHROPIC_AUTH_TOKEN: {anthropic_auth_token}")
-        logging.info(f"ANTHROPIC_DEFAULT_OPUS_MODEL: {anthropic_default_opus_model}")
-        logging.info(f"ANTHROPIC_DEFAULT_SONNET_MODEL: {anthropic_default_sonnet_model}")
-        logging.info(f"ANTHROPIC_DEFAULT_HAIKU_MODEL: {anthropic_default_haiku_model}")
+        logging.info(f"PRIMARY_BASE_URL: {primary_base_url}")
+        logging.info(f"PRIMARY_API_KEY: {primary_api_key}")
+        logging.info(f"PRIMARY_AUTH_TOKEN: {primary_auth_token}")
+        logging.info(f"PRIMARY_MODEL: {primary_model}")
+        logging.info(f"SECONDARY_BASE_URL: {secondary_base_url}")
+        logging.info(f"SECONDARY_API_KEY: {secondary_api_key}")
+        logging.info(f"SECONDARY_AUTH_TOKEN: {secondary_auth_token}")
+        logging.info(f"SECONDARY_MODEL: {secondary_model}")
         logging.info(f"CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS: {claude_code_experimental_agent_teams}")
 
         # Check for conflicts
@@ -1143,7 +1161,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 permission_mode="bypassPermissions",
                 model="sonnet",
                 fallback_model="haiku",
-                env=_agent_env,
+                env=_primary_env,
             ),
         ):
             _log_agent_message(message)
@@ -1245,9 +1263,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=exploration_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1296,9 +1314,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=generation_budget,
 
                             enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
+                            model="sonnet",
+                            fallback_model="haiku",
+                            env=_primary_env,
 
                         ),
                     ):
@@ -1333,7 +1351,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             enable_file_checkpointing=True,
                             model="sonnet",
                             fallback_model="haiku",
-                            env=_agent_env,
+                            env=_primary_env,
 
                         ),
                     ):
@@ -1400,9 +1418,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1480,9 +1498,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
                     )
 
                     logging.info("[prove-formalization] invoking orchestrator query — agent will spawn per-chunk subagents, merge, and build")
@@ -1551,9 +1569,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=critic_budget,
 
                             enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
+                            model="sonnet",
+                            fallback_model="haiku",
+                            env=_primary_env,
 
                         ),
                     ):
@@ -1588,9 +1606,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         permission_mode=PERMISSIONS,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1697,7 +1715,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         enable_file_checkpointing=True,
                         model="sonnet",
                         fallback_model="haiku",
-                        env=_agent_env,
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1749,9 +1767,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=generation_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1786,7 +1804,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         enable_file_checkpointing=True,
                         model="sonnet",
                         fallback_model="haiku",
-                        env=_agent_env,
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1857,9 +1875,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1903,9 +1921,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -1949,9 +1967,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
 
                     ),
                 ):
@@ -2022,9 +2040,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="opus",
-                                fallback_model="sonnet",
-                                env=_agent_env,
+                                model="sonnet",
+                                fallback_model="haiku",
+                                env=_primary_env,
 
                             ),
                         ):
@@ -2078,9 +2096,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="opus",
-                                fallback_model="sonnet",
-                                env=_agent_env,
+                                model="sonnet",
+                                fallback_model="haiku",
+                                env=_primary_env,
 
                             ),
                         ):
@@ -2134,9 +2152,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="opus",
-                                fallback_model="sonnet",
-                                env=_agent_env,
+                                model="sonnet",
+                                fallback_model="haiku",
+                                env=_primary_env,
 
                             ),
                         ):
@@ -2190,9 +2208,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="opus",
-                                fallback_model="sonnet",
-                                env=_agent_env,
+                                model="sonnet",
+                                fallback_model="haiku",
+                                env=_primary_env,
 
                             ),
                         ):
@@ -2279,9 +2297,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=formalization_budget,
 
                             enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
+                            model="sonnet",
+                            fallback_model="haiku",
+                            env=_primary_env,
 
                         ),
                     ):
@@ -2365,9 +2383,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
-                        env=_agent_env,
+                        model="sonnet",
+                        fallback_model="haiku",
+                        env=_primary_env,
                     )
 
                     _prompt_prefix = f"Formalize {source} into {project_path}."
@@ -2444,9 +2462,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=critic_budget,
 
                             enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
+                            model="sonnet",
+                            fallback_model="haiku",
+                            env=_primary_env,
 
                         ),
                     ):
@@ -2493,9 +2511,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=critic_budget,
 
                             enable_file_checkpointing=True,
-                            model="opus",
-                            fallback_model="sonnet",
-                            env=_agent_env,
+                            model="sonnet",
+                            fallback_model="haiku",
+                            env=_primary_env,
 
                         ),
                     ):
@@ -2537,9 +2555,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     permission_mode=PERMISSIONS,
 
                     enable_file_checkpointing=True,
-                    model="opus",
-                    fallback_model="sonnet",
-                    env=_agent_env,
+                    model="sonnet",
+                    fallback_model="haiku",
+                    env=_primary_env,
 
                 ),
             ):
