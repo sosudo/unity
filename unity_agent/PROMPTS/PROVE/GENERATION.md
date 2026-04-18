@@ -128,6 +128,21 @@ cd language && git init && git add . && git commit -m "generation phase complete
 
 ---
 
+**Revision behavior**
+
+If `VALIDATION_REPORT.md` exists at the unity run dir when you start, a previous generation attempt was judged `INVALID` and you are now on a revision pass. Before doing anything else:
+
+1. Read `VALIDATION_REPORT.md` end-to-end and enumerate every `FAIL`.
+2. For every FAIL that names a specific chunk file as non-conformant, missing a required field, or "must be removed" / "must be deleted", delete that file directly (`rm language/chunks/<name>.json`). Do not leave stale chunks behind — validation re-reads the full directory and will flag the same file again if you merely emit new chunks alongside it.
+3. For every FAIL that describes a structural issue (missing dependency edges, coverage gaps, schema drift), fix it in the chunks it affects.
+4. Preserve passing chunks unchanged unless a FAIL implicates them.
+5. Commit the cleanup and the revised IR together in a single commit with message `generation phase revision <N>` (where `<N>` is the validation iteration).
+
+Emitting a fresh IR without reading the prior `VALIDATION_REPORT.md` is the single most common cause of non-convergent validation loops. Read it first.
+
+
+---
+
 **Forum**
 
 At the start, call `forum_create_thread("generation", "IR Design")`. Use this thread throughout:
