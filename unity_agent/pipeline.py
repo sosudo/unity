@@ -845,7 +845,7 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
             permission_mode="bypassPermissions",
 
             model="opus",
-            fallback_model="sonnet",
+            # fallback_model="sonnet",
             env={k: v for k, v in {
                 "ANTHROPIC_BASE_URL": os.getenv("PRIMARY_BASE_URL"),
                 "ANTHROPIC_API_KEY": os.getenv("PRIMARY_API_KEY"),
@@ -1329,7 +1329,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 hooks=FORUM_HOOKS,
                 permission_mode="bypassPermissions",
                 model="opus",
-                fallback_model="sonnet",
+                # fallback_model="sonnet",
                 env=_primary_env,
             ),
         ):
@@ -1369,7 +1369,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         tier = _choose_tier(state)
         env_for_tier = _secondary_env if tier == "B" else _primary_env
         model_for_tier = "opus" if tier == "B" else "sonnet"
-        fallback_for_tier = "sonnet" if tier == "B" else "haiku"
+        # fallback_for_tier = "sonnet" if tier == "B" else "haiku"
         logging.info(f"[escalation] tier={tier} model={model_for_tier}")
 
         _console.rule(f"[bold magenta]Escalation Phase[/bold magenta] (tier={tier})")
@@ -1436,7 +1436,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     max_budget_usd=formalization_budget,
                     enable_file_checkpointing=True,
                     model=model_for_tier,
-                    fallback_model=fallback_for_tier,
+                    # fallback_model=fallback_for_tier,
                     env=env_for_tier,
                 ),
             ):
@@ -1573,7 +1573,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -1624,7 +1624,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            fallback_model="opus",
+                            # fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -1659,7 +1659,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            fallback_model="sonnet",
+                            # fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -1728,7 +1728,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -1808,7 +1808,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
                     )
 
@@ -1879,7 +1879,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            fallback_model="opus",
+                            # fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -1916,7 +1916,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2029,7 +2029,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2083,7 +2083,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2118,7 +2118,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="sonnet",
+                        # fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2191,7 +2191,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2237,7 +2237,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2283,7 +2283,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2356,7 +2356,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                fallback_model="opus",
+                                # fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2412,7 +2412,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                fallback_model="opus",
+                                # fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2468,7 +2468,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                fallback_model="opus",
+                                # fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2524,7 +2524,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                fallback_model="opus",
+                                # fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2613,7 +2613,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            fallback_model="opus",
+                            # fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -2699,7 +2699,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
                         model="opus",
-                        fallback_model="opus",
+                        # fallback_model="opus",
                         env=_primary_env,
                     )
 
@@ -2778,7 +2778,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            fallback_model="opus",
+                            # fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -2827,7 +2827,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            fallback_model="opus",
+                            # fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -2871,7 +2871,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                     enable_file_checkpointing=True,
                     model="opus",
-                    fallback_model="opus",
+                    # fallback_model="opus",
                     env=_primary_env,
 
                 ),
