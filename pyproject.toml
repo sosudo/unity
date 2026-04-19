@@ -1,12 +1,12 @@
 [project]
 name = "unity-agent"
-version = "0.3.7"
+version = "0.3.9"
 description = "Autoformalization pipeline for Lean theorem proving"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "asyncclick>=8.3.0.7",
-    "claude-agent-sdk>=0.1.48",
+    "claude-agent-sdk==0.1.59",
     "click>=8.3.1",
     "lean-lsp-mcp>=0.1.0",
     "python-dotenv>=1.2.2",

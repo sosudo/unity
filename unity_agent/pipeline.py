@@ -2028,8 +2028,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=source_scan_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        fallback_model="sonnet",
+                        model="sonnet",
+                        fallback_model="haiku",
                         env=_primary_env,
 
                     ),
