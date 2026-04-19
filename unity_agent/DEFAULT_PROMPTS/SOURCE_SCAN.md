@@ -54,6 +54,8 @@ The Unity Forum uses in-context reinforcement learning (ICRL) credits to reward 
 
 Proceed as instructed.
 
+**Before ending:** Verify `mathlib-context.md` exists in your CWD and is non-empty. If it does not exist or is empty, write it now — this is mandatory. Do not end_turn until this file is present.
+
 
 **Filesystem scope (mandatory)**
 

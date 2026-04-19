@@ -844,8 +844,8 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
             system_prompt=infer_prompt,
             permission_mode="bypassPermissions",
 
-            model="sonnet",
-            fallback_model="haiku",
+            model="opus",
+            fallback_model="sonnet",
             env={k: v for k, v in {
                 "ANTHROPIC_BASE_URL": os.getenv("PRIMARY_BASE_URL"),
                 "ANTHROPIC_API_KEY": os.getenv("PRIMARY_API_KEY"),
@@ -971,7 +971,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         # Build per-tier env dicts for agent query() calls. Unset values are omitted
         # so the SDK falls back to its own credential / model resolution.
-        # Primary-tier queries use model="sonnet" (with fallback_model="haiku"); we pin
+        # Primary-tier queries use model="opus" (with fallback_model="sonnet") for most phases; we pin
         # all three DEFAULT_*_MODEL slots to PRIMARY_MODEL so stray routing never crosses
         # tiers. Secondary mirrors the pattern with SECONDARY_MODEL and the secondary
         # provider's credentials; the escalation phase uses _secondary_env.
@@ -1328,8 +1328,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 mcp_servers=LEAN_MCP_SERVER,
                 hooks=FORUM_HOOKS,
                 permission_mode="bypassPermissions",
-                model="sonnet",
-                fallback_model="haiku",
+                model="opus",
+                fallback_model="sonnet",
                 env=_primary_env,
             ),
         ):
@@ -1572,8 +1572,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=exploration_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -1623,8 +1623,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=generation_budget,
 
                             enable_file_checkpointing=True,
-                            model="sonnet",
-                            fallback_model="haiku",
+                            model="opus",
+                            fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -1658,8 +1658,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=validation_budget,
 
                             enable_file_checkpointing=True,
-                            model="sonnet",
-                            fallback_model="haiku",
+                            model="opus",
+                            fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -1727,8 +1727,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -1807,8 +1807,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
                     )
 
@@ -1878,8 +1878,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=critic_budget,
 
                             enable_file_checkpointing=True,
-                            model="sonnet",
-                            fallback_model="haiku",
+                            model="opus",
+                            fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -1915,8 +1915,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         permission_mode=PERMISSIONS,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2028,8 +2028,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=source_scan_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2082,8 +2082,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=generation_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2117,8 +2117,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=validation_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2190,8 +2190,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2236,8 +2236,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2282,8 +2282,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=semiformalization_budget,
 
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
 
                     ),
@@ -2355,8 +2355,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="sonnet",
-                                fallback_model="haiku",
+                                model="opus",
+                                fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2411,8 +2411,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="sonnet",
-                                fallback_model="haiku",
+                                model="opus",
+                                fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2467,8 +2467,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="sonnet",
-                                fallback_model="haiku",
+                                model="opus",
+                                fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2523,8 +2523,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                                 max_budget_usd=exploration_budget,
 
                                 enable_file_checkpointing=True,
-                                model="sonnet",
-                                fallback_model="haiku",
+                                model="opus",
+                                fallback_model="opus",
                                 env=_primary_env,
 
                             ),
@@ -2612,8 +2612,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=formalization_budget,
 
                             enable_file_checkpointing=True,
-                            model="sonnet",
-                            fallback_model="haiku",
+                            model="opus",
+                            fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -2698,8 +2698,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         permission_mode=PERMISSIONS,
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
-                        model="sonnet",
-                        fallback_model="haiku",
+                        model="opus",
+                        fallback_model="opus",
                         env=_primary_env,
                     )
 
@@ -2777,8 +2777,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=critic_budget,
 
                             enable_file_checkpointing=True,
-                            model="sonnet",
-                            fallback_model="haiku",
+                            model="opus",
+                            fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -2826,8 +2826,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=critic_budget,
 
                             enable_file_checkpointing=True,
-                            model="sonnet",
-                            fallback_model="haiku",
+                            model="opus",
+                            fallback_model="opus",
                             env=_primary_env,
 
                         ),
@@ -2870,8 +2870,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     permission_mode=PERMISSIONS,
 
                     enable_file_checkpointing=True,
-                    model="sonnet",
-                    fallback_model="haiku",
+                    model="opus",
+                    fallback_model="opus",
                     env=_primary_env,
 
                 ),
