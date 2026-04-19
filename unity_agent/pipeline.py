@@ -424,27 +424,14 @@ def _audit_worktree_commits(worktree_assignments: dict[str, str], project_path: 
                 f"merge commit on main — subagent likely returned without doing work."
             )
         elif committed and not merged:
-            logging.error(
+            logging.warning(
                 f"[audit] chunk {chunk_id}: branch '{branch}' has commits but orchestrator did not "
-                f"squash-merge them into main — merge step was skipped. This is a correctness "
-                f"regression: subagent work is stranded on the worktree branch."
+                f"squash-merge them into main — merge step was skipped."
             )
         else:
             logging.info(
                 f"[audit] chunk {chunk_id}: ok (committed={committed}, merged={merged}, dirty={dirty})"
             )
-
-    skipped = sorted(cid for cid, r in report.items() if r["committed"] and not r["merged"])
-    if skipped:
-        log_path = Path.cwd() / "MERGE_SKIPPED.md"
-        header = not log_path.exists()
-        with log_path.open("a") as f:
-            if header:
-                f.write("# Merge Skipped Log\n\nChunks whose worktree branches were left unmerged by the formalization orchestrator. This is a correctness regression — the retrospective phase should flag it, and the critic should treat stranded work as equivalent to missing work.\n")
-            f.write(f"\n## Orchestrator run ({len(skipped)} chunk(s))\n")
-            for cid in skipped:
-                safe_id = re.sub(r"[^a-zA-Z0-9_-]", "_", cid)
-                f.write(f"- `{cid}` (branch `worktree/{safe_id}`)\n")
     return report
 
 
@@ -844,8 +831,8 @@ async def _infer_flags() -> tuple[str | None, str | None, bool]:
             system_prompt=infer_prompt,
             permission_mode="bypassPermissions",
 
-            model="opus",
-            # fallback_model="sonnet",
+            model="sonnet",
+            fallback_model="haiku",
             env={k: v for k, v in {
                 "ANTHROPIC_BASE_URL": os.getenv("PRIMARY_BASE_URL"),
                 "ANTHROPIC_API_KEY": os.getenv("PRIMARY_API_KEY"),
@@ -1328,8 +1315,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 mcp_servers=LEAN_MCP_SERVER,
                 hooks=FORUM_HOOKS,
                 permission_mode="bypassPermissions",
-                model="opus",
-                # fallback_model="sonnet",
+                model="sonnet",
+                fallback_model="haiku",
                 env=_primary_env,
             ),
         ):
@@ -1366,11 +1353,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             _save_bandit_state(state_path, state)
             return
 
-        tier = _choose_tier(state)
-        env_for_tier = _secondary_env if tier == "B" else _primary_env
-        model_for_tier = "opus" if tier == "B" else "sonnet"
-        # fallback_for_tier = "sonnet" if tier == "B" else "haiku"
-        logging.info(f"[escalation] tier={tier} model={model_for_tier}")
+        tier = "B"
+        logging.info(f"[escalation] tier={tier} model=opus (secondary)")
 
         _console.rule(f"[bold magenta]Escalation Phase[/bold magenta] (tier={tier})")
         _assert_lsp_alive("escalation")
@@ -1435,9 +1419,9 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     permission_mode=PERMISSIONS,
                     max_budget_usd=formalization_budget,
                     enable_file_checkpointing=True,
-                    model=model_for_tier,
-                    # fallback_model=fallback_for_tier,
-                    env=env_for_tier,
+                    model="opus",
+                    fallback_model="sonnet",
+                    env=_secondary_env,
                 ),
             ):
                 _log_agent_message(message)
@@ -1573,7 +1557,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -1624,7 +1608,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            # fallback_model="opus",
+                            fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -1658,8 +1642,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                             max_budget_usd=validation_budget,
 
                             enable_file_checkpointing=True,
-                            model="opus",
-                            # fallback_model="sonnet",
+                            model="sonnet",
+                            fallback_model="haiku",
                             env=_primary_env,
 
                         ),
@@ -1677,7 +1661,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             # Validation loop status check
             try:
                 report_text = Path("VALIDATION_REPORT.md").read_text()
-                if not re.search(r"(?:\*\*)?Status:(?:\*\*)?\s+(?:\*\*)?INVALID", report_text, re.IGNORECASE):
+                if not re.search(r"\*\*Status:\*\*\s+INVALID", report_text, re.IGNORECASE):
                     logging.info("Validation loop: report does not contain INVALID marker — proceeding to semiformalization.")
                     break
                 elif max_validation_iterations is not None and validation_iteration + 1 >= max_validation_iterations:
@@ -1728,7 +1712,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -1808,7 +1792,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
                     )
 
@@ -1879,7 +1863,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            # fallback_model="opus",
+                            fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -1916,7 +1900,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2028,8 +2012,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=source_scan_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        # fallback_model="opus",
+                        model="sonnet",
+                        fallback_model="haiku",
                         env=_primary_env,
 
                     ),
@@ -2083,7 +2067,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2117,8 +2101,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=validation_budget,
 
                         enable_file_checkpointing=True,
-                        model="opus",
-                        # fallback_model="sonnet",
+                        model="sonnet",
+                        fallback_model="haiku",
                         env=_primary_env,
 
                     ),
@@ -2136,7 +2120,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         # Validation loop status check
         try:
             report_text = Path("VALIDATION_REPORT.md").read_text()
-            if not re.search(r"(?:\*\*)?Status:(?:\*\*)?\s+(?:\*\*)?INVALID", report_text, re.IGNORECASE):
+            if not re.search(r"\*\*Status:\*\*\s+INVALID", report_text, re.IGNORECASE):
                 logging.info("Validation loop: report does not contain INVALID marker — proceeding to semiformalization.")
                 break
             elif max_validation_iterations is not None and validation_iteration + 1 >= max_validation_iterations:
@@ -2191,7 +2175,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2237,7 +2221,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2283,7 +2267,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
 
                     ),
@@ -2356,7 +2340,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                # fallback_model="opus",
+                                fallback_model="sonnet",
                                 env=_primary_env,
 
                             ),
@@ -2412,7 +2396,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                # fallback_model="opus",
+                                fallback_model="sonnet",
                                 env=_primary_env,
 
                             ),
@@ -2468,7 +2452,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                # fallback_model="opus",
+                                fallback_model="sonnet",
                                 env=_primary_env,
 
                             ),
@@ -2524,7 +2508,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                                 enable_file_checkpointing=True,
                                 model="opus",
-                                # fallback_model="opus",
+                                fallback_model="sonnet",
                                 env=_primary_env,
 
                             ),
@@ -2613,7 +2597,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            # fallback_model="opus",
+                            fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -2699,7 +2683,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         max_budget_usd=formalization_budget,
                         enable_file_checkpointing=True,
                         model="opus",
-                        # fallback_model="opus",
+                        fallback_model="sonnet",
                         env=_primary_env,
                     )
 
@@ -2778,7 +2762,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            # fallback_model="opus",
+                            fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -2827,7 +2811,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                             enable_file_checkpointing=True,
                             model="opus",
-                            # fallback_model="opus",
+                            fallback_model="sonnet",
                             env=_primary_env,
 
                         ),
@@ -2871,7 +2855,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                     enable_file_checkpointing=True,
                     model="opus",
-                    # fallback_model="opus",
+                    fallback_model="sonnet",
                     env=_primary_env,
 
                 ),

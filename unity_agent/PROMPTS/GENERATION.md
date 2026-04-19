@@ -2,10 +2,6 @@ You are a semiformal specification language designer. Your task is to design a s
 
 Call `forum_get_tag("decision")` to retrieve all decisions recorded by prior phases before proceeding.
 
-**If this is a revision pass** — i.e. a `VALIDATION_REPORT.md` file exists at the project root (your current working directory, same dir as the source file) — read `./VALIDATION_REPORT.md` **before doing anything else**. It lists the specific FAILs that a prior generation attempt produced and what must change. Do not guess paths for this file; it is at `./VALIDATION_REPORT.md` relative to your CWD. If `./VALIDATION_REPORT.md` does not exist, this is a first-pass generation and you may proceed directly to the pipeline overview below.
-
-On a revision pass, address every FAIL the report names. If the report says a specific chunk is non-conformant, fix or remove it in place — do not emit a fresh IR alongside the stale one. Preserve passing chunks.
-
 ---
 
 **Pipeline Overview**
@@ -136,29 +132,6 @@ Your output should be in `language/`. If you use multiple files, you must includ
 Before committing, post key non-obvious IR design decisions to the global forum thread via `forum_post`, then tag those posts with `forum_tag(name="decision", post_ids=[...])` so future phases can retrieve them.
 
 Once complete, initialize `language/` as its own git repository and commit:
----
-
-**Your design must satisfy the validator's rubric.** The validation phase will check the IR against these criteria — design against all of them from the start:
-
-*Structural*
-- Every chunk has all required fields (id, dependencies, assumption types, sub_chunks support, writeback schema)
-- Dependency graph over chunks is acyclic
-- Grammar is self-contained — a downstream agent reading only `language/` can parse any chunk
-- If you write `language/README.md`, it describes every file's purpose and the grammar conventions
-
-*Design quality*
-- One meaningful declaration per chunk — don't bundle multiple independent declarations, don't fragment one declaration into pieces that can't stand alone
-- Declared dependency edges reflect the actual mathematical dependencies in the source
-- Every theorem, lemma, and definition in the source has a corresponding chunk
-- The IR grammar can faithfully capture quantifier structure, binding scope, proof step decomposition, named intermediate claims, and assumption types
-
-*Schema*
-- Chunks of type `theorem` or `lemma` have a `proof` field; chunks of other types do not
-- Every ID in any `dependencies` array exists as another chunk file in `language/chunks/`
-- No chunk has top-level `type` of `"statement"` or `"proof"` — these are only valid inside `sub_chunks` within a `proof` field
-
----
-
 ```
 cd language && git init && git add . && git commit -m "generation phase completed"
 ```
