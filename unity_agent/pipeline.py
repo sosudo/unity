@@ -331,7 +331,16 @@ def _toposort_chunks(language_dir: Path) -> None:
 
     dag = {"layers": layers, "chunks": dag_chunks}
     Path("dag.json").write_text(json.dumps(dag, indent=2))
-    logging.info(f"dag.json written: {len(chunks)} chunks across {len(layers)} layers.")
+    n_chunks = len(chunks)
+    n_layers = len(layers)
+    max_layer = max((len(layer) for layer in layers), default=0)
+    avg_layer = (n_chunks / n_layers) if n_layers else 0.0
+    logging.info(
+        f"dag.json written: {n_chunks} chunks across {n_layers} layers "
+        f"(max layer={max_layer}, avg layer={avg_layer:.2f}, "
+        f"parallelism={n_chunks}/{n_layers}≈{avg_layer:.2f}× theoretical). "
+        f"{'Layer-parallel formalization will deliver real speedup.' if max_layer >= 2 and avg_layer >= 1.5 else 'Chunks form a near-sequential chain; layer parallelism will deliver little speedup beyond worktree isolation.'}"
+    )
 
 
 def _create_worktree(chunk_id: str, project_path: Path) -> Path:
@@ -2082,10 +2091,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     _log_agent_message(message)
 
                 logging.info("Semiformalization phase completed successfully!")
-                try:
-                    _assert_semiformal_field_propagation(Path.cwd())
-                except Exception as _drift_err:
-                    logging.error(f"ERROR (semiformal field drift check): {_drift_err}")
+                _drifts = _assert_semiformal_field_propagation(Path.cwd())
+                if _drifts:
+                    raise FileNotFoundError(
+                        f"contract breach: {len(_drifts)} semiformal field drift(s) after "
+                        f"semiformalization phase; see SEMIFORMAL_FIELD_DRIFT.md. "
+                        f"Routing through resolver for fresh-session retry."
+                    )
                 _commit_phase("semiformalization")
                 _phase_succeeded("semiformalization")
                 break
@@ -2579,10 +2591,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     _log_agent_message(message)
 
                 logging.info("Semiformalization phase completed successfully!")
-                try:
-                    _assert_semiformal_field_propagation(Path.cwd())
-                except Exception as _drift_err:
-                    logging.error(f"ERROR (semiformal field drift check): {_drift_err}")
+                _drifts = _assert_semiformal_field_propagation(Path.cwd())
+                if _drifts:
+                    raise FileNotFoundError(
+                        f"contract breach: {len(_drifts)} semiformal field drift(s) after "
+                        f"semiformalization phase; see SEMIFORMAL_FIELD_DRIFT.md. "
+                        f"Routing through resolver for fresh-session retry."
+                    )
                 _commit_phase("semiformalization")
                 _phase_succeeded("semiformalization")
                 break
@@ -2626,10 +2641,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     _log_agent_message(message)
 
                 logging.info("Semiformalization phase completed successfully!")
-                try:
-                    _assert_semiformal_field_propagation(Path.cwd())
-                except Exception as _drift_err:
-                    logging.error(f"ERROR (semiformal field drift check): {_drift_err}")
+                _drifts = _assert_semiformal_field_propagation(Path.cwd())
+                if _drifts:
+                    raise FileNotFoundError(
+                        f"contract breach: {len(_drifts)} semiformal field drift(s) after "
+                        f"semiformalization phase; see SEMIFORMAL_FIELD_DRIFT.md. "
+                        f"Routing through resolver for fresh-session retry."
+                    )
                 _commit_phase("semiformalization")
                 _phase_succeeded("semiformalization")
                 break
@@ -2673,10 +2691,13 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     _log_agent_message(message)
 
                 logging.info("Semiformalization phase completed successfully!")
-                try:
-                    _assert_semiformal_field_propagation(Path.cwd())
-                except Exception as _drift_err:
-                    logging.error(f"ERROR (semiformal field drift check): {_drift_err}")
+                _drifts = _assert_semiformal_field_propagation(Path.cwd())
+                if _drifts:
+                    raise FileNotFoundError(
+                        f"contract breach: {len(_drifts)} semiformal field drift(s) after "
+                        f"semiformalization phase; see SEMIFORMAL_FIELD_DRIFT.md. "
+                        f"Routing through resolver for fresh-session retry."
+                    )
                 _commit_phase("semiformalization")
                 _phase_succeeded("semiformalization")
                 break
