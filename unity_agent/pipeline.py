@@ -11,6 +11,7 @@ import time
 import json
 import logging
 import subprocess
+from string import Template
 from pathlib import Path
 
 from rich.console import Console
@@ -1346,7 +1347,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
     if depth > 0:
         child_depth = depth - 1
         with open(_SUBAGENTS_DIR / "RECURSIVE/UNITY.md") as f:
-            recursive_prompt = f.read().format(depth=depth, child_depth=child_depth)
+            recursive_prompt = Template(f.read()).safe_substitute(depth=depth, child_depth=child_depth)
         LIBRARY_SUBAGENTS["recursive-unity"] = AgentDefinition(
             description=f"Spawns a child unity pipeline run for a self-contained subtask too large or complex for a single-context pass. Child runs at --depth {child_depth}.",
             prompt=recursive_prompt,
@@ -1355,18 +1356,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info(f"Recursive unity subagent registered (child depth: {child_depth})")
 
     def with_library(prompt: str) -> str:
-        """Append library context and tool-naming reminder to a prompt."""
-        tool_note = (
-            "\n\n---\n\n"
-            "**Tool naming:** MCP forum tools are named with a HYPHEN: "
-            "`mcp__unity-forum__forum_post`, `mcp__unity-forum__forum_create_thread`, etc. "
-            "Not `mcp__unity_forum__*` (underscore) and not bare `forum_post` via Skill. "
-            "Any other spelling will silently no-op."
-        )
-        out = prompt + tool_note
+        """Append the library context manifest to a prompt (if any libraries seeded)."""
         if library_context:
-            out = out + "\n\n---\n\n" + library_context
-        return out
+            return prompt + "\n\n---\n\n" + library_context
+        return prompt
 
     # Resolver infrastructure
     _retries: dict[str, int] = {}
@@ -2060,7 +2053,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             # Formalization phase (always T variant: existing project always present)
             _console.rule("[bold blue]Formalization Phase[/bold blue]")
             _assert_lsp_alive("formalization")
-            worktree_assignments: dict[str, str] = {}
+            worktree_assignments = {}
             while True:
                 for cid, wt in list(worktree_assignments.items()):
                     try:
@@ -2223,7 +2216,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             _assert_lsp_alive("retrospective")
             try:
                 with open(PROMPTS_DIR / "RETROSPECTIVE.md", "r") as f:
-                    RETROSPECTIVE_PROMPT = with_library(f.read().format(
+                    RETROSPECTIVE_PROMPT = with_library(Template(f.read()).safe_substitute(
                         SOURCE_PATH="(no source — proof completion mode)",
                         LIBRARY_DIR=str(_get_library_dir()),
                         PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
@@ -2321,7 +2314,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         _assert_lsp_alive("source scan")
         while True:
             try:
-                with open(_PROMPTS_DIR / "SOURCE_SCAN.md", "r") as f:
+                _scan_path = ACTIVE_PROMPTS_DIR / "SOURCE_SCAN.md"
+                if not _scan_path.exists():
+                    _scan_path = PROMPTS_DIR / "SOURCE_SCAN.md"  # teams omits SOURCE_SCAN; PROVE has no source-scan customization
+                if not _scan_path.exists():
+                    _scan_path = _PROMPTS_DIR / "SOURCE_SCAN.md"
+                with open(_scan_path, "r") as f:
                     SOURCE_SCAN_PROMPT = with_library(f.read())
                 with open(_SUBAGENTS_DIR / "SOURCE_SCAN/SCANNER.md", "r") as f:
                     SCANNER_SUBAGENT = f.read()
@@ -2889,7 +2887,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
         _assert_lsp_alive("formalization")
         if not context and iteration == 0:
-            worktree_assignments: dict[str, str] = {}
+            worktree_assignments = {}
             while True:
                 for cid, wt in list(worktree_assignments.items()):
                     try:
@@ -2989,7 +2987,7 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     _delete_worktrees_manifest()
                     await _invoke_resolver("formalization", e)
         elif context or iteration > 0:
-            worktree_assignments: dict[str, str] = {}
+            worktree_assignments = {}
             while True:
                 for cid, wt in list(worktree_assignments.items()):
                     try:
@@ -3222,8 +3220,8 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         _assert_lsp_alive("retrospective")
         try:
             with open(PROMPTS_DIR / "RETROSPECTIVE.md", "r") as f:
-                RETROSPECTIVE_PROMPT = with_library(f.read().format(
-                    SOURCE_PATH=source,
+                RETROSPECTIVE_PROMPT = with_library(Template(f.read()).safe_substitute(
+                    SOURCE_PATH=str(source),
                     LIBRARY_DIR=str(_get_library_dir()),
                     PROJECT_NOTES_DIR=str(_get_project_notes_dir()),
                     SUBAGENTS_DIR=str(_SUBAGENTS_DIR),

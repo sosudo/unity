@@ -8,8 +8,8 @@ You are the Recursive Unity subagent. The parent agent has decided a subtask war
 
 ## Parameters injected at load time
 
-- **Current depth:** {depth}
-- **Maximum child depth:** {child_depth} — always pass `--depth {child_depth}` to child runs
+- **Current depth:** $depth
+- **Maximum child depth:** $child_depth — always pass `--depth $child_depth` to child runs
 
 ## Steps
 
@@ -33,12 +33,12 @@ Create it if needed (unity will also create it via `--output-dir`).
 
 ```bash
 unity [--source <file>] [--project <dir>] [--prove] [--context] \
-      --depth {child_depth} --output-dir <chosen-dir>
+      --depth $child_depth --output-dir <chosen-dir>
 ```
 
-Always include `--depth {child_depth}`. Always include `--output-dir`.
+Always include `--depth $child_depth`. Always include `--output-dir`.
 
-If `{child_depth}` is 0, the child runs without further recursive capability — that is expected and fine.
+If `$child_depth` is 0, the child runs without further recursive capability — that is expected and fine.
 
 **4. Read results**
 
@@ -59,7 +59,7 @@ If the child run failed, report the error and suggest alternatives (fall back to
 
 ## Notes
 
-- Do not pass `--depth` higher than `{child_depth}`
+- Do not pass `--depth` higher than `$child_depth`
 - Each child run is a fully independent process with its own context window — it will not see the parent's in-memory state
 - The child writes all artifacts under `--output-dir`; the parent reads from there
 

@@ -110,7 +110,8 @@ def run_setup(output_path: str = ".env"):
     env_vars["FORMALIZATION_BUDGET"] = prompt_with_default("Formalization phase budget", "15.0")
     env_vars["CRITIC_BUDGET"] = prompt_with_default("Critic phase budget", "5.0")
     env_vars["VALIDATION_BUDGET"] = prompt_with_default("Validation phase budget", "5.0")
-    
+    env_vars["SECONDARY_BUDGET"] = prompt_with_default("Secondary tier (escalation) cumulative budget", "125")
+
     # Iteration / Retry Limits
     print("\n─── Iteration / Retry Limits ───\n")
 
@@ -122,6 +123,15 @@ def run_setup(output_path: str = ".env"):
     print("\n─── Server Configuration ───\n")
 
     env_vars["FORUM_PORT"] = prompt_with_default("Forum port", os.getenv("FORUM_PORT", "6367"))
+    env_vars["LEAN_LSP_PORT"] = prompt_with_default("Lean LSP MCP port", os.getenv("LEAN_LSP_PORT", "6368"))
+
+    # Advanced (press enter to accept defaults)
+    print("\n─── Advanced (press enter to accept defaults) ───\n")
+
+    env_vars["SDK_MESSAGE_IDLE_TIMEOUT"] = prompt_with_default("SDK message idle timeout (seconds)", "600")
+    env_vars["MAX_LSP_RESTARTS_BEFORE_DEGRADE"] = prompt_with_default(
+        "Max lean-lsp restarts before disabling LSP for the run", "2"
+    )
 
     # Experimental Features
     print("\n─── Experimental Features ───\n")
@@ -161,7 +171,7 @@ def run_setup(output_path: str = ".env"):
         f.write("\n# Budget Configuration (USD)\n")
         for key in ["GENERATION_BUDGET", "SEMIFORMALIZATION_BUDGET", "EXPLORATION_BUDGET",
                     "SOURCE_SCAN_BUDGET", "FORMALIZATION_BUDGET",
-                    "CRITIC_BUDGET", "VALIDATION_BUDGET"]:
+                    "CRITIC_BUDGET", "VALIDATION_BUDGET", "SECONDARY_BUDGET"]:
             f.write(f"{key}={env_vars[key]}\n")
 
         f.write("\n# Iteration / Retry Limits\n")
@@ -173,6 +183,11 @@ def run_setup(output_path: str = ".env"):
 
         f.write("\n# Server Configuration\n")
         f.write(f"FORUM_PORT={env_vars['FORUM_PORT']}\n")
+        f.write(f"LEAN_LSP_PORT={env_vars['LEAN_LSP_PORT']}\n")
+
+        f.write("\n# Advanced\n")
+        f.write(f"SDK_MESSAGE_IDLE_TIMEOUT={env_vars['SDK_MESSAGE_IDLE_TIMEOUT']}\n")
+        f.write(f"MAX_LSP_RESTARTS_BEFORE_DEGRADE={env_vars['MAX_LSP_RESTARTS_BEFORE_DEGRADE']}\n")
 
         f.write("\n# Experimental Features\n")
         if env_vars.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"):
