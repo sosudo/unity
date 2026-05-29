@@ -1,3 +1,3 @@
 """Unity Agent - Autoformalization pipeline for Lean theorem proving."""
 
-__version__ = "0.3.14"
+__version__ = "0.4.0"
