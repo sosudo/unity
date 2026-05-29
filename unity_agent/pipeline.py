@@ -1547,16 +1547,27 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
             unity_run_dir = Path.cwd()
             source_line = f"SOURCE_PATH: {source_label}\n" if source_label else ""
+            # Path 3 fallback: when semiformal chunk metadata is absent the candidates are
+            # .lean file paths (relative to project_path), not semiformal-chunk IDs.
+            semiformal_dir = unity_run_dir / "semiformal"
+            sourceless_fallback = not semiformal_dir.exists()
+            mode_line = (
+                "MODE: source-less proof completion (Path 3 fallback) — semiformal/ is "
+                "absent and each CANDIDATE_CHUNKS entry is a `.lean` file path relative to "
+                "PROJECT_PATH; read the file directly to find the sorry(s).\n"
+                if sourceless_fallback
+                else "MODE: chunk escalation — read the semiformal translation at "
+                f"{unity_run_dir}/semiformal/chunks/<id>.json for each candidate.\n"
+            )
             escalation_prompt = (
-                f"Escalation pass (iteration {iteration}, tier {tier}).\n\n"
+                f"Escalation pass (iteration {iteration}).\n\n"
                 f"UNITY_RUN_DIR: {unity_run_dir}\n"
                 f"PROJECT_PATH: {project_path}\n"
                 f"{source_line}"
                 f"WORKTREES_MANIFEST: {unity_run_dir}/worktrees.json\n"
-                f"CANDIDATE_CHUNKS: {candidates}\n\n"
-                f"Resolve the sorries in each candidate chunk using the source material "
-                f"(read from SOURCE_PATH if provided) and the semiformal translation at "
-                f"{unity_run_dir}/semiformal/chunks/<id>.json. Each candidate has a pre-created "
+                f"CANDIDATE_CHUNKS: {candidates}\n"
+                f"{mode_line}\n"
+                f"Resolve the sorries in each candidate. Each candidate has a pre-created "
                 f"worktree — read WORKTREES_MANIFEST for its worktree_path and branch, cd to "
                 f"the worktree, produce the proof, commit inside the worktree, then merge "
                 f"--squash into {_main_branch} from PROJECT_PATH with commit message "

@@ -19,6 +19,8 @@ For each candidate chunk, read before attempting any edit:
 
 If a `blueprint/` directory or `blueprint.xml` is present in the project root, consult it for the intended dependency structure and proof sketches.
 
+**Source-less proof completion (Path 3 fallback).** If `semiformal/`, `language/`, and `dag.json` are absent at the unity run dir, you are escalating without source material — the candidate "chunk IDs" in your spawn prompt are file paths relative to `<project_path>` rather than semiformal-chunk IDs, and no `semiformal/chunks/<id>.json` exists. For each such candidate, read the `.lean` file at `<project_path>/<id>` directly to locate the `sorry`(s). There is no `source_proof` to transcribe, so per `Mode: PROVE` any proof strategy that closes the goal is acceptable. Skip references to `semiformal/`, `language/`, `dag.json`, `gathered/`, and `source_proof` for these candidates; the worktree workflow, the `UNITY: merge chunk <id>` commit convention, the closing gate, and forum coordination are unchanged.
+
 **Paths** (consistent across this phase):
 - Your working directory is the **unity run dir** — where `dag.json`, `worktrees.json`, `semiformal/`, `language/`, `gathered/`, and `forum/` live. It is **outside** the Lean project.
 - `<project_path>` is the Lean repository (a subdirectory of — or sibling to — the unity run dir). `cd <project_path>` before running `git merge` or `lake build`.
