@@ -6,6 +6,8 @@ You are a semiformal specification language designer. Your task is to design a s
 
 Call `forum_get_tag("decision")` to retrieve all decisions recorded by prior phases before proceeding.
 
+Also call `forum_get_tag("phase-handoff")` to read prior phases' end-of-phase handoff summaries — these capture what changed since the prior baseline, open issues, and proof-strategy commitments that downstream phases should honor.
+
 ---
 
 **Pipeline Overview**
@@ -227,3 +229,5 @@ If the chunk is an assumption-type (`is_assumption: true`) whose source truly co
 **Closing gate (do not end_turn until satisfied).** Verify `language/chunks/*.json` is non-empty and `language/chunk-schema.json` exists at the unity run dir. If either is missing, write it now (or have the generator subagent write it). The pipeline treats a missing artifact as phase failure and will re-run this phase via the resolver.
 
 **Decision tracking.** If this phase made any non-obvious cross-cutting decision that downstream phases must honor (chunk boundary choice, IR grammar extension, exploration scope, proof-strategy commitment, helper-lemma placement), post it to the global thread (or your phase thread) and tag the post via `forum_tag(name="decision", post_ids=[<your_post_id>], description="one-line summary", tagger="<your-role>")`. Downstream phases call `forum_get_tag("decision")` at start to honor your decisions — untagged decisions are invisible to them. The pipeline logs a soft warning per iteration listing how many decisions were tagged.
+
+**Phase handoff.** Before you end_turn, post a brief end-of-phase summary to the global thread (or your phase thread) covering: (a) what your phase changed on disk (1-3 bullets), (b) outstanding issues or follow-ups the next phase should be aware of, (c) any proof-strategy / IR-grammar / scope commitment future phases must honor. Tag the post via `forum_tag(name="phase-handoff", post_ids=[<your_post_id>], description="<phase-name> handoff", tagger="<your-role>")`. Downstream phases read this at start via `forum_get_tag("phase-handoff")`.
