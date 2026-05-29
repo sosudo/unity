@@ -5,6 +5,15 @@ forum/<thread_id>.json. Config (dimensions, tags) lives in forum/config.json.
 
 Run via:
     python -m unity_agent.forum_mcp --forum-dir <path>
+
+SECURITY MODEL: This server has no authentication. Any client can post as any
+author, vote with any voter, redact/archive any post, and propose/approve any
+dimension. It is designed for a single trusted Unity pipeline session; do not
+expose the port to untrusted clients.
+
+PERSISTENCE: Threads are written to <forum-dir>/*.json and persist until the
+unity run dir is cleaned up. There is no automatic pruning. For multi-run
+setups, use a separate --forum-dir per run or archive each run's forum/.
 """
 
 import argparse
@@ -22,8 +31,12 @@ from fastmcp import FastMCP
 mcp = FastMCP("unity-forum")
 FORUM_DIR: Path = Path("forum")
 
-_MENTION_RE = re.compile(r'@([\w][\w-]*)')
+# @-mentions must be preceded by start-of-string or whitespace, so Lean code
+# snippets like `@MeasureTheory.foo` inside post bodies do NOT register as
+# mentions and pollute the ICRL ledger.
+_MENTION_RE = re.compile(r'(?:^|\s)@([a-zA-Z][\w-]*)')
 _DIM_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+_POST_ID_RE = re.compile(r'^[a-f0-9]{8}$')
 
 DEFAULT_DIMENSIONS = [
     "correctness",
@@ -35,6 +48,11 @@ DEFAULT_DIMENSIONS = [
 ]
 DIMENSION_APPROVAL_THRESHOLD = 3   # net upvotes on a proposal post to auto-approve
 DIMENSIONS_THREAD = "_dimensions"
+
+# Hot-score time term: signed log10(net_score) + timestamp / HOT_TIME_SCALE.
+# 45000s = 12.5h means for short-lived pipeline forums, time dominates and
+# "hot" ≈ "new"; for longer-lived forums, accumulated votes start to matter.
+HOT_TIME_SCALE = 45000
 
 
 # ── Locking ───────────────────────────────────────────────────────────────────
@@ -205,9 +223,10 @@ def _net_score(post: dict) -> int:
 
 
 def _hot(post: dict) -> float:
+    """Hot score: signed log10(|score|) + timestamp / HOT_TIME_SCALE."""
     score = _net_score(post)
     sign = 1 if score > 0 else (-1 if score < 0 else 0)
-    return math.log10(max(abs(score), 1)) * sign + post["timestamp"] / 45000
+    return math.log10(max(abs(score), 1)) * sign + post["timestamp"] / HOT_TIME_SCALE
 
 
 def _sorted_posts(posts: list[dict], sort: str) -> list[dict]:
@@ -279,8 +298,14 @@ def forum_post(
     Returns the new post's metadata including icrl_balance and any pending
     icrl_notifications (vote feedback and @mention alerts since your last post).
     """
+    if not author or not author.strip():
+        raise ValueError("author must be a non-empty string")
+    reply_to = reply_to or []
+    bad = [pid for pid in reply_to if not _POST_ID_RE.match(pid)]
+    if bad:
+        raise ValueError(f"reply_to must contain 8-char lowercase hex post_ids; got {bad}")
     with _thread_lock(thread_id):
-        return _forum_post_locked(thread_id, author, content, reply_to or [])
+        return _forum_post_locked(thread_id, author, content, reply_to)
 
 
 def _forum_post_locked(thread_id: str, author: str, content: str, reply_to: list[str]) -> dict:
@@ -337,6 +362,10 @@ def forum_vote(
     """
     if vote not in ("up", "down", "remove"):
         raise ValueError("vote must be 'up', 'down', or 'remove'")
+    if not voter or not voter.strip():
+        raise ValueError("voter must be a non-empty string")
+    if not _POST_ID_RE.match(post_id):
+        raise ValueError(f"post_id must be 8-char lowercase hex; got '{post_id}'")
     active = _active_dimensions()
     if active:
         if dimension is None:
@@ -468,18 +497,29 @@ def forum_read(thread_id: str, sort: str = "hot") -> dict:
 
 
 @mcp.tool()
-def forum_check_balance(author: str) -> dict:
-    """Check your ICRL balance and full trajectory."""
+def forum_check_balance(author: str, drain: bool = True) -> dict:
+    """Check your ICRL balance and full trajectory.
+
+    By default, pending notifications are drained when returned (read-once
+    semantics). Pass drain=False to peek without consuming — useful for
+    a watchdog or read-only audit that should not affect agent state.
+    """
+    if not author or not author.strip():
+        raise ValueError("author must be a non-empty string")
     balances = _load_balances()
     if author not in balances:
-        return {"author": author, "balance": 0.0, "history": [], "notifications": []}
+        return {"author": author, "balance": 0.0, "history": [], "pending_notifications": []}
     rec = balances[author]
-    return {
+    result = {
         "author": author,
         "balance": rec["balance"],
         "history": rec["history"],
-        "pending_notifications": rec.get("notifications", []),
+        "pending_notifications": list(rec.get("notifications", [])),
     }
+    if drain and result["pending_notifications"]:
+        rec["notifications"] = []
+        _save_balances(balances)
+    return result
 
 
 @mcp.tool()
@@ -533,23 +573,51 @@ def forum_list() -> dict:
 # ── Dimension management ───────────────────────────────────────────────────────
 
 @mcp.tool()
-def forum_set_dimensions(dimensions: list[str]) -> dict:
+def forum_set_dimensions(dimensions: list[str], allow_orphan: bool = False) -> dict:
     """Set the canonical vote dimensions for this run (call once at pipeline start).
 
     Each dimension name must be lowercase alphanumeric with underscores (e.g. 'correctness').
     If not called, the default set is used: correctness, faithfulness, style_alignment,
     priority, confidence, feasibility.
 
-    This replaces any previously active dimensions.
+    This replaces any previously active dimensions. If a previously-active
+    dimension has cast votes and is not in the new list, the call is rejected
+    unless allow_orphan=True. Orphaned dimensions stay in old posts' vote
+    histories but new votes use only the new active set.
     """
     for d in dimensions:
         if not _DIM_NAME_RE.match(d):
             raise ValueError(f"Invalid dimension name '{d}'. Use lowercase letters, digits, underscores.")
     with _config_lock():
         config = _load_config()
+        prev = set(config["dimensions"]["active"])
+        new = set(dimensions)
+        removed = prev - new
+        if removed and not allow_orphan:
+            orphaned = [d for d in removed if _dimension_has_votes(d)]
+            if orphaned:
+                raise ValueError(
+                    f"Dimensions {orphaned} have cast votes; pass allow_orphan=True to override."
+                )
         config["dimensions"]["active"] = list(dimensions)
         _save_config(config)
     return {"active_dimensions": dimensions}
+
+
+def _dimension_has_votes(dim: str) -> bool:
+    """True if any post anywhere has a non-empty vote tally for `dim`."""
+    for path in FORUM_DIR.glob("*.json"):
+        if path.name in ("balances.json", "config.json"):
+            continue
+        try:
+            data = json.loads(path.read_text())
+        except Exception:
+            continue
+        for post in data.get("posts", []):
+            bucket = post.get("votes_by_dimension", {}).get(dim)
+            if bucket and (bucket.get("up", 0) > 0 or bucket.get("down", 0) > 0):
+                return True
+    return False
 
 
 @mcp.tool()
@@ -564,26 +632,32 @@ def forum_propose_dimension(name: str, description: str, proposed_by: str) -> di
     """.format(threshold=DIMENSION_APPROVAL_THRESHOLD)
     if not _DIM_NAME_RE.match(name):
         raise ValueError(f"Invalid dimension name '{name}'. Use lowercase letters, digits, underscores.")
+    if not proposed_by or not proposed_by.strip():
+        raise ValueError("proposed_by must be a non-empty string")
 
-    with _config_lock():
-        config = _load_config()
-        if name in config["dimensions"]["active"]:
-            return {"status": "already_active", "name": name}
-        if name in config["dimensions"]["pending"]:
-            return {"status": "already_pending", "name": name}
+    # Ensure the _dimensions thread exists before taking any lock. Idempotent;
+    # a concurrent racer either finds the file already there (skip) or both
+    # write equivalent content. `_save` does a single write so torn reads on
+    # the subsequent _forum_post_locked are impossible.
+    if not _thread_path(DIMENSIONS_THREAD).exists():
+        _save({
+            "thread_id": DIMENSIONS_THREAD,
+            "title": "Dimension Proposals",
+            "description": "Propose and vote on new vote dimensions. A proposal auto-activates at net +3.",
+            "created_at": int(time.time()),
+            "posts": [],
+        })
 
-        # Ensure _dimensions thread exists
-        if not _thread_path(DIMENSIONS_THREAD).exists():
-            _save({
-                "thread_id": DIMENSIONS_THREAD,
-                "title": "Dimension Proposals",
-                "description": "Propose and vote on new vote dimensions. A proposal auto-activates at net +3.",
-                "created_at": int(time.time()),
-                "posts": [],
-            })
+    # Lock order: thread → config. Matches forum_vote's order so the two
+    # operations cannot deadlock on the _dimensions thread.
+    with _thread_lock(DIMENSIONS_THREAD):
+        with _config_lock():
+            config = _load_config()
+            if name in config["dimensions"]["active"]:
+                return {"status": "already_active", "name": name}
+            if name in config["dimensions"]["pending"]:
+                return {"status": "already_pending", "name": name}
 
-        # Post the proposal
-        with _thread_lock(DIMENSIONS_THREAD):
             proposal_post = _forum_post_locked(
                 DIMENSIONS_THREAD,
                 proposed_by,
@@ -592,14 +666,14 @@ def forum_propose_dimension(name: str, description: str, proposed_by: str) -> di
                 [],
             )
 
-        proposal_post_id = proposal_post["post_id"]
-        config["dimensions"]["pending"][name] = {
-            "description": description,
-            "proposed_by": proposed_by,
-            "proposal_post_id": proposal_post_id,
-            "timestamp": int(time.time()),
-        }
-        _save_config(config)
+            proposal_post_id = proposal_post["post_id"]
+            config["dimensions"]["pending"][name] = {
+                "description": description,
+                "proposed_by": proposed_by,
+                "proposal_post_id": proposal_post_id,
+                "timestamp": int(time.time()),
+            }
+            _save_config(config)
 
     # Notify all known agents
     _notify_all(
@@ -656,6 +730,11 @@ def forum_tag(
     """
     if not re.match(r'^[\w-]+$', name):
         raise ValueError("Tag name may only contain letters, digits, hyphens, and underscores.")
+    if not tagger or not tagger.strip():
+        raise ValueError("tagger must be a non-empty string")
+    invalid = [pid for pid in post_ids if not _POST_ID_RE.match(pid)]
+    if invalid:
+        raise ValueError(f"post_ids must be 8-char lowercase hex; got invalid: {invalid}")
     with _config_lock():
         config = _load_config()
         tags = config.setdefault("tags", {})
@@ -689,22 +768,34 @@ def forum_tag(
 
 
 def _stamp_tag_on_post(post_id: str, tag_name: str) -> None:
-    """Add tag_name to the post's tags list in its thread file."""
+    """Add tag_name to the post's tags list in its thread file.
+
+    Two-phase: (1) cheap out-of-lock scan to locate the owning thread,
+    (2) re-read under the per-thread lock before mutating, so concurrent
+    forum_post writes between scan and mutation aren't clobbered.
+    """
     for path in FORUM_DIR.glob("*.json"):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
-            data = json.loads(path.read_text())
+            preview = json.loads(path.read_text())
+        except Exception:
+            continue
+        if not any(p["post_id"] == post_id for p in preview.get("posts", [])):
+            continue
+        thread_id = preview["thread_id"]
+        with _thread_lock(thread_id):
+            try:
+                data = json.loads(path.read_text())  # re-read inside the lock
+            except Exception:
+                return
             for post in data["posts"]:
                 if post["post_id"] == post_id:
                     tags = post.setdefault("tags", [])
                     if tag_name not in tags:
                         tags.append(tag_name)
-                        with _thread_lock(data["thread_id"]):
-                            path.write_text(json.dumps(data, indent=2))
+                        path.write_text(json.dumps(data, indent=2))
                     return
-        except Exception:
-            continue
 
 
 @mcp.tool()
