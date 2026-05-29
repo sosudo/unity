@@ -107,3 +107,7 @@ Never scan, traverse, or glob outside these roots. On shared/NFS filesystems, wi
 - If a helper lemma is needed, add it adjacent to the declaration it supports with a comment `-- [<strategy-id> helper]` above it.
 - Do not invent new strategies on the fly during the merge step — that's the next iteration's job (or a new agent team during step 6).
 - Worktrees persist across iterations; on iteration > 0, read `worktrees.json` and reuse existing worktrees rather than re-creating.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify that for every strategy worktree you created, either a winning proof was merged into the main branch (via `UNITY: merge chunk <strategy>`), or a forum post on the strategy thread records why the strategy failed. Dirty worktrees with neither a merge nor a forum explanation will be flagged as lost work.

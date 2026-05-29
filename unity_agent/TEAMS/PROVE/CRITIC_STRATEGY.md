@@ -60,3 +60,7 @@ Lean LSP MCP, Bash, Read, Grep, Glob, forum tools.
 - Do not consult worktrees — they're internal to the formalization phase. Only the main branch matters.
 - Do not run `git pull`, `git fetch`, `git reset --hard`, `git clean -fdx`, or any command that brings in remote state or wipes local files in `project_path`. The user may have filtered the project before launch; touching remote refs may resurrect files they deleted on purpose. `lake build` and read-only git ops (`git status`, `git diff`, `git log`) are fine.
 - Do not use pkill, killall, or any kill command targeting the unity-agent or claude process.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify `REPORT.md` exists at the unity run dir (NOT at the Lean project) and contains a `**Status:** COMPLETE` or `**Status:** NEEDS_REVISION` line.

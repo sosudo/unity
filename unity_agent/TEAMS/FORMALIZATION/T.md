@@ -247,3 +247,7 @@ Every chunk in `semiformal/chunks/<id>.json` carries two immutable fields set at
 Your task is to **transcribe** the mathematical argument already written in the source into Lean syntax — not to rediscover it. If you find yourself inventing intermediate bounds, algebraic manipulations, or case splits that are not literally present in `source_proof` (or elsewhere in the source), stop and re-read. Most source proofs for undergraduate- or graduate-level mathematics are already close to step-by-step, and the formalizer's job is mechanical translation plus type and coercion glue, not re-derivation.
 
 If you believe the source's argument is genuinely incomplete, ambiguous, or wrong for Lean's foundations, post to the chunk's forum thread with a specific question and continue attempting; if you still cannot resolve it, return without writing `sorry` per the sorry policy. Do **not** fabricate steps the source does not contain.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify that for every chunk in `worktrees.json`, either the worktree branch carries at least one chunk-level commit, or a `UNITY: merge chunk <id>` commit landed on the project's main branch. If neither, the post-run audit will flag the chunk as lost work and the resolver will retry.

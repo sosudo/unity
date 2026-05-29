@@ -215,3 +215,7 @@ Every chunk written to `language/chunks/<id>.json` must include two additional f
 If the chunk is an assumption-type (`is_assumption: true`) whose source truly contains no proof text (e.g. a pure blackbox citation), set `source_proof` to the exact cited text if any, or `""` if literally none exists — but always set `source_range` to the line range of the citation.
 
 **You may not change `source_range` or `source_proof` for any chunk once written.** These fields are immutable from generation onward, same rule as `is_assumption`. Downstream phases read them but must never rewrite them. A mismatch between `source_proof` and the verbatim content of `source_range` in the raw source file is a misalignment incident and will be detected.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify `language/chunks/*.json` is non-empty and `language/chunk-schema.json` exists at the unity run dir. If either is missing, write it now (or have the generator subagent write it). The pipeline treats a missing artifact as phase failure and will re-run this phase via the resolver.

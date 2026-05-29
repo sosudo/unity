@@ -124,3 +124,7 @@ For every chunk in `language/chunks/`, verify:
 - The content of `source_proof` matches the raw source file exactly between `start_line` and `end_line` inclusive (trailing-newline differences are tolerated; any other divergence is a mismatch).
 
 Any missing field, wrong type, out-of-range line number, or content mismatch is a validation failure. Record it in `VALIDATION_REPORT.md` so generation can re-emit the chunks.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify `VALIDATION_REPORT.md` exists at the unity run dir and contains a `**Status:** VALID` or `**Status:** INVALID` line. If missing, write it now per the spec above.

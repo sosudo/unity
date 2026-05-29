@@ -159,3 +159,7 @@ Never scan, traverse, or glob outside these roots. On shared/NFS filesystems, wi
 A forbidden scan is a pipeline stall, not a minor inefficiency. Stay inside your roots.
 
 **IMPORTANT: Do not use `pkill`, `killall`, or any kill command targeting the unity-agent or claude process. Do not attempt to kill the pipeline or any parent process.**
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify that for every chunk in `worktrees.json`, either the worktree branch carries at least one chunk-level commit, or a `UNITY: merge chunk <id>` commit landed on the project's main branch. If neither, the post-run audit will flag the chunk as lost work and the resolver will retry.

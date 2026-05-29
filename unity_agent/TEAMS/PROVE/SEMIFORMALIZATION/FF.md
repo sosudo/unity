@@ -112,3 +112,7 @@ Every chunk in `semiformal/chunks/<id>.json` must include the `is_assumption: bo
 **`source_range` and `source_proof` carry-through (mandatory, immutable)**
 
 Every chunk in `semiformal/chunks/<id>.json` must include the `source_range` and `source_proof` fields copied unchanged from `language/chunks/<id>.json`. **You may not modify either field for any chunk ever.** These fields, like `is_assumption`, are immutable from generation onward. A mismatch between `source_proof` and the raw source file content, or a divergence from the generation-phase values, is a misalignment incident and will be detected.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify that for every `language/chunks/<id>.json`, a matching `semiformal/chunks/<id>.json` exists at the unity run dir with `is_assumption`, `source_range`, and `source_proof` propagated verbatim from the language chunk. The pipeline runs a field-propagation audit; missing or drifted fields are surfaced as errors.

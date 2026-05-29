@@ -85,3 +85,7 @@ Never scan, traverse, or glob outside these roots. On shared/NFS filesystems, wi
 3. Fail loudly with a clear error message and return. The orchestrator will re-dispatch you with better context.
 
 A forbidden scan is a pipeline stall, not a minor inefficiency. There is no "it probably finishes quickly on this machine." Assume NFS. Stay inside your roots.
+
+---
+
+**Closing gate (do not end_turn until satisfied).** Verify `mathlib-context.md` exists at the unity run dir and is non-empty. If it doesn't, write it now.

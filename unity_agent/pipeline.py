@@ -1863,12 +1863,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     logging.info("Generation phase completed successfully!")
                     _chunks_dir = Path("language") / "chunks"
                     if not _chunks_dir.exists() or not any(_chunks_dir.glob("*.json")):
-                        logging.warning("[generation] contract breach: language/chunks/ is empty — one-shot repair")
-                        async for message in _query_with_idle_timeout(
-                            prompt="You completed the generation phase but language/chunks/ is empty. Write the chunk JSON files now per language/chunk-schema.json. Reminder: JSON strings containing LaTeX must escape every backslash — write \\\\mathbb not \\mathbb, \\\\forall not \\forall.",
-                            options=_gen_opts,
-                        ):
-                            _log_agent_message(message)
+                        raise FileNotFoundError(
+                            "contract breach: language/chunks/ is empty after generation phase ended; "
+                            "routing through resolver for fresh-session retry"
+                        )
                     _commit_phase("generation")
                     break
                 except Exception as e:
@@ -1905,12 +1903,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                     logging.info("Validation phase completed successfully!")
                     if not Path("VALIDATION_REPORT.md").exists():
-                        logging.warning("[validation] contract breach: VALIDATION_REPORT.md missing — one-shot repair")
-                        async for message in _query_with_idle_timeout(
-                            prompt="You completed the validation phase but VALIDATION_REPORT.md does not exist in the run directory. Write it now with per-check PASS/FAIL and an overall `**Status:** VALID` or `**Status:** INVALID` line.",
-                            options=_val_opts,
-                        ):
-                            _log_agent_message(message)
+                        raise FileNotFoundError(
+                            "contract breach: VALIDATION_REPORT.md missing after validation phase ended; "
+                            "routing through resolver for fresh-session retry"
+                        )
                     _commit_phase("validation")
                     break
                 except SystemExit:
@@ -2137,12 +2133,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                         _log_agent_message(message)
                     logging.info("Critic phase completed successfully!")
                     if not Path("REPORT.md").exists():
-                        logging.warning("[critic] contract breach: REPORT.md missing — one-shot repair")
-                        async for message in _query_with_idle_timeout(
-                            prompt="You completed the critic phase but REPORT.md does not exist in the run directory. Write it now with per-chunk status and an overall status line (`**Status:** RESOLVED` or `**Status:** NEEDS_REVISION`).",
-                            options=_crit_opts,
-                        ):
-                            _log_agent_message(message)
+                        raise FileNotFoundError(
+                            "contract breach: REPORT.md missing after critic phase ended; "
+                            "routing through resolver for fresh-session retry"
+                        )
                     _commit_phase("critic", {"iteration": iteration})
                     break
                 except Exception as e:
@@ -2342,12 +2336,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 logging.info("Generation phase completed successfully!")
                 _chunks_dir = Path("language") / "chunks"
                 if not _chunks_dir.exists() or not any(_chunks_dir.glob("*.json")):
-                    logging.warning("[generation] contract breach: language/chunks/ is empty — one-shot repair")
-                    async for message in _query_with_idle_timeout(
-                        prompt="You completed the generation phase but language/chunks/ is empty. Write the chunk JSON files now per language/chunk-schema.json. Reminder: JSON strings containing LaTeX must escape every backslash — write \\\\mathbb not \\mathbb, \\\\forall not \\forall.",
-                        options=_gen_opts,
-                    ):
-                        _log_agent_message(message)
+                    raise FileNotFoundError(
+                        "contract breach: language/chunks/ is empty after generation phase ended; "
+                        "routing through resolver for fresh-session retry"
+                    )
                 _commit_phase("generation")
                 break
             except Exception as e:
@@ -2384,12 +2376,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                 logging.info("Validation phase completed successfully!")
                 if not Path("VALIDATION_REPORT.md").exists():
-                    logging.warning("[validation] contract breach: VALIDATION_REPORT.md missing — one-shot repair")
-                    async for message in _query_with_idle_timeout(
-                        prompt="You completed the validation phase but VALIDATION_REPORT.md does not exist in the run directory. Write it now with per-check PASS/FAIL and an overall `**Status:** VALID` or `**Status:** INVALID` line.",
-                        options=_val_opts,
-                    ):
-                        _log_agent_message(message)
+                    raise FileNotFoundError(
+                        "contract breach: VALIDATION_REPORT.md missing after validation phase ended; "
+                        "routing through resolver for fresh-session retry"
+                    )
                 _commit_phase("validation")
                 break
             except SystemExit:
@@ -3057,12 +3047,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                     logging.info("Critic phase completed successfully!")
                     if not Path("REPORT.md").exists():
-                        logging.warning("[critic] contract breach: REPORT.md missing — one-shot repair")
-                        async for message in _query_with_idle_timeout(
-                            prompt="You completed the critic phase but REPORT.md does not exist in the run directory. Write it now with per-chunk status and an overall status line (`**Status:** RESOLVED` or `**Status:** NEEDS_REVISION`).",
-                            options=_crit_opts,
-                        ):
-                            _log_agent_message(message)
+                        raise FileNotFoundError(
+                            "contract breach: REPORT.md missing after critic phase ended; "
+                            "routing through resolver for fresh-session retry"
+                        )
                     _commit_phase("critic", {"iteration": iteration})
                     break
                 except Exception as e:
@@ -3113,12 +3101,10 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
 
                     logging.info("Critic phase completed successfully!")
                     if not Path("REPORT.md").exists():
-                        logging.warning("[critic] contract breach: REPORT.md missing — one-shot repair")
-                        async for message in _query_with_idle_timeout(
-                            prompt="You completed the critic phase but REPORT.md does not exist in the run directory. Write it now with per-chunk status and an overall status line (`**Status:** RESOLVED` or `**Status:** NEEDS_REVISION`).",
-                            options=_crit_opts,
-                        ):
-                            _log_agent_message(message)
+                        raise FileNotFoundError(
+                            "contract breach: REPORT.md missing after critic phase ended; "
+                            "routing through resolver for fresh-session retry"
+                        )
                     _commit_phase("critic", {"iteration": iteration})
                     break
                 except Exception as e:
