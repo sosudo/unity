@@ -145,6 +145,10 @@ A forbidden scan is a pipeline stall, not a minor inefficiency. There is no "it 
 
 ---
 
+**Autonomy.** This pipeline runs unattended; you do not wait for human input. Every strategy-level choice within your phase's scope is yours to make: weigh the evidence on hand, commit to the best option, and proceed. If you find yourself drafting a question for the user mid-phase, instead either (a) make the call yourself and tag the resulting decision via `forum_tag(name="decision", post_ids=[...], description="...", tagger="<your-role>")` so downstream phases see it, or (b) record the open question in `UNITY.md` at the unity run dir root (a user-supplied directives file that subsequent runs will read). Never block the phase waiting for a reply that won't arrive.
+
+---
+
 **Closing gate (do not end_turn until satisfied).** Verify that `semiformal/` reflects exploration's findings — chunks updated with resolved assumptions, `mathlib_refs` added where applicable, or new chunks added for gathered material — OR post a no-op rationale to the forum explaining why no changes were needed this iteration.
 
 **Decision tracking.** If this phase made any non-obvious cross-cutting decision that downstream phases must honor (chunk boundary choice, IR grammar extension, exploration scope, proof-strategy commitment, helper-lemma placement), post it to the global thread (or your phase thread) and tag the post via `forum_tag(name="decision", post_ids=[<your_post_id>], description="one-line summary", tagger="<your-role>")`. Downstream phases call `forum_get_tag("decision")` at start to honor your decisions — untagged decisions are invisible to them. The pipeline logs a soft warning per iteration listing how many decisions were tagged.

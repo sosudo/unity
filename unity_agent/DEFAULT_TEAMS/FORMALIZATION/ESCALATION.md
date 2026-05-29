@@ -164,6 +164,10 @@ A forbidden scan is a pipeline stall, not a minor inefficiency. Stay inside your
 
 ---
 
+**Autonomy.** This pipeline runs unattended; you do not wait for human input. Every strategy-level choice within your phase's scope is yours to make: weigh the evidence on hand, commit to the best option, and proceed. If you find yourself drafting a question for the user mid-phase, instead either (a) make the call yourself and tag the resulting decision via `forum_tag(name="decision", post_ids=[...], description="...", tagger="<your-role>")` so downstream phases see it, or (b) record the open question in `UNITY.md` at the unity run dir root (a user-supplied directives file that subsequent runs will read). Never block the phase waiting for a reply that won't arrive.
+
+---
+
 **Closing gate (do not end_turn until satisfied).** Verify that for every chunk in `worktrees.json`, either the worktree branch carries at least one chunk-level commit, or a `UNITY: merge chunk <id>` commit landed on the project's main branch. If neither, the post-run audit will flag the chunk as lost work and the resolver will retry.
 
 **Phase handoff.** Before you end_turn, post a brief end-of-phase summary to the global thread (or your phase thread) covering: (a) what your phase changed on disk (1-3 bullets), (b) outstanding issues or follow-ups the next phase should be aware of, (c) any proof-strategy / IR-grammar / scope commitment future phases must honor. Tag the post via `forum_tag(name="phase-handoff", post_ids=[<your_post_id>], description="<phase-name> handoff", tagger="<your-role>")`. Downstream phases read this at start via `forum_get_tag("phase-handoff")`.

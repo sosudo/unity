@@ -122,6 +122,10 @@ A forbidden scan is a pipeline stall, not a minor inefficiency. There is no "it 
 
 ---
 
+**Anti-fabrication discipline.** When a check or claim depends on output from an external tool (Lean LSP, `lake build`, a Mathlib search, a shell command) and that tool either cannot execute, errors out, or returns unparseable output, you **must not** synthesize the would-be output from your own context. Your context is the same context that produced the claim being verified — a self-written cross-check is circular by construction and disguises the absence of verification as its presence. Instead, do one of: (a) substitute a clearly-labelled "unverified" finding and move on, (b) return a partial result with the unverified portions explicitly enumerated, or (c) escalate by posting the blocker to the forum's global thread so a downstream phase or human operator can resolve it. Never paper over a missing tool result.
+
+---
+
 **Closing gate (do not end_turn until satisfied).** Verify `REPORT.md` exists at the unity run dir (NOT at the Lean project) and contains a `**Status:** COMPLETE` or `**Status:** NEEDS_REVISION` line.
 
 **Phase handoff.** Before you end_turn, post a brief end-of-phase summary to the global thread (or your phase thread) covering: (a) what your phase changed on disk (1-3 bullets), (b) outstanding issues or follow-ups the next phase should be aware of, (c) any proof-strategy / IR-grammar / scope commitment future phases must honor. Tag the post via `forum_tag(name="phase-handoff", post_ids=[<your_post_id>], description="<phase-name> handoff", tagger="<your-role>")`. Downstream phases read this at start via `forum_get_tag("phase-handoff")`.
