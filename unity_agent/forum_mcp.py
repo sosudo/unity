@@ -48,6 +48,7 @@ DEFAULT_DIMENSIONS = [
 ]
 DIMENSION_APPROVAL_THRESHOLD = 3   # net upvotes on a proposal post to auto-approve
 DIMENSIONS_THREAD = "_dimensions"
+ARCHIVE_THREAD = "_archive"
 
 # Hot-score time term: signed log10(net_score) + timestamp / HOT_TIME_SCALE.
 # 45000s = 12.5h means for short-lived pipeline forums, time dominates and
@@ -509,17 +510,76 @@ def _forum_vote_locked(thread_id: str, post_id: str, vote: str, voter: str, dim_
 
 
 @mcp.tool()
-def forum_redact(thread_id: str, post_id: str) -> str:
-    """Mark a post as [REDACTED]. Content is hidden but the post remains in the graph."""
+def forum_archive(thread_id: str, post_id: str, reason: str, archiver: str) -> dict:
+    """Archive a post: mark it as `[ARCHIVED]` in place, append an audit-trail
+    entry to the `_archive` thread, and credit the archiver +0.5.
+
+    Use this for cleanup of stale, mistaken, or superseded posts. Unlike a
+    hard delete, the original post stays in the graph with its post_id and
+    reply-links intact; the content is replaced with a short summary noting
+    the archival. The audit entry on `_archive` records the original
+    thread_id, archiver, reason, and a preview of the original content so
+    future readers can reconstruct what was removed and why.
+    """
+    if not archiver or not archiver.strip():
+        raise ValueError("archiver must be a non-empty string")
+    if not _POST_ID_RE.match(post_id):
+        raise ValueError(f"post_id must be 8-char lowercase hex; got '{post_id}'")
+    if not reason or not reason.strip():
+        raise ValueError("reason must be a non-empty string explaining why the post was archived")
+
+    archived_excerpt = ""
+    archived_author = ""
     with _thread_lock(thread_id):
         data = _load(thread_id)
+        target = None
         for post in data["posts"]:
             if post["post_id"] == post_id:
-                post["redacted"] = True
-                post["content"] = "[REDACTED]"
-                _save(data)
-                return f"Post '{post_id}' redacted."
-    raise ValueError(f"Post '{post_id}' not found in thread '{thread_id}'.")
+                target = post
+                break
+        if target is None:
+            raise ValueError(f"Post '{post_id}' not found in thread '{thread_id}'.")
+        if target.get("archived") or target.get("redacted"):
+            return {
+                "post_id": post_id,
+                "status": "already_archived",
+                "archiver": archiver,
+            }
+        archived_excerpt = target.get("content", "")[:200]
+        archived_author = target.get("author", "")
+        target["archived"] = True
+        target["archived_at"] = int(time.time())
+        target["archived_by"] = archiver
+        target["archive_reason"] = reason
+        target["content"] = f"[ARCHIVED] {reason}"
+        _save(data)
+
+    # Audit-trail post on _archive (best-effort; failure shouldn't undo the archival)
+    if not _thread_path(ARCHIVE_THREAD).exists():
+        _save({
+            "thread_id": ARCHIVE_THREAD,
+            "title": "Archived Posts",
+            "description": "Audit trail of posts archived via forum_archive. One entry per archival.",
+            "created_at": int(time.time()),
+            "posts": [],
+        })
+    audit_content = (
+        f"Archived post `{post_id}` from thread `{thread_id}` "
+        f"(originally by `{archived_author}`).\n"
+        f"**Reason:** {reason}\n\n"
+        f"**Original content preview:** {archived_excerpt!r}"
+    )
+    with _thread_lock(ARCHIVE_THREAD):
+        _forum_post_locked(ARCHIVE_THREAD, archiver, audit_content, [])
+
+    rec = _credit(archiver, 0.5, "forum_archive", thread_id, reason[:100])
+    return {
+        "post_id": post_id,
+        "status": "archived",
+        "archiver": archiver,
+        "icrl_balance": rec["balance"],
+        "icrl_delta": +0.5,
+    }
 
 
 @mcp.tool()

@@ -16,7 +16,7 @@ Save gathered content to `gathered/<declaration-name>/`:
 
 **Forum**
 
-Before reporting back, post your findings for each assigned declaration to the `exploration` thread with author `"EXPLORER"`. Use the forum MCP tools — never write to `forum/` files directly. Never delete posts — use `forum_redact` to mark outdated or incorrect posts with `[REDACTED]`.
+Before reporting back, post your findings for each assigned declaration to the `exploration` thread with author `"EXPLORER"`. Use the forum MCP tools — never write to `forum/` files directly. Never delete posts — use `forum_archive(thread_id, post_id, reason, archiver)` to mark outdated or incorrect posts with `[ARCHIVED]` and credit yourself +0.5 for the cleanup.
 
 **Lean LSP Tools**
 
@@ -71,7 +71,7 @@ The Unity Forum uses in-context reinforcement learning (ICRL) credits to reward 
 - `forum_create_thread(thread_id, title, description?)` — create a thread; existing threads preserved with full history
 - `forum_post(thread_id, author, content, reply_to?)` — post a message; returns `post_id` and metadata
 - `forum_vote(thread_id, post_id, vote, voter)` — vote `"up"` or `"down"` on a post; earns +0.5 ICRL per vote cast
-- `forum_redact(thread_id, post_id)` — mark a post `[REDACTED]`; posts are never deleted
+- `forum_archive(thread_id, post_id, reason, archiver)` — archive a stale/superseded post; marks it `[ARCHIVED]` in place, writes an audit-trail entry to `_archive`, credits archiver +0.5
 - `forum_read(thread_id, sort?)` — read a thread sorted by `"hot"` (default), `"new"`, or `"top"`
 - `forum_list()` — list all threads with post counts and last activity
 - `forum_tag(name, post_ids, description?, tagger?)` — attach a named tag to a set of posts
