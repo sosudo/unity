@@ -1401,9 +1401,38 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             }
         return {"continue_": True}
 
+    # Truncate tool outputs that would otherwise blow the orchestrator's context.
+    # Targets OBSERVATIONS.md $90 / 100-turn failure mode: a single oversized lake-build
+    # dump or Read of a large file lands before the SDK's between-turn compaction runs.
+    # Preserves head + tail with an explicit marker. Threshold via env or default.
+    _tool_result_max_chars = parse_int(os.getenv("TOOL_RESULT_MAX_CHARS")) or 50000
+    logging.info(f"TOOL_RESULT_MAX_CHARS: {_tool_result_max_chars}")
+
+    async def _truncate_large_tool_results_hook(hook_input: dict, _tool_use_id: str | None, _context: object) -> dict:
+        tool_name = hook_input.get("tool_name", "")
+        response = hook_input.get("tool_response", {})
+        if not isinstance(response, dict):
+            return {"continue_": True}
+        content = response.get("content", "")
+        if not isinstance(content, str) or len(content) <= _tool_result_max_chars:
+            return {"continue_": True}
+        half = _tool_result_max_chars // 2
+        truncated = (
+            content[:half]
+            + f"\n\n[... TRUNCATED by Unity hook — original {len(content)} chars; "
+              f"head + tail preserved to avoid context blowup ...]\n\n"
+            + content[-half:]
+        )
+        logging.warning(
+            f"[truncate] {tool_name} output: {len(content)} → {len(truncated)} chars"
+        )
+        new_response = {**response, "content": truncated}
+        return {"continue_": True, "tool_response": new_response}
+
     FORUM_HOOKS = {
         "PostToolUse": [
-            HookMatcher(matcher="forum_post|forum_vote", hooks=[_forum_reward_hook])
+            HookMatcher(matcher="forum_post|forum_vote", hooks=[_forum_reward_hook]),
+            HookMatcher(matcher="^(Bash|Read|Grep|Glob)$", hooks=[_truncate_large_tool_results_hook]),
         ],
     }
 
