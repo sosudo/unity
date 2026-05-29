@@ -701,11 +701,11 @@ def _chunk_body_signatures(run_dir: Path, project_path: Path) -> dict[str, tuple
     return out
 
 
-def _default_bandit_state() -> dict:
+def _default_escalation_state() -> dict:
     return {"chunks": {}, "secondary_spend": 0.0}
 
 
-def _load_bandit_state(path: Path) -> dict:
+def _load_escalation_state(path: Path) -> dict:
     if path.exists():
         try:
             state = json.loads(path.read_text())
@@ -714,10 +714,10 @@ def _load_bandit_state(path: Path) -> dict:
             return state
         except Exception:
             pass
-    return _default_bandit_state()
+    return _default_escalation_state()
 
 
-def _save_bandit_state(path: Path, state: dict) -> None:
+def _save_escalation_state(path: Path, state: dict) -> None:
     path.write_text(json.dumps(state, indent=2))
 
 
@@ -740,26 +740,13 @@ def _stagnant_chunks(state: dict, threshold: int = 2) -> list[str]:
     )
 
 
-def _resolve_escalation_outcomes(state: dict, current_sigs: dict[str, tuple[str, bool]]) -> None:
-    """For each chunk with an unresolved prior escalation, record whether the sorry is now gone."""
-    for cid, entry in state["chunks"].items():
-        last = entry.get("last_escalation")
-        if not last or last.get("outcome_resolved"):
-            continue
-        sig = current_sigs.get(cid)
-        if sig is None:
-            continue
-        last["outcome_resolved"] = True
-        last["success"] = not sig[1]  # sorry gone
-
-
-def _append_escalated_log(run_dir: Path, iteration: int, tier: str, chunks: list[str], cost: float, t_sec: float, secondary_spend_total: float) -> None:
+def _append_escalated_log(run_dir: Path, iteration: int, chunks: list[str], cost: float, t_sec: float, secondary_spend_total: float) -> None:
     log_path = run_dir / "ESCALATED.md"
     header = not log_path.exists()
     with log_path.open("a") as f:
         if header:
             f.write("# Escalation Log\n")
-        f.write(f"\n## Iteration {iteration} — tier {tier}\n")
+        f.write(f"\n## Iteration {iteration}\n")
         f.write(f"- chunks: {', '.join(chunks)}\n")
         f.write(f"- cost: ${cost:.4f}\n")
         f.write(f"- wall_time: {t_sec:.1f}s\n")
@@ -1454,13 +1441,14 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
         logging.info(f"Resolver completed for phase '{phase_name}' — retrying.")
 
     async def _run_escalation_phase(iteration: int, source_label: str | None) -> None:
-        """Escalation phase: run formalization T on stagnant sorry-carrying chunks.
+        """Escalation phase: re-run formalization on the secondary provider for stagnant sorry-carrying chunks.
 
-        Tier selection uses a Beta(α,β) bandit over prior outcomes with running wall-clock means.
-        Soft give-up when cumulative secondary spend exceeds SECONDARY_BUDGET.
+        Soft give-up when cumulative secondary spend exceeds SECONDARY_BUDGET. (There is no
+        primary/secondary bandit selection — all candidates always run on the secondary tier.
+        See PROPOSED_FIXES.md S0.3(b) for a real bandit if/when that's implemented.)
         """
-        state_path = Path.cwd() / "bandit_state.json"
-        state = _load_bandit_state(state_path)
+        state_path = Path.cwd() / "escalation_state.json"
+        state = _load_escalation_state(state_path)
 
         current_sigs = _chunk_body_signatures(Path.cwd(), project_path)
         if not current_sigs:
@@ -1476,12 +1464,11 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                     "[escalation] no chunk signatures resolved (lean_declaration/dag.json both empty) "
                     "but project tree contains `sorry` — stagnation tracker is blind, escalation will not fire"
                 )
-        _resolve_escalation_outcomes(state, current_sigs)
         _update_stagnation(state, current_sigs)
 
         candidates = _stagnant_chunks(state, threshold=2)
         if not candidates:
-            _save_bandit_state(state_path, state)
+            _save_escalation_state(state_path, state)
             return
 
         logging.info(f"[escalation] iteration={iteration} stagnant chunks: {candidates}")
@@ -1492,13 +1479,12 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
                 f"(${state['secondary_spend']:.4f} / ${secondary_budget:.4f}) — "
                 f"{len(candidates)} chunk(s) unresolved: {candidates}"
             )
-            _save_bandit_state(state_path, state)
+            _save_escalation_state(state_path, state)
             return
 
-        tier = "B"
-        logging.info(f"[escalation] tier={tier} model=opus (secondary)")
+        logging.info("[escalation] running on secondary provider")
 
-        _console.rule(f"[bold magenta]Escalation Phase[/bold magenta] (tier={tier})")
+        _console.rule("[bold magenta]Escalation Phase[/bold magenta]")
         _assert_lsp_alive("escalation")
 
         worktree_assignments: dict[str, str] = {}
@@ -1582,26 +1568,23 @@ async def run_pipeline(source: str | None, project_dir: str, context: bool, prov
             _delete_worktrees_manifest()
 
         t_sec = time.monotonic() - t_start
-        if tier == "B":
-            state["secondary_spend"] = float(state.get("secondary_spend", 0.0)) + run_cost
+        state["secondary_spend"] = float(state.get("secondary_spend", 0.0)) + run_cost
 
         for cid in candidates:
             entry = state["chunks"].setdefault(cid, {"prev_sig": None, "stagnation": 0, "last_escalation": None})
             entry["last_escalation"] = {
                 "iteration": iteration,
-                "tier": tier,
                 "t_sec": t_sec,
                 "cost": run_cost,
-                "outcome_resolved": False,
             }
             entry["stagnation"] = 0
 
-        _save_bandit_state(state_path, state)
+        _save_escalation_state(state_path, state)
         _append_escalated_log(
-            Path.cwd(), iteration, tier, candidates, run_cost, t_sec,
+            Path.cwd(), iteration, candidates, run_cost, t_sec,
             float(state.get("secondary_spend", 0.0)),
         )
-        _commit_phase("escalation", {"iteration": iteration, "tier": tier, "cost": f"{run_cost:.4f}"})
+        _commit_phase("escalation", {"iteration": iteration, "cost": f"{run_cost:.4f}"})
 
     # Ensure lake cache + update finished before any agent phase starts
     try:
