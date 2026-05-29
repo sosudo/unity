@@ -115,3 +115,5 @@ Every chunk in `semiformal/chunks/<id>.json` must include the `source_range` and
 ---
 
 **Closing gate (do not end_turn until satisfied).** Verify that for every `language/chunks/<id>.json`, a matching `semiformal/chunks/<id>.json` exists at the unity run dir with `is_assumption`, `source_range`, and `source_proof` propagated verbatim from the language chunk. The pipeline runs a field-propagation audit; missing or drifted fields are surfaced as errors.
+
+**Convergence gate.** Also verify, before you end_turn, that the council's convergence is visible on the forum: the semiformalization thread (or whichever thread the council used — name it explicitly in the post body) contains at least one explicit `ACCEPT` post from this discussion round and no unresolved `OBJECT` post left from this round. If consensus has not been reached and budget remains, run another round. If budget forces convergence, post a clearly-labeled `BUDGET_FORCED_CONVERGENCE` summary post listing every unresolved `OBJECT` and the coordinator's unilateral resolution; that counts as convergence for this phase.
