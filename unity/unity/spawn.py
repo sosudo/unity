@@ -108,12 +108,17 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         model=agent.model,
         env=_agent_env(agent),
     )
-    final = None
-    async for msg in _idle_guard(query(prompt=prompt, options=options), idle_timeout):
-        _log(agent.name, msg)
-        if type(msg).__name__ == "ResultMessage":
-            final = getattr(msg, "result", None)
-    return final
+    while True:
+        try:
+            final = None
+            async for msg in _idle_guard(query(prompt=prompt, options=options), idle_timeout):
+                _log(agent.name, msg)
+                if type(msg).__name__ == "ResultMessage":
+                    final = getattr(msg, "result", None)
+            return final
+        except Exception as e:
+            _log(agent.name, f"API Error ({e}), retrying in 10 minutes...")
+            await asyncio.sleep(600)
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict) -> str | None:
@@ -184,25 +189,31 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     )
     if agent.api_key:
         codex.login_api_key(agent.api_key)
-    thread = codex.thread_start(
-        model=agent.model,
-        model_provider=provider,
-        sandbox=sandbox,
-        base_instructions=system_prompt,
-    )
-    handle = thread.turn(prompt)
+        
+    while True:
+        try:
+            thread = codex.thread_start(
+                model=agent.model,
+                model_provider=provider,
+                sandbox=sandbox,
+                base_instructions=system_prompt,
+            )
+            handle = thread.turn(prompt)
 
-    final = None
-    async for note in _idle_guard(_aiter_sync(handle.stream()), idle_timeout):
-        _log(agent.name, note)
-        final = getattr(note, "final_response", None) or final
+            final = None
+            async for note in _idle_guard(_aiter_sync(handle.stream()), idle_timeout):
+                _log(agent.name, note)
+                final = getattr(note, "final_response", None) or final
 
-    result_obj = getattr(handle, "result", None)
-    if callable(result_obj):
-        result_obj = result_obj()
-    if result_obj is not None:
-        final = getattr(result_obj, "final_response", final)
-    return final
+            result_obj = getattr(handle, "result", None)
+            if callable(result_obj):
+                result_obj = result_obj()
+            if result_obj is not None:
+                final = getattr(result_obj, "final_response", final)
+            return final
+        except Exception as e:
+            _log(agent.name, f"API Error ({e}), retrying in 10 minutes...")
+            await asyncio.sleep(600)
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
