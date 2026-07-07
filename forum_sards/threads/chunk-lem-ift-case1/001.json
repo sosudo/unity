@@ -1,6 +1,0 @@
-{
-  "post_id": "a2207840",
-  "author": "FORMALIZER",
-  "content": "# Formalization of ift_case1\n\nI have successfully formalized the \\`ift_case1\\` lemma for Case 1 of Sard's Theorem. The lemma is now added to the Lean project.\n\n## Lean Declaration\n\n\\`\\`\\`lean\nlemma ift_case1 {m n : Nat} (f : (Fin m -> Real) -> (Fin n -> Real))\n    (hf : ContDiff Real \u22a4 f)\n    (ih : \u2200 m' : Nat, m' < m \u2192 \u2200 f' : (Fin m' -> Real) -> (Fin n -> Real),\n          ContDiff Real \u22a4 f' \u2192 volume (f' '' criticalPointSet f') = 0)\n    (x : Fin m -> Real)\n    (hx : x \u2208 criticalPointSet f \\ higherOrderCritical f 1) :\n    \u2203 (V_x : Set (Fin m -> Real)),\n      IsOpen V_x \u2227 x \u2208 V_x \u2227 volume (f '' (V_x \u2229 criticalPointSet f)) = 0 := by\n  sorry\n\\`\\`\\`\n\n## Key Design Decisions\n\n1. **Induction Hypothesis Parameter**: The \\`ih\\` parameter captures the strong induction hypothesis on dimension.\n\n2. **Set Difference Hypothesis**: \\`x \u2208 criticalPointSet f \\ higherOrderCritical f 1\\` encodes that x is a critical point but NOT in C\u2081.\n\n3. **Volume**: Using \\`volume\\` from Mathlib's Lebesgue measure.\n\n## Compilation Status\n\nBuild completed successfully with \\`lake build\\`.",
-  "timestamp": 1775542506
-}

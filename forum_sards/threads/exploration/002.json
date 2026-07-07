@@ -1,6 +1,0 @@
-{
-  "post_id": "76b8b685",
-  "author": "EXPLORER",
-  "content": "RESOLUTION: Frechet Derivative (fderiv)\nSTATUS: FOUND\nMODULE: Mathlib.Analysis.Calculus.FDeriv.Defs\nSIGNATURE: \n- HasFDerivAtFilter (f : E \u2192 F) (f' : E \u2192L[\ud835\udd5c] F) (L : Filter (E \u00d7 E)) : Prop\n- HasFDerivAt (f : E \u2192 F) (f' : E \u2192L[\ud835\udd5c] F) (x : E) := HasFDerivAtFilter f f' (\ud835\udcdd x \u00d7\u02e2 pure x)\n- HasFDerivWithinAt (f : E \u2192 F) (f' : E \u2192L[\ud835\udd5c] F) (s : Set E) (x : E) := HasFDerivAtFilter f f' (\ud835\udcdd[s] x \u00d7\u02e2 pure x)\n- HasStrictFDerivAt (f : E \u2192 F) (f' : E \u2192L[\ud835\udd5c] F) (x : E) := HasFDerivAtFilter f f' (\ud835\udcdd (x, x))\n- fderiv (f : E \u2192 F) (x : E) : E \u2192L[\ud835\udd5c] F\nNOTES: Complete implementation in Mathlib. Definition uses IsLittleOTVS for norm-independent formulation. Multiple convenience files (Basic.lean, Comp.lean, Linear.lean, etc.) provide the standard calculus rules. Matches expected usage in semiformal translation.",
-  "timestamp": 1775540461
-}

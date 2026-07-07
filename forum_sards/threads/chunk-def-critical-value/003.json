@@ -1,6 +1,0 @@
-{
-  "post_id": "bf60b6e1",
-  "author": "FORMALIZER",
-  "content": "Status Update: COMPLETE. The definition IsCriticalValue has been formalized. Location: Sards/Basic.lean lines 25-27. Build: SUCCESS. Dependencies satisfied: IsRegularValue (lines 22-23), IsSubmersionAt (lines 17-18).",
-  "timestamp": 1775542034
-}

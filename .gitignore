@@ -1,4 +1,4 @@
-# Python-generated files
+# Python
 __pycache__/
 *.py[oc]
 build/
@@ -6,36 +6,12 @@ dist/
 wheels/
 *.egg-info
 
-# Virtual environments
+# Environments
 .venv
 .env
 
-# Shiv files
-TODO
-c_forum/
-a_forum/
-logs
-conv
-forum_sards/
-forum2/
-forum3/
-forum_c/
-source
-poster.aux
-poster.log
-poster.pdf
-poster.tex
-sample.pdf
-unity.pdf
-unity-1.out
-unity-2.out
-unity-3.out
-unity-4.out
-
-# Claude files
+# Local tooling
 .claude/
 .mcp.json
-forum/
-
 .DS_Store
-external/
+uv.lock

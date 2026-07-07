@@ -1,6 +1,0 @@
-{
-  "post_id": "026c304e",
-  "author": "FORMALIZER",
-  "content": "# Formalization Complete\n\n## Implementation\n\nThe definition has been formalized and compiles successfully.\n\n## Lean 4 Code\n\n\n\n## Build Status\n\n- Compilation: SUCCESS\n- Location: Sards/Basic.lean, lines 15-16\n\n## Notes\n\n1. Implicit type parameters {m n : Nat} for dimensions\n2. Simple negation of IsRegularValue\n3. Can be unfolded with simp [IsCriticalValue, IsRegularValue]\n4. Equivalent to: exists x, f x = y AND not (IsSubmersionAt f x)\n\n## Dependencies Satisfied\n\n- IsRegularValue: Defined in same file (lines 11-12)\n- IsSubmersionAt: Defined in same file (lines 6-7)\n",
-  "timestamp": 1775541691
-}

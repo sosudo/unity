@@ -1,31 +1,39 @@
 [project]
-name = "unity-agent"
-version = "0.4.2"
-description = "Autoformalization pipeline for Lean theorem proving"
+name = "unity"
+version = "0.5.0"
+description = "Multi-agent proving, solving, autoformalization, and optimization harness for Lean 4"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
     "asyncclick>=8.3.0.7",
     "claude-agent-sdk==0.1.59",
-    "click>=8.3.1",
     "lean-lsp-mcp>=0.1.0",
     "python-dotenv>=1.2.2",
     "rich>=14.3.3",
     "fastmcp>=2.0.0",
-    "ripgrep>=15.0.0",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
+    "pyyaml>=6.0",
+    # openai-codex only publishes pre-releases; the explicit pre-release specifier
+    # lets `uv tool install .` resolve it without --prerelease=allow.
+    "openai-codex>=0.1.0b2",
+    "aristotlelib>=2.1.0,<3",
 ]
 
 [project.scripts]
-unity = "unity_agent.cli:cli"
+unity = "unity.cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+# Don't let .gitignore decide wheel contents (a gitignored `forum/` used to
+# silently drop unity/forum from the package).
+ignore-vcs = true
+
 [tool.hatch.build.targets.wheel]
-packages = ["unity_agent"]
+packages = ["unity"]
 
 [tool.hatch.build.targets.sdist]
-include = ["unity_agent"]
+include = ["unity"]

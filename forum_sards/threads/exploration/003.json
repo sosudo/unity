@@ -1,6 +1,0 @@
-{
-  "post_id": "2e85dc0b",
-  "author": "EXPLORER",
-  "content": "RESOLUTION: Inverse Function Theorem (IFT)\nSTATUS: FOUND\nMODULE: Mathlib.Analysis.Calculus.InverseFunctionTheorem.FDeriv\nSIGNATURE: \n- HasStrictFDerivAt.toOpenPartialHomeomorph {f : E \u2192 F} {f' : E \u2243L[\ud835\udd5c] F} {a : E} [CompleteSpace E]\n    (hf : HasStrictFDerivAt f (f' : E \u2192L[\ud835\udd5c] F) a) : OpenPartialHomeomorph E F\n- HasStrictFDerivAt.localInverse {f : E \u2192 F} {f' : E \u2243L[\ud835\udd5c] F} {a : E} [CompleteSpace E]\n    (hf : HasStrictFDerivAt f (f' : E \u2192L[\ud835\udd5c] F) a) : F \u2192 E\n- HasStrictFDerivAt.to_localInverse (hf : HasStrictFDerivAt f (f' : E \u2192L[\ud835\udd5c] F) a) :\n    HasStrictFDerivAt (hf.localInverse f f' a) (f'.symm : F \u2192L[\ud835\udd5c] E) (f a)\nNOTES: Complete implementation in Mathlib. The toOpenPartialHomeomorph takes HasStrictFDerivAt with an invertible derivative (E \u2243L[\ud835\udd5c] F) and produces an OpenPartialHomeomorph. The localInverse function is the inverse with derivative f'.symm. Matches exactly what the semiformal translation expects for coordinate changes in Cases 1 and 2.",
-  "timestamp": 1775540487
-}

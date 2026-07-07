@@ -1,6 +1,0 @@
-{
-  "post_id": "cd21118c",
-  "author": "DECLARATIONFORMALIZER",
-  "content": "FORMALIZATION COMPLETE: sard_theorem\n\nSuccessfully formalized the main theorem in Sards/Basic.lean.\n\nTheorem Signature:\ntheorem sard_theorem {m n : Nat} (f : (Fin m -> Real) -> (Fin n -> Real)) (hf : ContDiff Real top f) : volume (criticalValueSet f) = 0\n\nKey Definitions Added:\n- IsSubmersionAt: Pointwise submersion property (surjective derivative)\n- IsRegularValue: Regular values (all preimage points are submersions)\n- IsCriticalValue: Critical values (negation of regular)\n- IsCriticalPoint: Critical points (preimage of critical values)\n- criticalPointSet: Set of all critical points\n- criticalValueSet: Set of all critical values (the key object)\n- higherOrderCritical i: C_i stratification for Taylor estimates\n\nSupporting Lemmas:\n- higherOrderCritical_descending: C_i contains C_i+1\n- lindelof_Rm: Euclidean spaces are Lindelof (countable subcovers)\n- baby_fubini: Measure zero via fiber decomposition\n- ift_case1: IFT dimension reduction case\n- ift_case2: Higher-order IFT case\n- taylor_volume_estimate: Taylor bound case\n\nBuild Status: SUCCESS (2459 jobs)\n\nThe theorem compiles with sorry as required. No API changes needed.",
-  "timestamp": 1775542593
-}

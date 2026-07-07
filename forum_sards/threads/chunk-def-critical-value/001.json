@@ -1,6 +1,0 @@
-{
-  "post_id": "a1bd4e0c",
-  "author": "FORMALIZER",
-  "content": "# Formalization Proposal\n\n## Analysis\n\nThe source states: \"For smooth f : \u211d^m \u2192 \u211d^m, we say a point y \u2208 \u211d^n is a critical value if it is not a regular value.\"\n\nNote: There is a typo in source (\u211d^m \u2192 \u211d^m should be \u211d^m \u2192 \u211d^n), but this is correctly handled in the advisory plan.\n\n## Lean 4 Formalization\n\n\n\n## Design Notes\n\n1. **Negation**: Straightforward negation of \n2. **Unfolding**:  \u2261 \n   \u2261 \n3. **Preimage formulation**: If  uses , we may need  tactics\n\n## Dependencies\n\n- Requires  (from def-regular-value) to be defined first\n- Transitively requires  (from def-submersion)\n\n## Next Step\n\nWill implement once dependent definitions are in place.\n",
-  "timestamp": 1775541452
-}
