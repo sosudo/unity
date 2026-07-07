@@ -63,6 +63,10 @@ async def _idle_guard(aiter, timeout: float):
 _MAX_API_RETRIES = 6
 _RETRY_SLEEP = 600.0
 
+# Last-run accounting per agent name, harvested by spawn() into .unity/logs/run.jsonl
+# so benchmark runs can compare cost across rosters.
+_last_run_stats: dict[str, dict] = {}
+
 
 def _log(name: str, msg) -> None:
     content = getattr(msg, "content", None)
@@ -112,6 +116,10 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                 _log(agent.name, msg)
                 if type(msg).__name__ == "ResultMessage":
                     final = getattr(msg, "result", None)
+                    _last_run_stats[agent.name] = {
+                        "cost_usd": getattr(msg, "total_cost_usd", None),
+                        "num_turns": getattr(msg, "num_turns", None),
+                    }
             return final
         except Exception as e:
             if attempt == _MAX_API_RETRIES - 1:
@@ -199,6 +207,11 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             async for note in _idle_guard(handle.stream(), idle_timeout):
                 _log(agent.name, note)
             result = await handle.run()
+            usage = getattr(result, "usage", None)
+            _last_run_stats[agent.name] = {
+                "cost_usd": None,  # codex SDK exposes no spend figure
+                "usage": {k: getattr(usage, k) for k in dir(usage) if "token" in k} if usage else None,
+            }
             return result.final_response
         except Exception as e:
             if attempt == _MAX_API_RETRIES - 1:
@@ -211,9 +224,36 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
 
+def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
+    """Append per-agent run accounting to .unity/logs/run.jsonl (best-effort)."""
+    from .config import find_unity_dir
+    import json, time
+    unity = find_unity_dir(Path(cwd))
+    if unity is None:
+        return
+    try:
+        logs = unity / "logs"
+        logs.mkdir(exist_ok=True)
+        entry = {
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "agent": agent.name, "model": agent.model, "backend": agent.backend,
+            "seconds": round(seconds, 1),
+            **_last_run_stats.pop(agent.name, {}),
+        }
+        with (logs / "run.jsonl").open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=()) -> str | None:
     backend = claude_spawner if agent.backend == "claude_code" else codex_spawner
-    return await backend(agent, system_prompt, prompt, cwd, mcp_servers,
-                         permission=permission, idle_timeout=idle_timeout, subagents=subagents)
+    import time
+    t0 = time.monotonic()
+    try:
+        return await backend(agent, system_prompt, prompt, cwd, mcp_servers,
+                             permission=permission, idle_timeout=idle_timeout, subagents=subagents)
+    finally:
+        _write_run_log(agent, cwd, time.monotonic() - t0)
