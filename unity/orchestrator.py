@@ -45,15 +45,38 @@ def build_mcp(paths) -> dict:
     return servers
 
 
-def _preamble(agent, roster) -> str:
-    team = "\n".join(
-        f"- {a.name}: {a.model} ({a.backend}, strength {a.strength})"
-        f"{' [primary]' if a.is_primary else ''}"
+def _effective_ranking(roster, forum_dir) -> dict:
+    """Dynamic capability ranking: static strength + a bounded boost from forum ICRL
+    credit (earned by posts and upvotes on an agent's contributions). Re-computed at
+    every dispatch, so standings shift as the run progresses."""
+    balances = {}
+    try:
+        raw = json.loads((Path(forum_dir) / "balances.json").read_text())
+        balances = {k.lower(): v.get("balance", 0.0) for k, v in raw.items()}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    return {
+        a.name: a.strength + min(3.0, max(-1.0, balances.get(a.name.lower(), 0.0) / 10.0))
         for a in roster.agents
+    }
+
+
+def _preamble(agent, roster, ranking: dict | None = None) -> str:
+    ranking = ranking or {a.name: float(a.strength) for a in roster.agents}
+    order = sorted(roster.agents, key=lambda a: -ranking[a.name])
+    standing = {a.name: i + 1 for i, a in enumerate(order)}
+    team = "\n".join(
+        f"- {a.name}: {a.model} ({a.backend}) — standing #{standing[a.name]}, "
+        f"effective capability {ranking[a.name]:.1f} (base strength {a.strength})"
+        f"{' [primary]' if a.is_primary else ''}"
+        for a in order
     )
     return (
         f"You are agent '{agent.name}', running model '{agent.model}' (backend: {agent.backend}).\n"
         f"You are collaborating with this team via the forum:\n{team}\n"
+        f"Standings are dynamic: effective capability re-ranks from forum credit as the run "
+        f"progresses — strong contributions raise your standing, and chunk sign-ups should follow "
+        f"current standings, not the initial ordering.\n"
         f"The primary agent is '{roster.primary.name}'.\n\n"
     )
 
@@ -70,8 +93,14 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
     full = base_prompt + f"\n\n{tools_ref}" + (f"\n\n{context}" if context else "")
     subagents = library.library_subagents()
 
+    # Dynamic capability re-ranking: standings from forum credit, refreshed per dispatch.
+    from .config import find_unity_dir
+    any_cwd = next(iter(cwd.values())) if isinstance(cwd, dict) else cwd
+    unity_dir = find_unity_dir(Path(any_cwd))
+    ranking = _effective_ranking(roster, unity_dir / "forum") if unity_dir else None
+
     results = await asyncio.gather(
-        *[spawn(a, _preamble(a, roster) + full, task, _cwd(a), mcp, subagents=subagents)
+        *[spawn(a, _preamble(a, roster, ranking) + full, task, _cwd(a), mcp, subagents=subagents)
           for a in agents],
         return_exceptions=True,
     )

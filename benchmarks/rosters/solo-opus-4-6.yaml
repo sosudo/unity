@@ -1,0 +1,7 @@
+# Condition A baseline for FormalQualBench (matches Math Inc's opus-4-6).
+agents:
+  - names: [solo]
+    model: claude-opus-4-6
+    backend: claude_code
+    provider: anthropic     # Claude Pro login — no keys needed
+    strength: 9

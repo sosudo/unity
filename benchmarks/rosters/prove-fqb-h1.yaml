@@ -1,0 +1,53 @@
+# H1 run: weak swarm aiming at opus-4-6-solo performance for ~$0 marginal cost.
+# Env vars go in .unity/.env (FREEINFERENCE_*, OPENROUTER_*, BABEL_*).
+agents:
+  - names: [primary]
+    model: claude-haiku-4-5          # cheapest capable consensus-runner/primary
+    backend: claude_code
+    provider: anthropic
+    strength: 6
+  - names: [glm-1]
+    model: glm-5.1
+    backend: codex                   # FreeInference is OpenAI-compatible
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 5
+    budget: 4
+  - names: [mm-1, mm-2]
+    model: minimax-m2.5
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 4
+    budget: 3
+  - names: [qwen-fi-1, qwen-fi-2]
+    model: qwen3.6-35b
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 4
+    budget: 3
+  - names: [goedel-1]                # sbatch goedel-prover-v2-32b.sh; proof-search grunt
+    model: goedel-prover-v2-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_GOEDEL_URL}    # http://<node>:8000/v1
+    api_key: unity
+    strength: 3
+  - names: [qwen-babel-1]            # sbatch qwen3-32b.sh
+    model: qwen3-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_QWEN_URL}
+    api_key: unity
+    strength: 4
+  - names: [free-1]
+    model: nvidia/nemotron-3-ultra-550b-a55b:free
+    backend: claude_code             # same OpenRouter wiring as the VPA run
+    provider: openrouter
+    base_url: ${OPENROUTER_ANTHROPIC_URL}
+    api_key: ${OPENROUTER_API_KEY}
+    strength: 3

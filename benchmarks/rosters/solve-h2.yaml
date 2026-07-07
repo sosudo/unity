@@ -1,0 +1,39 @@
+# Capability play: heterogeneous frontier roster (diverse strategy pools).
+agents:
+  - names: [primary]
+    model: claude-opus-4-8
+    backend: claude_code
+    provider: anthropic
+    strength: 9
+  - names: [opus47-1]
+    model: claude-opus-4-7
+    backend: claude_code
+    provider: anthropic
+    strength: 8
+  - names: [sonnet-1]
+    model: claude-sonnet-5
+    backend: claude_code
+    provider: anthropic
+    strength: 8
+  - names: [glm-1]
+    model: glm-5.1
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 5
+    budget: 5
+  - names: [mm3-1]
+    model: minimax-m3
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 5
+    budget: 5
+#  - names: [gpt-1]                  # uncomment if the OpenAI key lands
+#    model: gpt-5.2
+#    backend: codex
+#    provider: openai
+#    api_key: ${OPENAI_API_KEY}
+#    strength: 8

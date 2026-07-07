@@ -1,0 +1,13 @@
+# H2 run: a bunch of opus-4-6's — pure multi-agency vs the solo-opus-4-6 baseline.
+# Pro rate windows: if 4 concurrent opus sessions throttle, drop to opus-x3.
+agents:
+  - names: [opus-1]
+    model: claude-opus-4-6
+    backend: claude_code
+    provider: anthropic
+    strength: 9
+  - names: [opus-2, opus-3, opus-4]
+    model: claude-opus-4-6
+    backend: claude_code
+    provider: anthropic
+    strength: 9

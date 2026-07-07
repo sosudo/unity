@@ -1,0 +1,16 @@
+agents:
+  - names: [primary]
+    model: claude-opus-4-8
+    backend: claude_code
+    provider: anthropic
+    strength: 9
+  - names: [opus47-1]
+    model: claude-opus-4-7
+    backend: claude_code
+    provider: anthropic
+    strength: 8
+  - names: [sonnet-1]
+    model: claude-sonnet-5
+    backend: claude_code
+    provider: anthropic
+    strength: 8

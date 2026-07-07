@@ -1,0 +1,37 @@
+agents:
+  - names: [primary]
+    model: claude-haiku-4-5
+    backend: claude_code
+    provider: anthropic
+    strength: 6
+  - names: [qwen-fi-1, qwen-fi-2]
+    model: qwen3.6-35b
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 4
+    budget: 3
+  - names: [glmt-1]
+    model: glm-5-turbo
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 4
+    budget: 3
+  - names: [mm-1]
+    model: minimax-m2.5
+    backend: codex
+    provider: freeinference
+    base_url: ${FREEINFERENCE_BASE_URL}
+    api_key: ${FREEINFERENCE_API_KEY}
+    strength: 4
+    budget: 3
+  - names: [free-1, free-2]
+    model: tencent/hy3:free
+    backend: claude_code
+    provider: openrouter
+    base_url: ${OPENROUTER_ANTHROPIC_URL}
+    api_key: ${OPENROUTER_API_KEY}
+    strength: 3

@@ -10,8 +10,15 @@
 Every benchmark below runs (up to budget) three conditions:
 **(A)** single frontier model solo — the baseline; **(B)** Unity small-swarm (H1); **(C)** Unity
 frontier-swarm (H2). Condition A should run *through Unity with a 1-agent roster* so the harness is
-controlled and only multi-agency varies. Per-run cost/wall-time now lands in
-`.unity/logs/run.jsonl` (see `changes2.md`) — cite those numbers.
+controlled and only multi-agency varies. **Each comparative benchmark is therefore (at least) two
+comparison runs against its baseline: the H1 run (weaker models matching the solo frontier for less
+money) and the H2 run (a bunch of the frontier model beating itself solo).** Per-run cost/wall-time
+now lands in `.unity/logs/run.jsonl` (see `changes2.md`) — cite those numbers.
+
+**Ready-made rosters: `benchmarks/rosters/`** — one agents.yaml per condition per benchmark, with a
+README mapping every experiment to its files and the env vars they expect. Chunk allocation uses
+**dynamic capability re-ranking** (static `strength` + live forum-credit boost; see `changes3.md`),
+so swarm standings adjust to who is actually delivering during a run.
 
 ## Compute inventory → roles
 
@@ -52,10 +59,14 @@ Babel `agents.yaml` snippet (after `sbatch ~/unity-models/qwen3-32b.sh`, note th
 - **Metrics:** problems solved (builds, sorry/axiom-free, `lean_verify` clean), cost/solve, wall
   time. Full 23 for A & C; if Pro limits bite, ablate B on a fixed 10-problem subset.
 
-### `solve` — **FirstProof** (benchmark) + **Erdős problems** (case studies)
+### `solve` — **FirstProof + Formal Conjectures** (benchmarks) + **Erdős problems** (case studies)
 - **FirstProof:** 10 research-level problems; the *Second Batch community round is live right now
   (Community Week #2 started July 1, 2026)* — run Unity and submit; Aletheia's 6/10 is the bar.
-- **Erdős:** pick 3–5 from erdosproblems.com / google-deepmind's **formal-conjectures** repo
+- **Formal Conjectures** (google-deepmind): open, evolving benchmark of *formally stated* open
+  conjectures — statements are already Lean, so faithfulness is free and every outcome is
+  kernel-checkable. Select a fixed slice (e.g., 10–15 Erdős-tagged + graph-theory entries at
+  mixed difficulty), report proved / refuted / verified-partial-progress per condition.
+- **Erdős:** pick 3–5 from erdosproblems.com / the formal-conjectures repo
   (formalized statements = free faithfulness): 2 recently-resolved (sanity, ground truth exists) +
   2–3 open-but-approachable (any progress is publishable; a rigorous "here's why X fails" also
   counts per Unity's determination design).
@@ -73,10 +84,18 @@ Babel `agents.yaml` snippet (after `sbatch ~/unity-models/qwen3-32b.sh`, note th
      faithfulness is checkable against a reference;
   2. *sards.pdf* (Sard's theorem) — not in Mathlib, the honest hard case, and directly comparable
      to Unity v1's attempt (a built-in ablation vs the old architecture).
+- **Head-to-head vs LeanMarathon** (arXiv 2606.05400, June 2026): the closest competing system — a
+  multi-agent, blueprint-DAG, paper-level Lean autoformalization harness. Run `unity autoformalize`
+  on **its published evaluation suite** (two 2026 papers spanning four Erdős problems, seven target
+  theorems, which LeanMarathon formalizes sorry-free while a commercial-agent baseline fails).
+  Matching or beating a purpose-built competitor on its own suite is the strongest autoformalize
+  result available; also adopt its adversarial **target-fidelity audit** as an additional
+  faithfulness measure alongside the metrics below.
 - **Faithfulness measurement** (required): typecheck + **BEq/BEq+** where a reference
   formalization exists; **FormalAlign**-style alignment score + round-trip informalization with an
   LLM judge (use a model *not* in the roster, e.g. gemini if the key lands, else opus-3) where
-  none does; plus a human audit of a 20-statement sample. Report all three.
+  none does; LeanMarathon-style target-fidelity review; plus a human audit of a 20-statement
+  sample. Report all of them.
 - **Conditions:** A/B/C as standard (A = 1× sonnet-5 to keep Pro budget for `prove`/`solve`).
 
 ### `formalize` — **HoTTLean case study** + **miniCTX-style benchmark**

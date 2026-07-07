@@ -1,0 +1,26 @@
+# Hard targets: frontier pair + self-hosted proof-search grunts.
+agents:
+  - names: [primary]
+    model: claude-opus-4-8
+    backend: claude_code
+    provider: anthropic
+    strength: 9
+  - names: [sonnet-1]
+    model: claude-sonnet-5
+    backend: claude_code
+    provider: anthropic
+    strength: 8
+  - names: [goedel-1]
+    model: goedel-prover-v2-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_GOEDEL_URL}
+    api_key: unity
+    strength: 3
+  - names: [qwen-babel-1]
+    model: qwen3-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_QWEN_URL}
+    api_key: unity
+    strength: 4
