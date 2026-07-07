@@ -1,0 +1,172 @@
+"""Shared multi-agent engine: dispatch the roster per phase via the spawners."""
+
+import asyncio
+import json
+import os
+import sys
+from pathlib import Path
+
+from rich.console import Console
+
+from .spawn import spawn
+from . import worktree, library
+
+_console = Console()
+_PROMPTS = Path(__file__).parent / "prompts"
+
+
+def load_prompt(name: str) -> str:
+    return (_PROMPTS / f"{name}.md").read_text()
+
+
+def build_mcp(paths) -> dict:
+    """MCP servers every agent attaches to (stdio; forum is file-backed + flock-safe)."""
+    servers = {
+        "lean-lsp": {"command": "uvx", "args": ["lean-lsp-mcp"]},
+        "unity-forum": {
+            "command": sys.executable,
+            "args": ["-m", "unity.forum.server", "--forum-dir", str(paths.forum)],
+        },
+    }
+    axle_key = os.getenv("AXLE_API_KEY")
+    if axle_key:
+        servers["axle"] = {
+            "command": "uvx",
+            "args": ["--from", "axiom-axle-mcp", "axle-mcp-server"],
+            "env": {"AXLE_API_KEY": axle_key},
+        }
+    aristotle_key = os.getenv("ARISTOTLE_API_KEY")
+    if aristotle_key:
+        servers["aristotle"] = {
+            "command": sys.executable,
+            "args": ["-m", "unity.aristotle"],
+            "env": {"ARISTOTLE_API_KEY": aristotle_key},
+        }
+    return servers
+
+
+def _preamble(agent, roster) -> str:
+    team = "\n".join(
+        f"- {a.name}: {a.model} ({a.backend}, strength {a.strength})"
+        f"{' [primary]' if a.is_primary else ''}"
+        for a in roster.agents
+    )
+    return (
+        f"You are agent '{agent.name}', running model '{agent.model}' (backend: {agent.backend}).\n"
+        f"You are collaborating with this team via the forum:\n{team}\n"
+        f"The primary agent is '{roster.primary.name}'.\n\n"
+    )
+
+
+async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
+    """Spawn `agents` concurrently with per-agent prompts; await all, log failures.
+
+    `cwd` is a single Path (shared) or a dict {agent.name: Path} (per-agent worktrees)."""
+    def _cwd(a):
+        return cwd[a.name] if isinstance(cwd, dict) else cwd
+
+    tools_ref = load_prompt("TOOLS")
+    context = library.library_context()
+    full = base_prompt + f"\n\n{tools_ref}" + (f"\n\n{context}" if context else "")
+    subagents = library.library_subagents()
+
+    results = await asyncio.gather(
+        *[spawn(a, _preamble(a, roster) + full, task, _cwd(a), mcp, subagents=subagents)
+          for a in agents],
+        return_exceptions=True,
+    )
+    for a, r in zip(agents, results):
+        if isinstance(r, Exception):
+            _console.print(f"[red]agent {a.name} failed: {r!r}[/red]")
+    return results
+
+
+def read_approved(paths) -> bool:
+    """Read the critic's approval flag from .unity/critic.json (False if absent/invalid)."""
+    f = paths.unity / "critic.json"
+    if not f.exists():
+        return False
+    try:
+        return bool(json.loads(f.read_text()).get("approved", False))
+    except (json.JSONDecodeError, OSError):
+        return False
+    
+def read_finalized(paths) -> bool:
+    """Read the finalized flag from .unity/finalized.json (True if absent/invalid)."""
+    f = paths.unity / "finalized.json"
+    if not f.exists():
+        return True
+    try:
+        return bool(json.loads(f.read_text()).get("finalized", True))
+    except (json.JSONDecodeError, OSError):
+        return True
+
+
+def toposort(paths) -> None:
+    """Toposort the chunk dependency graph in .unity/dag.json into layers (Kahn's),
+    writing `layers` back. For the forum viewer + the agents' own traversal — never used
+    to gate dispatch. Re-run whenever chunks change. Ported from unity_agent._toposort_chunks."""
+    dag_path = paths.unity / "dag.json"
+    if not dag_path.exists():
+        _console.print("[red]no .unity/dag.json to toposort[/red]")
+        return
+    data = json.loads(dag_path.read_text())
+    chunks = data.get("chunks", [])
+    if not chunks:
+        return
+
+    chunk_ids = {c["id"] for c in chunks}
+    in_degree = {c["id"]: 0 for c in chunks}
+    dependents = {c["id"]: [] for c in chunks}
+    for c in chunks:
+        for dep in c.get("dependencies", []):
+            dep_id = dep["chunk_id"] if isinstance(dep, dict) else dep
+            if dep_id in chunk_ids:
+                in_degree[c["id"]] += 1
+                dependents[dep_id].append(c["id"])
+
+    layers = []
+    ready = sorted(cid for cid in chunk_ids if in_degree[cid] == 0)
+    while ready:
+        layers.append(ready)
+        nxt = []
+        for cid in ready:
+            for child in dependents[cid]:
+                in_degree[child] -= 1
+                if in_degree[child] == 0:
+                    nxt.append(child)
+        ready = sorted(nxt)
+
+    remaining = {cid for cid, deg in in_degree.items() if deg > 0}
+    if remaining:
+        _console.print(f"[yellow]cycle in DAG involving {sorted(remaining)}; appending as final layer[/yellow]")
+        layers.append(sorted(remaining))
+
+    data["layers"] = layers
+    dag_path.write_text(json.dumps(data, indent=2))
+
+
+async def run_worktree_phase(roster, paths, mcp, base_prompt, verb):
+    """Set up per-agent worktrees, dispatch once, tear down. Shared by the formalization /
+    proving / optimization phases — `verb` is the action word for the task ("Formalize",
+    "Prove", "Optimize"). Agents traverse the (dynamic) DAG, sign up for chunks, and reach
+    consensus + merge entirely via the forum + prompt. Python does NOT traverse dag.json."""
+    root = paths.project_root
+    worktrees = {}
+    for a in roster.agents:
+        wt = worktree.create_worktree(a.name, root)
+        worktree.symlink_lake_cache(wt, root)
+        worktrees[a.name] = wt
+
+    main_branch = worktree.detect_main_branch(root)
+    task = (
+        f"{verb} the project by working through .unity/dag.json (it is dynamic — re-read it as "
+        f"you go). Sign up for chunks via the forum, work in your worktree and commit, then reach "
+        f"consensus (forum vote; the primary breaks ties) and the primary squash-merges each "
+        f"winning chunk into '{main_branch}' as 'UNITY: merge chunk <id>'."
+    )
+    try:
+        await dispatch(roster.agents, roster, base_prompt, task, worktrees, mcp)
+    finally:
+        for a in roster.agents:
+            worktree.cleanup_worktree(a.name, worktrees[a.name], root)
