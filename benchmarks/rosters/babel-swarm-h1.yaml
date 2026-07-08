@@ -1,7 +1,6 @@
 # Fully self-hosted H1 swarm: every worker runs on babel GPUs (marginal cost ~$0).
 # GPU budget: leanstral fp8 (4) + qwen (2) + goedel (2) = exactly the 8-GPU cap.
 # Requires: sbatch leanstral.sh qwen3-32b.sh goedel-prover-v2-32b.sh, tunnel up.
-# (deepseek-v4-flash is TP8/standalone-only — usable as a self-hosted SOLO baseline instead.)
 agents:
   - names: [primary]
     model: leanstral

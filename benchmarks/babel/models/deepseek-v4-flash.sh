@@ -6,8 +6,9 @@
 #SBATCH --mem=384G
 #SBATCH --time=2-00:00:00
 #SBATCH --output=%x-%j.out
-# DeepSeek-V4-Flash (284B MoE, 13B active, MIT). Native-FP8 weights ~284GB -> TP8;
-# STANDALONE-ONLY on the 8-GPU cap.
+# EXPERIMENTAL/BLOCKED: vLLM 0.18.1 (newest for babel's CUDA-12.9 driver) has no native
+# DeepSeek-V4 impl; the transformers fallback cannot tensor-parallel, and 284GB of native-FP8
+# weights can't fit one GPU. Runnable only after a driver upgrade (then: newest vLLM, TP8).
 # Serves on port 8005. agents.yaml: backend codex, base_url http://localhost:8005/v1, api_key unity.
 source ~/miniconda/etc/profile.d/conda.sh
 conda activate unity-new

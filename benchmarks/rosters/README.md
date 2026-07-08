@@ -36,7 +36,7 @@ condition later if budget allows (the roster files compose freely).
 | `goedel-prover-v2-32b.sh` | Goedel-Prover-V2-32B | 8001 | 2 | `BABEL_GOEDEL_URL` | verified live |
 | `hy3.sh` | Hunyuan 3 (295B MoE, FP8) | 8003 | 8 | `BABEL_HY3_URL` | **experimental** — arch may need a newer vLLM than the CUDA-12.9 driver allows; fallback: `tencent/hy3:free` on OpenRouter |
 | `leanstral.sh` | **Leanstral-1.5-119B-A6B** (Mistral's Lean 4 prover; 587/672 PutnamBench) | 8004 | 4 (runtime FP8) | `BABEL_LEANSTRAL_URL` | the Goedel upgrade; co-fits with qwen+goedel or dsv4 |
-| `deepseek-v4-flash.sh` | DeepSeek-V4-Flash (284B MoE, native FP8 ~284GB) | 8005 | 8 | `BABEL_DSV4_URL` | strong self-hosted generalist; **standalone-only** |
+| `deepseek-v4-flash.sh` | DeepSeek-V4-Flash (284B MoE, native FP8 ~284GB) | 8005 | 8 | `BABEL_DSV4_URL` | **experimental/blocked** — needs a newer vLLM than the CUDA-12.9 driver allows (transformers fallback can't TP) |
 
 **GLM-5.2 is deliberately absent**: it's 754B total — ~380GB at 4-bit, over the 8×48GB budget
 before KV/overhead. You already get GLM-5.x hosted via FreeInference; use that.
@@ -54,7 +54,7 @@ Old-arch models (qwen/goedel) run in conda env `unity` (vllm 0.11.2); newer ones
 
 Each roster's babel subset fits the 8-GPU cap on its own (one benchmark at a time):
 prove-fqb-h1 / formalize-h2 / babel-swarm-h1 = goedel(2)+qwen(2)+leanstral(4) = 8;
-dsv4-flash(8) and hy3(8) are standalone-only.
+dsv4-flash and hy3 are blocked on the current driver (see table).
 
 First run of a new model downloads weights to `/data/user_data/$USER/hf` (can take a while);
 `status.sh` shows `boot` until the server logs ready. Jobs have a 2-day walltime.
