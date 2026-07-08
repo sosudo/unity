@@ -5,21 +5,51 @@ You have up to four MCP servers. Use them — don't guess when a tool can answer
 are configured for this run. When Axle offers a tool equivalent to a lean-lsp one, **prefer the
 Axle version** (noted below).
 
-## Forum — `unity-forum` (team coordination + shared memory)
-- `forum_create_thread(thread_id, title, description)` — create a thread.
-- `forum_post(thread_id, author, content, reply_to)` — post a message; the result also returns your ICRL balance and any @mentions since your last post.
-- `forum_read(thread_id, sort)` — read a thread (`sort`: hot/new/top).
-- `forum_list()` — list all threads, active vote dimensions, tags, and the ICRL leaderboard.
-- `forum_vote(thread_id, post_id, vote, voter, dimension)` — up/down-vote a post on a quality dimension.
-- `forum_tag(name, post_ids, description, tagger)` — attach a named concept tag linking posts across threads.
-- `forum_get_tag(name)` — retrieve all posts with a tag (e.g. `decision`, `phase-handoff`).
-- `forum_check_balance(author, drain)` — your ICRL balance, history, and pending @mention notifications.
-- `forum_log_attempt(chunk_id, author, what, outcome, error, notes)` — log a structured attempt at a chunk.
-- `forum_chunk_history(chunk_id, limit)` — recent structured attempts on a chunk, newest first.
-- `forum_archive(thread_id, post_id, reason, archiver)` — archive a stale/superseded post.
-- `forum_set_dimensions(dimensions, allow_orphan)` — set the run's canonical vote dimensions (once, at start).
-- `forum_propose_dimension(name, description, proposed_by)` — propose a new vote dimension.
-- `forum_approve_dimension(name)` — approve a proposed vote dimension.
+## Forum — `unity-forum` (typed shared workspace: coordination + knowledge transfer)
+
+**Work through the typed acts below — each one has a guaranteed consumer** (briefs, consensus,
+later phases). Start every stint with `forum_brief`; use free-form `forum_post` only for what no
+act covers.
+
+*Read (cheap, do these often):*
+- `forum_brief(author, chunk?)` — one-call digest: binding decisions, latest handoff, open
+  obstacles/claims on your chunk, questions addressed to you, ledger highlights. **Your default
+  read.**
+- `forum_consensus(chunk)` — merge dashboard: each result's endorsements + open objections.
+- `ledger_get(query?, chunk?)` — retrieve verified reusable knowledge (lemmas/tactics/failures).
+- `forum_read(thread_id, sort)` / `forum_list()` — raw thread access when the digest isn't enough.
+- `forum_get_tag(name)` — legacy tag retrieval (`decision`, `phase-handoff` still work).
+
+*Coordinate (typed acts):*
+- `forum_claim(chunk, author, strategy)` — sign up for a chunk with your strategy (avoids
+  duplicate work/strategies).
+- `forum_result(chunk, author, status, build_ok, decl_names, error_sig, notes)` — report your
+  outcome; auto-closes your claim, and `build_ok=true` resolves the chunk's open obstacles.
+- `forum_obstacle(chunk, author, goal_state, tried, hypothesis)` — a goal you can't close; pushed
+  to every teammate's brief so anyone with the missing piece can respond.
+- `forum_question(author, body, to?, chunk?)` / `forum_answer(question_id, author, body)` —
+  addressed Q&A; open questions appear in the addressee's brief. **Answer your open questions
+  before claiming new work.**
+- `forum_endorse(chunk, result_id, author)` — you checked a teammate's result (correct+faithful).
+- `forum_object(chunk, result_id, author, reason)` — an OPEN objection blocks that result's merge
+  until `forum_resolve_objection(chunk, result_id, objector, resolution)`.
+- `forum_decision(author, topic, choice, rationale)` — binding cross-cutting decision (newer
+  decision on the same topic supersedes; injected into all later phases).
+- `forum_handoff(author, phase, changed, open, commitments)` — end-of-phase summary (injected
+  into later phases).
+
+*Transfer knowledge (the ledger — evidence required, folklore rejected):*
+- `ledger_add(author, kind=lemma|tactic|failure, title, content, evidence, goal_shape?, chunk?)` —
+  a compiling lemma teammates can reuse, a tactic recipe + the goal shape it closes, or a proven
+  dead end. `evidence` = build output / error text / the compiling snippet.
+
+*Legacy (still available):*
+- `forum_post(thread_id, author, content, reply_to)` — free-form note (returns ICRL balance +
+  @mentions since your last post).
+- `forum_vote(thread_id, post_id, vote, voter, dimension)` — dimensions are `correctness` and
+  `faithfulness`; prefer endorse/object, which record votes for you.
+- `forum_tag`, `forum_check_balance`, `forum_log_attempt`, `forum_chunk_history`, `forum_archive`,
+  `forum_set_dimensions`, `forum_propose_dimension`, `forum_approve_dimension`, `forum_stats()`.
 
 ## Lean LSP — `lean-lsp` (inspect and drive the Lean project)
 - `lean_goal` ★ — proof goals at a position. The most important tool; use often.

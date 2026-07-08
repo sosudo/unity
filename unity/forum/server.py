@@ -42,10 +42,6 @@ _POST_ID_RE = re.compile(r'^[a-f0-9]{8}$')
 DEFAULT_DIMENSIONS = [
     "correctness",
     "faithfulness",
-    "style_alignment",
-    "priority",
-    "confidence",
-    "feasibility",
 ]
 DIMENSION_APPROVAL_THRESHOLD = 3   # net upvotes on a proposal post to auto-approve
 DIMENSIONS_THREAD = "_dimensions"
@@ -1108,6 +1104,331 @@ def forum_get_tag(name: str) -> dict:
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
+
+
+# ── Typed workspace (speech acts + ledger + brief) ────────────────────────────
+# Free-form posts remain (forum_post = NOTE). The acts below are structured
+# artifacts with guaranteed consumers: DECISION/HANDOFF are read at every later
+# phase (legacy tags preserved), OBSTACLE/QUESTION surface in forum_brief and the
+# dispatch digest, RESULT feeds consensus/merging, the ledger feeds sign-ups.
+
+def _ensure_thread(thread_id: str, title: str) -> None:
+    if not _thread_path(thread_id).exists():
+        _save({"thread_id": thread_id, "title": title, "description": "",
+               "created_at": int(time.time()), "posts": []})
+
+
+def _typed_post(thread_id: str, title: str, author: str, act: str, fields: dict,
+                content: str, reply_to: list[str] | None = None) -> dict:
+    with _thread_lock(thread_id):
+        _ensure_thread(thread_id, title)
+        post = _forum_post_locked(thread_id, author, content, reply_to or [])
+        data = _load(thread_id)
+        for p in data["posts"]:
+            if p["post_id"] == post["post_id"]:
+                p["act"] = act
+                p["fields"] = fields
+                break
+        _save(data)
+    return {"post_id": post["post_id"], "thread_id": thread_id, "act": act}
+
+
+def _acts(thread_id: str, act: str | None = None) -> list[dict]:
+    if not _thread_path(thread_id).exists():
+        return []
+    posts = _load(thread_id).get("posts", [])
+    return [p for p in posts if not act or p.get("act") == act]
+
+
+def _chunk_thread(chunk: str) -> str:
+    return chunk if chunk.startswith("chunk-") else f"chunk-{chunk}"
+
+
+@mcp.tool()
+def forum_claim(chunk: str, author: str, strategy: str = "") -> dict:
+    """Claim a chunk you are signing up to work on, stating your intended strategy.
+    Other agents see open claims in forum_brief and avoid duplicating the chunk/strategy.
+    Your later forum_result on this chunk auto-links to (and closes) this claim."""
+    tid = _chunk_thread(chunk)
+    return _typed_post(tid, chunk, author, "claim",
+                       {"chunk": chunk, "strategy": strategy, "status": "open"},
+                       f"CLAIM {chunk}" + (f" — strategy: {strategy}" if strategy else ""))
+
+
+@mcp.tool()
+def forum_result(chunk: str, author: str, status: str, build_ok: bool = False,
+                 decl_names: list[str] | None = None, error_sig: str = "",
+                 notes: str = "") -> dict:
+    """Report the outcome of your work on a chunk. status: 'done' | 'partial' | 'failed'.
+    build_ok means the chunk builds sorry-free. Auto-links to your open claim, closes it,
+    and (if build_ok) resolves the chunk's open obstacles. Teammates endorse/object on
+    this result and the primary merges from forum_consensus."""
+    tid = _chunk_thread(chunk)
+    reply = []
+    with _thread_lock(tid):
+        _ensure_thread(tid, chunk)
+        data = _load(tid)
+        for p in data["posts"]:
+            f = p.get("fields") or {}
+            if p.get("act") == "claim" and p["author"] == author and f.get("status") == "open":
+                reply = [p["post_id"]]
+                f["status"] = "resolved"
+            if build_ok and p.get("act") == "obstacle" and (p.get("fields") or {}).get("status") == "open":
+                p["fields"]["status"] = "resolved"
+        _save(data)
+    content = (f"RESULT {chunk}: {status}" + (" [builds sorry-free]" if build_ok else "")
+               + (f" decls={decl_names}" if decl_names else "")
+               + (f" error: {error_sig[:160]}" if error_sig else "")
+               + (f" — {notes[:300]}" if notes else ""))
+    return _typed_post(tid, chunk, author, "result",
+                       {"chunk": chunk, "status": status, "build_ok": build_ok,
+                        "decl_names": decl_names or [], "error_sig": error_sig,
+                        "endorsements": [], "objections": []},
+                       content, reply)
+
+
+@mcp.tool()
+def forum_obstacle(chunk: str, author: str, goal_state: str,
+                   tried: list[str] | None = None, hypothesis: str = "") -> dict:
+    """Report a concrete obstacle on a chunk: the goal state you cannot close, what you
+    tried, and your hypothesis. Open obstacles are pushed to every teammate's brief so
+    anyone with the missing lemma/technique can respond. Resolved automatically when a
+    build_ok result lands on the chunk."""
+    tid = _chunk_thread(chunk)
+    content = (f"OBSTACLE {chunk}: {goal_state[:300]}"
+               + (f" | tried: {', '.join(tried or [])[:200]}" if tried else "")
+               + (f" | hypothesis: {hypothesis[:200]}" if hypothesis else ""))
+    return _typed_post(tid, chunk, author, "obstacle",
+                       {"chunk": chunk, "goal_state": goal_state, "tried": tried or [],
+                        "hypothesis": hypothesis, "status": "open"}, content)
+
+
+@mcp.tool()
+def forum_question(author: str, body: str, to: str = "", chunk: str = "") -> dict:
+    """Ask the team (or a specific agent via `to`) a question. Open questions addressed
+    to an agent appear in their brief; answer with forum_answer(question_id, ...)."""
+    return _typed_post("qa", "Questions & Answers", author, "question",
+                       {"to": to, "chunk": chunk, "status": "open"},
+                       f"QUESTION{f' @{to}' if to else ''}{f' [{chunk}]' if chunk else ''}: {body}")
+
+
+@mcp.tool()
+def forum_answer(question_id: str, author: str, body: str) -> dict:
+    """Answer an open question by its post_id (auto-threads to it and closes it)."""
+    with _thread_lock("qa"):
+        _ensure_thread("qa", "Questions & Answers")
+        data = _load("qa")
+        for p in data["posts"]:
+            if p["post_id"] == question_id and p.get("act") == "question":
+                (p.get("fields") or {}).update(status="answered")
+        _save(data)
+    return _typed_post("qa", "Questions & Answers", author, "answer",
+                       {"question_id": question_id}, f"ANSWER: {body}", [question_id])
+
+
+@mcp.tool()
+def forum_decision(author: str, topic: str, choice: str, rationale: str = "") -> dict:
+    """Record a binding cross-cutting decision (one per topic; a newer decision on the
+    same topic supersedes). Injected into every later phase's briefs; also carries the
+    legacy 'decision' tag so forum_get_tag('decision') keeps working."""
+    r = _typed_post("global", "Global Discussion", author, "decision",
+                    {"topic": topic, "choice": choice, "rationale": rationale},
+                    f"DECISION [{topic}]: {choice}" + (f" — {rationale[:300]}" if rationale else ""))
+    forum_tag(name="decision", post_ids=[r["post_id"]], tagger=author)
+    return r
+
+
+@mcp.tool()
+def forum_handoff(author: str, phase: str, changed: str, open_items: str = "",
+                  commitments: str = "") -> dict:
+    """End-of-phase handoff: what changed on disk, what is open, what later phases must
+    honor. Injected into later phases' briefs; carries the legacy 'phase-handoff' tag."""
+    r = _typed_post("global", "Global Discussion", author, "handoff",
+                    {"phase": phase, "changed": changed, "open": open_items,
+                     "commitments": commitments},
+                    f"HANDOFF [{phase}]: {changed[:300]}"
+                    + (f" | open: {open_items[:200]}" if open_items else "")
+                    + (f" | commitments: {commitments[:200]}" if commitments else ""))
+    forum_tag(name="phase-handoff", post_ids=[r["post_id"]], tagger=author)
+    return r
+
+
+def _mutate_result(chunk: str, result_id: str, fn) -> bool:
+    tid = _chunk_thread(chunk)
+    ok = False
+    with _thread_lock(tid):
+        if not _thread_path(tid).exists():
+            return False
+        data = _load(tid)
+        for p in data["posts"]:
+            if p["post_id"] == result_id and p.get("act") == "result":
+                fn(p.setdefault("fields", {}))
+                ok = True
+        _save(data)
+    return ok
+
+
+@mcp.tool()
+def forum_endorse(chunk: str, result_id: str, author: str) -> dict:
+    """Endorse a result on a chunk (you checked it: correct + faithful). Counts toward
+    merge quorum in forum_consensus; also records a legacy correctness upvote."""
+    forum_vote(_chunk_thread(chunk), result_id, "up", author, "correctness")
+    if not _mutate_result(chunk, result_id, lambda f: f.setdefault("endorsements", []).append(author)
+                          if author not in f.get("endorsements", []) else None):
+        raise ValueError(f"no result {result_id} on {chunk}")
+    return {"result_id": result_id, "endorsed_by": author}
+
+
+@mcp.tool()
+def forum_object(chunk: str, result_id: str, author: str, reason: str) -> dict:
+    """Object to a result with a concrete reason. An OPEN objection blocks the merge of
+    that result until resolved (forum_resolve_objection) — objections are how the team
+    stops an unfaithful or broken chunk from landing."""
+    forum_vote(_chunk_thread(chunk), result_id, "down", author, "correctness")
+    if not _mutate_result(chunk, result_id, lambda f: f.setdefault("objections", []).append(
+            {"by": author, "reason": reason, "status": "open"})):
+        raise ValueError(f"no result {result_id} on {chunk}")
+    return {"result_id": result_id, "objection_by": author}
+
+
+@mcp.tool()
+def forum_resolve_objection(chunk: str, result_id: str, objector: str, resolution: str) -> dict:
+    """Mark an objection resolved (by the objector after their concern is addressed, or
+    by the primary with justification)."""
+    def fix(f):
+        for o in f.get("objections", []):
+            if o["by"] == objector and o["status"] == "open":
+                o["status"] = "resolved"
+                o["resolution"] = resolution
+    if not _mutate_result(chunk, result_id, fix):
+        raise ValueError(f"no result {result_id} on {chunk}")
+    return {"result_id": result_id, "resolved": objector}
+
+
+@mcp.tool()
+def forum_consensus(chunk: str) -> dict:
+    """Merge dashboard for a chunk: every result with its endorsement count and open
+    objections. The primary merges the winning result only if it has >=1 endorsement and
+    0 open objections (override allowed but must be posted as a DECISION)."""
+    out = []
+    for p in _acts(_chunk_thread(chunk), "result"):
+        f = p.get("fields") or {}
+        out.append({"result_id": p["post_id"], "author": p["author"],
+                    "status": f.get("status"), "build_ok": f.get("build_ok"),
+                    "endorsements": f.get("endorsements", []),
+                    "open_objections": [o for o in f.get("objections", []) if o["status"] == "open"]})
+    return {"chunk": chunk, "results": out}
+
+
+@mcp.tool()
+def ledger_add(author: str, kind: str, title: str, content: str, evidence: str,
+               goal_shape: str = "", chunk: str = "") -> dict:
+    """Add a verified knowledge artifact to the run ledger. kind: 'lemma' (a compiling
+    declaration teammates can reuse), 'tactic' (a recipe + the goal shape it closes), or
+    'failure' (an approach that provably doesn't work and why). `evidence` is REQUIRED —
+    build output, error text, or the compiling snippet itself; unverified folklore is
+    rejected. Ledger entries reach whoever signs up for related chunks."""
+    if kind not in ("lemma", "tactic", "failure"):
+        raise ValueError("kind must be lemma | tactic | failure")
+    if not evidence or not evidence.strip():
+        raise ValueError("evidence is required (build output / error text / compiling snippet)")
+    return _typed_post("ledger", "Run Ledger", author, "ledger",
+                       {"kind": kind, "title": title, "goal_shape": goal_shape,
+                        "chunk": chunk, "evidence": evidence[:2000]},
+                       f"LEDGER[{kind}] {title}: {content[:500]}")
+
+
+@mcp.tool()
+def ledger_get(query: str = "", chunk: str = "", limit: int = 8) -> dict:
+    """Retrieve ledger entries, newest first, optionally filtered by substring match on
+    title/goal_shape/content (`query`) and/or by chunk."""
+    entries = []
+    for p in reversed(_acts("ledger", "ledger")):
+        f = p.get("fields") or {}
+        hay = f"{f.get('title','')} {f.get('goal_shape','')} {p.get('content','')}".lower()
+        if query and query.lower() not in hay:
+            continue
+        if chunk and f.get("chunk") != chunk:
+            continue
+        entries.append({"id": p["post_id"], "author": p["author"], "kind": f.get("kind"),
+                        "title": f.get("title"), "goal_shape": f.get("goal_shape"),
+                        "content": p.get("content"), "evidence": f.get("evidence", "")[:500]})
+        if len(entries) >= limit:
+            break
+    return {"entries": entries}
+
+
+def build_brief(author: str, chunk: str = "") -> str:
+    """Compact digest of the workspace for one agent (also used by the dispatch
+    injection). Empty string when there is nothing to show (e.g. a fresh run)."""
+    lines: list[str] = []
+    decisions = _acts("global", "decision")
+    if decisions:
+        latest: dict[str, dict] = {}
+        for p in decisions:
+            latest[(p.get("fields") or {}).get("topic", "?")] = p
+        lines.append("Binding decisions:")
+        lines += [f"  - {p['content'][:180]}" for p in list(latest.values())[-6:]]
+    handoffs = _acts("global", "handoff")
+    if handoffs:
+        lines.append("Latest handoff:")
+        lines.append(f"  - {handoffs[-1]['content'][:220]}")
+    if chunk:
+        tid = _chunk_thread(chunk)
+        obstacles = [p for p in _acts(tid, "obstacle") if (p.get("fields") or {}).get("status") == "open"]
+        if obstacles:
+            lines.append(f"Open obstacles on {chunk}:")
+            lines += [f"  - {p['content'][:200]}" for p in obstacles[-4:]]
+        claims = [p for p in _acts(tid, "claim") if (p.get("fields") or {}).get("status") == "open"]
+        if claims:
+            lines.append(f"Open claims on {chunk}: " +
+                         ", ".join(f"{p['author']} ({(p.get('fields') or {}).get('strategy','')[:40]})"
+                                   for p in claims[-4:]))
+    me = _canonical_author(author)
+    open_qs = [p for p in _acts("qa", "question")
+               if (p.get("fields") or {}).get("status") == "open"
+               and (_canonical_author((p.get("fields") or {}).get("to", "")) == me
+                    or (chunk and (p.get("fields") or {}).get("chunk") == chunk))]
+    if open_qs:
+        lines.append("Open questions for you:")
+        lines += [f"  - [{p['post_id']}] {p['content'][:180]}" for p in open_qs[-4:]]
+    ledger = _acts("ledger", "ledger")
+    if ledger:
+        picks = [p for p in ledger if chunk and (p.get("fields") or {}).get("chunk") == chunk] or ledger
+        lines.append("Ledger (verified reusable knowledge; ledger_get for more):")
+        lines += [f"  - {p['content'][:180]}" for p in picks[-5:]]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def forum_brief(author: str, chunk: str = "") -> str:
+    """One-call compact digest: binding decisions, the latest handoff, open obstacles and
+    claims on your chunk, questions addressed to you, and relevant ledger entries. Call
+    this instead of reading raw threads."""
+    return build_brief(author, chunk) or "(workspace empty — nothing binding yet)"
+
+
+@mcp.tool()
+def forum_stats() -> dict:
+    """Communication telemetry: post counts by act type and by author (for benchmark
+    ablations)."""
+    by_act: dict[str, int] = {}
+    by_author: dict[str, int] = {}
+    for tp in FORUM_DIR.glob("*.json"):
+        if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
+            continue
+        try:
+            posts = json.loads(tp.read_text()).get("posts", [])
+        except (json.JSONDecodeError, OSError):
+            continue
+        for p in posts:
+            by_act[p.get("act", "note")] = by_act.get(p.get("act", "note"), 0) + 1
+            by_author[p.get("author", "?")] = by_author.get(p.get("author", "?"), 0) + 1
+    return {"by_act": by_act, "by_author": by_author}
+
+
+# ── entrypoint (must stay at end of module so all tools above are registered) ──
 
 def run(forum_dir: Path) -> None:
     """Start the MCP server against `forum_dir` (programmatic entry point)."""

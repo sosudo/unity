@@ -99,8 +99,24 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
     unity_dir = find_unity_dir(Path(any_cwd))
     ranking = _effective_ranking(roster, unity_dir / "forum") if unity_dir else None
 
+    def _brief(a) -> str:
+        """Workspace digest injected per agent: binding decisions, latest handoff, open
+        obstacles/questions, ledger highlights. Empty on a fresh run (nothing binding yet);
+        it earns its keep at phase boundaries, critic-loop iterations, and --continue runs.
+        Intra-phase freshness comes from the forum_brief tool instead."""
+        if unity_dir is None or os.getenv("UNITY_FORUM_BRIEF", "on").lower() == "off":
+            return ""  # UNITY_FORUM_BRIEF=off -> H3 substrate ablation
+        try:
+            from .forum import server as forum_server
+            forum_server.FORUM_DIR = unity_dir / "forum"
+            text = forum_server.build_brief(a.name)
+            return f"\nWorkspace brief (live state — refresh anytime with forum_brief):\n{text}\n" if text else ""
+        except Exception:
+            return ""
+
     results = await asyncio.gather(
-        *[spawn(a, _preamble(a, roster, ranking) + full, task, _cwd(a), mcp, subagents=subagents)
+        *[spawn(a, _preamble(a, roster, ranking) + _brief(a) + full, task, _cwd(a), mcp,
+                subagents=subagents)
           for a in agents],
         return_exceptions=True,
     )

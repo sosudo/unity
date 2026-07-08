@@ -6,6 +6,9 @@
   at a fraction of the cost. ("10 sonnets ≈ 1 opus, cheaper")
 - **H2 (capability):** a roster of *frontier* models in Unity > one of those models working solo.
   ("10 opuses > 1 opus")
+- **H3 (substrate):** the *design* of the communication substrate matters — the typed shared
+  workspace (speech acts + evidence-gated ledger + injected briefs; see `FORUM2.md`) beats the
+  same roster on a legacy free-form forum.
 
 Every benchmark below runs (up to budget) three conditions:
 **(A)** single frontier model solo — the baseline; **(B)** Unity small-swarm (H1); **(C)** Unity
@@ -139,6 +142,22 @@ Babel `agents.yaml` snippet (after `sbatch ~/unity-models/qwen3-32b.sh`, note th
   harness is easily revivable.
 - **Conditions:** B (qwen3.6-35b ×2 + glm-5-turbo + haiku primary) vs A (1× sonnet-5) — optimize
   is where "free tokens, many tries" should shine.
+
+## H3 — forum-substrate ablation
+
+Pick one benchmark where swarm coordination is load-bearing (recommended: the `prove`
+FormalQualBench 10-problem subset, or `create` on PraLean) and run the **same roster** twice:
+
+- **TYPED** (default): typed acts + ledger + brief injection as shipped.
+- **LEGACY**: set `UNITY_FORUM_BRIEF=off` in the environment (disables the dispatch digest) and
+  swap `unity/prompts/TOOLS.md`'s forum section for the legacy-only tool list (keep a copy of the
+  old section for this; the typed MCP tools remain registered but unadvertised — mirroring the
+  pre-redesign situation where usage was prompt-driven).
+
+**Metrics:** task outcome (solved chunks / build state) + cost/time from `run.jsonl`, plus
+communication telemetry from `forum_stats()` (artifacts by act/author) archived per run. The
+VerifiedProbabilisticAlgorithms forum autopsy (86 posts, 0 replies, 2/6 vote dims used, 23
+organic tags — see `FORUM2.md`) is the pre-redesign baseline data point.
 
 ## Run protocol (all experiments)
 1. Fresh project per run; roster in `.unity/agents.yaml`; seed/scope in `UNITY.md`; sources via
