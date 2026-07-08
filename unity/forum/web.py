@@ -294,6 +294,62 @@ async def events():
 
 # ── Forum HTML ────────────────────────────────────────────────────────────────
 
+
+@app.get("/api/workspace")
+def get_workspace():
+    """Typed-workspace state: decisions, handoffs, per-chunk consensus, obstacles,
+    questions, ledger, and act telemetry (Forum 2.0 view)."""
+    decisions: dict = {}
+    handoffs: list = []
+    chunks: dict = {}
+    questions: list = []
+    ledger: list = []
+    by_act: dict = {}
+    for tp in sorted(FORUM_DIR.glob("*.json")):
+        if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
+            continue
+        try:
+            data = json.loads(tp.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        tid = data.get("thread_id", tp.stem)
+        for post in data.get("posts", []):
+            act = post.get("act")
+            by_act[act or "note"] = by_act.get(act or "note", 0) + 1
+            f = post.get("fields") or {}
+            if act == "decision":
+                decisions[f.get("topic", "?")] = {"topic": f.get("topic"), "choice": f.get("choice"),
+                                                  "rationale": f.get("rationale", ""), "author": post["author"],
+                                                  "ts": post["timestamp"]}
+            elif act == "handoff":
+                handoffs.append({"phase": f.get("phase"), "content": post["content"],
+                                 "author": post["author"], "ts": post["timestamp"]})
+            elif act in ("claim", "result", "obstacle") and tid.startswith("chunk-"):
+                c = chunks.setdefault(tid, {"chunk": tid, "claims": [], "results": [], "obstacles": []})
+                if act == "claim" and f.get("status") == "open":
+                    c["claims"].append({"author": post["author"], "strategy": f.get("strategy", "")})
+                elif act == "result":
+                    open_obj = [o for o in f.get("objections", []) if o.get("status") == "open"]
+                    c["results"].append({"id": post["post_id"], "author": post["author"],
+                                         "status": f.get("status"), "build_ok": f.get("build_ok"),
+                                         "endorsements": f.get("endorsements", []),
+                                         "open_objections": open_obj,
+                                         "mergeable": bool(f.get("endorsements")) and not open_obj})
+                elif act == "obstacle" and f.get("status") == "open":
+                    c["obstacles"].append({"author": post["author"], "content": post["content"]})
+            elif act == "question" and f.get("status") == "open":
+                questions.append({"id": post["post_id"], "author": post["author"], "to": f.get("to", ""),
+                                  "chunk": f.get("chunk", ""), "content": post["content"]})
+            elif act == "ledger":
+                ledger.append({"author": post["author"], "kind": f.get("kind"), "title": f.get("title"),
+                               "goal_shape": f.get("goal_shape", ""), "content": post["content"],
+                               "ts": post["timestamp"]})
+    return {"decisions": sorted(decisions.values(), key=lambda d: -d["ts"]),
+            "handoffs": handoffs[-3:][::-1],
+            "chunks": sorted(chunks.values(), key=lambda c: c["chunk"]),
+            "questions": questions, "ledger": ledger[::-1][:20], "by_act": by_act}
+
+
 FORUM_HTML = """\
 <!DOCTYPE html>
 <html>
@@ -366,6 +422,7 @@ main { display: flex; flex: 1; overflow: hidden; }
   <h1>union</h1>
   <div class="controls">
     <nav>
+      <a href="/workspace">workspace →</a>
       <a href="/graph">graph →</a>
       <a href="/dag">dag →</a>
     </nav>
@@ -587,6 +644,7 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
   <div class="controls">
     <nav>
       <a href="/">← forum</a>
+      <a href="/workspace">workspace →</a>
       <a href="/dag">dag →</a>
     </nav>
     <span id="status">loading...</span>
@@ -933,6 +991,7 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
   <div class="controls">
     <nav>
       <a href="/">← forum</a>
+      <a href="/workspace">workspace →</a>
       <a href="/graph">graph →</a>
     </nav>
     <span id="status">connecting...</span>
@@ -1105,6 +1164,112 @@ def graph():
 @app.get("/dag", response_class=HTMLResponse)
 def dag():
     return DAG_HTML
+
+
+WORKSPACE_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>union — workspace</title>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: #fafafa; color: #111; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #e4e4e4; background: #fafafa; position: sticky; top: 0; }
+header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.14em; }
+nav { display: flex; gap: 16px; }
+nav a { font-size: 12px; color: #888; text-decoration: none; }
+nav a:hover { color: #111; }
+#status { font-size: 11px; color: #bbb; }
+main { padding: 18px 20px; display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
+section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; }
+section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #bbb; margin-bottom: 8px; }
+.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; }
+.item:first-of-type { border-top: none; }
+.who { color: #999; font-size: 11px; }
+.chunk-card { margin-bottom: 10px; }
+.chunk-name { font-weight: 600; font-size: 12px; }
+.badge { display: inline-block; font-size: 10px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
+.ok { background: #e8f5e9; color: #1b5e20; }
+.blocked { background: #ffebee; color: #b71c1c; }
+.pending { background: #f5f5f5; color: #888; }
+.kind { font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: #888; margin-right: 6px; }
+.stats { display: flex; flex-wrap: wrap; gap: 8px; }
+.stat { border: 1px solid #eee; border-radius: 4px; padding: 2px 8px; font-size: 11px; color: #666; }
+.empty { color: #ccc; padding: 8px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>union — workspace</h1>
+  <div style="display:flex;gap:16px;align-items:center">
+    <nav>
+      <a href="/">← forum</a>
+      <a href="/graph">graph →</a>
+      <a href="/dag">dag →</a>
+    </nav>
+    <span id="status">connecting...</span>
+  </div>
+</header>
+<main id="main"></main>
+<script>
+const esc = t => (t || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+function badge(r) {
+  if (r.mergeable) return '<span class="badge ok">mergeable</span>';
+  if (r.open_objections.length) return '<span class="badge blocked">' + r.open_objections.length + ' objection(s)</span>';
+  return '<span class="badge pending">needs endorsement</span>';
+}
+async function refresh() {
+  try {
+    const d = await (await fetch('/api/workspace')).json();
+    document.getElementById('status').textContent = 'live';
+    let h = '';
+    h += '<section><h2>Binding decisions</h2>' + (d.decisions.length ? d.decisions.map(x =>
+      '<div class="item"><b>' + esc(x.topic) + '</b>: ' + esc(x.choice) +
+      (x.rationale ? ' — <span class="who">' + esc(x.rationale) + '</span>' : '') +
+      ' <span class="who">(' + esc(x.author) + ')</span></div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+    h += '<section><h2>Chunk consensus</h2>' + (d.chunks.length ? d.chunks.map(c =>
+      '<div class="chunk-card"><span class="chunk-name">' + esc(c.chunk) + '</span>' +
+      c.results.map(r => '<div class="item">' + esc(r.author) + ': ' + esc(r.status) +
+        (r.build_ok ? ' ✓build' : '') + badge(r) +
+        (r.endorsements.length ? ' <span class="who">endorsed by ' + esc(r.endorsements.join(', ')) + '</span>' : '') +
+        r.open_objections.map(o => '<div class="who">⛔ ' + esc(o.by) + ': ' + esc(o.reason) + '</div>').join('') +
+        '</div>').join('') +
+      (c.claims.length ? '<div class="item who">open claims: ' + c.claims.map(cl => esc(cl.author) +
+        (cl.strategy ? ' (' + esc(cl.strategy) + ')' : '')).join(', ') + '</div>' : '') +
+      '</div>').join('') : '<div class="empty">no typed chunk activity yet</div>') + '</section>';
+    h += '<section><h2>Open obstacles</h2>' + (d.chunks.some(c => c.obstacles.length) ?
+      d.chunks.flatMap(c => c.obstacles.map(o => '<div class="item">' + esc(o.content) +
+      ' <span class="who">(' + esc(o.author) + ')</span></div>')).join('') : '<div class="empty">none open</div>') + '</section>';
+    h += '<section><h2>Open questions</h2>' + (d.questions.length ? d.questions.map(q =>
+      '<div class="item">' + esc(q.content) + ' <span class="who">(' + esc(q.author) + ')</span></div>').join('')
+      : '<div class="empty">none open</div>') + '</section>';
+    h += '<section><h2>Ledger</h2>' + (d.ledger.length ? d.ledger.map(l =>
+      '<div class="item"><span class="kind">' + esc(l.kind) + '</span>' + esc(l.content) +
+      (l.goal_shape ? ' <span class="who">[' + esc(l.goal_shape) + ']</span>' : '') + '</div>').join('')
+      : '<div class="empty">no verified knowledge yet</div>') + '</section>';
+    h += '<section><h2>Latest handoffs</h2>' + (d.handoffs.length ? d.handoffs.map(x =>
+      '<div class="item">' + esc(x.content) + '</div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+    h += '<section><h2>Telemetry (posts by act)</h2><div class="stats">' +
+      Object.entries(d.by_act).map(([k, v]) => '<span class="stat">' + esc(k) + ': ' + v + '</span>').join('') +
+      '</div></section>';
+    document.getElementById('main').innerHTML = h;
+  } catch (e) {
+    document.getElementById('status').textContent = 'disconnected';
+  }
+}
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/workspace", response_class=HTMLResponse)
+def workspace():
+    return WORKSPACE_HTML
+
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
