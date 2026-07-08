@@ -24,9 +24,9 @@ condition later if budget allows (the roster files compose freely).
 
 | Var | Meaning |
 |---|---|
-| `FREEINFERENCE_BASE_URL` / `FREEINFERENCE_API_KEY` | Harvard FreeInference (OpenAI-compatible → codex backend). ≤2 instances/model, $20/day. |
+| `FREEINFERENCE_BASE_URL` / `FREEINFERENCE_API_KEY` | Harvard FreeInference: use `https://freeinference.org/v1` (OpenAI wire → codex backend; `/v1/models`, `/v1/responses` incl. SSE all verified live). Model ids as listed: `glm-5.1`, `glm-5-turbo`, `minimax-m2.5`, `minimax-m3`, `qwen3.6-35b`. ≤2 instances/model, $20/day. **Do not use the `/anthropic` gateway with claude_code yet** — as of 2026-07-07 it 404s every route/auth variant (server-side; the claude CLI reaches it but gets "issue with the selected model"). All FreeInference roster entries therefore use the codex backend. |
 | `OPENROUTER_ANTHROPIC_URL` / `OPENROUTER_API_KEY` | OpenRouter free tier via claude_code — reuse the exact base_url from the working VerifiedProbabilisticAlgorithms run. |
-| `BABEL_QWEN_URL` / `BABEL_GOEDEL_URL` | `http://<node>:8000/v1` after `sbatch ~/unity-models/<model>.sh` (node = the job's hostname; api key is literally `unity`). |
+| `BABEL_QWEN_URL` / `BABEL_GOEDEL_URL` | With the `babel-compute-node` tunnel up (`ssh -N -f babel-compute-node`; its config carries both forwards): `http://localhost:8000/v1` (qwen3-32b) and `http://localhost:8001/v1` (goedel-prover-v2-32b); api key is literally `unity`. After resubmitting jobs, update the node names in `~/.ssh/config` (`HostName` + the goedel `LocalForward`) to the new `squeue` nodes. vLLM serves `/v1/responses`, so the codex backend works against it (verified live 2026-07-07). |
 | `OPENAI_API_KEY` / `GEMINI_API_KEY` | tentative; uncomment the stanzas in `solve-h2.yaml` if they land. |
 
 Claude models authenticate through the logged-in Claude Code CLI (Claude Pro) — no keys in yaml.

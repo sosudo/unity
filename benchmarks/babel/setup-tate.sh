@@ -34,8 +34,10 @@ chmod +x ~/unity-models/$1
 write_script qwen3-32b.sh            Qwen/Qwen3-32B                     qwen3-32b            2 128G
 write_script goedel-prover-v2-32b.sh Goedel-LM/Goedel-Prover-V2-32B     goedel-prover-v2-32b 2 128G
 write_script llama33-70b.sh          meta-llama/Llama-3.3-70B-Instruct  llama33-70b          4 256G
+# goedel serves on 8001 so both models can co-locate on one node
+sed -i 's@--port 8000@--port 8001@; s@:8000/v1@:8001/v1@' ~/unity-models/goedel-prover-v2-32b.sh
 echo "scripts:"; ls ~/unity-models/
 source $CONDA_SH
 conda env remove -n unity -y >/dev/null 2>&1
-nohup bash -c "source $CONDA_SH && conda create -y -n unity python=3.12 && conda activate unity && pip install -q uv && uv pip install --system --python \$(which python) -q vllm || python -m pip install -q vllm && echo UNITY_ENV_READY" > ~/unity-env-setup.log 2>&1 &
+nohup bash -c "source $CONDA_SH && conda create -y -n unity python=3.12 && conda activate unity && pip install -q uv && uv pip install --system --python "$(which python)" -q "vllm==0.11.2" "flashinfer-cubin==0.5.2" --torch-backend=cu128 && echo UNITY_ENV_READY" > ~/unity-env-setup.log 2>&1 &
 echo "tate env setup backgrounded"

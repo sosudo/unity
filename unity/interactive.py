@@ -67,13 +67,22 @@ async def _codex_session(agent: Agent, system_prompt: str, cwd: Path, mcp: dict,
             if not user or user.lower() in ("exit", "quit"):
                 break
             handle = await thread.turn(user)
+            # stream() is the sole consumer (run() would compete for the same notification
+            # queue and hang); the final text arrives as an agentMessage item.
+            final = None
             async for note in handle.stream():
                 _log(agent.name, note)
-            result = await handle.run()
-            if result.final_response:
-                click.echo(f"\n{result.final_response}")
+                if getattr(note, "method", "") == "item/completed":
+                    root = getattr(getattr(getattr(note, "payload", None), "item", None), "root", None)
+                    if getattr(root, "type", "") == "agentMessage":
+                        final = getattr(root, "text", None) or final
+            if final:
+                click.echo(f"\n{final}")
     finally:
-        await codex.close()
+        try:
+            await asyncio.wait_for(codex.close(), timeout=15)
+        except (asyncio.TimeoutError, Exception):
+            pass
 
 
 async def run_interactive(agent: Agent, system_prompt: str, cwd: Path, mcp: dict, subagents=()) -> None:

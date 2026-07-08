@@ -83,6 +83,20 @@ def _log(name: str, msg) -> None:
         suffix = f" — ${cost:.4f}" if isinstance(cost, (int, float)) else ""
         _console.print(f"[green]\\[{name}] ✓ done{suffix}[/green]")
         return
+    method = getattr(msg, "method", None)
+    if method:  # codex Notification: typed payload objects
+        payload = getattr(msg, "payload", None)
+        if method == "item/agentMessage/delta":
+            delta = str(getattr(payload, "delta", "") or "")
+            if delta.strip():
+                _console.print(f"[dim]\\[{name}][/dim] {delta[:300]}")
+        elif method == "item/started":
+            root = getattr(getattr(payload, "item", None), "root", None)
+            if getattr(root, "type", "") == "commandExecution":
+                _console.print(f"[dim]\\[{name}][/dim] [cyan]⚙ {str(getattr(root, 'command', ''))[:160]}[/cyan]")
+        elif method == "turn/completed":
+            _console.print(f"[green]\\[{name}] ✓ turn complete[/green]")
+        return
     text = getattr(msg, "text", None) or getattr(msg, "message", None)
     if text:
         _console.print(f"[dim]\\[{name}][/dim] {str(text)[:500]}")
@@ -128,12 +142,19 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
             await asyncio.sleep(_RETRY_SLEEP)
 
 
-def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict) -> str | None:
-    """Seed CODEX_HOME/config.toml with a custom provider (if base_url) and MCP
-    servers. Returns the provider id to pass as model_provider, or None for the
-    default openai provider. (Schema to be verified against codex when wired live.)"""
+def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
+                        writable_root: Path | None = None) -> str | None:
+    """Seed CODEX_HOME/config.toml with a custom provider (if base_url), MCP servers,
+    and workspace-write sandbox tuning. Returns the provider id to pass as
+    model_provider, or None for the default openai provider."""
     home.mkdir(parents=True, exist_ok=True)
     lines: list[str] = []
+    # Unity agents run under workspace_write: they need network (lake, arXiv, MCP)
+    # and, from a worktree cwd, write access to the main project (.unity/dag.json).
+    lines += ["[sandbox_workspace_write]", "network_access = true"]
+    if writable_root is not None:
+        lines.append(f'writable_roots = ["{writable_root}"]')
+    lines.append("")
     provider = None
     if agent.base_url:
         provider = "unity"
@@ -142,7 +163,9 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict) -> str | No
             'name = "unity"',
             f'base_url = "{agent.base_url}"',
             'env_key = "CODEX_API_KEY"',
-            'wire_api = "chat"',
+            # codex-cli >= 0.132 dropped wire_api="chat"; providers must speak the
+            # OpenAI Responses API (vLLM and FreeInference both serve /v1/responses).
+            'wire_api = "responses"',
             "",
         ]
     for name, cfg in (mcp_servers or {}).items():
@@ -186,7 +209,11 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    provider = _write_codex_config(home, agent, mcp_servers)
+    # from a worktree cwd, the agent still needs write access to the main project (.unity/)
+    from .config import find_unity_dir
+    unity_dir = find_unity_dir(Path(cwd))
+    provider = _write_codex_config(home, agent, mcp_servers,
+                                   writable_root=unity_dir.parent if unity_dir else None)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
     sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
@@ -194,7 +221,9 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     for attempt in range(_MAX_API_RETRIES):
         codex = AsyncCodex(config=CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
         try:
-            if agent.api_key:
+            # login_api_key is OpenAI-official auth only; custom providers (base_url set)
+            # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
+            if agent.api_key and not agent.base_url:
                 await codex.login_api_key(agent.api_key)
             thread = await codex.thread_start(
                 model=agent.model,
@@ -204,22 +233,38 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 cwd=str(cwd),
             )
             handle = await thread.turn(prompt)
+            # handle.run() and handle.stream() are competing consumers of one notification
+            # queue — using both (in any order) starves one and hangs. Consume ONLY the
+            # stream and assemble the final response from agentMessage items ourselves.
+            final = None
+            usage = None
             async for note in _idle_guard(handle.stream(), idle_timeout):
                 _log(agent.name, note)
-            result = await handle.run()
-            usage = getattr(result, "usage", None)
-            _last_run_stats[agent.name] = {
-                "cost_usd": None,  # codex SDK exposes no spend figure
-                "usage": {k: getattr(usage, k) for k in dir(usage) if "token" in k} if usage else None,
-            }
-            return result.final_response
+                method = getattr(note, "method", "") or ""
+                payload = getattr(note, "payload", None)
+                if method == "item/completed":
+                    root = getattr(getattr(payload, "item", None), "root", None)
+                    if getattr(root, "type", "") == "agentMessage":
+                        final = getattr(root, "text", None) or final
+                elif method == "thread/tokenUsage/updated":
+                    total = getattr(getattr(payload, "token_usage", None), "total", None)
+                    if total is not None:
+                        usage = {k: getattr(total, k) for k in
+                                 ("input_tokens", "cached_input_tokens", "output_tokens",
+                                  "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
+            _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
+            return final
         except Exception as e:
             if attempt == _MAX_API_RETRIES - 1:
                 raise
             _log(agent.name, f"API Error ({e}), retrying in 10 minutes...")
             await asyncio.sleep(_RETRY_SLEEP)
         finally:
-            await codex.close()
+            # close() can hang after an aborted turn; don't let cleanup wedge the agent.
+            try:
+                await asyncio.wait_for(codex.close(), timeout=15)
+            except (asyncio.TimeoutError, Exception):
+                pass
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
