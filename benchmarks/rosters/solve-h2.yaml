@@ -31,9 +31,3 @@ agents:
     api_key: ${FREEINFERENCE_API_KEY}
     strength: 5
     budget: 5
-#  - names: [gpt-1]                  # uncomment if the OpenAI key lands
-#    model: gpt-5.2
-#    backend: codex
-#    provider: openai
-#    api_key: ${OPENAI_API_KEY}
-#    strength: 8

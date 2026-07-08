@@ -1,33 +1,26 @@
 # Fully self-hosted H1 swarm: every worker runs on babel GPUs (marginal cost ~$0).
-# GPU budget: deepseek-v4-flash (4) + leanstral fp8 (4) = exactly the 8-GPU cap.
-# Requires: sbatch deepseek-v4-flash.sh + leanstral.sh, tunnel up.
-# (To use qwen/goedel instead of one of them, swap the stanzas below.)
+# GPU budget: leanstral fp8 (4) + qwen (2) + goedel (2) = exactly the 8-GPU cap.
+# Requires: sbatch leanstral.sh qwen3-32b.sh goedel-prover-v2-32b.sh, tunnel up.
+# (deepseek-v4-flash is TP8/standalone-only — usable as a self-hosted SOLO baseline instead.)
 agents:
   - names: [primary]
-    model: deepseek-v4-flash
-    backend: codex
-    provider: vllm
-    base_url: ${BABEL_DSV4_URL}
-    api_key: unity
-    strength: 7
-  - names: [leanstral-1]
     model: leanstral
     backend: codex
     provider: vllm
     base_url: ${BABEL_LEANSTRAL_URL}
     api_key: unity
     strength: 6
-#  - names: [qwen-1]              # swap-in option (2 GPUs)
-#    model: qwen3-32b
-#    backend: codex
-#    provider: vllm
-#    base_url: ${BABEL_QWEN_URL}
-#    api_key: unity
-#    strength: 4
-#  - names: [goedel-1]            # swap-in option (2 GPUs)
-#    model: goedel-prover-v2-32b
-#    backend: codex
-#    provider: vllm
-#    base_url: ${BABEL_GOEDEL_URL}
-#    api_key: unity
-#    strength: 3
+  - names: [qwen-1]
+    model: qwen3-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_QWEN_URL}
+    api_key: unity
+    strength: 4
+  - names: [goedel-1]
+    model: goedel-prover-v2-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_GOEDEL_URL}
+    api_key: unity
+    strength: 3

@@ -28,14 +28,12 @@ so swarm standings adjust to who is actually delivering during a run.
 | FreeInference ($20/day, ≤2 instances each) | glm-5.1, glm-5-turbo, minimax-m2.5, minimax-m3, qwen3.6-35b | small swarm (H1). *Excluded:* bge-m3 (embeddings), diffusiongemma (non-agentic) |
 | OpenRouter free tier | any `:free` (nemotron-550b, hunyuan, poolside-laguna, …) | swarm filler / heterogeneity |
 | Babel vLLM (scripts in `benchmarks/babel/`) | qwen3-32b, goedel-prover-v2-32b (proof-search grunt), llama33-70b | self-hosted swarm members via **codex backend** (OpenAI-compatible) |
-| Tentative (advisor) | OpenAI + Gemini keys | drop into H2 rosters for cross-provider heterogeneity if they materialize |
 
 **Standard rosters** (tune per benchmark):
 - `SOLO-FRONTIER`: 1× opus-4-8 (or opus-4-6 where comparability demands).
 - `SWARM-SMALL` (H1): primary haiku-4-5 (str 6) + glm-5.1 + minimax-m2.5 ×2 + qwen3.6-35b ×2 +
   babel qwen3-32b + 1–2 OR-free (str 3–5). ~8 agents, ~$0/tok + $20/day cap.
-- `SWARM-FRONTIER` (H2): primary opus-4-8 (str 9) + opus-4-7 + sonnet-5 + opus-4-6 (+ gpt/gemini
-  if keys). 4–6 agents.
+- `SWARM-FRONTIER` (H2): primary opus-4-8 (str 9) + opus-4-7 + sonnet-5 + opus-4-6. 4 agents.
 
 Babel `agents.yaml` snippet (after `sbatch ~/unity-models/qwen3-32b.sh`, note the node's hostname):
 ```yaml
@@ -70,8 +68,8 @@ Babel `agents.yaml` snippet (after `sbatch ~/unity-models/qwen3-32b.sh`, note th
   (formalized statements = free faithfulness): 2 recently-resolved (sanity, ground truth exists) +
   2–3 open-but-approachable (any progress is publishable; a rigorous "here's why X fails" also
   counts per Unity's determination design).
-- **Conditions:** capability play → C only (SWARM-FRONTIER, max heterogeneity: add glm-5.1 +
-  minimax-m3 — diverse strategy pools are the point), with A = 1× opus-4-8 for contrast.
+- **Conditions:** capability play → C only (SWARM-FRONTIER, max heterogeneity: glm-5.1 +
+  minimax-m3 round out the strategy pool), with A = 1× opus-4-8 for contrast.
 - **Metrics:** FirstProof expert protocol; for Erdős, Lean-verified proof or verified partial
   progress (merged sorry-free lemmas).
 
@@ -93,7 +91,7 @@ Babel `agents.yaml` snippet (after `sbatch ~/unity-models/qwen3-32b.sh`, note th
   faithfulness measure alongside the metrics below.
 - **Faithfulness measurement** (required): typecheck + **BEq/BEq+** where a reference
   formalization exists; **FormalAlign**-style alignment score + round-trip informalization with an
-  LLM judge (use a model *not* in the roster, e.g. gemini if the key lands, else opus-3) where
+  LLM judge (a model *not* in the roster: opus-3) where
   none does; LeanMarathon-style target-fidelity review; plus a human audit of a 20-statement
   sample. Report all of them.
 - **Conditions:** A/B/C as standard (A = 1× sonnet-5 to keep Pro budget for `prove`/`solve`).
