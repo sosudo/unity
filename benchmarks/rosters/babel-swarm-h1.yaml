@@ -1,0 +1,32 @@
+# Fully self-hosted H1 swarm: every worker runs on babel GPUs (marginal cost ~$0).
+# deepseek-v4-flash acts as primary (strongest self-hosted generalist).
+# Requires: sbatch deepseek-v4-flash.sh + leanstral.sh (or qwen/goedel) + tunnel up.
+agents:
+  - names: [primary]
+    model: deepseek-v4-flash
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_DSV4_URL}
+    api_key: unity
+    strength: 7
+  - names: [leanstral-1]
+    model: leanstral
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_LEANSTRAL_URL}
+    api_key: unity
+    strength: 6
+  - names: [qwen-1]
+    model: qwen3-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_QWEN_URL}
+    api_key: unity
+    strength: 4
+  - names: [goedel-1]
+    model: goedel-prover-v2-32b
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_GOEDEL_URL}
+    api_key: unity
+    strength: 3

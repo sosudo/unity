@@ -51,3 +51,10 @@ agents:
     base_url: ${OPENROUTER_ANTHROPIC_URL}
     api_key: ${OPENROUTER_API_KEY}
     strength: 3
+  - names: [leanstral-1]           # sbatch leanstral.sh; Lean-specialist (587/672 PutnamBench)
+    model: leanstral
+    backend: codex
+    provider: vllm
+    base_url: ${BABEL_LEANSTRAL_URL}
+    api_key: unity
+    strength: 6
