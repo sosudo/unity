@@ -1331,7 +1331,7 @@ import base64
 import os
 import sys
 
-_run_state: dict = {"proc": None, "command": None, "started": 0.0, "log": None}
+_run_state: dict = {"proc": None}
 
 _COMMANDS: dict = {
     # command -> which extra inputs it takes
@@ -1381,6 +1381,37 @@ def _forum_nonempty() -> bool:
 def _active_metric() -> str:
     f = ROOT_DIR / "metrics" / ".active"
     return f.read_text().strip() if f.exists() else ""
+
+
+# Run state is persisted to .unity/logs/webrun.json so the status pill and the
+# stop button keep working across `unity serve` restarts (pid-based, process-group kill).
+
+def _run_state_path() -> Path:
+    return ROOT_DIR / "logs" / "webrun.json"
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def _current_run() -> dict:
+    """The last-launched run, reconstructed from disk: works even if serve restarted."""
+    try:
+        st = json.loads(_run_state_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"running": False, "pid": None, "command": None, "started": 0.0,
+                "log": None, "exit_code": None}
+    proc = _run_state["proc"]
+    if proc is not None and proc.pid == st.get("pid"):
+        code = proc.poll()
+        st.update(running=code is None, exit_code=code)
+    else:  # serve was restarted: we only know liveness, not the exit code
+        st.update(running=_pid_alive(st.get("pid")), exit_code=None)
+    return st
 
 
 @app.get("/api/project")
@@ -1435,14 +1466,8 @@ def api_agents_get():
     return {"raw": raw, "groups": groups}
 
 
-@app.put("/api/agents")
-def api_agents_put(payload: dict = Body(...)):
-    q = ROOT_DIR / "agents.yaml"
-    if "raw" in payload:
-        q.write_text(payload["raw"])
-        return {"ok": True}
+def _serialize_groups(groups: list) -> str:
     import yaml
-    groups = payload.get("groups") or []
     clean = []
     for g in groups:
         entry = {}
@@ -1455,8 +1480,34 @@ def api_agents_put(payload: dict = Body(...)):
         clean.append(entry)
     header = ("# First agent is the primary (preparation, critic, retrospective).\n"
               "# strength: static capability tier; budget: USD per instance.\n\n")
-    q.write_text(header + yaml.safe_dump({"agents": clean}, sort_keys=False))
+    return header + yaml.safe_dump({"agents": clean}, sort_keys=False)
+
+
+@app.put("/api/agents")
+def api_agents_put(payload: dict = Body(...)):
+    q = ROOT_DIR / "agents.yaml"
+    if "raw" in payload:
+        q.write_text(payload["raw"])
+        return {"ok": True}
+    q.write_text(_serialize_groups(payload.get("groups") or []))
     return {"ok": True}
+
+
+@app.post("/api/agents/convert")
+def api_agents_convert(payload: dict = Body(...)):
+    """Stateless converter for the two-way editor sync: groups -> raw, or raw -> groups.
+    Writes nothing."""
+    if "groups" in payload:
+        return {"raw": _serialize_groups(payload.get("groups") or [])}
+    import yaml
+    try:
+        doc = yaml.safe_load(payload.get("raw", "")) or {}
+        groups = doc.get("agents") or []
+        if not isinstance(groups, list):
+            raise ValueError("'agents' must be a list")
+        return {"groups": groups}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/api/sources")
@@ -1494,6 +1545,18 @@ def api_source_add(payload: dict = Body(...)):
     else:
         q.write_text(payload.get("content", ""))
     return {"ok": True, "name": name}
+
+
+@app.put("/api/sources/file")
+def api_source_put(payload: dict = Body(...)):
+    name = payload.get("name", "")
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    q = _safe_unity_path(f"source/{name}")
+    if not q.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    q.write_text(payload.get("content", ""))
+    return {"ok": True}
 
 
 @app.delete("/api/sources/file")
@@ -1543,9 +1606,12 @@ def api_metric_del(name: str):
 
 @app.post("/api/metrics/active")
 def api_metric_active(payload: dict = Body(...)):
-    name = Path(payload.get("name", "")).stem
     d = ROOT_DIR / "metrics"
     d.mkdir(exist_ok=True)
+    name = Path(payload.get("name") or "").stem
+    if not name or payload.get("clear"):
+        (d / ".active").unlink(missing_ok=True)
+        return {"ok": True, "active": ""}
     (d / ".active").write_text(name)
     return {"ok": True, "active": name}
 
@@ -1579,17 +1645,36 @@ def api_metric_new(payload: dict = Body(...)):
     return {"ok": True, "name": f"{name}.md"}
 
 
+@app.get("/api/logs")
+def api_logs():
+    d = ROOT_DIR / "logs"
+    if not d.exists():
+        return {"files": []}
+    files = [{"name": p.name, "size": p.stat().st_size, "mtime": p.stat().st_mtime}
+             for p in d.iterdir() if p.is_file() and p.suffix in (".log", ".jsonl")]
+    return {"files": sorted(files, key=lambda f: -f["mtime"])}
+
+
+@app.get("/api/logs/file")
+def api_log_get(name: str):
+    q = _safe_unity_path(f"logs/{Path(name).name}")
+    if not q.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    data = q.read_bytes()
+    clipped = len(data) > 200_000
+    return {"name": Path(name).name, "clipped": clipped,
+            "text": data[-200_000:].decode("utf-8", errors="replace")}
+
+
 @app.get("/api/run")
 def api_run_status():
-    proc = _run_state["proc"]
-    running = proc is not None and proc.poll() is None
+    st = _current_run()
     tail = ""
-    if _run_state["log"] and Path(_run_state["log"]).exists():
-        data = Path(_run_state["log"]).read_bytes()
+    if st.get("log") and Path(st["log"]).exists():
+        data = Path(st["log"]).read_bytes()
         tail = data[-4000:].decode("utf-8", errors="replace")
-    return {"running": running, "command": _run_state["command"],
-            "started": _run_state["started"],
-            "exit_code": (None if running or proc is None else proc.poll()),
+    return {"running": st["running"], "command": st.get("command"),
+            "started": st.get("started", 0.0), "exit_code": st.get("exit_code"),
             "log_tail": tail}
 
 
@@ -1598,8 +1683,7 @@ def api_run_start(payload: dict = Body(...)):
     command = payload.get("command", "")
     if command not in _COMMANDS:
         return JSONResponse({"error": f"unknown command '{command}'"}, status_code=400)
-    proc = _run_state["proc"]
-    if proc is not None and proc.poll() is None:
+    if _current_run()["running"]:
         return JSONResponse({"error": "a run is already active"}, status_code=409)
 
     argv = [command]
@@ -1628,19 +1712,38 @@ def api_run_start(payload: dict = Body(...)):
             "from unity.cli import main; main()")
     env = {**os.environ, "UNITY_WEB_ARGS": json.dumps(argv)}
     lf = open(log_path, "ab")
+    # own process group so stop can kill the whole agent tree, not just the wrapper
     proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(_project_root()),
-                            stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
-    _run_state.update(proc=proc, command=command, started=time.time(), log=str(log_path))
+                            stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                            env=env, start_new_session=True)
+    _run_state["proc"] = proc
+    _run_state_path().write_text(json.dumps(
+        {"pid": proc.pid, "command": command, "started": time.time(), "log": str(log_path)}))
     return {"ok": True, "argv": argv, "log": str(log_path)}
 
 
 @app.post("/api/run/stop")
 def api_run_stop():
-    proc = _run_state["proc"]
-    if proc is not None and proc.poll() is None:
-        proc.terminate()
-        return {"ok": True, "stopped": True}
-    return {"ok": True, "stopped": False}
+    import signal
+    st = _current_run()
+    if not st["running"]:
+        return {"ok": True, "stopped": False}
+    pid = st["pid"]
+    try:
+        pgid = os.getpgid(pid)
+        os.killpg(pgid, signal.SIGTERM)
+        for _ in range(30):  # up to 3s of grace, then hard-kill the group
+            time.sleep(0.1)
+            if not _pid_alive(pid):
+                break
+        else:
+            os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    return {"ok": True, "stopped": True}
 
 
 
@@ -1671,7 +1774,9 @@ nav a:hover { color: #111; }
 .runmenu div { padding: 7px 14px; cursor: pointer; font-size: 12px; color: #444; }
 .runmenu div:hover { background: #f2f2f2; color: #111; }
 #status { font-size: 11px; color: #bbb; }
-main { padding: 18px 20px; }
+main { padding: 0; }
+.pane { padding: 18px 20px; }
+.framewrap iframe { display: block; width: 100%; height: calc(100vh - 54px); border: none; background: #fff; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
 section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; }
 section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #bbb; margin-bottom: 8px; }
@@ -1708,15 +1813,16 @@ pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-
   <h1 id="title">unity</h1>
   <div class="tabs" id="tabs">
     <button data-tab="workspace" class="active">workspace</button>
+    <button data-tab="forum">forum</button>
+    <button data-tab="graph">graph</button>
+    <button data-tab="dag">dag</button>
     <button data-tab="agents">agents</button>
     <button data-tab="prompt">prompt</button>
     <button data-tab="sources">sources</button>
     <button data-tab="metrics">metrics</button>
+    <button data-tab="logs">logs</button>
   </div>
   <nav>
-    <a href="/forum">forum →</a>
-    <a href="/graph">graph →</a>
-    <a href="/dag">dag →</a>
     <span id="status">idle</span>
     <div class="runwrap">
       <button id="runbtn">run ▾</button>
@@ -1725,11 +1831,15 @@ pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-
   </nav>
 </header>
 <main>
-  <div id="tab-workspace" class="grid"></div>
-  <div id="tab-agents" style="display:none"></div>
-  <div id="tab-prompt" style="display:none"></div>
-  <div id="tab-sources" style="display:none"></div>
-  <div id="tab-metrics" style="display:none"></div>
+  <div id="tab-workspace" class="pane grid"></div>
+  <div id="tab-forum" class="framewrap" style="display:none"><iframe data-src="/forum"></iframe></div>
+  <div id="tab-graph" class="framewrap" style="display:none"><iframe data-src="/graph"></iframe></div>
+  <div id="tab-dag" class="framewrap" style="display:none"><iframe data-src="/dag"></iframe></div>
+  <div id="tab-agents" class="pane" style="display:none"></div>
+  <div id="tab-prompt" class="pane" style="display:none"></div>
+  <div id="tab-sources" class="pane" style="display:none"></div>
+  <div id="tab-metrics" class="pane" style="display:none"></div>
+  <div id="tab-logs" class="pane" style="display:none"></div>
 </main>
 
 <div class="modal" id="runmodal"><div class="box">
@@ -1769,12 +1879,18 @@ const J = (url, opts) => fetch(url, opts).then(r => r.json());
 const put = (url, body) => J(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 const post = (url, body) => J(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 
+const TABS = ['workspace','forum','graph','dag','agents','prompt','sources','metrics','logs'];
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
-  ['workspace','agents','prompt','sources','metrics'].forEach(t => $('tab-'+t).style.display = 'none');
+  TABS.forEach(t => $('tab-'+t).style.display = 'none');
   const t = b.dataset.tab; $('tab-'+t).style.display = t === 'workspace' ? 'grid' : 'block';
-  loaders[t]();
+  const fr = document.querySelector('#tab-' + t + ' iframe');
+  if (fr && !fr.getAttribute('src')) fr.src = fr.dataset.src;
+  if (loaders[t]) loaders[t]();
+});
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') document.querySelectorAll('.modal.open').forEach(m => m.classList.remove('open'));
 });
 
 function badge(r) {
@@ -1806,34 +1922,60 @@ async function loadWorkspace() {
   } catch (e) { $('tab-workspace').innerHTML = '<section><div class="empty">workspace unavailable</div></section>'; }
 }
 
+const AG_F = ['model','backend','provider','strength','budget','base_url','api_key','auth_token'];
+let agTimer = null, agLastEdited = 'cards';
+function agCollect() {
+  return [...document.querySelectorAll('.agent-card')].map(c => {
+    const g = {names: c.querySelector('[data-f=names]').value.split(',').map(x => x.trim()).filter(Boolean)};
+    AG_F.forEach(f => { const v = c.querySelector('[data-f=' + f + ']').value.trim(); if (v) g[f] = (f === 'strength' ? parseInt(v) : (f === 'budget' ? parseFloat(v) : v)); });
+    return g;
+  });
+}
+function agRenderCards(groups) {
+  $('agent-cards').innerHTML = (groups || []).map((g, i) => agentCard(g, i, AG_F)).join('');
+  document.querySelectorAll('.ag-del').forEach(b => b.onclick = () => { b.closest('.agent-card').remove(); agSyncRaw(); });
+}
+async function agSyncRaw() {  // cards -> raw mirror
+  agLastEdited = 'cards';
+  const r = await post('/api/agents/convert', {groups: agCollect()});
+  if (document.activeElement !== $('ag-raw-text')) { $('ag-raw-text').value = r.raw; $('ag-err').textContent = ''; }
+}
+async function agSyncCards() {  // raw -> cards mirror
+  agLastEdited = 'raw';
+  const r = await post('/api/agents/convert', {raw: $('ag-raw-text').value});
+  if (r.error) { $('ag-err').textContent = 'yaml: ' + r.error; return; }
+  $('ag-err').textContent = '';
+  agRenderCards(r.groups);
+}
 async function loadAgents() {
   const d = await J('/api/agents');
-  const el = $('tab-agents');
-  const F = ['model','backend','provider','strength','budget','base_url','api_key','auth_token'];
-  let h = '<section><h2>agents.yaml</h2><div id="agent-cards">';
-  (d.groups || []).forEach((g, i) => { h += agentCard(g, i, F); });
-  h += '</div><div class="row"><button class="act" id="ag-add">+ group</button>' +
-       '<button class="act primary" id="ag-save">save</button>' +
-       '<button class="act" id="ag-raw-toggle">raw</button><span class="savemsg" id="ag-msg"></span></div>' +
-       '<div id="ag-raw" style="display:none"><textarea id="ag-raw-text"></textarea>' +
-       '<div class="row"><button class="act primary" id="ag-raw-save">save raw</button></div></div></section>';
-  el.innerHTML = h;
+  $('tab-agents').innerHTML =
+    '<section><h2>agents.yaml — blocks and raw stay in sync; save writes whichever you last edited</h2>' +
+    '<div id="agent-cards"></div>' +
+    '<div class="row"><button class="act" id="ag-add">+ group</button>' +
+    '<button class="act primary" id="ag-save">save</button>' +
+    '<button class="act" id="ag-raw-toggle">raw</button>' +
+    '<span class="savemsg" id="ag-msg"></span><span class="who" id="ag-err" style="color:#b71c1c"></span></div>' +
+    '<div id="ag-raw" style="display:none"><textarea id="ag-raw-text"></textarea></div></section>';
+  agRenderCards(d.groups);
   $('ag-raw-text').value = d.raw;
-  $('ag-add').onclick = () => { $('agent-cards').insertAdjacentHTML('beforeend', agentCard({names:['agent']}, Date.now(), F)); wire(); };
+  $('agent-cards').addEventListener('input', () => { clearTimeout(agTimer); agTimer = setTimeout(agSyncRaw, 350); });
+  $('ag-raw-text').addEventListener('input', () => { clearTimeout(agTimer); agTimer = setTimeout(agSyncCards, 500); });
+  $('ag-add').onclick = () => {
+    $('agent-cards').insertAdjacentHTML('beforeend', agentCard({names:['agent']}, Date.now(), AG_F));
+    document.querySelectorAll('.ag-del').forEach(b => b.onclick = () => { b.closest('.agent-card').remove(); agSyncRaw(); });
+    agSyncRaw();
+  };
   $('ag-raw-toggle').onclick = () => { const r = $('ag-raw'); r.style.display = r.style.display === 'none' ? 'block' : 'none'; };
   $('ag-save').onclick = async () => {
-    const groups = [...document.querySelectorAll('.agent-card')].map(c => {
-      const g = {names: c.querySelector('[data-f=names]').value.split(',').map(x => x.trim()).filter(Boolean)};
-      F.forEach(f => { const v = c.querySelector('[data-f=' + f + ']').value.trim(); if (v) g[f] = (f === 'strength' ? parseInt(v) : (f === 'budget' ? parseFloat(v) : v)); });
-      return g;
-    });
-    await put('/api/agents', {groups});
-    $('ag-msg').textContent = 'saved'; setTimeout(() => $('ag-msg').textContent = '', 1500);
-    loadAgents();
+    clearTimeout(agTimer);
+    if (agLastEdited === 'raw') await put('/api/agents', {raw: $('ag-raw-text').value});
+    else await put('/api/agents', {groups: agCollect()});
+    $('ag-msg').textContent = 'saved'; setTimeout(() => { $('ag-msg').textContent = ''; }, 1500);
+    const wasOpen = $('ag-raw').style.display !== 'none';
+    await loadAgents();
+    if (wasOpen) $('ag-raw').style.display = 'block';
   };
-  $('ag-raw-save').onclick = async () => { await put('/api/agents', {raw: $('ag-raw-text').value}); loadAgents(); };
-  function wire() { document.querySelectorAll('.ag-del').forEach(b => b.onclick = () => b.closest('.agent-card').remove()); }
-  wire();
 }
 function agentCard(g, i, F) {
   const inp = (f, v, type) => '<div><label>' + f + '</label><input data-f="' + f + '" value="' + esc(String(v ?? '')) + '"' + (type ? ' type="' + type + '"' : '') + ' style="width:100%"></div>';
@@ -1860,11 +2002,14 @@ async function loadSources() {
   const d = await J('/api/sources');
   let h = '<section><h2>.unity/source/</h2><table class="filelist">';
   h += (d.files.length ? d.files.map(f => '<tr><td>' + esc(f.name) + '</td><td class="who">' + f.size + ' B</td>' +
-    '<td><button class="act" onclick="viewSource(\'' + esc(f.name) + '\')">view</button></td>' +
+    '<td><button class="act" onclick="editSource(\'' + esc(f.name) + '\')">edit</button></td>' +
     '<td><button class="act" onclick="delSource(\'' + esc(f.name) + '\')">remove</button></td></tr>').join('')
     : '<tr><td class="empty">no sources yet</td></tr>') + '</table>';
   h += '<div class="row" style="margin-top:12px"><input type="file" id="src-upload" multiple>' +
-       '<span class="who">files are copied into .unity/source/</span></div></section>';
+       '<span class="who">files are copied into .unity/source/</span></div>' +
+       '<div id="src-editor" style="display:none;margin-top:10px"><div class="who" id="src-edit-name"></div>' +
+       '<textarea id="src-text"></textarea><div class="row"><button class="act primary" id="src-save">save</button>' +
+       '<span class="savemsg" id="src-msg"></span></div></div></section>';
   $('tab-sources').innerHTML = h;
   $('src-upload').onchange = async (e) => {
     for (const file of e.target.files) {
@@ -1873,11 +2018,15 @@ async function loadSources() {
     }
     loadSources();
   };
+  $('src-save').onclick = async () => {
+    await put('/api/sources/file', {name: $('src-edit-name').textContent, content: $('src-text').value});
+    $('src-msg').textContent = 'saved'; setTimeout(() => $('src-msg').textContent = '', 1500);
+  };
 }
-async function viewSource(name) {
+async function editSource(name) {
   const d = await J('/api/sources/file?name=' + encodeURIComponent(name));
-  $('view-name').textContent = name; $('view-body').textContent = d.text;
-  $('viewmodal').classList.add('open');
+  if (d.binary) { $('view-name').textContent = name; $('view-body').textContent = d.text; $('viewmodal').classList.add('open'); return; }
+  $('src-editor').style.display = 'block'; $('src-edit-name').textContent = name; $('src-text').value = d.text;
 }
 async function delSource(name) {
   await fetch('/api/sources/file?name=' + encodeURIComponent(name), {method: 'DELETE'});
@@ -1887,10 +2036,10 @@ async function delSource(name) {
 async function loadMetrics() {
   const d = await J('/api/metrics');
   let h = '<section><h2>.unity/metrics/ ' + (d.active ? '<span class="badge ok">active: ' + esc(d.active) + '</span>' : '') + '</h2><table class="filelist">';
-  h += (d.files.length ? d.files.map(f => '<tr><td>' + esc(f) + (f.replace(/[.]md$/, '') === d.active ? ' *' : '') + '</td>' +
+  h += (d.files.length ? d.files.map(f => { const on = f.replace(/[.]md$/, '') === d.active; return '<tr><td>' + esc(f) + (on ? ' *' : '') + '</td>' +
     '<td><button class="act" onclick="editMetric(\'' + esc(f) + '\')">edit</button></td>' +
-    '<td><button class="act" onclick="setActive(\'' + esc(f) + '\')">set active</button></td>' +
-    '<td><button class="act" onclick="delMetric(\'' + esc(f) + '\')">remove</button></td></tr>').join('')
+    '<td><button class="act" onclick="' + (on ? 'unsetActive()' : 'setActive(\'' + esc(f) + '\')') + '">' + (on ? 'unset' : 'set active') + '</button></td>' +
+    '<td><button class="act" onclick="delMetric(\'' + esc(f) + '\')">remove</button></td></tr>'; }).join('')
     : '<tr><td class="empty">no metrics</td></tr>') + '</table>';
   h += '<div class="row" style="margin-top:12px"><input id="mt-new-name" placeholder="new metric name">' +
        '<button class="act" id="mt-new">create</button></div>' +
@@ -1910,6 +2059,23 @@ async function editMetric(name) {
   $('mt-editor').style.display = 'block'; $('mt-edit-name').textContent = name; $('mt-text').value = d.content;
 }
 async function setActive(name) { await post('/api/metrics/active', {name}); loadMetrics(); }
+async function unsetActive() { await post('/api/metrics/active', {clear: true}); loadMetrics(); }
+
+async function loadLogs() {
+  const d = await J('/api/logs');
+  const fmt = t => new Date(t * 1000).toLocaleString();
+  $('tab-logs').innerHTML = '<section><h2>.unity/logs/</h2><table class="filelist">' +
+    (d.files.length ? d.files.map(f => '<tr><td>' + esc(f.name) + '</td><td class="who">' + f.size + ' B</td>' +
+      '<td class="who">' + fmt(f.mtime) + '</td>' +
+      '<td><button class="act" onclick="viewLog(\'' + esc(f.name) + '\')">view</button></td></tr>').join('')
+      : '<tr><td class="empty">no logs yet</td></tr>') + '</table></section>';
+}
+async function viewLog(name) {
+  const d = await J('/api/logs/file?name=' + encodeURIComponent(name));
+  $('view-name').textContent = name + (d.clipped ? ' (last 200 KB)' : '');
+  $('view-body').textContent = d.text;
+  $('viewmodal').classList.add('open');
+}
 async function delMetric(name) { await fetch('/api/metrics/file?name=' + encodeURIComponent(name), {method: 'DELETE'}); loadMetrics(); }
 
 function buildRunMenu() {
@@ -1948,13 +2114,21 @@ $('rm-start').onclick = async () => {
   pollRun();
 };
 $('runbtn').onclick = () => { if ($('runbtn').classList.contains('running')) showLog(); };
-$('log-stop').onclick = async () => { await post('/api/run/stop', {}); };
-async function showLog() {
+$('log-stop').onclick = async () => {
+  $('log-stop').textContent = 'stopping…'; $('log-stop').disabled = true;
+  await post('/api/run/stop', {});
+  $('log-stop').textContent = 'stop run'; $('log-stop').disabled = false;
+  refreshLog(); pollRun();
+};
+async function refreshLog() {
   const d = await J('/api/run');
-  $('log-meta').textContent = d.command ? (d.command + (d.running ? ' running' : ' exit ' + d.exit_code)) : '';
-  $('log-tail').textContent = d.log_tail || '(empty)';
-  $('logmodal').classList.add('open');
+  const ended = d.exit_code === null ? 'ended' : 'exit ' + d.exit_code;
+  $('log-meta').textContent = d.command ? (d.command + (d.running ? ' running' : ' ' + ended)) : '';
+  const el = $('log-tail'), stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
+  el.textContent = d.log_tail || '(empty)';
+  if (stick) el.scrollTop = el.scrollHeight;
 }
+async function showLog() { await refreshLog(); $('logmodal').classList.add('open'); }
 async function pollRun() {
   const d = await J('/api/run');
   if (d.running) {
@@ -1963,18 +2137,23 @@ async function pollRun() {
     $('status').textContent = 'running';
   } else {
     $('runbtn').classList.remove('running'); $('runbtn').textContent = 'run ▾';
-    $('status').textContent = d.command ? ('last: ' + d.command + ' (exit ' + d.exit_code + ')') : 'idle';
+    $('status').textContent = d.command ? ('last: ' + d.command + (d.exit_code === null ? '' : ' (exit ' + d.exit_code + ')')) : 'idle';
   }
 }
 
-const loaders = {workspace: loadWorkspace, agents: loadAgents, prompt: loadPrompt, sources: loadSources, metrics: loadMetrics};
+const loaders = {workspace: loadWorkspace, agents: loadAgents, prompt: loadPrompt,
+                 sources: loadSources, metrics: loadMetrics, logs: loadLogs};
 async function boot() {
   PROJECT = await J('/api/project');
   $('title').textContent = 'unity — ' + PROJECT.name;
   buildRunMenu();
   loadWorkspace();
   pollRun();
-  setInterval(() => { pollRun(); if ($('tab-workspace').style.display !== 'none') loadWorkspace(); }, 4000);
+  setInterval(() => {
+    pollRun();
+    if ($('tab-workspace').style.display !== 'none') loadWorkspace();
+    if ($('logmodal').classList.contains('open')) refreshLog();
+  }, 4000);
 }
 boot();
 </script>
