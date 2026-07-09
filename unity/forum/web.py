@@ -472,6 +472,7 @@ main { display: flex; flex: 1; overflow: hidden; }
   <h1>union</h1>
   <div class="controls">
     <nav>
+      <a href="/">← app</a>
       <a href="/workspace">workspace →</a>
       <a href="/graph">graph →</a>
       <a href="/dag">dag →</a>
@@ -693,7 +694,8 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
   <h1>union</h1>
   <div class="controls">
     <nav>
-      <a href="/">← forum</a>
+      <a href="/">← app</a>
+      <a href="/forum">forum →</a>
       <a href="/workspace">workspace →</a>
       <a href="/dag">dag →</a>
     </nav>
@@ -1040,7 +1042,8 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
   <h1>union</h1>
   <div class="controls">
     <nav>
-      <a href="/">← forum</a>
+      <a href="/">← app</a>
+      <a href="/forum">forum →</a>
       <a href="/workspace">workspace →</a>
       <a href="/graph">graph →</a>
     </nav>
@@ -1201,9 +1204,6 @@ loadDag(true); connect();
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
-@app.get("/", response_class=HTMLResponse)
-def forum():
-    return FORUM_HTML
 
 
 @app.get("/graph", response_class=HTMLResponse)
@@ -1254,7 +1254,8 @@ section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
   <h1>union — workspace</h1>
   <div style="display:flex;gap:16px;align-items:center">
     <nav>
-      <a href="/">← forum</a>
+      <a href="/">← app</a>
+      <a href="/forum">forum →</a>
       <a href="/graph">graph →</a>
       <a href="/dag">dag →</a>
     </nav>
@@ -1320,6 +1321,676 @@ setInterval(refresh, 3000);
 def workspace():
     return WORKSPACE_HTML
 
+
+
+
+
+# ── App APIs (project control center) ─────────────────────────────────────────
+
+import base64
+import os
+import sys
+
+_run_state: dict = {"proc": None, "command": None, "started": 0.0, "log": None}
+
+_COMMANDS: dict = {
+    # command -> which extra inputs it takes
+    "autoformalize": {"targets": True, "metric": False},
+    "formalize":     {"targets": True, "metric": False},
+    "prove":         {"targets": True, "metric": False},
+    "solve":         {"targets": False, "metric": False},
+    "create":        {"targets": False, "metric": False},
+    "verify":        {"targets": True, "metric": False},
+    "bump":          {"targets": False, "metric": False},
+    "optimize":      {"targets": True, "metric": True},
+}
+
+
+from fastapi import Request
+from fastapi.responses import JSONResponse as _JR
+
+
+@app.exception_handler(ValueError)
+async def _value_error_handler(request: Request, exc: ValueError):
+    return _JR({"error": str(exc)}, status_code=400)
+
+
+def _project_root() -> Path:
+    return ROOT_DIR.parent
+
+
+def _safe_unity_path(rel: str) -> Path:
+    q = (ROOT_DIR / rel).resolve()
+    if not str(q).startswith(str(ROOT_DIR.resolve())):
+        raise ValueError("path escapes .unity")
+    return q
+
+
+def _forum_nonempty() -> bool:
+    for tp in FORUM_DIR.glob("*.json"):
+        if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
+            continue
+        try:
+            if json.loads(tp.read_text()).get("posts"):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _active_metric() -> str:
+    f = ROOT_DIR / "metrics" / ".active"
+    return f.read_text().strip() if f.exists() else ""
+
+
+@app.get("/api/project")
+def api_project():
+    dag = ROOT_DIR / "dag.json"
+    chunk_ids = []
+    if dag.exists():
+        try:
+            chunk_ids = [c.get("id") for c in json.loads(dag.read_text()).get("chunks", [])]
+        except Exception:
+            pass
+    return {"name": _project_root().name,
+            "continue": _forum_nonempty(),
+            "has_dag": dag.exists(), "chunks": chunk_ids,
+            "active_metric": _active_metric(),
+            "commands": _COMMANDS,
+            "metrics": sorted(p.name for p in (ROOT_DIR / "metrics").glob("*.md")) if (ROOT_DIR / "metrics").exists() else []}
+
+
+@app.get("/api/unityfile")
+def api_file_get(name: str):
+    if name not in ("UNITY.md", "agents.yaml"):
+        return JSONResponse({"error": "file not editable"}, status_code=400)
+    q = _safe_unity_path(name)
+    return {"name": name, "content": q.read_text() if q.exists() else ""}
+
+
+from fastapi import Body
+
+
+@app.put("/api/unityfile")
+def api_file_put(payload: dict = Body(...)):
+    name = payload.get("name", "")
+    if name not in ("UNITY.md", "agents.yaml"):
+        return JSONResponse({"error": "file not editable"}, status_code=400)
+    q = _safe_unity_path(name)
+    q.write_text(payload.get("content", ""))
+    return {"ok": True}
+
+
+@app.get("/api/agents")
+def api_agents_get():
+    q = ROOT_DIR / "agents.yaml"
+    raw = q.read_text() if q.exists() else ""
+    groups = []
+    try:
+        import yaml
+        doc = yaml.safe_load(raw) or {}
+        groups = doc.get("agents") or []
+    except Exception:
+        pass
+    return {"raw": raw, "groups": groups}
+
+
+@app.put("/api/agents")
+def api_agents_put(payload: dict = Body(...)):
+    q = ROOT_DIR / "agents.yaml"
+    if "raw" in payload:
+        q.write_text(payload["raw"])
+        return {"ok": True}
+    import yaml
+    groups = payload.get("groups") or []
+    clean = []
+    for g in groups:
+        entry = {}
+        for k in ("names", "model", "backend", "provider", "strength", "budget",
+                  "base_url", "api_key", "auth_token"):
+            v = g.get(k)
+            if v in (None, "", []):
+                continue
+            entry[k] = v
+        clean.append(entry)
+    header = ("# First agent is the primary (preparation, critic, retrospective).\n"
+              "# strength: static capability tier; budget: USD per instance.\n\n")
+    q.write_text(header + yaml.safe_dump({"agents": clean}, sort_keys=False))
+    return {"ok": True}
+
+
+@app.get("/api/sources")
+def api_sources():
+    d = ROOT_DIR / "source"
+    d.mkdir(exist_ok=True)
+    out = []
+    for p in sorted(d.rglob("*")):
+        if p.is_file():
+            out.append({"name": str(p.relative_to(d)), "size": p.stat().st_size})
+    return {"files": out}
+
+
+@app.get("/api/sources/file")
+def api_source_get(name: str):
+    q = _safe_unity_path(f"source/{name}")
+    if not q.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    data = q.read_bytes()
+    try:
+        return {"name": name, "text": data.decode("utf-8"), "binary": False}
+    except UnicodeDecodeError:
+        return {"name": name, "text": f"(binary file, {len(data)} bytes)", "binary": True}
+
+
+@app.post("/api/sources/file")
+def api_source_add(payload: dict = Body(...)):
+    name = Path(payload.get("name", "")).name
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    q = _safe_unity_path(f"source/{name}")
+    q.parent.mkdir(parents=True, exist_ok=True)
+    if "content_b64" in payload:
+        q.write_bytes(base64.b64decode(payload["content_b64"]))
+    else:
+        q.write_text(payload.get("content", ""))
+    return {"ok": True, "name": name}
+
+
+@app.delete("/api/sources/file")
+def api_source_del(name: str):
+    q = _safe_unity_path(f"source/{name}")
+    if q.exists():
+        q.unlink()
+    return {"ok": True}
+
+
+@app.get("/api/metrics")
+def api_metrics():
+    d = ROOT_DIR / "metrics"
+    d.mkdir(exist_ok=True)
+    return {"files": sorted(p.name for p in d.iterdir() if p.is_file() and not p.name.startswith(".")),
+            "active": _active_metric()}
+
+
+@app.get("/api/metrics/file")
+def api_metric_get(name: str):
+    q = _safe_unity_path(f"metrics/{Path(name).name}")
+    if not q.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return {"name": Path(name).name, "content": q.read_text(errors="replace")}
+
+
+@app.put("/api/metrics/file")
+def api_metric_put(payload: dict = Body(...)):
+    name = Path(payload.get("name", "")).name
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    q = _safe_unity_path(f"metrics/{name}")
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(payload.get("content", ""))
+    return {"ok": True}
+
+
+@app.delete("/api/metrics/file")
+def api_metric_del(name: str):
+    q = _safe_unity_path(f"metrics/{Path(name).name}")
+    if q.exists():
+        q.unlink()
+    if _active_metric() == Path(name).stem:
+        (ROOT_DIR / "metrics" / ".active").unlink(missing_ok=True)
+    return {"ok": True}
+
+
+@app.post("/api/metrics/active")
+def api_metric_active(payload: dict = Body(...)):
+    name = Path(payload.get("name", "")).stem
+    d = ROOT_DIR / "metrics"
+    d.mkdir(exist_ok=True)
+    (d / ".active").write_text(name)
+    return {"ok": True, "active": name}
+
+
+_METRIC_TEMPLATE = """# {name}
+
+## Prompt
+<what to optimize for, and how to judge an improvement>
+
+## Examples
+(none)
+
+## Score function
+(none)
+
+## Metric function
+(none)
+"""
+
+
+@app.post("/api/metrics/new")
+def api_metric_new(payload: dict = Body(...)):
+    name = Path(payload.get("name", "")).stem.lower()
+    if not name:
+        return JSONResponse({"error": "name required"}, status_code=400)
+    q = _safe_unity_path(f"metrics/{name}.md")
+    if q.exists():
+        return JSONResponse({"error": "metric exists"}, status_code=400)
+    q.parent.mkdir(parents=True, exist_ok=True)
+    q.write_text(_METRIC_TEMPLATE.format(name=name))
+    return {"ok": True, "name": f"{name}.md"}
+
+
+@app.get("/api/run")
+def api_run_status():
+    proc = _run_state["proc"]
+    running = proc is not None and proc.poll() is None
+    tail = ""
+    if _run_state["log"] and Path(_run_state["log"]).exists():
+        data = Path(_run_state["log"]).read_bytes()
+        tail = data[-4000:].decode("utf-8", errors="replace")
+    return {"running": running, "command": _run_state["command"],
+            "started": _run_state["started"],
+            "exit_code": (None if running or proc is None else proc.poll()),
+            "log_tail": tail}
+
+
+@app.post("/api/run")
+def api_run_start(payload: dict = Body(...)):
+    command = payload.get("command", "")
+    if command not in _COMMANDS:
+        return JSONResponse({"error": f"unknown command '{command}'"}, status_code=400)
+    proc = _run_state["proc"]
+    if proc is not None and proc.poll() is None:
+        return JSONResponse({"error": "a run is already active"}, status_code=409)
+
+    argv = [command]
+    if command == "optimize":
+        metric = payload.get("metric") or _active_metric()
+        if not metric:
+            return JSONResponse({"error": "optimize needs a metric (set one active or pass it)"},
+                                status_code=400)
+        argv.append(Path(metric).stem)
+    targets = (payload.get("targets") or "").strip()
+    if targets and _COMMANDS[command]["targets"]:
+        argv += ["--targets", ", ".join(t.strip() for t in targets.splitlines() if t.strip())]
+    cont = payload.get("continue")
+    if cont is None:
+        cont = _forum_nonempty()
+    if cont:
+        argv.append("--continue")
+
+    if payload.get("dry"):
+        return {"ok": True, "dry": True, "argv": argv}
+
+    logs = ROOT_DIR / "logs"
+    logs.mkdir(exist_ok=True)
+    log_path = logs / f"webrun-{int(time.time())}-{command}.log"
+    code = ("import sys, json, os; sys.argv = ['unity'] + json.loads(os.environ['UNITY_WEB_ARGS']); "
+            "from unity.cli import main; main()")
+    env = {**os.environ, "UNITY_WEB_ARGS": json.dumps(argv)}
+    lf = open(log_path, "ab")
+    proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(_project_root()),
+                            stdout=lf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, env=env)
+    _run_state.update(proc=proc, command=command, started=time.time(), log=str(log_path))
+    return {"ok": True, "argv": argv, "log": str(log_path)}
+
+
+@app.post("/api/run/stop")
+def api_run_stop():
+    proc = _run_state["proc"]
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        return {"ok": True, "stopped": True}
+    return {"ok": True, "stopped": False}
+
+
+
+
+APP_HTML = """\
+<!DOCTYPE html>
+<html>
+<head>
+<title>unity</title>
+<meta charset="utf-8">
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: #fafafa; color: #111; }
+header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #e4e4e4; background: #fafafa; position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.14em; }
+.tabs { display: flex; gap: 2px; border: 1px solid #e0e0e0; border-radius: 5px; overflow: hidden; }
+.tabs button { background: none; border: none; border-left: 1px solid #e0e0e0; cursor: pointer; font: inherit; font-size: 12px; padding: 4px 12px; color: #666; }
+.tabs button:first-child { border-left: none; }
+.tabs button.active { background: #111; color: #fff; }
+nav { display: flex; gap: 14px; align-items: center; }
+nav a { font-size: 12px; color: #888; text-decoration: none; }
+nav a:hover { color: #111; }
+.runwrap { position: relative; }
+#runbtn { background: #111; color: #fff; border: none; border-radius: 5px; font: inherit; font-size: 12px; padding: 5px 14px; cursor: pointer; }
+#runbtn.running { background: #b7791f; }
+.runmenu { display: none; position: absolute; right: 0; top: 110%; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; min-width: 150px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); z-index: 20; }
+.runwrap:hover .runmenu { display: block; }
+.runmenu div { padding: 7px 14px; cursor: pointer; font-size: 12px; color: #444; }
+.runmenu div:hover { background: #f2f2f2; color: #111; }
+#status { font-size: 11px; color: #bbb; }
+main { padding: 18px 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
+section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; }
+section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #bbb; margin-bottom: 8px; }
+.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; }
+.item:first-of-type { border-top: none; }
+.who { color: #999; font-size: 11px; }
+.badge { display: inline-block; font-size: 10px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
+.ok { background: #e8f5e9; color: #1b5e20; } .blocked { background: #ffebee; color: #b71c1c; } .pending { background: #f5f5f5; color: #888; }
+.kind { font-size: 10px; text-transform: uppercase; color: #888; margin-right: 6px; }
+textarea { width: 100%; min-height: 320px; font: inherit; font-size: 12.5px; border: 1px solid #e0e0e0; border-radius: 6px; padding: 10px; background: #fff; resize: vertical; }
+input, select { font: inherit; font-size: 12px; border: 1px solid #e0e0e0; border-radius: 5px; padding: 4px 8px; background: #fff; }
+button.act { font: inherit; font-size: 12px; border: 1px solid #d8d8d8; background: #fff; border-radius: 5px; padding: 4px 12px; cursor: pointer; color: #333; }
+button.act:hover { border-color: #999; }
+button.primary { background: #111; color: #fff; border-color: #111; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+.agent-card { border: 1px solid #e8e8e8; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
+.agent-card .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
+.agent-card label { font-size: 10px; text-transform: uppercase; color: #aaa; display: block; margin-bottom: 2px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+.chip { font-size: 11px; border: 1px solid #ddd; border-radius: 10px; padding: 1px 9px; cursor: pointer; color: #555; }
+.chip.on { background: #111; color: #fff; border-color: #111; }
+.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.28); display: none; align-items: center; justify-content: center; z-index: 40; }
+.modal.open { display: flex; }
+.modal .box { background: #fff; border-radius: 8px; padding: 18px 20px; width: min(680px, 92vw); max-height: 84vh; overflow-y: auto; }
+.modal h3 { font-size: 13px; margin-bottom: 10px; }
+pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-radius: 6px; max-height: 50vh; overflow: auto; white-space: pre-wrap; }
+.filelist td { padding: 5px 10px 5px 0; border-top: 1px solid #f2f2f2; font-size: 12px; }
+.empty { color: #ccc; padding: 8px 0; }
+.savemsg { font-size: 11px; color: #2d7a2d; margin-left: 8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">unity</h1>
+  <div class="tabs" id="tabs">
+    <button data-tab="workspace" class="active">workspace</button>
+    <button data-tab="agents">agents</button>
+    <button data-tab="prompt">prompt</button>
+    <button data-tab="sources">sources</button>
+    <button data-tab="metrics">metrics</button>
+  </div>
+  <nav>
+    <a href="/forum">forum →</a>
+    <a href="/graph">graph →</a>
+    <a href="/dag">dag →</a>
+    <span id="status">idle</span>
+    <div class="runwrap">
+      <button id="runbtn">run ▾</button>
+      <div class="runmenu" id="runmenu"></div>
+    </div>
+  </nav>
+</header>
+<main>
+  <div id="tab-workspace" class="grid"></div>
+  <div id="tab-agents" style="display:none"></div>
+  <div id="tab-prompt" style="display:none"></div>
+  <div id="tab-sources" style="display:none"></div>
+  <div id="tab-metrics" style="display:none"></div>
+</main>
+
+<div class="modal" id="runmodal"><div class="box">
+  <h3 id="rm-title">run</h3>
+  <div class="row"><label><input type="checkbox" id="rm-continue"> --continue</label>
+    <span class="who" id="rm-continue-note"></span></div>
+  <div id="rm-metric-row" class="row" style="display:none">metric:
+    <select id="rm-metric"></select></div>
+  <div id="rm-targets-row" style="display:none">
+    <div class="who">targets — one per line (empty = default scope)</div>
+    <textarea id="rm-targets" style="min-height:90px"></textarea>
+    <div class="chips" id="rm-chips"></div>
+  </div>
+  <div class="row"><button class="act primary" id="rm-start">start</button>
+    <button class="act" onclick="document.getElementById('runmodal').classList.remove('open')">cancel</button>
+    <span class="who" id="rm-err"></span></div>
+</div></div>
+
+<div class="modal" id="logmodal"><div class="box">
+  <h3>run log <span class="who" id="log-meta"></span></h3>
+  <pre class="log" id="log-tail">(empty)</pre>
+  <div class="row"><button class="act" id="log-stop">stop run</button>
+    <button class="act" onclick="document.getElementById('logmodal').classList.remove('open')">close</button></div>
+</div></div>
+
+<div class="modal" id="viewmodal"><div class="box">
+  <h3 id="view-name"></h3>
+  <pre class="log" id="view-body" style="background:#fafafa;color:#111;border:1px solid #eee"></pre>
+  <div class="row"><button class="act" onclick="document.getElementById('viewmodal').classList.remove('open')">close</button></div>
+</div></div>
+
+<script>
+const esc = t => (t || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const $ = id => document.getElementById(id);
+let PROJECT = {commands:{}, chunks:[], metrics:[]};
+const J = (url, opts) => fetch(url, opts).then(r => r.json());
+const put = (url, body) => J(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+const post = (url, body) => J(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
+
+document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
+  b.classList.add('active');
+  ['workspace','agents','prompt','sources','metrics'].forEach(t => $('tab-'+t).style.display = 'none');
+  const t = b.dataset.tab; $('tab-'+t).style.display = t === 'workspace' ? 'grid' : 'block';
+  loaders[t]();
+});
+
+function badge(r) {
+  if (r.mergeable) return '<span class="badge ok">mergeable</span>';
+  if (r.open_objections.length) return '<span class="badge blocked">' + r.open_objections.length + ' objection(s)</span>';
+  return '<span class="badge pending">needs endorsement</span>';
+}
+async function loadWorkspace() {
+  try {
+    const d = await J('/api/workspace');
+    let h = '';
+    h += '<section><h2>Binding decisions</h2>' + (d.decisions.length ? d.decisions.map(x =>
+      '<div class="item"><b>' + esc(x.topic) + '</b>: ' + esc(x.choice) + ' <span class="who">(' + esc(x.author) + ')</span></div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+    h += '<section><h2>Chunk consensus</h2>' + (d.chunks.length ? d.chunks.map(c =>
+      '<div class="item"><b>' + esc(c.chunk) + '</b>' +
+      c.results.map(r => '<div class="item">' + esc(r.author) + ': ' + esc(r.status) + (r.build_ok ? ' ✓build' : '') + badge(r) +
+        r.open_objections.map(o => '<div class="who">⛔ ' + esc(o.by) + ': ' + esc(o.reason) + '</div>').join('') + '</div>').join('') +
+      (c.claims.length ? '<div class="who">claims: ' + c.claims.map(cl => esc(cl.author)).join(', ') + '</div>' : '') +
+      '</div>').join('') : '<div class="empty">no chunk activity yet</div>') + '</section>';
+    h += '<section><h2>Open obstacles</h2>' + (d.chunks.some(c => c.obstacles.length) ?
+      d.chunks.flatMap(c => c.obstacles.map(o => '<div class="item">' + esc(o.content) + '</div>')).join('') : '<div class="empty">none open</div>') + '</section>';
+    h += '<section><h2>Open questions</h2>' + (d.questions.length ? d.questions.map(q =>
+      '<div class="item">' + esc(q.content) + '</div>').join('') : '<div class="empty">none open</div>') + '</section>';
+    h += '<section><h2>Ledger</h2>' + (d.ledger.length ? d.ledger.map(l =>
+      '<div class="item"><span class="kind">' + esc(l.kind) + '</span>' + esc(l.content) + '</div>').join('') : '<div class="empty">no verified knowledge yet</div>') + '</section>';
+    h += '<section><h2>Latest handoffs</h2>' + (d.handoffs.length ? d.handoffs.map(x =>
+      '<div class="item">' + esc(x.content) + '</div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+    $('tab-workspace').innerHTML = h;
+  } catch (e) { $('tab-workspace').innerHTML = '<section><div class="empty">workspace unavailable</div></section>'; }
+}
+
+async function loadAgents() {
+  const d = await J('/api/agents');
+  const el = $('tab-agents');
+  const F = ['model','backend','provider','strength','budget','base_url','api_key','auth_token'];
+  let h = '<section><h2>agents.yaml</h2><div id="agent-cards">';
+  (d.groups || []).forEach((g, i) => { h += agentCard(g, i, F); });
+  h += '</div><div class="row"><button class="act" id="ag-add">+ group</button>' +
+       '<button class="act primary" id="ag-save">save</button>' +
+       '<button class="act" id="ag-raw-toggle">raw</button><span class="savemsg" id="ag-msg"></span></div>' +
+       '<div id="ag-raw" style="display:none"><textarea id="ag-raw-text"></textarea>' +
+       '<div class="row"><button class="act primary" id="ag-raw-save">save raw</button></div></div></section>';
+  el.innerHTML = h;
+  $('ag-raw-text').value = d.raw;
+  $('ag-add').onclick = () => { $('agent-cards').insertAdjacentHTML('beforeend', agentCard({names:['agent']}, Date.now(), F)); wire(); };
+  $('ag-raw-toggle').onclick = () => { const r = $('ag-raw'); r.style.display = r.style.display === 'none' ? 'block' : 'none'; };
+  $('ag-save').onclick = async () => {
+    const groups = [...document.querySelectorAll('.agent-card')].map(c => {
+      const g = {names: c.querySelector('[data-f=names]').value.split(',').map(x => x.trim()).filter(Boolean)};
+      F.forEach(f => { const v = c.querySelector('[data-f=' + f + ']').value.trim(); if (v) g[f] = (f === 'strength' ? parseInt(v) : (f === 'budget' ? parseFloat(v) : v)); });
+      return g;
+    });
+    await put('/api/agents', {groups});
+    $('ag-msg').textContent = 'saved'; setTimeout(() => $('ag-msg').textContent = '', 1500);
+    loadAgents();
+  };
+  $('ag-raw-save').onclick = async () => { await put('/api/agents', {raw: $('ag-raw-text').value}); loadAgents(); };
+  function wire() { document.querySelectorAll('.ag-del').forEach(b => b.onclick = () => b.closest('.agent-card').remove()); }
+  wire();
+}
+function agentCard(g, i, F) {
+  const inp = (f, v, type) => '<div><label>' + f + '</label><input data-f="' + f + '" value="' + esc(String(v ?? '')) + '"' + (type ? ' type="' + type + '"' : '') + ' style="width:100%"></div>';
+  let h = '<div class="agent-card"><div class="fields">';
+  h += inp('names', (g.names || []).join(', '));
+  h += inp('model', g.model); h += inp('backend', g.backend || 'claude_code'); h += inp('provider', g.provider);
+  h += inp('strength', g.strength); h += inp('budget', g.budget); h += inp('base_url', g.base_url);
+  h += inp('api_key', g.api_key, 'password'); h += inp('auth_token', g.auth_token, 'password');
+  h += '</div><div class="row"><button class="act ag-del">remove</button></div></div>';
+  return h;
+}
+
+async function loadPrompt() {
+  const d = await J('/api/unityfile?name=UNITY.md');
+  $('tab-prompt').innerHTML = '<section><h2>UNITY.md — goal and state</h2>' +
+    '<textarea id="um-text"></textarea><div class="row">' +
+    '<button class="act primary" id="um-save">save</button><span class="savemsg" id="um-msg"></span></div></section>';
+  $('um-text').value = d.content;
+  $('um-save').onclick = async () => { await put('/api/unityfile', {name: 'UNITY.md', content: $('um-text').value});
+    $('um-msg').textContent = 'saved'; setTimeout(() => $('um-msg').textContent = '', 1500); };
+}
+
+async function loadSources() {
+  const d = await J('/api/sources');
+  let h = '<section><h2>.unity/source/</h2><table class="filelist">';
+  h += (d.files.length ? d.files.map(f => '<tr><td>' + esc(f.name) + '</td><td class="who">' + f.size + ' B</td>' +
+    '<td><button class="act" onclick="viewSource(\'' + esc(f.name) + '\')">view</button></td>' +
+    '<td><button class="act" onclick="delSource(\'' + esc(f.name) + '\')">remove</button></td></tr>').join('')
+    : '<tr><td class="empty">no sources yet</td></tr>') + '</table>';
+  h += '<div class="row" style="margin-top:12px"><input type="file" id="src-upload" multiple>' +
+       '<span class="who">files are copied into .unity/source/</span></div></section>';
+  $('tab-sources').innerHTML = h;
+  $('src-upload').onchange = async (e) => {
+    for (const file of e.target.files) {
+      const b64 = await new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.readAsDataURL(file); });
+      await post('/api/sources/file', {name: file.name, content_b64: b64});
+    }
+    loadSources();
+  };
+}
+async function viewSource(name) {
+  const d = await J('/api/sources/file?name=' + encodeURIComponent(name));
+  $('view-name').textContent = name; $('view-body').textContent = d.text;
+  $('viewmodal').classList.add('open');
+}
+async function delSource(name) {
+  await fetch('/api/sources/file?name=' + encodeURIComponent(name), {method: 'DELETE'});
+  loadSources();
+}
+
+async function loadMetrics() {
+  const d = await J('/api/metrics');
+  let h = '<section><h2>.unity/metrics/ ' + (d.active ? '<span class="badge ok">active: ' + esc(d.active) + '</span>' : '') + '</h2><table class="filelist">';
+  h += (d.files.length ? d.files.map(f => '<tr><td>' + esc(f) + (f.replace(/[.]md$/, '') === d.active ? ' *' : '') + '</td>' +
+    '<td><button class="act" onclick="editMetric(\'' + esc(f) + '\')">edit</button></td>' +
+    '<td><button class="act" onclick="setActive(\'' + esc(f) + '\')">set active</button></td>' +
+    '<td><button class="act" onclick="delMetric(\'' + esc(f) + '\')">remove</button></td></tr>').join('')
+    : '<tr><td class="empty">no metrics</td></tr>') + '</table>';
+  h += '<div class="row" style="margin-top:12px"><input id="mt-new-name" placeholder="new metric name">' +
+       '<button class="act" id="mt-new">create</button></div>' +
+       '<div id="mt-editor" style="display:none;margin-top:10px"><div class="who" id="mt-edit-name"></div>' +
+       '<textarea id="mt-text"></textarea><div class="row"><button class="act primary" id="mt-save">save</button>' +
+       '<span class="savemsg" id="mt-msg"></span></div></div></section>';
+  $('tab-metrics').innerHTML = h;
+  $('mt-new').onclick = async () => { const n = $('mt-new-name').value.trim(); if (!n) return;
+    await post('/api/metrics/new', {name: n}); loadMetrics(); };
+  $('mt-save').onclick = async () => {
+    await put('/api/metrics/file', {name: $('mt-edit-name').textContent, content: $('mt-text').value});
+    $('mt-msg').textContent = 'saved'; setTimeout(() => $('mt-msg').textContent = '', 1500);
+  };
+}
+async function editMetric(name) {
+  const d = await J('/api/metrics/file?name=' + encodeURIComponent(name));
+  $('mt-editor').style.display = 'block'; $('mt-edit-name').textContent = name; $('mt-text').value = d.content;
+}
+async function setActive(name) { await post('/api/metrics/active', {name}); loadMetrics(); }
+async function delMetric(name) { await fetch('/api/metrics/file?name=' + encodeURIComponent(name), {method: 'DELETE'}); loadMetrics(); }
+
+function buildRunMenu() {
+  $('runmenu').innerHTML = Object.keys(PROJECT.commands).map(c => '<div data-c="' + c + '">' + c + '</div>').join('');
+  document.querySelectorAll('#runmenu div').forEach(el => el.onclick = () => openRunModal(el.dataset.c));
+}
+let RUN_CMD = null;
+function openRunModal(cmd) {
+  RUN_CMD = cmd;
+  $('rm-title').textContent = 'run: unity ' + cmd;
+  $('rm-continue').checked = PROJECT['continue'];
+  $('rm-continue-note').textContent = PROJECT['continue'] ? '(auto-detected: forum has prior state)' : '(fresh run: forum empty)';
+  const spec = PROJECT.commands[cmd];
+  $('rm-metric-row').style.display = spec.metric ? 'flex' : 'none';
+  if (spec.metric) {
+    $('rm-metric').innerHTML = PROJECT.metrics.map(m => '<option' + (m.replace(/[.]md$/, '') === PROJECT.active_metric ? ' selected' : '') + '>' + esc(m) + '</option>').join('');
+  }
+  $('rm-targets-row').style.display = spec.targets ? 'block' : 'none';
+  $('rm-targets').value = '';
+  $('rm-chips').innerHTML = (PROJECT.chunks || []).map(c => '<span class="chip" data-c="' + esc(c) + '">' + esc(c) + '</span>').join('');
+  document.querySelectorAll('#rm-chips .chip').forEach(ch => ch.onclick = () => {
+    ch.classList.toggle('on');
+    const t = $('rm-targets'); const lines = new Set(t.value.split('\n').filter(Boolean));
+    if (ch.classList.contains('on')) lines.add(ch.dataset.c); else lines.delete(ch.dataset.c);
+    t.value = [...lines].join('\n');
+  });
+  $('rm-err').textContent = '';
+  $('runmodal').classList.add('open');
+}
+$('rm-start').onclick = async () => {
+  const body = {command: RUN_CMD, 'continue': $('rm-continue').checked, targets: $('rm-targets').value};
+  if (PROJECT.commands[RUN_CMD].metric) body.metric = $('rm-metric').value;
+  const r = await post('/api/run', body);
+  if (r.error) { $('rm-err').textContent = r.error; return; }
+  $('runmodal').classList.remove('open');
+  pollRun();
+};
+$('runbtn').onclick = () => { if ($('runbtn').classList.contains('running')) showLog(); };
+$('log-stop').onclick = async () => { await post('/api/run/stop', {}); };
+async function showLog() {
+  const d = await J('/api/run');
+  $('log-meta').textContent = d.command ? (d.command + (d.running ? ' running' : ' exit ' + d.exit_code)) : '';
+  $('log-tail').textContent = d.log_tail || '(empty)';
+  $('logmodal').classList.add('open');
+}
+async function pollRun() {
+  const d = await J('/api/run');
+  if (d.running) {
+    const mins = Math.floor((Date.now() / 1000 - d.started) / 60);
+    $('runbtn').classList.add('running'); $('runbtn').textContent = d.command + ' ' + mins + 'm log';
+    $('status').textContent = 'running';
+  } else {
+    $('runbtn').classList.remove('running'); $('runbtn').textContent = 'run ▾';
+    $('status').textContent = d.command ? ('last: ' + d.command + ' (exit ' + d.exit_code + ')') : 'idle';
+  }
+}
+
+const loaders = {workspace: loadWorkspace, agents: loadAgents, prompt: loadPrompt, sources: loadSources, metrics: loadMetrics};
+async function boot() {
+  PROJECT = await J('/api/project');
+  $('title').textContent = 'unity — ' + PROJECT.name;
+  buildRunMenu();
+  loadWorkspace();
+  pollRun();
+  setInterval(() => { pollRun(); if ($('tab-workspace').style.display !== 'none') loadWorkspace(); }, 4000);
+}
+boot();
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+def app_shell():
+    return APP_HTML
+
+
+@app.get("/forum", response_class=HTMLResponse)
+def forum_page():
+    return FORUM_HTML
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
