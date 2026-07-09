@@ -1714,17 +1714,171 @@ def _scan_blueprint(base: Path) -> list[tuple[str, list[dict], dict]]:
     return parsed
 
 
+# ── Kernel-exact blueprint (LeanArchitect's mechanism without its annotations) ────
+# unity/blueprint_extract.lean loads the project's compiled modules and dumps every
+# project decl with kernel-derived kind / sorry usage / used-constant deps. Slow-ish
+# and needs a built project, so it runs in a background thread, is cached against the
+# newest .lean mtime, and the regex scan serves whenever it's stale or unavailable.
+
+import threading
+
+_KERNEL: dict = {"running": False}
+_KERNEL_LOCK = threading.Lock()
+
+
+def _kernel_cache_path() -> Path:
+    return ROOT_DIR / "blueprint-kernel.json"
+
+
+def _src_stamp(base: Path) -> float:
+    stamp = 0.0
+    for p in base.rglob("*.lean"):
+        if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
+            continue
+        try:
+            stamp = max(stamp, p.stat().st_mtime)
+        except OSError:
+            pass
+    return stamp
+
+
+def _kernel_extract(base: Path) -> dict | None:
+    """Run the bundled extractor; None when the project isn't built, the toolchain is
+    too old for the script, or anything else fails (caller keeps the regex scan)."""
+    mods = []
+    for p in base.rglob("*.lean"):
+        if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
+            continue
+        mods.append(".".join(p.relative_to(base).with_suffix("").parts))
+    if not mods:
+        return None
+    script = Path(__file__).parent.parent / "blueprint_extract.lean"
+    env = dict(os.environ)
+    env["PATH"] = env.get("PATH", "") + os.pathsep + str(Path.home() / ".elan" / "bin")
+    try:
+        r = subprocess.run(["lake", "env", "lean", "--run", str(script)] + sorted(mods),
+                           cwd=base, capture_output=True, text=True, timeout=300, env=env)
+        if r.returncode != 0:
+            return None
+        rows = json.loads(r.stdout.strip().splitlines()[-1])
+        return {row["name"]: row for row in rows}
+    except Exception:
+        return None
+
+
+def _kernel_refresh(stamp: float) -> None:
+    data = _kernel_extract(_project_root())
+    with _KERNEL_LOCK:
+        _KERNEL.update(running=False, stamp=stamp, data=data)
+    try:
+        _kernel_cache_path().write_text(json.dumps({"stamp": stamp, "decls": data}))
+    except OSError:
+        pass
+
+
+def _kernel_data() -> tuple[dict | None, bool]:
+    """(fresh kernel data for the main tree | None, refresh-in-flight?). A stale cache
+    kicks off a background re-extract; a recorded failed attempt is not retried until
+    the sources change again."""
+    stamp = _src_stamp(_project_root())
+    with _KERNEL_LOCK:
+        if "stamp" not in _KERNEL:  # first call after serve start: load persisted cache
+            try:
+                saved = json.loads(_kernel_cache_path().read_text())
+                _KERNEL.update(stamp=saved.get("stamp", 0.0), data=saved.get("decls"))
+            except (OSError, json.JSONDecodeError):
+                _KERNEL.update(stamp=0.0, data=None)
+        if _KERNEL["stamp"] == stamp:
+            return _KERNEL["data"], _KERNEL["running"]
+        if not _KERNEL["running"]:
+            _KERNEL["running"] = True
+            threading.Thread(target=_kernel_refresh, args=(stamp,), daemon=True).start()
+        return None, True
+
+
+def _apply_kernel(files: list, kernel: dict) -> None:
+    """Overlay kernel-exact deps + status onto the regex scan. Kernel names are fully
+    qualified; regex names are as written — match exactly or by unique '.name' suffix.
+    Adds the 'tainted' status: proof complete but transitively resting on a sorry/axiom."""
+    regex_names = {d["name"] for f in files for d in f["decls"]}
+    to_regex: dict = {}
+    for kname in kernel:
+        if kname in regex_names:
+            to_regex[kname] = kname
+        else:
+            tails = [r for r in regex_names if kname.endswith("." + r)]
+            if len(tails) == 1:
+                to_regex[kname] = tails[0]
+    to_kernel = {v: k for k, v in to_regex.items()}
+
+    def direct_bad(k: str) -> bool:
+        return kernel[k]["sorried"] or kernel[k]["kind"] == "axiom"
+
+    memo: dict = {}
+
+    def tainted(k: str, seen: tuple = ()) -> bool:
+        if k in memo:
+            return memo[k]
+        if k in seen:
+            return False
+        bad = any(direct_bad(d) or tainted(d, seen + (k,))
+                  for d in kernel[k]["deps"] if d in kernel)
+        memo[k] = bad
+        return bad
+
+    for f in files:
+        for d in f["decls"]:
+            k = to_kernel.get(d["name"])
+            if not k:
+                continue
+            row = kernel[k]
+            d["deps"] = sorted({to_regex[x] for x in row["deps"] if x in to_regex})
+            if row["sorried"]:
+                d["status"] = "sorry"
+            elif row["kind"] == "axiom":
+                d["status"] = "axiom"
+            elif tainted(k):
+                d["status"] = "tainted"
+            else:
+                d["status"] = "complete"
+    counts: dict = {}
+    for f in files:
+        for d in f["decls"]:
+            for x in d["deps"]:
+                counts[x] = counts.get(x, 0) + 1
+    for f in files:
+        for d in f["decls"]:
+            d["used_by"] = counts.get(d["name"], 0)
+
+
+def _blueprint_files(tree: str):
+    """(files, bodies-by-(path,name), source, refreshing) — regex scan with the kernel
+    overlay applied when fresh exact data exists (main tree only)."""
+    parsed = _scan_blueprint(_blueprint_base(tree))
+    files = [{"path": path, "decls": decls} for path, decls, _ in parsed]
+    bodies = {(path, d["name"]): bs[d["name"]] for path, decls, bs in parsed for d in decls}
+    source, refreshing = "regex", False
+    if tree in ("", "main"):
+        kernel, refreshing = _kernel_data()
+        if kernel:
+            _apply_kernel(files, kernel)
+            source = "kernel"
+    return files, bodies, source, refreshing
+
+
 @app.get("/api/blueprint")
 def api_blueprint(tree: str = "main"):
     """The Lean blueprint: every declaration in the selected tree's .lean files, with
-    proof status (sorry / axiom / complete) and naive in-project dependency links. This
-    is the project's actual Lean structure, distinct from the run's chunk DAG."""
-    parsed = _scan_blueprint(_blueprint_base(tree))
-    files = [{"path": path, "decls": decls} for path, decls, _ in parsed]
+    proof status (complete / tainted / sorry / axiom) and in-project dependency links —
+    kernel-exact when the project builds, regex-approximate otherwise. This is the
+    project's actual Lean structure, distinct from the run's chunk DAG."""
+    files, _, source, refreshing = _blueprint_files(tree)
     total = sum(len(f["decls"]) for f in files)
-    sorries = sum(1 for f in files for d in f["decls"] if d["status"] == "sorry")
-    axioms = sum(1 for f in files for d in f["decls"] if d["status"] == "axiom")
-    return {"files": files, "total": total, "sorries": sorries, "axioms": axioms,
+    counts = {s: sum(1 for f in files for d in f["decls"] if d["status"] == s)
+              for s in ("sorry", "axiom", "tainted")}
+    return {"files": files, "total": total, "sorries": counts["sorry"],
+            "axioms": counts["axiom"], "tainted": counts["tainted"],
+            "source": source, "refreshing": refreshing,
             "tree": tree or "main", "trees": _blueprint_trees()}
 
 
@@ -1749,23 +1903,23 @@ def _chunk_for_decl(name: str) -> dict | None:
 
 @app.get("/api/blueprint/decl")
 def api_blueprint_decl(name: str, file: str, tree: str = "main"):
-    """Detail for one declaration: signature, full source, deps both ways, chunk link."""
-    base = _blueprint_base(tree)
-    parsed = _scan_blueprint(base)
-    for path, decls, bodies in parsed:
-        if path != file:
+    """Detail for one declaration: signature, full source, deps both ways (kernel-exact
+    when available), chunk link."""
+    files, bodies, source, _ = _blueprint_files(tree)
+    for f in files:
+        if f["path"] != file:
             continue
-        for d in decls:
+        for d in f["decls"]:
             if d["name"] != name:
                 continue
-            body = bodies[name]
+            body = bodies[(file, name)]
             # signature: decl head up to the proof/definition body
             sig_end = _re.search(r":=|\bby\b|\bwhere\b", body)
             signature = body[:sig_end.start()].rstrip() if sig_end else body.splitlines()[0]
-            used_by = sorted({x["name"] for _, ds, bs in parsed for x in ds
-                              if name in (set(_IDENT_RE.findall(bs[x["name"]])) - {x["name"]})})
+            used_by = sorted({x["name"] for f2 in files for x in f2["decls"]
+                              if name in x["deps"]})
             return {**{k: d[k] for k in ("name", "kind", "status", "line", "deps")},
-                    "file": path, "signature": signature[:2000],
+                    "file": file, "signature": signature[:2000], "source_kind": source,
                     "source": body.rstrip()[:6000], "truncated": len(body) > 6000,
                     "used_by": used_by[:20], "chunk": _chunk_for_decl(name)}
     return JSONResponse({"error": f"declaration '{name}' not found in {file}"}, status_code=404)
@@ -1986,7 +2140,7 @@ pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-
 .bp-decl { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px solid #f4f4f4; font-size: 12px; }
 .bp-decl:first-of-type { border-top: none; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
-.dot.complete { background: #43a047; } .dot.sorry { background: #e53935; } .dot.axiom { background: #fb8c00; }
+.dot.complete { background: #43a047; } .dot.sorry { background: #e53935; } .dot.axiom { background: #fb8c00; } .dot.tainted { background: #fbc02d; }
 .bp-kind { color: #aaa; font-size: 10px; text-transform: uppercase; width: 68px; flex: none; }
 .bp-deps { color: #bbb; font-size: 11px; margin-left: auto; text-align: right; }
 pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-radius: 6px; height: 58vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -2134,9 +2288,14 @@ async function loadBlueprint() {
   const counts = ' — ' + d.total + ' declarations' +
     (d.sorries ? ' · <span style="color:#e53935">' + d.sorries + ' sorry</span>' : '') +
     (d.axioms ? ' · <span style="color:#fb8c00">' + d.axioms + ' axiom</span>' : '') +
-    (d.total && !d.sorries && !d.axioms ? ' · all complete ✓' : '');
+    (d.tainted ? ' · <span style="color:#c8a000" title="proof complete but transitively rests on a sorry/axiom">' + d.tainted + ' tainted</span>' : '') +
+    (d.total && !d.sorries && !d.axioms && !d.tainted ? ' · all complete ✓' : '');
+  const src = d.source === 'kernel' ? '<span class="badge ok" title="statuses and dependencies read from the compiled Lean environment">kernel-verified</span>'
+    : '<span class="badge pending" title="textual approximation — kernel data appears once the project builds">regex approx.</span>';
+  const refr = d.refreshing ? ' <span class="who">kernel extraction running…</span>' : '';
+  if (d.refreshing) setTimeout(() => { if ($('tab-blueprint').style.display !== 'none') loadBlueprint(); }, 8000);
   let h = '<section><div class="row" style="margin:0">' +
-    '<h2 style="margin:0">Lean blueprint' + counts + '</h2><span style="flex:1"></span>' +
+    '<h2 style="margin:0">Lean blueprint' + counts + ' ' + src + refr + '</h2><span style="flex:1"></span>' +
     '<span class="who">tree:</span> <select id="bp-tree">' +
     (d.trees || ['main']).map(t => '<option' + (t === d.tree ? ' selected' : '') + '>' + esc(t) + '</option>').join('') +
     '</select><button class="act" id="bp-toggle">' + (BP.view === 'list' ? 'graph view' : 'list view') + '</button></div></section>';
@@ -2171,7 +2330,7 @@ function buildBpGraph(d) {
   }
   if (!BP.dagreWired) { cytoscape.use(cytoscapeDagre); BP.dagreWired = true; }
   const COLORS = {complete: {bg: '#c8f0c8', border: '#2d7a2d'}, sorry: {bg: '#f8c8c8', border: '#c02020'},
-                  axiom: {bg: '#ffe2b8', border: '#c87800'}};
+                  axiom: {bg: '#ffe2b8', border: '#c87800'}, tainted: {bg: '#fff3a0', border: '#c8a000'}};
   const names = new Set(); d.files.forEach(f => f.decls.forEach(x => names.add(x.name)));
   const elements = [];
   d.files.forEach(f => f.decls.forEach(x => {
