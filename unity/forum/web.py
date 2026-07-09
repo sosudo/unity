@@ -10,6 +10,7 @@ or programmatically via run(forum_dir, root_dir, port).
 import argparse
 import asyncio
 import json
+import subprocess
 import math
 import re
 import time
@@ -79,7 +80,35 @@ _SORRY_RE = re.compile(r'\bsorry\b')
 _ONLY_SORRY_RE = re.compile(r':=\s*sorry\s*$|by\s*\n?\s*sorry\s*$', re.MULTILINE)
 
 
-def _chunk_status(chunk: dict) -> str:
+def _merged_chunk_ids() -> set:
+    """Chunk ids with a 'UNITY: merge chunk <id>' commit on the project repo (cached 10s).
+    ROOT_DIR is .unity, so the repo is its parent."""
+    now = time.time()
+    if now - _merged_cache["ts"] < 10:
+        return _merged_cache["ids"]
+    ids: set = set()
+    try:
+        out = subprocess.run(
+            ["git", "-C", str(ROOT_DIR.parent), "log", "--grep=UNITY: merge chunk", "--pretty=%s"],
+            capture_output=True, text=True, timeout=5)
+        for line in out.stdout.splitlines():
+            m = re.search(r"UNITY: merge chunk (\S+)", line)
+            if m:
+                ids.add(m.group(1))
+    except Exception:
+        pass
+    _merged_cache.update(ts=now, ids=ids)
+    return ids
+
+
+_merged_cache: dict = {"ts": 0.0, "ids": set()}
+
+
+def _chunk_status(chunk: dict, merged: set | None = None) -> str:
+    """Auto-color a DAG node from every signal available, in fidelity order:
+    Lean source inspection > merge commits / dag status > typed forum acts > recency."""
+    cid = str(chunk.get("id", ""))
+    # 1) highest fidelity: inspect the Lean declaration itself (v1-style fields, if present)
     lean_file = chunk.get("lean_file")
     lines_range = chunk.get("lean_decl_lines")
     if lean_file and lines_range:
@@ -98,14 +127,34 @@ def _chunk_status(chunk: dict) -> str:
                     return "blue"
             except Exception:
                 pass
-    thread_path = FORUM_DIR / f"{chunk.get('id', '')}.json"
-    if thread_path.exists():
+    # 2) authoritative completion: merge commits or the chunk's own status field
+    st = str(chunk.get("status") or "").lower()
+    if (merged and cid in merged) or st in ("merged", "done", "complete", "completed"):
+        return "green"
+    if st in ("blocked", "failed"):
+        return "red"
+    if st in ("in_progress", "in-progress", "claimed", "active"):
+        return "yellow"
+    # 3) typed forum acts on the chunk's thread
+    for tid in dict.fromkeys([cid, f"chunk-{cid}"]):
+        thread_path = FORUM_DIR / f"{tid}.json"
+        if not thread_path.exists():
+            continue
         try:
-            data = json.loads(thread_path.read_text())
-            if any(time.time() - p["timestamp"] < 300 for p in data["posts"]):
-                return "yellow"
+            posts = json.loads(thread_path.read_text()).get("posts", [])
         except Exception:
-            pass
+            continue
+        acts = [(p.get("act"), p.get("fields") or {}, p.get("timestamp", 0)) for p in posts]
+        if any(a == "result" and f.get("build_ok") for a, f, _ in acts):
+            return "green"
+        if any(a == "obstacle" and f.get("status") == "open" for a, f, _ in acts):
+            return "red"
+        if any(a == "result" and f.get("status") == "partial" for a, f, _ in acts):
+            return "blue"
+        if any(a == "claim" and f.get("status") == "open" for a, f, _ in acts):
+            return "yellow"
+        if any(time.time() - ts < 300 for _, _, ts in acts):
+            return "yellow"
     return "grey"
 
 
@@ -261,7 +310,8 @@ def get_dag():
         dag = json.loads(dag_file.read_text())
     except Exception:
         return JSONResponse({"error": "failed to parse dag.json"}, status_code=500)
-    chunks = [{**c, "status": _chunk_status(c)} for c in dag.get("chunks", [])]
+    merged = _merged_chunk_ids()
+    chunks = [{**c, "status": _chunk_status(c, merged)} for c in dag.get("chunks", [])]
     return JSONResponse({"chunks": chunks})
 
 
@@ -1004,11 +1054,11 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
     <div id="info-content"></div>
   </div>
   <div id="legend">
-    <div class="legend-row"><span class="status-dot" style="background:#e8e8e8;border:1px solid #999"></span>not started</div>
-    <div class="legend-row"><span class="status-dot" style="background:#fff3a0;border:1px solid #c8a000"></span>in progress</div>
-    <div class="legend-row"><span class="status-dot" style="background:#c8f0c8;border:1px solid #2d7a2d"></span>fully formalized</div>
-    <div class="legend-row"><span class="status-dot" style="background:#c8e0f8;border:1px solid #1a5fa0"></span>partially formalized</div>
-    <div class="legend-row"><span class="status-dot" style="background:#f8c8c8;border:1px solid #c02020"></span>by sorry</div>
+    <div class="legend-row"><span class="status-dot" style="background:#e8e8e8;border:1px solid #999"></span>pending</div>
+    <div class="legend-row"><span class="status-dot" style="background:#fff3a0;border:1px solid #c8a000"></span>claimed / active</div>
+    <div class="legend-row"><span class="status-dot" style="background:#c8f0c8;border:1px solid #2d7a2d"></span>merged / builds sorry-free</div>
+    <div class="legend-row"><span class="status-dot" style="background:#c8e0f8;border:1px solid #1a5fa0"></span>partial result</div>
+    <div class="legend-row"><span class="status-dot" style="background:#f8c8c8;border:1px solid #c02020"></span>blocked / open obstacle</div>
   </div>
   <div id="waiting" style="display:none">waiting for dag.json...</div>
 </main>
