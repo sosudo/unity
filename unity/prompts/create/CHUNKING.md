@@ -25,6 +25,6 @@ spec's real dependency structure (foundational definitions before the results th
 wrong dependencies will stall formalization.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or modify
-outside it. If `SPEC.md` is ambiguous or you're unsure how to split something, raise it on the forum.
+outside it. If `SPEC.md` is ambiguous or you're unsure how to split something, raise it with `forum_obstacle`.
 Don't touch `.unity/finalized.json` or `.unity/critic.json`. Consult the global unity library
 (`~/.unity/library/`). Do not write Lean or begin formalization in this phase.

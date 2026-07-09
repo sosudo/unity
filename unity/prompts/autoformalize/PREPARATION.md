@@ -13,7 +13,7 @@ Survey, in this order:
 - The Lean project — what builds and what is incomplete (`sorry`, `axiom`, errors). Prefer Axle's
   `check` over the lean-lsp equivalent.
 - `.unity/logs/` — the latest run logs: what was attempted and what failed.
-- The forum — `forum_get_tag("decision")`, `forum_get_tag("phase-handoff")`, and recent threads.
+- The forum — `forum_brief` — also injected into your preamble, and recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): what is
 semiformalized (chunked), what is formalized and verified, what remains, key decisions and constraints,

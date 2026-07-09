@@ -27,5 +27,5 @@ Be rigorous and skeptical — a build that quietly weakened statements or proved
 faithful formalization, and approving it defeats the purpose.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a formalization is faithful to the source, raise it on the forum before deciding. Consult the
+whether a formalization is faithful to the source, raise it with `forum_obstacle` before deciding. Consult the
 global unity library (`~/.unity/library/`).

@@ -50,6 +50,6 @@ formalize independently, with correct dependencies. If part of the source is amb
 how to model it, propose a resolution on the forum and record the decision rather than silently guessing.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify outside it. If you can't read part of the source or are unsure, say so on the forum and ask the
+modify outside it. If you can't read part of the source or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the
 team rather than fabricating mathematical content. Don't touch `.unity/critic.json`. Consult the global
 unity library (`~/.unity/library/`). Check the forum often. Do not write Lean in this phase.

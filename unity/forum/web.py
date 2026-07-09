@@ -57,10 +57,11 @@ def _load_thread(thread_id: str) -> dict | None:
         return None
 
 
-_DEFAULT_DIMENSIONS = [
-    "correctness", "faithfulness", "style_alignment",
-    "priority", "confidence", "feasibility",
-]
+_DEFAULT_DIMENSIONS = ["correctness", "faithfulness"]
+# Pre-Forum-2.0 default set; configs still carrying exactly these six display as the
+# current two (mirrors the migration in forum/server.py).
+_LEGACY_DIMENSIONS = ["correctness", "faithfulness", "style_alignment",
+                      "priority", "confidence", "feasibility"]
 
 
 def _load_config() -> dict:
@@ -71,6 +72,8 @@ def _load_config() -> dict:
         cfg = json.loads(path.read_text())
         if not cfg.get("dimensions", {}).get("active"):
             cfg.setdefault("dimensions", {})["active"] = list(_DEFAULT_DIMENSIONS)
+        if sorted(cfg["dimensions"]["active"]) == sorted(_LEGACY_DIMENSIONS):
+            cfg["dimensions"]["active"] = list(_DEFAULT_DIMENSIONS)
         return cfg
     except Exception:
         return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
@@ -1208,12 +1211,12 @@ loadDag(true); connect();
 
 @app.get("/graph", response_class=HTMLResponse)
 def graph():
-    return GRAPH_HTML
+    return _embeddable(GRAPH_HTML)
 
 
 @app.get("/dag", response_class=HTMLResponse)
 def dag():
-    return DAG_HTML
+    return _embeddable(DAG_HTML)
 
 
 WORKSPACE_HTML = """\
@@ -1232,9 +1235,9 @@ nav a { font-size: 12px; color: #888; text-decoration: none; }
 nav a:hover { color: #111; }
 #status { font-size: 11px; color: #bbb; }
 main { padding: 18px 20px; display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
-section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; }
+section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; min-width: 0; overflow-wrap: anywhere; }
 section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #bbb; margin-bottom: 8px; }
-.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; }
+.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; overflow-wrap: anywhere; word-break: break-word; }
 .item:first-of-type { border-top: none; }
 .who { color: #999; font-size: 11px; }
 .chunk-card { margin-bottom: 10px; }
@@ -1319,7 +1322,7 @@ setInterval(refresh, 3000);
 
 @app.get("/workspace", response_class=HTMLResponse)
 def workspace():
-    return WORKSPACE_HTML
+    return _embeddable(WORKSPACE_HTML)
 
 
 
@@ -1335,14 +1338,14 @@ _run_state: dict = {"proc": None}
 
 _COMMANDS: dict = {
     # command -> which extra inputs it takes
-    "autoformalize": {"targets": True, "metric": False},
-    "formalize":     {"targets": True, "metric": False},
-    "prove":         {"targets": True, "metric": False},
-    "solve":         {"targets": False, "metric": False},
-    "create":        {"targets": False, "metric": False},
-    "verify":        {"targets": True, "metric": False},
-    "bump":          {"targets": False, "metric": False},
-    "optimize":      {"targets": True, "metric": True},
+    "autoformalize": {"targets": True, "metric": False, "version": False},
+    "formalize":     {"targets": True, "metric": False, "version": False},
+    "prove":         {"targets": True, "metric": False, "version": False},
+    "solve":         {"targets": False, "metric": False, "version": False},
+    "create":        {"targets": False, "metric": False, "version": False},
+    "verify":        {"targets": True, "metric": False, "version": False},
+    "bump":          {"targets": False, "metric": False, "version": True},
+    "optimize":      {"targets": True, "metric": True, "version": False},
 }
 
 
@@ -1645,6 +1648,82 @@ def api_metric_new(payload: dict = Body(...)):
     return {"ok": True, "name": f"{name}.md"}
 
 
+import re as _re
+
+_DECL_RE = _re.compile(
+    r"^(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+|partial\s+|unsafe\s+|scoped\s+)*"
+    r"(theorem|lemma|def|abbrev|structure|inductive|class|instance|opaque|axiom)\s+([A-Za-z0-9_.'₀-₉]+)",
+    _re.M)
+
+
+@app.get("/api/blueprint")
+def api_blueprint():
+    """The Lean blueprint: every declaration in the project's .lean files, with proof
+    status (sorry / axiom / complete) and naive in-project dependency links (name
+    references in the decl body). This is the project's actual Lean structure, distinct
+    from the run's chunk DAG."""
+    root = _project_root()
+    files = []
+    all_names: set = set()
+    parsed = []
+    for p in sorted(root.rglob("*.lean")):
+        if any(part in (".lake", ".unity", "lake-packages", "build") for part in p.parts):
+            continue
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        matches = list(_DECL_RE.finditer(text))
+        decls = []
+        for i, m in enumerate(matches):
+            body = text[m.start():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
+            kind, name = m.group(1), m.group(2)
+            status = ("axiom" if kind == "axiom"
+                      else "sorry" if _re.search(r"\bsorry\b|\badmit\b", body) else "complete")
+            decls.append({"name": name, "kind": kind, "status": status,
+                          "line": text.count("\n", 0, m.start()) + 1, "_body": body})
+            all_names.add(name)
+        if decls:
+            parsed.append((str(p.relative_to(root)), decls))
+    used_by: dict = {}
+    ident_re = _re.compile(r"[A-Za-z_][A-Za-z0-9_.'₀-₉]*")
+    for path, decls in parsed:
+        for d in decls:
+            deps = sorted((set(ident_re.findall(d["_body"])) & all_names) - {d["name"]})
+            d["deps"] = deps[:12]
+            for n in deps:
+                used_by[n] = used_by.get(n, 0) + 1
+            del d["_body"]
+    for path, decls in parsed:
+        for d in decls:
+            d["used_by"] = used_by.get(d["name"], 0)
+        files.append({"path": path, "decls": decls})
+    total = sum(len(f["decls"]) for f in files)
+    sorries = sum(1 for f in files for d in f["decls"] if d["status"] == "sorry")
+    axioms = sum(1 for f in files for d in f["decls"] if d["status"] == "axiom")
+    return {"files": files, "total": total, "sorries": sorries, "axioms": axioms}
+
+
+@app.get("/api/tools")
+def api_tools():
+    """Aggregated tool-call telemetry from .unity/logs/tools.jsonl: agent × tool counts."""
+    f = ROOT_DIR / "logs" / "tools.jsonl"
+    counts: dict = {}
+    last_ts = None
+    if f.exists():
+        for line in f.read_text(errors="replace").splitlines():
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            key = (e.get("agent", "?"), e.get("tool", "?"))
+            counts[key] = counts.get(key, 0) + 1
+            last_ts = e.get("ts", last_ts)
+    rows = [{"agent": a, "tool": t, "count": c} for (a, t), c in counts.items()]
+    rows.sort(key=lambda r: -r["count"])
+    return {"rows": rows, "last_ts": last_ts}
+
+
 @app.get("/api/logs")
 def api_logs():
     d = ROOT_DIR / "logs"
@@ -1655,6 +1734,17 @@ def api_logs():
     return {"files": sorted(files, key=lambda f: -f["mtime"])}
 
 
+_ANSI_RE = None
+
+
+def _strip_ansi(text: str) -> str:
+    global _ANSI_RE
+    if _ANSI_RE is None:
+        import re
+        _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+    return _ANSI_RE.sub("", text)
+
+
 @app.get("/api/logs/file")
 def api_log_get(name: str):
     q = _safe_unity_path(f"logs/{Path(name).name}")
@@ -1663,7 +1753,7 @@ def api_log_get(name: str):
     data = q.read_bytes()
     clipped = len(data) > 200_000
     return {"name": Path(name).name, "clipped": clipped,
-            "text": data[-200_000:].decode("utf-8", errors="replace")}
+            "text": _strip_ansi(data[-200_000:].decode("utf-8", errors="replace"))}
 
 
 @app.get("/api/run")
@@ -1672,9 +1762,17 @@ def api_run_status():
     tail = ""
     if st.get("log") and Path(st["log"]).exists():
         data = Path(st["log"]).read_bytes()
-        tail = data[-4000:].decode("utf-8", errors="replace")
+        tail = _strip_ansi(data[-4000:].decode("utf-8", errors="replace"))
+    phase = None
+    if st["running"]:
+        try:
+            phase = json.loads((ROOT_DIR / "state.json").read_text()).get("phase")
+        except (OSError, json.JSONDecodeError):
+            pass
     return {"running": st["running"], "command": st.get("command"),
             "started": st.get("started", 0.0), "exit_code": st.get("exit_code"),
+            "phase": phase, "stopping": st["running"] and (ROOT_DIR / "stop-requested").exists(),
+            "log": Path(st["log"]).name if st.get("log") else None,
             "log_tail": tail}
 
 
@@ -1693,6 +1791,10 @@ def api_run_start(payload: dict = Body(...)):
             return JSONResponse({"error": "optimize needs a metric (set one active or pass it)"},
                                 status_code=400)
         argv.append(Path(metric).stem)
+    if _COMMANDS[command].get("version"):
+        ver = (payload.get("version") or "").strip()
+        if ver:
+            argv.append(ver)
     targets = (payload.get("targets") or "").strip()
     if targets and _COMMANDS[command]["targets"]:
         argv += ["--targets", ", ".join(t.strip() for t in targets.splitlines() if t.strip())]
@@ -1711,6 +1813,7 @@ def api_run_start(payload: dict = Body(...)):
     code = ("import sys, json, os; sys.argv = ['unity'] + json.loads(os.environ['UNITY_WEB_ARGS']); "
             "from unity.cli import main; main()")
     env = {**os.environ, "UNITY_WEB_ARGS": json.dumps(argv)}
+    (ROOT_DIR / "stop-requested").unlink(missing_ok=True)  # clear any stale safe-stop flag
     lf = open(log_path, "ab")
     # own process group so stop can kill the whole agent tree, not just the wrapper
     proc = subprocess.Popen([sys.executable, "-c", code], cwd=str(_project_root()),
@@ -1723,11 +1826,16 @@ def api_run_start(payload: dict = Body(...)):
 
 
 @app.post("/api/run/stop")
-def api_run_stop():
+def api_run_stop(payload: dict = Body(default={})):
     import signal
     st = _current_run()
     if not st["running"]:
         return {"ok": True, "stopped": False}
+    if payload.get("mode", "safe") == "safe":
+        # Safe stop: agents end at their next stream item, remaining phases are skipped,
+        # worktrees get cleaned up. Force mode (second click) kills the process group.
+        (ROOT_DIR / "stop-requested").write_text(str(time.time()))
+        return {"ok": True, "stopping": True}
     pid = st["pid"]
     try:
         pgid = os.getpgid(pid)
@@ -1768,9 +1876,11 @@ nav a { font-size: 12px; color: #888; text-decoration: none; }
 nav a:hover { color: #111; }
 .runwrap { position: relative; }
 #runbtn { background: #111; color: #fff; border: none; border-radius: 5px; font: inherit; font-size: 12px; padding: 5px 14px; cursor: pointer; }
-#runbtn.running { background: #b7791f; }
+#runbtn.running { background: #b71c1c; }
+#runbtn.stopping { background: #b7791f; }
 .runmenu { display: none; position: absolute; right: 0; top: 110%; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; min-width: 150px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); z-index: 20; }
 .runwrap:hover .runmenu { display: block; }
+.runwrap.running .runmenu { display: none; }
 .runmenu div { padding: 7px 14px; cursor: pointer; font-size: 12px; color: #444; }
 .runmenu div:hover { background: #f2f2f2; color: #111; }
 #status { font-size: 11px; color: #bbb; }
@@ -1778,9 +1888,9 @@ main { padding: 0; }
 .pane { padding: 18px 20px; }
 .framewrap iframe { display: block; width: 100%; height: calc(100vh - 54px); border: none; background: #fff; }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
-section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; }
+section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; min-width: 0; overflow-wrap: anywhere; }
 section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #bbb; margin-bottom: 8px; }
-.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; }
+.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; overflow-wrap: anywhere; word-break: break-word; }
 .item:first-of-type { border-top: none; }
 .who { color: #999; font-size: 11px; }
 .badge { display: inline-block; font-size: 10px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
@@ -1806,16 +1916,24 @@ pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-
 .filelist td { padding: 5px 10px 5px 0; border-top: 1px solid #f2f2f2; font-size: 12px; }
 .empty { color: #ccc; padding: 8px 0; }
 .savemsg { font-size: 11px; color: #2d7a2d; margin-left: 8px; }
+.bp-decl { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px solid #f4f4f4; font-size: 12px; }
+.bp-decl:first-of-type { border-top: none; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
+.dot.complete { background: #43a047; } .dot.sorry { background: #e53935; } .dot.axiom { background: #fb8c00; }
+.bp-kind { color: #aaa; font-size: 10px; text-transform: uppercase; width: 68px; flex: none; }
+.bp-deps { color: #bbb; font-size: 11px; margin-left: auto; text-align: right; }
+pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-radius: 6px; height: 58vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
 </style>
 </head>
 <body>
 <header>
   <h1 id="title">unity</h1>
   <div class="tabs" id="tabs">
-    <button data-tab="workspace" class="active">workspace</button>
+    <button data-tab="blueprint" class="active">blueprint</button>
+    <button data-tab="overview">overview</button>
     <button data-tab="forum">forum</button>
     <button data-tab="graph">graph</button>
-    <button data-tab="dag">dag</button>
+    <button data-tab="chunks">chunks</button>
     <button data-tab="agents">agents</button>
     <button data-tab="prompt">prompt</button>
     <button data-tab="sources">sources</button>
@@ -1824,17 +1942,18 @@ pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-
   </div>
   <nav>
     <span id="status">idle</span>
-    <div class="runwrap">
+    <div class="runwrap" id="runwrap">
       <button id="runbtn">run ▾</button>
       <div class="runmenu" id="runmenu"></div>
     </div>
   </nav>
 </header>
 <main>
-  <div id="tab-workspace" class="pane grid"></div>
+  <div id="tab-blueprint" class="pane"></div>
+  <div id="tab-overview" class="pane grid" style="display:none"></div>
   <div id="tab-forum" class="framewrap" style="display:none"><iframe data-src="/forum"></iframe></div>
   <div id="tab-graph" class="framewrap" style="display:none"><iframe data-src="/graph"></iframe></div>
-  <div id="tab-dag" class="framewrap" style="display:none"><iframe data-src="/dag"></iframe></div>
+  <div id="tab-chunks" class="framewrap" style="display:none"><iframe data-src="/dag"></iframe></div>
   <div id="tab-agents" class="pane" style="display:none"></div>
   <div id="tab-prompt" class="pane" style="display:none"></div>
   <div id="tab-sources" class="pane" style="display:none"></div>
@@ -1848,21 +1967,16 @@ pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-
     <span class="who" id="rm-continue-note"></span></div>
   <div id="rm-metric-row" class="row" style="display:none">metric:
     <select id="rm-metric"></select></div>
+  <div id="rm-version-row" class="row" style="display:none">version:
+    <input id="rm-version" placeholder="e.g. v4.16.0 (blank = from UNITY.md)" style="flex:1"></div>
   <div id="rm-targets-row" style="display:none">
-    <div class="who">targets — one per line (empty = default scope)</div>
+    <div class="who">targets — one per line (empty = all)</div>
     <textarea id="rm-targets" style="min-height:90px"></textarea>
     <div class="chips" id="rm-chips"></div>
   </div>
   <div class="row"><button class="act primary" id="rm-start">start</button>
     <button class="act" onclick="document.getElementById('runmodal').classList.remove('open')">cancel</button>
     <span class="who" id="rm-err"></span></div>
-</div></div>
-
-<div class="modal" id="logmodal"><div class="box">
-  <h3>run log <span class="who" id="log-meta"></span></h3>
-  <pre class="log" id="log-tail">(empty)</pre>
-  <div class="row"><button class="act" id="log-stop">stop run</button>
-    <button class="act" onclick="document.getElementById('logmodal').classList.remove('open')">close</button></div>
 </div></div>
 
 <div class="modal" id="viewmodal"><div class="box">
@@ -1879,16 +1993,24 @@ const J = (url, opts) => fetch(url, opts).then(r => r.json());
 const put = (url, body) => J(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 const post = (url, body) => J(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 
-const TABS = ['workspace','forum','graph','dag','agents','prompt','sources','metrics','logs'];
+const TABS = ['blueprint','overview','forum','graph','chunks','agents','prompt','sources','metrics','logs'];
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
   TABS.forEach(t => $('tab-'+t).style.display = 'none');
-  const t = b.dataset.tab; $('tab-'+t).style.display = t === 'workspace' ? 'grid' : 'block';
+  const t = b.dataset.tab; $('tab-'+t).style.display = t === 'overview' ? 'grid' : 'block';
   const fr = document.querySelector('#tab-' + t + ' iframe');
   if (fr && !fr.getAttribute('src')) fr.src = fr.dataset.src;
   if (loaders[t]) loaders[t]();
 });
+function reltime(ts) {
+  if (!ts) return '';
+  const s = Date.now() / 1000 - ts;
+  if (s < 90) return 'just now';
+  if (s < 5400) return Math.round(s / 60) + 'm ago';
+  if (s < 129600) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') document.querySelectorAll('.modal.open').forEach(m => m.classList.remove('open'));
 });
@@ -1898,12 +2020,13 @@ function badge(r) {
   if (r.open_objections.length) return '<span class="badge blocked">' + r.open_objections.length + ' objection(s)</span>';
   return '<span class="badge pending">needs endorsement</span>';
 }
-async function loadWorkspace() {
+async function loadOverview() {
   try {
     const d = await J('/api/workspace');
+    const when = x => x.ts ? ' <span class="who">· ' + reltime(x.ts) + '</span>' : '';
     let h = '';
     h += '<section><h2>Binding decisions</h2>' + (d.decisions.length ? d.decisions.map(x =>
-      '<div class="item"><b>' + esc(x.topic) + '</b>: ' + esc(x.choice) + ' <span class="who">(' + esc(x.author) + ')</span></div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+      '<div class="item"><b>' + esc(x.topic) + '</b>: ' + esc(x.choice) + ' <span class="who">(' + esc(x.author) + ')</span>' + when(x) + '</div>').join('') : '<div class="empty">none yet</div>') + '</section>';
     h += '<section><h2>Chunk consensus</h2>' + (d.chunks.length ? d.chunks.map(c =>
       '<div class="item"><b>' + esc(c.chunk) + '</b>' +
       c.results.map(r => '<div class="item">' + esc(r.author) + ': ' + esc(r.status) + (r.build_ok ? ' ✓build' : '') + badge(r) +
@@ -1915,19 +2038,45 @@ async function loadWorkspace() {
     h += '<section><h2>Open questions</h2>' + (d.questions.length ? d.questions.map(q =>
       '<div class="item">' + esc(q.content) + '</div>').join('') : '<div class="empty">none open</div>') + '</section>';
     h += '<section><h2>Ledger</h2>' + (d.ledger.length ? d.ledger.map(l =>
-      '<div class="item"><span class="kind">' + esc(l.kind) + '</span>' + esc(l.content) + '</div>').join('') : '<div class="empty">no verified knowledge yet</div>') + '</section>';
+      '<div class="item"><span class="kind">' + esc(l.kind) + '</span>' + esc(l.content) + when(l) + '</div>').join('') : '<div class="empty">no verified knowledge yet</div>') + '</section>';
     h += '<section><h2>Latest handoffs</h2>' + (d.handoffs.length ? d.handoffs.map(x =>
-      '<div class="item">' + esc(x.content) + '</div>').join('') : '<div class="empty">none yet</div>') + '</section>';
-    $('tab-workspace').innerHTML = h;
-  } catch (e) { $('tab-workspace').innerHTML = '<section><div class="empty">workspace unavailable</div></section>'; }
+      '<div class="item">' + esc(x.content) + when(x) + '</div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+    const t = await J('/api/tools');
+    h += '<section><h2>Tool usage</h2>' + (t.rows.length ?
+      '<table class="filelist">' + t.rows.slice(0, 30).map(r =>
+        '<tr><td>' + esc(r.agent) + '</td><td>' + esc(r.tool) + '</td><td class="who">' + r.count + '×</td></tr>').join('') + '</table>'
+      : '<div class="empty">no tool calls recorded yet</div>') + '</section>';
+    $('tab-overview').innerHTML = h;
+  } catch (e) { $('tab-overview').innerHTML = '<section><div class="empty">overview unavailable</div></section>'; }
 }
 
-const AG_F = ['model','backend','provider','strength','budget','base_url','api_key','auth_token'];
+async function loadBlueprint() {
+  const d = await J('/api/blueprint');
+  if (!d.files.length) {
+    $('tab-blueprint').innerHTML = '<section><div class="empty">no Lean declarations found in this project yet</div></section>';
+    return;
+  }
+  let h = '<section><h2>Lean blueprint — ' + d.total + ' declarations' +
+    (d.sorries ? ' · <span style="color:#e53935">' + d.sorries + ' sorry</span>' : '') +
+    (d.axioms ? ' · <span style="color:#fb8c00">' + d.axioms + ' axiom</span>' : '') +
+    (!d.sorries && !d.axioms ? ' · all complete ✓' : '') + '</h2></section>';
+  h += d.files.map(f =>
+    '<section style="margin-top:12px"><h2>' + esc(f.path) + '</h2>' +
+    f.decls.map(x =>
+      '<div class="bp-decl"><span class="dot ' + x.status + '"></span>' +
+      '<span class="bp-kind">' + esc(x.kind) + '</span>' +
+      '<span title="line ' + x.line + (x.deps.length ? ' — uses: ' + esc(x.deps.join(', ')) : '') + '">' + esc(x.name) + '</span>' +
+      '<span class="bp-deps">' + (x.deps.length ? '→ ' + x.deps.length : '') + (x.used_by ? ' · used by ' + x.used_by : '') + '</span></div>'
+    ).join('') + '</section>').join('');
+  $('tab-blueprint').innerHTML = h;
+}
+
+const AG_F = ['model','backend','provider','budget','base_url','api_key','auth_token'];
 let agTimer = null, agLastEdited = 'cards';
 function agCollect() {
   return [...document.querySelectorAll('.agent-card')].map(c => {
     const g = {names: c.querySelector('[data-f=names]').value.split(',').map(x => x.trim()).filter(Boolean)};
-    AG_F.forEach(f => { const v = c.querySelector('[data-f=' + f + ']').value.trim(); if (v) g[f] = (f === 'strength' ? parseInt(v) : (f === 'budget' ? parseFloat(v) : v)); });
+    AG_F.forEach(f => { const v = c.querySelector('[data-f=' + f + ']').value.trim(); if (v) g[f] = (f === 'budget' ? parseFloat(v) : v); });
     return g;
   });
 }
@@ -1982,7 +2131,7 @@ function agentCard(g, i, F) {
   let h = '<div class="agent-card"><div class="fields">';
   h += inp('names', (g.names || []).join(', '));
   h += inp('model', g.model); h += inp('backend', g.backend || 'claude_code'); h += inp('provider', g.provider);
-  h += inp('strength', g.strength); h += inp('budget', g.budget); h += inp('base_url', g.base_url);
+  h += inp('budget', g.budget); h += inp('base_url', g.base_url);
   h += inp('api_key', g.api_key, 'password'); h += inp('auth_token', g.auth_token, 'password');
   h += '</div><div class="row"><button class="act ag-del">remove</button></div></div>';
   return h;
@@ -2061,20 +2210,30 @@ async function editMetric(name) {
 async function setActive(name) { await post('/api/metrics/active', {name}); loadMetrics(); }
 async function unsetActive() { await post('/api/metrics/active', {clear: true}); loadMetrics(); }
 
+let LOG_OPEN = null;
 async function loadLogs() {
   const d = await J('/api/logs');
   const fmt = t => new Date(t * 1000).toLocaleString();
   $('tab-logs').innerHTML = '<section><h2>.unity/logs/</h2><table class="filelist">' +
-    (d.files.length ? d.files.map(f => '<tr><td>' + esc(f.name) + '</td><td class="who">' + f.size + ' B</td>' +
-      '<td class="who">' + fmt(f.mtime) + '</td>' +
-      '<td><button class="act" onclick="viewLog(\'' + esc(f.name) + '\')">view</button></td></tr>').join('')
-      : '<tr><td class="empty">no logs yet</td></tr>') + '</table></section>';
+    (d.files.length ? d.files.map(f => '<tr><td>' + esc(f.name) + (f.name === RUN.log && RUN.running ? ' <span class="badge ok">live</span>' : '') + '</td>' +
+      '<td class="who">' + f.size + ' B</td>' +
+      '<td class="who">' + fmt(f.mtime) + ' (' + reltime(f.mtime) + ')</td>' +
+      '<td><button class="act" onclick="openLog(\'' + esc(f.name) + '\')">view</button></td></tr>').join('')
+      : '<tr><td class="empty">no logs yet</td></tr>') + '</table>' +
+    '<div id="log-viewer" style="display:none;margin-top:12px"><div class="who" id="log-viewer-name"></div>' +
+    '<pre class="tail" id="log-viewer-body"></pre></div></section>';
+  if (LOG_OPEN) openLog(LOG_OPEN);
 }
-async function viewLog(name) {
+async function openLog(name) {
+  LOG_OPEN = name;
   const d = await J('/api/logs/file?name=' + encodeURIComponent(name));
-  $('view-name').textContent = name + (d.clipped ? ' (last 200 KB)' : '');
-  $('view-body').textContent = d.text;
-  $('viewmodal').classList.add('open');
+  const v = $('log-viewer'); if (!v) return;
+  v.style.display = 'block';
+  $('log-viewer-name').textContent = name + (d.clipped ? ' (last 200 KB)' : '') +
+    (name === RUN.log && RUN.running ? ' — live, auto-refreshing' : '');
+  const el = $('log-viewer-body'), stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 12 || !el.textContent;
+  el.textContent = d.text || '(empty)';
+  if (stick) el.scrollTop = el.scrollHeight;
 }
 async function delMetric(name) { await fetch('/api/metrics/file?name=' + encodeURIComponent(name), {method: 'DELETE'}); loadMetrics(); }
 
@@ -2093,6 +2252,8 @@ function openRunModal(cmd) {
   if (spec.metric) {
     $('rm-metric').innerHTML = PROJECT.metrics.map(m => '<option' + (m.replace(/[.]md$/, '') === PROJECT.active_metric ? ' selected' : '') + '>' + esc(m) + '</option>').join('');
   }
+  $('rm-version-row').style.display = spec.version ? 'flex' : 'none';
+  $('rm-version').value = '';
   $('rm-targets-row').style.display = spec.targets ? 'block' : 'none';
   $('rm-targets').value = '';
   $('rm-chips').innerHTML = (PROJECT.chunks || []).map(c => '<span class="chip" data-c="' + esc(c) + '">' + esc(c) + '</span>').join('');
@@ -2108,51 +2269,52 @@ function openRunModal(cmd) {
 $('rm-start').onclick = async () => {
   const body = {command: RUN_CMD, 'continue': $('rm-continue').checked, targets: $('rm-targets').value};
   if (PROJECT.commands[RUN_CMD].metric) body.metric = $('rm-metric').value;
+  if (PROJECT.commands[RUN_CMD].version) body.version = $('rm-version').value;
   const r = await post('/api/run', body);
   if (r.error) { $('rm-err').textContent = r.error; return; }
   $('runmodal').classList.remove('open');
   pollRun();
 };
-$('runbtn').onclick = () => { if ($('runbtn').classList.contains('running')) showLog(); };
-$('log-stop').onclick = async () => {
-  $('log-stop').textContent = 'stopping…'; $('log-stop').disabled = true;
-  await post('/api/run/stop', {});
-  $('log-stop').textContent = 'stop run'; $('log-stop').disabled = false;
-  refreshLog(); pollRun();
+let RUN = {running: false, stopping: false, log: null};
+$('runbtn').onclick = async () => {
+  if (!RUN.running) return;  // idle: the hover menu launches runs
+  if (!RUN.stopping) {
+    await post('/api/run/stop', {mode: 'safe'});  // agents end their current turn, run winds down
+  } else if (confirm('Force stop? This kills the whole run immediately.')) {
+    await post('/api/run/stop', {mode: 'force'});
+  }
+  pollRun();
 };
-async function refreshLog() {
-  const d = await J('/api/run');
-  const ended = d.exit_code === null ? 'ended' : 'exit ' + d.exit_code;
-  $('log-meta').textContent = d.command ? (d.command + (d.running ? ' running' : ' ' + ended)) : '';
-  const el = $('log-tail'), stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 8;
-  el.textContent = d.log_tail || '(empty)';
-  if (stick) el.scrollTop = el.scrollHeight;
-}
-async function showLog() { await refreshLog(); $('logmodal').classList.add('open'); }
 async function pollRun() {
   const d = await J('/api/run');
+  RUN = {running: d.running, stopping: d.stopping, log: d.log};
   if (d.running) {
+    $('runwrap').classList.add('running');
     const mins = Math.floor((Date.now() / 1000 - d.started) / 60);
-    $('runbtn').classList.add('running'); $('runbtn').textContent = d.command + ' ' + mins + 'm log';
-    $('status').textContent = 'running';
+    $('runbtn').classList.toggle('stopping', d.stopping);
+    $('runbtn').classList.toggle('running', !d.stopping);
+    $('runbtn').textContent = d.stopping ? 'force stop' : 'stop';
+    $('status').textContent = d.command + (d.phase ? ' · ' + d.phase : '') + ' · ' + mins + 'm' +
+      (d.stopping ? ' · stopping after current turns…' : '');
   } else {
-    $('runbtn').classList.remove('running'); $('runbtn').textContent = 'run ▾';
+    $('runwrap').classList.remove('running');
+    $('runbtn').classList.remove('running', 'stopping'); $('runbtn').textContent = 'run ▾';
     $('status').textContent = d.command ? ('last: ' + d.command + (d.exit_code === null ? '' : ' (exit ' + d.exit_code + ')')) : 'idle';
   }
 }
 
-const loaders = {workspace: loadWorkspace, agents: loadAgents, prompt: loadPrompt,
-                 sources: loadSources, metrics: loadMetrics, logs: loadLogs};
+const loaders = {blueprint: loadBlueprint, overview: loadOverview, agents: loadAgents,
+                 prompt: loadPrompt, sources: loadSources, metrics: loadMetrics, logs: loadLogs};
 async function boot() {
   PROJECT = await J('/api/project');
   $('title').textContent = 'unity — ' + PROJECT.name;
   buildRunMenu();
-  loadWorkspace();
+  loadBlueprint();
   pollRun();
   setInterval(() => {
     pollRun();
-    if ($('tab-workspace').style.display !== 'none') loadWorkspace();
-    if ($('logmodal').classList.contains('open')) refreshLog();
+    if ($('tab-overview').style.display !== 'none') loadOverview();
+    if ($('tab-logs').style.display !== 'none' && LOG_OPEN && LOG_OPEN === RUN.log && RUN.running) openLog(LOG_OPEN);
   }, 4000);
 }
 boot();
@@ -2162,6 +2324,16 @@ boot();
 """
 
 
+# When a page is embedded as an app-shell tab, drop its own header so navbars don't
+# nest (and can't recurse via the "← app" link).
+_EMBED_SNIPPET = ("<script>if(self!==top){var _h=document.querySelector('header');"
+                  "if(_h)_h.remove();}</script>")
+
+
+def _embeddable(html: str) -> str:
+    return html.replace("</body>", _EMBED_SNIPPET + "\n</body>")
+
+
 @app.get("/", response_class=HTMLResponse)
 def app_shell():
     return APP_HTML
@@ -2169,7 +2341,7 @@ def app_shell():
 
 @app.get("/forum", response_class=HTMLResponse)
 def forum_page():
-    return FORUM_HTML
+    return _embeddable(FORUM_HTML)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

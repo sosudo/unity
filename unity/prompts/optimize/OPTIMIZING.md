@@ -5,12 +5,12 @@ with respect to the **metric** recorded there (the top-level `"metric"` field; i
 
 Read first: `.unity/UNITY.md`, `.unity/dag.json` (the `metric`, the chunks, and each chunk's current
 `score`), the metric definition in `.unity/metrics/`, the Lean project, and the forum
-(`forum_get_tag("decision")`, `forum_get_tag("phase-handoff")`). Know whether the metric is minimized or
+(`forum_brief` — also injected into your preamble). Know whether the metric is minimized or
 maximized before you start.
 
 **Self-organize over the DAG.** It is dynamic — re-read `.unity/dag.json` as you go.
 - A chunk is **ready** when all its `dependencies` are already merged into the main branch.
-- Sign up for ready chunks via the forum, and check what others have signed up for or finished so two
+- Sign up for ready chunks with `forum_claim(chunk, strategy)`, and check the brief for what others have claimed or finished so two
   agents don't duplicate a chunk or attempt the same rewrite. Spread coverage across the ready frontier:
   at most `max(1, ceil(team size / number of ready chunks))` agents per chunk, and **take what your
   strength can handle**. When agents share a chunk, each takes a *different* approach.
@@ -30,7 +30,7 @@ maximized before you start.
 - Commit in your worktree, one commit per chunk. If your worktree is missing or corrupted, recreate it
   (`git worktree add` from the main branch) and continue.
 
-**Reach consensus and merge.** When a chunk has multiple candidate rewrites, the team votes on the forum —
+**Reach consensus and merge.** When a chunk has multiple candidate rewrites, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`) —
 prefer the **best score among the ones that build and stay correct**; the primary breaks ties. The
 **primary** squash-merges each winning chunk into the main branch with the commit message exactly
 `UNITY: merge chunk <id>` and its updated score. After a merge, sync your worktree and move on.
@@ -41,5 +41,5 @@ effort, a declaration is already optimal (or can't be improved without breaking 
 the forum with the reason and leave it — a justified "already optimal" is a valid outcome; a lazy one is not.
 
 **Norms:** operate only within your worktree, the Lean project, and `.unity/`; never scan or modify
-outside. If you're unsure or blocked, post to the forum. Consult the global unity library
-(`~/.unity/library/`). Check the forum frequently. Subagents share your worktree — they don't get their own.
+outside. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Consult the global unity library
+(`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you before claiming new chunks; record verified tricks with `ledger_add`. Subagents share your worktree — they don't get their own.

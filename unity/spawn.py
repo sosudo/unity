@@ -68,20 +68,52 @@ _RETRY_SLEEP = 600.0
 _last_run_stats: dict[str, dict] = {}
 
 
-def _log(name: str, msg) -> None:
+def _ts() -> str:
+    import time
+    return time.strftime("%H:%M:%S")
+
+
+def _stop_requested(cwd) -> bool:
+    """Safe stop: .unity/stop-requested asks agents to end after the current stream item."""
+    from .config import find_unity_dir
+    u = find_unity_dir(Path(cwd))
+    return u is not None and (u / "stop-requested").exists()
+
+
+def _tool_log(cwd, name: str, tool: str, detail: str = "") -> None:
+    """Per-call tool telemetry → .unity/logs/tools.jsonl (best-effort)."""
+    from .config import find_unity_dir
+    import json, time
+    u = find_unity_dir(Path(cwd)) if cwd else None
+    if u is None:
+        return
+    try:
+        logs = u / "logs"
+        logs.mkdir(exist_ok=True)
+        entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": name, "tool": tool}
+        if detail:
+            entry["detail"] = detail[:160]
+        with (logs / "tools.jsonl").open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def _log(name: str, msg, cwd=None) -> None:
     content = getattr(msg, "content", None)
     if isinstance(content, list):  # AssistantMessage-like
         for b in content:
             text = getattr(b, "text", "")
             if isinstance(text, str) and text.strip():
-                _console.print(f"[dim]\\[{name}][/dim] {text[:500]}")
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] {text[:500]}")
             elif getattr(b, "name", None):
-                _console.print(f"[dim]\\[{name}][/dim] [cyan]⚙ {b.name}[/cyan]")
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {b.name}[/cyan]")
+                _tool_log(cwd, name, b.name)
         return
     if type(msg).__name__ == "ResultMessage":
         cost = getattr(msg, "total_cost_usd", None)
         suffix = f" — ${cost:.4f}" if isinstance(cost, (int, float)) else ""
-        _console.print(f"[green]\\[{name}] ✓ done{suffix}[/green]")
+        _console.print(f"[green]{_ts()} \\[{name}] ✓ done{suffix}[/green]")
         return
     method = getattr(msg, "method", None)
     if method:  # codex Notification: typed payload objects
@@ -89,17 +121,28 @@ def _log(name: str, msg) -> None:
         if method == "item/agentMessage/delta":
             delta = str(getattr(payload, "delta", "") or "")
             if delta.strip():
-                _console.print(f"[dim]\\[{name}][/dim] {delta[:300]}")
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] {delta[:300]}")
         elif method == "item/started":
             root = getattr(getattr(payload, "item", None), "root", None)
-            if getattr(root, "type", "") == "commandExecution":
-                _console.print(f"[dim]\\[{name}][/dim] [cyan]⚙ {str(getattr(root, 'command', ''))[:160]}[/cyan]")
+            rtype = getattr(root, "type", "")
+            if rtype == "commandExecution":
+                cmd = str(getattr(root, "command", ""))
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {cmd[:160]}[/cyan]")
+                _tool_log(cwd, name, "shell", cmd)
+            elif rtype == "mcpToolCall":
+                server = str(getattr(root, "server", "") or "")
+                tool = str(getattr(root, "tool", "") or "")
+                label = f"{server}.{tool}".strip(".")
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {label}[/cyan]")
+                _tool_log(cwd, name, label)
+            elif rtype and rtype not in ("agentMessage", "reasoning", "error"):
+                _tool_log(cwd, name, rtype)
         elif method == "turn/completed":
-            _console.print(f"[green]\\[{name}] ✓ turn complete[/green]")
+            _console.print(f"[green]{_ts()} \\[{name}] ✓ turn complete[/green]")
         return
     text = getattr(msg, "text", None) or getattr(msg, "message", None)
     if text:
-        _console.print(f"[dim]\\[{name}][/dim] {str(text)[:500]}")
+        _console.print(f"[dim]{_ts()} \\[{name}][/dim] {str(text)[:500]}")
 
 
 # ── backends ────────────────────────────────────────────────────────────────────
@@ -127,13 +170,18 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         try:
             final = None
             async for msg in _idle_guard(query(prompt=prompt, options=options), idle_timeout):
-                _log(agent.name, msg)
+                _log(agent.name, msg, cwd)
                 if type(msg).__name__ == "ResultMessage":
                     final = getattr(msg, "result", None)
                     _last_run_stats[agent.name] = {
                         "cost_usd": getattr(msg, "total_cost_usd", None),
                         "num_turns": getattr(msg, "num_turns", None),
                     }
+                if _stop_requested(cwd):
+                    # Safe stop: wind down at the next stream item instead of being killed
+                    # mid-write; abandoning the iterator disconnects the SDK client cleanly.
+                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                    return final
             return final
         except Exception as e:
             if attempt == _MAX_API_RETRIES - 1:
@@ -239,7 +287,10 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             final = None
             usage = None
             async for note in _idle_guard(handle.stream(), idle_timeout):
-                _log(agent.name, note)
+                _log(agent.name, note, cwd)
+                if _stop_requested(cwd):
+                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                    break
                 method = getattr(note, "method", "") or ""
                 payload = getattr(note, "payload", None)
                 if method == "item/completed":

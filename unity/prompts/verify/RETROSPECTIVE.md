@@ -34,3 +34,5 @@ attempt.
 
 **Norms:** operate only within the Lean project, `.unity/`, and `~/.unity/library/`; never scan outside.
 Consult the existing library before writing so you extend rather than duplicate it.
+
+Graduate the run ledger: `ledger_get()` lists this run's verified lemmas/tactics/failure patterns — promote the reusable ones into `~/.unity/library/` (they carry evidence already).

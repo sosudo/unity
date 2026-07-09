@@ -20,5 +20,5 @@ and faithfully proven (builds clean, no sorry/axiom, no cheating); otherwise `{"
 Be rigorous and skeptical — approving an incomplete or cheated proof is worse than another iteration.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether something counts as cheating or faithful, raise it on the forum before deciding. Consult the
+whether something counts as cheating or faithful, raise it with `forum_obstacle` before deciding. Consult the
 global unity library (`~/.unity/library/`).

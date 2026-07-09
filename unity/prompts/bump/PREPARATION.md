@@ -14,7 +14,7 @@ Survey, in this order:
   equivalent.
 - `.unity/dag.json` — the declaration chunks and their status, if chunking has run.
 - `.unity/logs/` — the latest run logs: what was attempted and what failed.
-- The forum — `forum_get_tag("decision")`, `forum_get_tag("phase-handoff")`, and recent threads.
+- The forum — `forum_brief` — also injected into your preamble, and recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): the current
 vs. target version, which declarations already build under the target and which remain broken, key
@@ -25,6 +25,6 @@ version or the user's directives.
 restarting from scratch.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't read something or are unsure, say so on the forum rather than
+modify anything outside it. If you can't read something or are unsure, raise a `forum_obstacle` (goal state + what you tried) rather than
 guessing. Leave `.unity/critic.json` untouched in this phase. Consult the global unity library
 (`~/.unity/library/`) for relevant prior context — including any migration notes from past bumps.

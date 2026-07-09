@@ -28,6 +28,6 @@ phase actually moves the needle instead of guessing. If a part of the codebase l
 this metric, note that too.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't read something or are unsure, say so on the forum and ask the
+modify anything outside it. If you can't read something or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the
 team rather than fabricating. Don't touch `.unity/critic.json`. Consult the global unity library
 (`~/.unity/library/`). Check the forum often.

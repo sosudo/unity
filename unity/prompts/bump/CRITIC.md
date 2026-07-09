@@ -25,5 +25,5 @@ Be rigorous and skeptical — approving a build that quietly weakened or sorried
 purpose of the bump.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a statement was preserved or a proof is genuine, raise it on the forum before deciding. Consult
+whether a statement was preserved or a proof is genuine, raise it with `forum_obstacle` before deciding. Consult
 the global unity library (`~/.unity/library/`).

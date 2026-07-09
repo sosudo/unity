@@ -29,6 +29,6 @@ the right modeling primitives; even a documented gap ("no Lean model of X exists
 helps the verifying phase.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't access a resource or are unsure, say so on the forum and ask the
+modify anything outside it. If you can't access a resource or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the
 team rather than fabricating. Don't touch `.unity/critic.json`. Consult the global unity library
 (`~/.unity/library/`). Check the forum often.

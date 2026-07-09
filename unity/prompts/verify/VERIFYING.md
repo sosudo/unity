@@ -4,11 +4,11 @@ and **prove the correctness properties** captured in the chunks of `.unity/dag.j
 through the forum.
 
 Read first: `.unity/UNITY.md` (the verification goals), `.unity/source/` (the code), `.unity/dag.json`,
-the existing Lean project, and the forum (`forum_get_tag("decision")`, `forum_get_tag("phase-handoff")`).
+the existing Lean project, and the forum (`forum_brief` — also injected into your preamble).
 
 **Self-organize over the DAG.** It is dynamic — re-read `.unity/dag.json` as you go.
 - A chunk is **ready** when all its `dependencies` are already merged into the main branch.
-- Sign up for ready chunks via the forum, and check what others have signed up for or finished so two
+- Sign up for ready chunks with `forum_claim(chunk, strategy)`, and check the brief for what others have claimed or finished so two
   agents don't duplicate a chunk or attempt the same approach. Spread coverage across the ready frontier:
   at most `max(1, ceil(team size / number of ready chunks))` agents per chunk, and **take what your
   strength can handle** — stronger agents take harder chunks. When agents share a chunk, each takes a
@@ -20,13 +20,12 @@ the existing Lean project, and the forum (`forum_get_tag("decision")`, `forum_ge
   `.unity/source/`. For a property chunk, state the correctness property precisely and **prove it**.
 - Verify with Axle's `check` / `verify_proof` (preferred) or the lean-lsp tools. It must **build** and be
   **sorry-free** — no `sorry`, no `axiom`, no metaprogramming escape hatches to fake a proof. If you
-  genuinely can't close a goal, leave a `sorry`, say so on the forum, and don't claim the chunk done.
+  genuinely can't close a goal, leave a `sorry`, raise a `forum_obstacle` (goal state + what you tried), and don't claim the chunk done.
   Offload a stubborn proof to Aristotle (`aristotle_submit`).
 - Commit your work in your worktree, one commit per chunk. If your worktree is missing or corrupted,
   recreate it (`git worktree add` from the main branch) and continue.
 
-**Reach consensus and merge.** When a chunk has multiple candidate solutions, the team votes on the
-forum; the primary breaks ties. The **primary** squash-merges each winning chunk into the main branch
+**Reach consensus and merge.** When a chunk has multiple candidate solutions, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`); the primary breaks ties. The **primary** squash-merges each winning chunk into the main branch
 with the commit message exactly `UNITY: merge chunk <id>`. After a merge, sync your worktree with the
 main branch and move to the next ready chunks.
 
@@ -43,5 +42,5 @@ make it pass.
 Faithfulness matters: a proof of a weakened or wrong property is worthless.
 
 **Norms:** operate only within your worktree, the Lean project, and `.unity/`; never scan or modify
-outside. If you're unsure or blocked, post to the forum. Consult the global unity library
-(`~/.unity/library/`). Check the forum frequently. Subagents share your worktree — they don't get their own.
+outside. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Consult the global unity library
+(`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you before claiming new chunks; record verified tricks with `ledger_add`. Subagents share your worktree — they don't get their own.

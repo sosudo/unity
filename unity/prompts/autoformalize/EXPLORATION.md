@@ -32,5 +32,5 @@ itself a useful finding.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
 modify anything outside it. If you can't access the source (a paywalled or unreadable PDF) or a resource,
-or are unsure, say so on the forum and ask the team rather than fabricating. Don't touch
+or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the team rather than fabricating. Don't touch
 `.unity/critic.json`. Consult the global unity library (`~/.unity/library/`). Check the forum often.

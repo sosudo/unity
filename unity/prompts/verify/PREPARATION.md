@@ -14,7 +14,7 @@ Survey, in this order:
 - The Lean project — the verification artifact so far: what builds, what is incomplete (`sorry`,
   `axiom`, errors). Prefer Axle's `check` over the lean-lsp equivalent.
 - `.unity/logs/` — the latest run logs: what was attempted and what failed.
-- The forum — `forum_get_tag("decision")`, `forum_get_tag("phase-handoff")`, and recent threads.
+- The forum — `forum_brief` — also injected into your preamble, and recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): what is
 modeled, which properties are proven and verified, what remains, key decisions and constraints, current
@@ -25,6 +25,6 @@ user's directives.
 restarting from scratch.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't read something or are unsure, say so on the forum rather than
+modify anything outside it. If you can't read something or are unsure, raise a `forum_obstacle` (goal state + what you tried) rather than
 guessing. Leave `.unity/critic.json` untouched in this phase. Consult the global unity library
 (`~/.unity/library/`) for relevant prior context.

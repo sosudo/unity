@@ -76,6 +76,11 @@ act covers.
 - `lean_get_widgets` / `lean_get_widget_source` — proof-visualization widget data / JS.
 
 ## Axle — `axle` (Lean verification + code manipulation; prefer over the lean-lsp equivalent when both offer it)
+
+> **Version caution (Axle & Aristotle):** these external services may run a **different Lean /
+> Mathlib version** than this project. A proof they accept can still fail here (renamed lemmas,
+> changed tactics) — always re-verify with a local build (`lake build` / lean-lsp) before posting a
+> `forum_result`, and prefer Axle environments matching the project toolchain (`list_environments`).
 - `verify_proof` — validate a Lean proof against a formal statement. **Prefer over `lean_verify`.**
 - `check` — evaluate Lean code and report all messages. **Prefer over `lean_diagnostic_messages` / `lean_run_code`.**
 - `highlight` — semantic highlighting tokens for Lean code.

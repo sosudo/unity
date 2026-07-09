@@ -4,7 +4,7 @@ current working directory). As a team you migrate this Lean project to the **tar
 preserved and a real proof**, coordinating through the forum.
 
 Read first: `.unity/UNITY.md` (the target version), `.unity/dag.json` (one chunk per declaration), the
-Lean project, and the forum (`forum_get_tag("decision")`, `forum_get_tag("phase-handoff")` — the
+Lean project, and the forum (`forum_brief` — also injected into your preamble — the
 exploration phase's old→new migration map).
 
 The project has **already been set to the target version** (from `.unity/UNITY.md`) on the main branch,
@@ -13,7 +13,7 @@ version. Your job is to fix the declarations so it builds cleanly again under th
 
 **Self-organize over the DAG.** It is dynamic — re-read `.unity/dag.json` as you go.
 - A chunk is **ready** when all its `dependencies` are already merged into the main branch.
-- Sign up for ready chunks via the forum, and check what others have signed up for or finished so two
+- Sign up for ready chunks with `forum_claim(chunk, strategy)`, and check the brief for what others have claimed or finished so two
   agents don't duplicate a chunk or attempt the same fix. Spread coverage across the ready frontier: at
   most `max(1, ceil(team size / number of ready chunks))` agents per chunk, and **take what your strength
   can handle**. When agents share a chunk, each takes a different approach.
@@ -30,7 +30,7 @@ version. Your job is to fix the declarations so it builds cleanly again under th
 - Commit in your worktree, one commit per chunk. If your worktree is missing or corrupted, recreate it
   (`git worktree add` from the main branch) and continue.
 
-**Reach consensus and merge.** When a chunk has multiple candidate fixes, the team votes on the forum;
+**Reach consensus and merge.** When a chunk has multiple candidate fixes, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`);
 the primary breaks ties. The **primary** squash-merges each winning chunk into the main branch with the
 commit message exactly `UNITY: merge chunk <id>`. After a merge, sync your worktree and move on.
 
@@ -42,6 +42,6 @@ a false or weakened proof. Use Mathlib search (against the target version), `lea
 `repair_proofs`, and Aristotle before conceding.
 
 **Norms:** operate only within your worktree, the Lean project, and `.unity/`; never scan or modify
-outside. If you're unsure or blocked, post to the forum. Consult the global unity library
-(`~/.unity/library/`) — prior bumps may record the exact fixes. Check the forum frequently. Subagents
+outside. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Consult the global unity library
+(`~/.unity/library/`) — prior bumps may record the exact fixes. Call `forum_brief` frequently; answer questions addressed to you before claiming new chunks; record verified tricks with `ledger_add`. Subagents
 share your worktree — they don't get their own.

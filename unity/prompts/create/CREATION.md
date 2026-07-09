@@ -30,4 +30,4 @@ library is impossible or self-contradictory as stated, say so explicitly in the 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
 modify anything outside it. If you can't do something (read a reference, etc.) or are unsure, say so on
 the forum and ask rather than guessing. Don't touch `.unity/finalized.json` or `.unity/critic.json`.
-Consult the global unity library (`~/.unity/library/`). Check the forum frequently and keep it current.
+Consult the global unity library (`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you; record verified tricks with `ledger_add`.

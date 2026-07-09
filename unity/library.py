@@ -26,6 +26,55 @@ def ensure_library() -> Path:
     return lib
 
 
+# ── Autostrength ────────────────────────────────────────────────────────────────
+# Per-model strengths learned across runs: an EMA over each run's end-of-phase forum
+# credit (the same clamp used for dynamic re-ranking). Rosters no longer declare
+# strength; an explicit strength in agents.yaml still overrides the learned value.
+
+_STRENGTH_BASE = 5.0
+_STRENGTH_EMA = 0.3  # weight of the newest observation
+
+
+def strengths_path() -> Path:
+    return library_dir() / "strengths.json"
+
+
+def learned_strength(model: str) -> float:
+    """The stored strength for a model (default 5.0)."""
+    import json
+    try:
+        return float(json.loads(strengths_path().read_text()).get(model, _STRENGTH_BASE))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return _STRENGTH_BASE
+
+
+def update_strengths(roster, forum_dir: Path) -> None:
+    """Fold this run's forum credit into the per-model strength store (best-effort)."""
+    import json
+    try:
+        raw = json.loads((Path(forum_dir) / "balances.json").read_text())
+        balances = {k.lower(): v.get("balance", 0.0) for k, v in raw.items()}
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return
+    observed: dict[str, list[float]] = {}
+    for a in roster.agents:
+        boost = min(3.0, max(-1.0, balances.get(a.name.lower(), 0.0) / 10.0))
+        observed.setdefault(a.model, []).append(_STRENGTH_BASE + boost)
+    try:
+        stored = json.loads(strengths_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        stored = {}
+    for model, obs in observed.items():
+        prev = float(stored.get(model, _STRENGTH_BASE))
+        new = (1 - _STRENGTH_EMA) * prev + _STRENGTH_EMA * (sum(obs) / len(obs))
+        stored[model] = round(new, 2)
+    try:
+        strengths_path().parent.mkdir(parents=True, exist_ok=True)
+        strengths_path().write_text(json.dumps(stored, indent=2))
+    except OSError:
+        pass
+
+
 def _first_heading(path: Path) -> str:
     try:
         for line in path.read_text(errors="replace").splitlines():

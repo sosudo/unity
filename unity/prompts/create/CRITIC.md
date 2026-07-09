@@ -26,5 +26,5 @@ Be rigorous and skeptical — a build that quietly weakened the spec or left the
 successful creation.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether the build is faithful to the spec or the library is complete, raise it on the forum before
+whether the build is faithful to the spec or the library is complete, raise it with `forum_obstacle` before
 deciding. Consult the global unity library (`~/.unity/library/`).

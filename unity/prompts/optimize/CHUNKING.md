@@ -38,5 +38,5 @@ optimizing phase measures its improvement against these numbers, so a wrong base
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
 modify outside it. If a file won't parse, the metric is ambiguous, or you're unsure how to score
-something, raise it on the forum. Don't touch `.unity/critic.json`. Consult the global unity library
+something, raise it with `forum_obstacle`. Don't touch `.unity/critic.json`. Consult the global unity library
 (`~/.unity/library/`). Do not optimize or edit declarations in this phase.

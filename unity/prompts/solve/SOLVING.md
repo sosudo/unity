@@ -8,7 +8,7 @@ step justified, no hand-waving, no gaps a formalizer couldn't fill.
 **Work as a team on one shared document.** `.unity/source/PROOF.tex` is shared. Coordinate on the
 forum: agree on the overall proof structure, then claim sections so two agents don't edit the same
 part at once and clobber each other. Build on the exploration findings (forum `decision` tags,
-`.unity/source/`). Discuss competing approaches and converge — vote on the forum when the team
+`.unity/source/`). Discuss competing approaches and converge — record an endorsed `forum_decision` when the team
 disagrees on strategy.
 
 Aim for a proof that will formalize cleanly: prefer constructions and lemmas that exist in Mathlib
@@ -24,6 +24,6 @@ valuable result; an unsupported "we couldn't do it" is not.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
 modify anything outside it. If you can't do something (read the source or a reference) or are unsure,
-say so on the forum and ask rather than guessing or fabricating a step. Don't touch
+raise a `forum_obstacle` (goal state + what you tried) and ask rather than guessing or fabricating a step. Don't touch
 `.unity/finalized.json` or `.unity/critic.json`. Consult the global unity library (`~/.unity/library/`).
-Check the forum frequently and keep it current.
+Call `forum_brief` frequently; answer questions addressed to you; record verified tricks with `ledger_add`.

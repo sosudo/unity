@@ -40,7 +40,6 @@ async def _collect_agent(idx: int) -> dict:
     backend = await click.prompt("backend", type=click.Choice(["claude_code", "codex"]), default="claude_code")
     model = await click.prompt("model")
     provider = await click.prompt("provider", default="")
-    strength = await click.prompt("strength", type=int, default=5)
     budget = await click.prompt("budget USD per instance (blank = unlimited)", default="")
     base_url = await click.prompt("base_url", default="")
     api_key = await click.prompt("api_key", default="", hide_input=True, show_default=False)
@@ -49,7 +48,6 @@ async def _collect_agent(idx: int) -> dict:
     agent = {"names": names, "model": model, "backend": backend}
     if provider:
         agent["provider"] = provider
-    agent["strength"] = strength
     if budget:
         agent["budget"] = float(budget)
     if base_url:
@@ -64,7 +62,7 @@ async def _collect_agent(idx: int) -> dict:
 def _write_agents_yaml(path: Path, agents: list[dict]) -> None:
     with path.open("w") as f:
         f.write("# First agent is the primary (preparation, critic, retrospective).\n")
-        f.write("# strength: static capability tier for chunk allocation.\n")
+        f.write("# strength is learned automatically per model (autostrength); set it here only to override.\n")
         f.write("# budget: USD per instance (not shared across instances of a model).\n\n")
         yaml.safe_dump({"agents": agents}, f, sort_keys=False)
 

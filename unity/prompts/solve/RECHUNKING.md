@@ -17,6 +17,6 @@ Coordinate on the forum; converge before writing. Post a `phase-handoff` note su
 dependencies will stall the next formalization loop.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify outside it. If `PROOF.tex` is ambiguous, raise it on the forum. Don't touch
+modify outside it. If `PROOF.tex` is ambiguous, raise it with `forum_obstacle`. Don't touch
 `.unity/finalized.json` or `.unity/critic.json`. Consult the global unity library (`~/.unity/library/`).
 Do not write Lean in this phase.

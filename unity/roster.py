@@ -17,7 +17,7 @@ class Agent:
     model: str
     provider: str
     backend: str  # "claude_code" | "codex"
-    strength: int
+    strength: float  # autostrength (learned per model) unless overridden in agents.yaml
     base_url: str | None
     api_key: str | None
     auth_token: str | None
@@ -88,13 +88,22 @@ def load_roster(path: Path) -> Roster:
         budget = g.get("budget")
         budget = float(budget) if budget not in (None, "") else None
 
+        # Autostrength: learned per-model (EMA of forum credit across runs); an explicit
+        # strength in agents.yaml overrides.
+        raw_strength = g.get("strength")
+        if raw_strength in (None, ""):
+            from .library import learned_strength
+            strength = learned_strength(model)
+        else:
+            strength = float(raw_strength)
+
         for name in names:
             agents.append(Agent(
                 name=name,
                 model=model,
                 provider=g.get("provider", ""),
                 backend=backend,
-                strength=int(g.get("strength", 0)),
+                strength=strength,
                 base_url=base_url,
                 api_key=api_key,
                 auth_token=auth_token,

@@ -28,6 +28,6 @@ found here saves the proving phase a long search. If a target looks unprovable w
 flag it with the specific obstacle.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify outside it. If you can't access a resource or are unsure, say so on the forum and ask the team
+modify outside it. If you can't access a resource or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the team
 rather than fabricating a lemma name. Don't touch `.unity/critic.json`. Consult the global unity library
 (`~/.unity/library/`). Check the forum often.

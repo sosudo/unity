@@ -23,5 +23,5 @@ Be rigorous and skeptical — approving a target that was weakened, or sorried e
 pass, defeats the purpose.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a target is genuinely proven or a statement was preserved, raise it on the forum before deciding.
+whether a target is genuinely proven or a statement was preserved, raise it with `forum_obstacle` before deciding.
 Consult the global unity library (`~/.unity/library/`).

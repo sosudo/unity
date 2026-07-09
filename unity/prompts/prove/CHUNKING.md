@@ -32,6 +32,6 @@ finalizing so every in-scope target is captured with correct dependencies.
 proved, and a wrong dependency edge stalls the proving order.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify outside it. If a file won't parse or the scope is unclear, raise it on the forum. Don't touch
+modify outside it. If a file won't parse or the scope is unclear, raise it with `forum_obstacle`. Don't touch
 `.unity/critic.json`. Consult the global unity library (`~/.unity/library/`). Do not prove or edit
 declarations in this phase.

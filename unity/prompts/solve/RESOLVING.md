@@ -10,7 +10,7 @@ correct the erroneous step, or restructure the argument into pieces that formali
 were already formalized and merged intact where possible, so their work isn't wasted.
 
 **Work as a team on the shared document.** `.unity/source/PROOF.tex` is shared — coordinate on the
-forum: claim sections, discuss the fix, and vote on the approach when the team disagrees. Keep changes
+forum: claim sections, discuss the fix, and record a `forum_decision` on the approach when the team disagrees. Keep changes
 minimal and targeted to the actual problem.
 
 **Determination:** the proof has to become correct and formalizable. If the fix reveals the result is
@@ -18,6 +18,6 @@ actually false or unprovable, say so and give a rigorous disproof / impossibilit
 `PROOF.tex` instead — a justified negative result is valid.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you're unsure or blocked, post to the forum. Don't touch
+modify anything outside it. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Don't touch
 `.unity/finalized.json` or `.unity/critic.json` (the primary manages those). Consult the global unity
-library (`~/.unity/library/`). Check the forum frequently.
+library (`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you before claiming new chunks; record verified tricks with `ledger_add`.

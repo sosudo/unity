@@ -26,5 +26,5 @@ Be rigorous and skeptical — an "improvement" that weakened a statement or game
 no change at all.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a score is honest or a statement was preserved, raise it on the forum before deciding. Consult the
+whether a score is honest or a statement was preserved, raise it with `forum_obstacle` before deciding. Consult the
 global unity library (`~/.unity/library/`).

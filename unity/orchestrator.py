@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 from rich.console import Console
@@ -15,8 +16,36 @@ _console = Console()
 _PROMPTS = Path(__file__).parent / "prompts"
 
 
+def _mark_phase(command: str, phase: str) -> None:
+    """Record the running phase (.unity/state.json, for the web navbar) and print a
+    timestamped delimiter banner (lands in the web run log)."""
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    _console.print(f"\n[bold]════════ {stamp} · {command} · {phase} ════════[/bold]")
+    try:
+        from .config import find_unity_dir
+        u = find_unity_dir(Path.cwd())
+        if u is not None:
+            (u / "state.json").write_text(json.dumps(
+                {"command": command, "phase": phase, "ts": time.time()}))
+    except OSError:
+        pass
+
+
 def load_prompt(name: str) -> str:
+    # A "command/PHASE" prompt load is exactly a phase transition — mark it here so
+    # every command gets phase tracking without per-command bookkeeping.
+    if "/" in name:
+        cmd, phase = name.split("/", 1)
+        _mark_phase(cmd, phase.lower())
     return (_PROMPTS / f"{name}.md").read_text()
+
+
+def stop_requested(cwd) -> bool:
+    """True when a safe stop was requested (.unity/stop-requested exists): finish the
+    current agent turns, then skip all remaining phases."""
+    from .config import find_unity_dir
+    u = find_unity_dir(Path(cwd))
+    return u is not None and (u / "stop-requested").exists()
 
 
 def build_mcp(paths) -> dict:
@@ -88,6 +117,11 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
     def _cwd(a):
         return cwd[a.name] if isinstance(cwd, dict) else cwd
 
+    any_cwd = next(iter(cwd.values())) if isinstance(cwd, dict) else cwd
+    if stop_requested(any_cwd):
+        _console.print("[yellow]stop requested — skipping phase[/yellow]")
+        return []
+
     tools_ref = load_prompt("TOOLS")
     context = library.library_context()
     full = base_prompt + f"\n\n{tools_ref}" + (f"\n\n{context}" if context else "")
@@ -95,7 +129,6 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
 
     # Dynamic capability re-ranking: standings from forum credit, refreshed per dispatch.
     from .config import find_unity_dir
-    any_cwd = next(iter(cwd.values())) if isinstance(cwd, dict) else cwd
     unity_dir = find_unity_dir(Path(any_cwd))
     ranking = _effective_ranking(roster, unity_dir / "forum") if unity_dir else None
 
@@ -197,6 +230,9 @@ async def run_worktree_phase(roster, paths, mcp, base_prompt, verb):
     "Prove", "Optimize"). Agents traverse the (dynamic) DAG, sign up for chunks, and reach
     consensus + merge entirely via the forum + prompt. Python does NOT traverse dag.json."""
     root = paths.project_root
+    if stop_requested(root):
+        _console.print("[yellow]stop requested — skipping worktree phase[/yellow]")
+        return
     worktrees = {}
     for a in roster.agents:
         wt = worktree.create_worktree(a.name, root)
@@ -206,12 +242,15 @@ async def run_worktree_phase(roster, paths, mcp, base_prompt, verb):
     main_branch = worktree.detect_main_branch(root)
     task = (
         f"{verb} the project by working through .unity/dag.json (it is dynamic — re-read it as "
-        f"you go). Sign up for chunks via the forum, work in your worktree and commit, then reach "
-        f"consensus (forum vote; the primary breaks ties) and the primary squash-merges each "
-        f"winning chunk into '{main_branch}' as 'UNITY: merge chunk <id>'."
+        f"you go). Sign up for chunks with forum_claim, work in your worktree and commit, post "
+        f"each finished chunk with forum_result, and review + forum_endorse (or forum_object) "
+        f"teammates' results. The primary checks forum_consensus and squash-merges each mergeable "
+        f"chunk into '{main_branch}' as 'UNITY: merge chunk <id>'."
     )
+    contract = load_prompt("FORUM_CONTRACT")
     try:
-        await dispatch(roster.agents, roster, base_prompt, task, worktrees, mcp)
+        await dispatch(roster.agents, roster, base_prompt + "\n\n" + contract, task, worktrees, mcp)
     finally:
         for a in roster.agents:
             worktree.cleanup_worktree(a.name, worktrees[a.name], root)
+        library.update_strengths(roster, paths.unity / "forum")

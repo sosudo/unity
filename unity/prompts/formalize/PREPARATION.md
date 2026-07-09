@@ -15,7 +15,7 @@ Survey, in this order:
 - `.unity/source/` — the source material that provides what's needed to fill those gaps.
 - `.unity/dag.json` — the chunks and their status, if semiformalization has run.
 - `.unity/logs/` — the latest run logs.
-- The forum — `forum_get_tag("decision")`, `forum_get_tag("phase-handoff")`, and recent threads.
+- The forum — `forum_brief` — also injected into your preamble, and recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): which target
 gaps are filled and which remain, what is chunked, key decisions and constraints, and current blockers.

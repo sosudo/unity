@@ -25,5 +25,5 @@ Be rigorous and skeptical — approving an unfaithful model or a weakened proper
 purpose of verification.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a model is faithful or a property is the intended one, raise it on the forum before deciding.
+whether a model is faithful or a property is the intended one, raise it with `forum_obstacle` before deciding.
 Consult the global unity library (`~/.unity/library/`).

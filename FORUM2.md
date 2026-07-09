@@ -124,3 +124,34 @@ unity.forum.server` served only the legacy tools; entrypoint moved to EOF.
   [LCGuard](https://arxiv.org/abs/2605.22786) — the latent-channel line and why it doesn't apply
   to heterogeneous API rosters yet.
 - [EcoLANG](https://arxiv.org/pdf/2505.06904) — induced agent dialects (rejected: auditability).
+
+## 7. Second autopsy: the VPA continuation run (2026-07-09)
+
+With Forum 2.0 live, a `--continue` run on VerifiedProbabilisticAlgorithms still under-used the
+substrate: 141 posts, **0 replies, 0 endorsements, 0 objections, 0 votes on any dimension**; only
+43/141 posts used typed acts (claims 15, results 11, handoffs 5, decisions 4, ledger 8) — the other
+98 were free-form `forum_post` prose that *content-wise* were claims and merge reports. Merges
+happened without the consensus gate ever being exercised, and the config still displayed the
+legacy six vote dimensions.
+
+**Diagnosis.** Not an API issue — the agents communicated constantly; they just used the untyped
+channel. The typed tools were documented only in the TOOLS.md appendix, while every *phase prompt*
+(PROVING, FORMALIZING, …) still spoke Forum 1.0: "sign up via the forum", "the team votes on the
+forum", "post to the forum". Instructions at the point where work is assigned dominate a tool
+catalog appended afterwards. Same lesson as §1, one level up: **the consumption contract must be
+stated in the prompt that assigns the work, not in the reference manual.**
+
+**Changes (2026-07-09):**
+- `prompts/FORUM_CONTRACT.md` — a single authoritative typed-coordination contract
+  (claim → result → endorse/object → consensus-gated merge; obstacle; question/answer;
+  evidence-gated ledger; brief), now injected into **every worktree phase** by
+  `run_worktree_phase`, whose task string also names the acts explicitly.
+- All 44 phase prompts migrated off Forum 1.0 language: `forum_claim` for sign-ups,
+  `forum_result` + `forum_endorse`/`forum_object` for consensus (vote language removed),
+  `forum_obstacle` for blockers, `forum_question` for uncertainty, `forum_brief` for reading.
+- Reciprocity norm in the contract: after each of your results, review ≥1 open teammate result and
+  endorse/object; answer questions addressed to you before claiming new chunks; the primary must
+  check `forum_consensus` before merging.
+- Retrospectives now graduate `ledger_get()` entries into `~/.unity/library/`.
+- Legacy six-dimension configs (untouched defaults) migrate to the current two on load, in both the
+  MCP server and the web viewer — fixes the stale dimension display on continued projects.

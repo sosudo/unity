@@ -8,10 +8,12 @@ from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase,
 
 
 @click.command(name="bump")
+@click.argument("version", required=False, default=None)
 @click.option("--continue", "continue_", is_flag=True, default=False, help="Run a reprompt cycle first.")
-async def bump(continue_):
-    """Bump Lean/Mathlib version if possible"""
+async def bump(version, continue_):
+    """Bump Lean/Mathlib to VERSION (e.g. v4.16.0; omit to use the target in .unity/UNITY.md)."""
     paths = load_paths()
+    target = f"version '{version}'" if version else "the target version in .unity/UNITY.md"
     roster = load_roster(paths.agents_yaml)
     mcp = build_mcp(paths)
     root = paths.project_root
@@ -28,15 +30,15 @@ async def bump(continue_):
     toposort(paths)
 
     await dispatch(roster.agents, roster, load_prompt("bump/EXPLORATION"),
-                   "Research what changed between the project's current version and the target version in "
-                   ".unity/UNITY.md (renamed/moved/removed declarations, API and tactic changes, deprecations) "
+                   f"Research what changed between the project's current version and {target} "
+                   "(renamed/moved/removed declarations, API and tactic changes, deprecations) "
                    "and gather the replacements; resolve dependencies for the chunks.",
                    root, mcp)
 
     # Deterministically set the project to the target version on master (builds with errors);
     # the worktree bumping phase then fixes the breakage.
     await dispatch([roster.primary], roster, load_prompt("bump/SETVERSION"),
-                   "Set the project to the target version in .unity/UNITY.md (edit lean-toolchain and the "
+                   f"Set the project to {target} (edit lean-toolchain and the "
                    "lakefile dependency, remove .lake, run lake update and lake exe cache get, commit). The "
                    "project will build with errors afterward — that is expected; do not fix declarations.",
                    root, mcp)

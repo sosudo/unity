@@ -26,5 +26,5 @@ Be rigorous and skeptical — a build that faked a target, weakened a statement,
 not a successful formalization.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a target is genuinely closed or a formalization is faithful, raise it on the forum before
+whether a target is genuinely closed or a formalization is faithful, raise it with `forum_obstacle` before
 deciding. Consult the global unity library (`~/.unity/library/`).

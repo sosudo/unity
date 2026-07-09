@@ -43,6 +43,11 @@ DEFAULT_DIMENSIONS = [
     "correctness",
     "faithfulness",
 ]
+# The pre-Forum-2.0 default set: configs still carrying exactly these six are migrated
+# to DEFAULT_DIMENSIONS on load (custom dimension sets are left alone).
+_LEGACY_DEFAULT_DIMENSIONS = [
+    "correctness", "faithfulness", "style_alignment", "priority", "confidence", "feasibility",
+]
 DIMENSION_APPROVAL_THRESHOLD = 3   # net upvotes on a proposal post to auto-approve
 DIMENSIONS_THREAD = "_dimensions"
 ARCHIVE_THREAD = "_archive"
@@ -99,6 +104,9 @@ def _load_config() -> dict:
         # Back-fill if a saved config has an empty active list (e.g. legacy file)
         if not cfg.get("dimensions", {}).get("active"):
             cfg.setdefault("dimensions", {})["active"] = list(DEFAULT_DIMENSIONS)
+        # Migrate untouched legacy default sets to the current (smaller) default
+        if sorted(cfg["dimensions"]["active"]) == sorted(_LEGACY_DEFAULT_DIMENSIONS):
+            cfg["dimensions"]["active"] = list(DEFAULT_DIMENSIONS)
         return cfg
     except Exception:
         return _default_config()

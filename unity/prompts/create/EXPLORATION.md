@@ -26,6 +26,6 @@ Post a concise summary of promising designs, reusable APIs, and strategies, and 
 and design options — the more you map out now, the more coherent and buildable the specification will be.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't access a resource or are unsure, say so on the forum and ask the
+modify anything outside it. If you can't access a resource or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the
 team rather than fabricating. Don't touch `.unity/finalized.json` or `.unity/critic.json`. Consult the
 global unity library (`~/.unity/library/`). Check the forum often.
