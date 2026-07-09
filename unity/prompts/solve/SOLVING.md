@@ -6,8 +6,8 @@ phases chunk and formalize in Lean, so the proof must be **rigorous, complete, a
 step justified, no hand-waving, no gaps a formalizer couldn't fill.
 
 **Work as a team on one shared document.** `.unity/source/PROOF.tex` is shared. Coordinate on the
-forum: agree on the overall proof structure, then claim sections so two agents don't edit the same
-part at once and clobber each other. Build on the exploration findings (forum `decision` tags,
+forum: agree on the overall proof structure, then claim sections (`forum_claim` with the section as the chunk) so two agents don't edit the
+same part at once and clobber each other. Build on the exploration findings (binding `forum_decision`s in your brief,
 `.unity/source/`). Discuss competing approaches and converge — record an endorsed `forum_decision` when the team
 disagrees on strategy.
 

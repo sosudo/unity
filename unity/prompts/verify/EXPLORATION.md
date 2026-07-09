@@ -21,7 +21,7 @@ For each dependency a chunk needs, in priority order:
    `https://api.semanticscholar.org/graph/v1/paper/search?query=...`), save them under `.unity/source/`,
    and add/refine chunks so dependencies stay coherent.
 
-Post a summary and tag key calls with `forum_tag(name="decision", ...)` so the verifying phase inherits
+Post a summary and record each binding call with `forum_decision(topic, choice, rationale)` so the verifying phase inherits
 them.
 
 **Determination:** the code may use nonstandard constructs or rely on unformalized semantics — dig for

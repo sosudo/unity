@@ -34,14 +34,13 @@ when the source is already Lean or close to it.
 
 Work collaboratively via the forum: agree on the modeling approach (how to represent the language's
 semantics, what to specify), divide the code among you, and converge before finalizing. Vote when the
-team disagrees on how to model something, and tag key calls with `forum_tag(name="decision", ...)`.
+team disagrees on how to model something, and record each binding call with `forum_decision(topic, choice, rationale)`.
 
 **Determination:** model at the right granularity — faithful to the code, small enough to verify
 independently, with correct dependencies. If the verification goals in `.unity/UNITY.md` are vague,
 propose concrete properties on the forum and record the decision; don't silently under-specify.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify outside it. If you can't read part of the source, or are unsure how to model something, say so on
-the forum and ask the team rather than guessing or fabricating semantics. Don't touch
+modify outside it. If you can't read part of the source, or are unsure how to model something, raise a `forum_question` and ask the team rather than guessing or fabricating semantics. Don't touch
 `.unity/critic.json`. Consult the global unity library (`~/.unity/library/`). Check the forum often. Do
 not write Lean in this phase.

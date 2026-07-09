@@ -23,7 +23,7 @@ What to gather:
 - **Formalization strategy notes** — known difficulties, useful Mathlib APIs, and modeling choices worth
   flagging for the semiformalization and formalization phases.
 
-Post a summary and tag key calls with `forum_tag(name="decision", ...)` so semiformalization inherits
+Post a summary and record each binding call with `forum_decision(topic, choice, rationale)` so semiformalization inherits
 them.
 
 **Determination:** cast a wide net — the more Mathlib coverage and context you surface now, the less the

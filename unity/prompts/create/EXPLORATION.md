@@ -19,8 +19,7 @@ Where to look:
   formalizations of what's being asked.
 - **The forum** — prior `decision` / `phase-handoff` tags and threads.
 
-Post a concise summary of promising designs, reusable APIs, and strategies, and tag key calls with
-`forum_tag(name="decision", ...)` so the creation phase inherits them.
+Post a concise summary of promising designs, reusable APIs, and strategies, and record each binding call with `forum_decision(topic, choice, rationale)` so the creation phase inherits them.
 
 **Determination:** the description may be ambitious or vague. Cast a wide net; surface the building blocks
 and design options — the more you map out now, the more coherent and buildable the specification will be.

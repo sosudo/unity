@@ -4,7 +4,7 @@ Formalization found that the solution in `.unity/source/PROOF.tex` itself needs 
 `finalized` flag was set to false). Revise `PROOF.tex` to fix the underlying problem — a gap, an error,
 or a step that could not be formalized as written — so the next formalization attempt can succeed.
 
-Read the forum for exactly what went wrong (the formalization phase's posts and `decision` tags) and
+Read the forum for exactly what went wrong (the formalization phase's results, obstacles, and binding decisions — `forum_brief` surfaces them) and
 `.unity/CRITIC.md` if present. Fix the **mathematics**, not just the presentation: close the gap,
 correct the erroneous step, or restructure the argument into pieces that formalize. Keep the parts that
 were already formalized and merged intact where possible, so their work isn't wasted.

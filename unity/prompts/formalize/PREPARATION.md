@@ -15,7 +15,7 @@ Survey, in this order:
 - `.unity/source/` — the source material that provides what's needed to fill those gaps.
 - `.unity/dag.json` — the chunks and their status, if semiformalization has run.
 - `.unity/logs/` — the latest run logs.
-- The forum — `forum_brief` — also injected into your preamble, and recent threads.
+- The forum — `forum_brief` gives the live workspace digest; also scan recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): which target
 gaps are filled and which remain, what is chunked, key decisions and constraints, and current blockers.
@@ -25,6 +25,5 @@ Do not change the goal/scope or the user's directives.
 restarting from scratch.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't read something (e.g. a PDF source) or are unsure, say so on the
-forum rather than guessing. Leave `.unity/critic.json` untouched in this phase. Consult the global unity
+modify anything outside it. If you can't read something (e.g. a PDF source) or are unsure, raise a `forum_question` rather than guessing. Leave `.unity/critic.json` untouched in this phase. Consult the global unity
 library (`~/.unity/library/`) for relevant prior context.

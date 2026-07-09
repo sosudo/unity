@@ -14,7 +14,7 @@ Survey, in this order:
   the lean-lsp equivalent.
 - `.unity/dag.json` — the chunks, their status, and their recorded metric **scores**, if chunking has run.
 - `.unity/logs/` — the latest run logs.
-- The forum — `forum_brief` — also injected into your preamble, and recent threads.
+- The forum — `forum_brief` gives the live workspace digest; also scan recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): which
 declarations have been optimized and their score changes, what remains, key decisions and constraints,

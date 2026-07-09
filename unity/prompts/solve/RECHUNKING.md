@@ -10,7 +10,7 @@ match the revised proof.
 - Keep the same schema as chunking (`id`, `title`, `summary`, `dependencies`, `status`; optional
   `statement`/`type`). Do not hand-write a topological ordering — the system toposorts the DAG.
 
-Coordinate on the forum; converge before writing. Post a `phase-handoff` note summarizing what changed
+Coordinate on the forum; converge before writing. Post a `forum_handoff` summarizing what changed
 (which chunks are new, revised, or unchanged) so the formalization phase knows what to re-attempt.
 
 **Determination:** get the dependency structure of the *revised* proof right — stale or wrong

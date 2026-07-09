@@ -21,8 +21,7 @@ What to gather:
 - **External references** — cited results the source relies on (the web, arXiv, Semantic Scholar); save
   them under `.unity/source/`.
 
-Post a summary mapping target gaps → source material → Mathlib coverage, and tag key calls with
-`forum_tag(name="decision", ...)` so semiformalization inherits them.
+Post a summary mapping target gaps → source material → Mathlib coverage, and record each binding call with `forum_decision(topic, choice, rationale)` so semiformalization inherits them.
 
 **Determination:** the more precisely you map each gap to the source material and existing API now, the
 less the formalization phase flounders. If a target gap has no coverage in the source or Mathlib, flag

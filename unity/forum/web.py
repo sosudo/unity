@@ -1656,52 +1656,119 @@ _DECL_RE = _re.compile(
     _re.M)
 
 
-@app.get("/api/blueprint")
-def api_blueprint():
-    """The Lean blueprint: every declaration in the project's .lean files, with proof
-    status (sorry / axiom / complete) and naive in-project dependency links (name
-    references in the decl body). This is the project's actual Lean structure, distinct
-    from the run's chunk DAG."""
-    root = _project_root()
-    files = []
-    all_names: set = set()
+_IDENT_RE = _re.compile(r"[A-Za-z_][A-Za-z0-9_.'₀-₉]*")
+
+
+def _blueprint_trees() -> list[str]:
+    """Selectable sources for the blueprint: the main checkout + live agent worktrees."""
+    trees = ["main"]
+    wd = _project_root() / ".worktrees"
+    if wd.is_dir():
+        trees += sorted(p.name for p in wd.iterdir() if p.is_dir())
+    return trees
+
+
+def _blueprint_base(tree: str) -> Path:
+    if tree in ("", "main"):
+        return _project_root()
+    base = (_project_root() / ".worktrees" / tree).resolve()
+    if base.parent != (_project_root() / ".worktrees").resolve() or not base.is_dir():
+        raise ValueError(f"unknown tree '{tree}'")
+    return base
+
+
+def _scan_blueprint(base: Path) -> list[tuple[str, list[dict], dict]]:
+    """Parse `base`'s .lean files into (relpath, decls, bodies-by-name) triples."""
     parsed = []
-    for p in sorted(root.rglob("*.lean")):
-        if any(part in (".lake", ".unity", "lake-packages", "build") for part in p.parts):
+    for p in sorted(base.rglob("*.lean")):
+        if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
             continue
         try:
             text = p.read_text(errors="replace")
         except OSError:
             continue
         matches = list(_DECL_RE.finditer(text))
-        decls = []
+        decls, bodies = [], {}
         for i, m in enumerate(matches):
             body = text[m.start():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
             kind, name = m.group(1), m.group(2)
             status = ("axiom" if kind == "axiom"
                       else "sorry" if _re.search(r"\bsorry\b|\badmit\b", body) else "complete")
             decls.append({"name": name, "kind": kind, "status": status,
-                          "line": text.count("\n", 0, m.start()) + 1, "_body": body})
-            all_names.add(name)
+                          "line": text.count("\n", 0, m.start()) + 1})
+            bodies[name] = body
         if decls:
-            parsed.append((str(p.relative_to(root)), decls))
+            parsed.append((str(p.relative_to(base)), decls, bodies))
+    # naive in-project deps: identifiers in a decl's body that name another project decl
+    all_names = {d["name"] for _, decls, _ in parsed for d in decls}
     used_by: dict = {}
-    ident_re = _re.compile(r"[A-Za-z_][A-Za-z0-9_.'₀-₉]*")
-    for path, decls in parsed:
+    for _, decls, bodies in parsed:
         for d in decls:
-            deps = sorted((set(ident_re.findall(d["_body"])) & all_names) - {d["name"]})
+            deps = sorted((set(_IDENT_RE.findall(bodies[d["name"]])) & all_names) - {d["name"]})
             d["deps"] = deps[:12]
             for n in deps:
-                used_by[n] = used_by.get(n, 0) + 1
-            del d["_body"]
-    for path, decls in parsed:
+                used_by.setdefault(n, []).append(d["name"])
+    for _, decls, _ in parsed:
         for d in decls:
-            d["used_by"] = used_by.get(d["name"], 0)
-        files.append({"path": path, "decls": decls})
+            d["used_by"] = len(used_by.get(d["name"], []))
+    return parsed
+
+
+@app.get("/api/blueprint")
+def api_blueprint(tree: str = "main"):
+    """The Lean blueprint: every declaration in the selected tree's .lean files, with
+    proof status (sorry / axiom / complete) and naive in-project dependency links. This
+    is the project's actual Lean structure, distinct from the run's chunk DAG."""
+    parsed = _scan_blueprint(_blueprint_base(tree))
+    files = [{"path": path, "decls": decls} for path, decls, _ in parsed]
     total = sum(len(f["decls"]) for f in files)
     sorries = sum(1 for f in files for d in f["decls"] if d["status"] == "sorry")
     axioms = sum(1 for f in files for d in f["decls"] if d["status"] == "axiom")
-    return {"files": files, "total": total, "sorries": sorries, "axioms": axioms}
+    return {"files": files, "total": total, "sorries": sorries, "axioms": axioms,
+            "tree": tree or "main", "trees": _blueprint_trees()}
+
+
+def _chunk_for_decl(name: str) -> dict | None:
+    """Find the chunk in dag.json that covers a declaration, if any."""
+    try:
+        chunks = json.loads((ROOT_DIR / "dag.json").read_text()).get("chunks", [])
+    except (OSError, json.JSONDecodeError):
+        return None
+    short = name.split(".")[-1]
+    for c in chunks:
+        decls = c.get("declarations") or []
+        if (name in decls or short in decls or c.get("lean_decl") in (name, short)
+                or c.get("title") in (name, short)):
+            return {"id": c.get("id"), "title": c.get("title", ""), "status": c.get("status", "")}
+    for c in chunks:  # weaker match: the decl name inside the chunk id or statement
+        if short and (short.lower() in str(c.get("id", "")).lower()
+                      or _re.search(r"\b" + _re.escape(short) + r"\b", str(c.get("statement", "")))):
+            return {"id": c.get("id"), "title": c.get("title", ""), "status": c.get("status", "")}
+    return None
+
+
+@app.get("/api/blueprint/decl")
+def api_blueprint_decl(name: str, file: str, tree: str = "main"):
+    """Detail for one declaration: signature, full source, deps both ways, chunk link."""
+    base = _blueprint_base(tree)
+    parsed = _scan_blueprint(base)
+    for path, decls, bodies in parsed:
+        if path != file:
+            continue
+        for d in decls:
+            if d["name"] != name:
+                continue
+            body = bodies[name]
+            # signature: decl head up to the proof/definition body
+            sig_end = _re.search(r":=|\bby\b|\bwhere\b", body)
+            signature = body[:sig_end.start()].rstrip() if sig_end else body.splitlines()[0]
+            used_by = sorted({x["name"] for _, ds, bs in parsed for x in ds
+                              if name in (set(_IDENT_RE.findall(bs[x["name"]])) - {x["name"]})})
+            return {**{k: d[k] for k in ("name", "kind", "status", "line", "deps")},
+                    "file": path, "signature": signature[:2000],
+                    "source": body.rstrip()[:6000], "truncated": len(body) > 6000,
+                    "used_by": used_by[:20], "chunk": _chunk_for_decl(name)}
+    return JSONResponse({"error": f"declaration '{name}' not found in {file}"}, status_code=404)
 
 
 @app.get("/api/tools")
@@ -1985,6 +2052,16 @@ pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border
   <div class="row"><button class="act" onclick="document.getElementById('viewmodal').classList.remove('open')">close</button></div>
 </div></div>
 
+<div class="modal" id="declmodal"><div class="box">
+  <h3 id="dm-title"></h3>
+  <div class="who" id="dm-meta" style="margin-bottom:10px; line-height:1.6"></div>
+  <pre class="log" id="dm-source" style="background:#fafafa;color:#111;border:1px solid #eee; max-height:46vh"></pre>
+  <div class="row"><button class="act" onclick="document.getElementById('declmodal').classList.remove('open')">close</button></div>
+</div></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/dagre/0.8.5/dagre.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
 <script>
 const esc = t => (t || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const $ = id => document.getElementById(id);
@@ -2050,25 +2127,87 @@ async function loadOverview() {
   } catch (e) { $('tab-overview').innerHTML = '<section><div class="empty">overview unavailable</div></section>'; }
 }
 
+let BP = {tree: 'main', view: 'list', cy: null, dagreWired: false};
 async function loadBlueprint() {
-  const d = await J('/api/blueprint');
-  if (!d.files.length) {
-    $('tab-blueprint').innerHTML = '<section><div class="empty">no Lean declarations found in this project yet</div></section>';
-    return;
-  }
-  let h = '<section><h2>Lean blueprint — ' + d.total + ' declarations' +
+  const d = await J('/api/blueprint?tree=' + encodeURIComponent(BP.tree));
+  if (d.error) { BP.tree = 'main'; return loadBlueprint(); }
+  const counts = ' — ' + d.total + ' declarations' +
     (d.sorries ? ' · <span style="color:#e53935">' + d.sorries + ' sorry</span>' : '') +
     (d.axioms ? ' · <span style="color:#fb8c00">' + d.axioms + ' axiom</span>' : '') +
-    (!d.sorries && !d.axioms ? ' · all complete ✓' : '') + '</h2></section>';
-  h += d.files.map(f =>
-    '<section style="margin-top:12px"><h2>' + esc(f.path) + '</h2>' +
-    f.decls.map(x =>
-      '<div class="bp-decl"><span class="dot ' + x.status + '"></span>' +
-      '<span class="bp-kind">' + esc(x.kind) + '</span>' +
-      '<span title="line ' + x.line + (x.deps.length ? ' — uses: ' + esc(x.deps.join(', ')) : '') + '">' + esc(x.name) + '</span>' +
-      '<span class="bp-deps">' + (x.deps.length ? '→ ' + x.deps.length : '') + (x.used_by ? ' · used by ' + x.used_by : '') + '</span></div>'
-    ).join('') + '</section>').join('');
-  $('tab-blueprint').innerHTML = h;
+    (d.total && !d.sorries && !d.axioms ? ' · all complete ✓' : '');
+  let h = '<section><div class="row" style="margin:0">' +
+    '<h2 style="margin:0">Lean blueprint' + counts + '</h2><span style="flex:1"></span>' +
+    '<span class="who">tree:</span> <select id="bp-tree">' +
+    (d.trees || ['main']).map(t => '<option' + (t === d.tree ? ' selected' : '') + '>' + esc(t) + '</option>').join('') +
+    '</select><button class="act" id="bp-toggle">' + (BP.view === 'list' ? 'graph view' : 'list view') + '</button></div></section>';
+  if (!d.files.length) {
+    h += '<section style="margin-top:12px"><div class="empty">no Lean declarations found in this tree</div></section>';
+    $('tab-blueprint').innerHTML = h;
+  } else if (BP.view === 'list') {
+    h += d.files.map(f =>
+      '<section style="margin-top:12px"><h2>' + esc(f.path) + '</h2>' +
+      f.decls.map(x =>
+        '<div class="bp-decl" style="cursor:pointer" data-file="' + esc(f.path) + '" data-name="' + esc(x.name) + '">' +
+        '<span class="dot ' + x.status + '"></span>' +
+        '<span class="bp-kind">' + esc(x.kind) + '</span>' +
+        '<span title="line ' + x.line + (x.deps.length ? ' — uses: ' + esc(x.deps.join(', ')) : '') + '">' + esc(x.name) + '</span>' +
+        '<span class="bp-deps">' + (x.deps.length ? '→ ' + x.deps.length : '') + (x.used_by ? ' · used by ' + x.used_by : '') + '</span></div>'
+      ).join('') + '</section>').join('');
+    $('tab-blueprint').innerHTML = h;
+    document.querySelectorAll('#tab-blueprint .bp-decl').forEach(el =>
+      el.onclick = () => showDecl(el.dataset.file, el.dataset.name));
+  } else {
+    h += '<section style="margin-top:12px; padding:0"><div id="bp-cy" style="height:74vh"></div></section>';
+    $('tab-blueprint').innerHTML = h;
+    buildBpGraph(d);
+  }
+  $('bp-tree').onchange = e => { BP.tree = e.target.value; loadBlueprint(); };
+  $('bp-toggle').onclick = () => { BP.view = BP.view === 'list' ? 'graph' : 'list'; loadBlueprint(); };
+}
+function buildBpGraph(d) {
+  if (typeof cytoscape === 'undefined' || typeof cytoscapeDagre === 'undefined') {
+    $('bp-cy').innerHTML = '<div class="empty" style="padding:20px">graph libraries unavailable (offline?) — use list view</div>';
+    return;
+  }
+  if (!BP.dagreWired) { cytoscape.use(cytoscapeDagre); BP.dagreWired = true; }
+  const COLORS = {complete: {bg: '#c8f0c8', border: '#2d7a2d'}, sorry: {bg: '#f8c8c8', border: '#c02020'},
+                  axiom: {bg: '#ffe2b8', border: '#c87800'}};
+  const names = new Set(); d.files.forEach(f => f.decls.forEach(x => names.add(x.name)));
+  const elements = [];
+  d.files.forEach(f => f.decls.forEach(x => {
+    const col = COLORS[x.status] || COLORS.complete;
+    elements.push({data: {id: x.name, label: x.name.split('.').pop(), file: f.path,
+                          bgColor: col.bg, borderColor: col.border}});
+    x.deps.forEach(dep => { if (names.has(dep)) elements.push({data: {id: dep + '->' + x.name, source: dep, target: x.name}}); });
+  }));
+  BP.cy = cytoscape({
+    container: $('bp-cy'), elements,
+    style: [
+      {selector: 'node', style: {'background-color': 'data(bgColor)', 'border-color': 'data(borderColor)',
+        'border-width': 1.5, 'label': 'data(label)', 'font-size': '11px',
+        'font-family': 'ui-monospace, "Cascadia Code", "Fira Code", "Menlo", monospace',
+        'text-valign': 'center', 'text-halign': 'center', 'shape': 'roundrectangle',
+        'color': '#111', 'padding': '8px 12px', 'min-zoomed-font-size': 7}},
+      {selector: 'edge', style: {'curve-style': 'bezier', 'target-arrow-shape': 'triangle',
+        'target-arrow-color': '#ccc', 'line-color': '#ccc', 'arrow-scale': 0.75, 'width': 1}},
+    ],
+    layout: {name: 'dagre', rankDir: 'TB', nodeSep: 30, rankSep: 60, padding: 24},
+  });
+  BP.cy.on('tap', 'node', e => showDecl(e.target.data('file'), e.target.id()));
+}
+async function showDecl(file, name) {
+  const d = await J('/api/blueprint/decl?tree=' + encodeURIComponent(BP.tree) +
+                    '&file=' + encodeURIComponent(file) + '&name=' + encodeURIComponent(name));
+  if (d.error) return;
+  $('dm-title').textContent = d.kind + ' ' + d.name;
+  const chunk = d.chunk ? 'chunk: <b>' + esc(d.chunk.id) + '</b>' + (d.chunk.status ? ' (' + esc(d.chunk.status) + ')' : '') : 'no matching chunk';
+  $('dm-meta').innerHTML = [
+    'status: <b>' + esc(d.status) + '</b>', esc(d.file) + ':' + d.line, chunk,
+    d.deps.length ? 'uses: ' + esc(d.deps.join(', ')) : 'uses: nothing in-project',
+    d.used_by.length ? 'used by: ' + esc(d.used_by.join(', ')) : 'used by: nothing in-project',
+  ].join('<br>');
+  $('dm-source').textContent = d.source + (d.truncated ? '\n… (truncated)' : '');
+  $('declmodal').classList.add('open');
 }
 
 const AG_F = ['model','backend','provider','budget','base_url','api_key','auth_token'];

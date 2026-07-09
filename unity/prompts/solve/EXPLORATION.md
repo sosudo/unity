@@ -15,10 +15,9 @@ Where to look:
   results you can reuse in the proof and its formalization.
 - The literature — the web, arXiv (`https://export.arxiv.org/api/query?search_query=...`) and
   Semantic Scholar (`https://api.semanticscholar.org/graph/v1/paper/search?query=...`), both free.
-- The forum — prior `decision` / `phase-handoff` tags and threads.
+- The forum — `forum_brief` gives the live workspace digest (decisions, handoffs); also scan recent threads.
 
-Post a concise summary of promising strategies and resources to the forum, and tag key calls with
-`forum_tag(name="decision", ...)` so the solving phase inherits them.
+Post a concise summary of promising strategies and resources to the forum, and record each binding call with `forum_decision(topic, choice, rationale)` so the solving phase inherits them.
 
 **Determination:** the problem may be hard or open. Cast a wide net; surface partial results,
 near-misses, and alternative framings — even a documented dead end saves the solving phase time.

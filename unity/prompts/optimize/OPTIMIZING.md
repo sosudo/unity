@@ -37,8 +37,7 @@ prefer the **best score among the ones that build and stay correct**; the primar
 
 **Determination:** push the metric as far as it will go while staying correct — try several rewrites,
 combine techniques, and use Mathlib search / `lean_multi_attempt` / Axle / Aristotle. If, after genuine
-effort, a declaration is already optimal (or can't be improved without breaking correctness), say so on
-the forum with the reason and leave it — a justified "already optimal" is a valid outcome; a lazy one is not.
+effort, a declaration is already optimal (or can't be improved without breaking correctness), post a `forum_result` with the reason and leave it — a justified "already optimal" is a valid outcome; a lazy one is not.
 
 **Norms:** operate only within your worktree, the Lean project, and `.unity/`; never scan or modify
 outside. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Consult the global unity library

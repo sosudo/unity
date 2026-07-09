@@ -11,7 +11,7 @@ Survey, in this order:
   incomplete. Prefer Axle's `check` over the lean-lsp equivalent.
 - `.unity/dag.json` — the target chunks and their status, if chunking has run.
 - `.unity/logs/` — the latest run logs: what was attempted and what failed.
-- The forum — `forum_brief` — also injected into your preamble, and recent threads.
+- The forum — `forum_brief` gives the live workspace digest; also scan recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): which
 targets are proven and which remain, key decisions and constraints (e.g. helper lemmas needed), and

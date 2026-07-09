@@ -20,7 +20,7 @@ What to gather:
   and note Axle tools that directly help (`simplify_theorems`, `have2lemma`, `repair_proofs`, `normalize`).
 - **References** — prior work, style guides, or examples relevant to this metric; save them under `.unity/`.
 
-Post a summary and tag key calls with `forum_tag(name="decision", ...)` so chunking and optimizing
+Post a summary and record each binding call with `forum_decision(topic, choice, rationale)` so chunking and optimizing
 inherit them.
 
 **Determination:** the more concretely you pin down what improves the metric now, the more the optimizing

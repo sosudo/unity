@@ -14,7 +14,7 @@ Survey, in this order:
   equivalent.
 - `.unity/dag.json` — the declaration chunks and their status, if chunking has run.
 - `.unity/logs/` — the latest run logs: what was attempted and what failed.
-- The forum — `forum_brief` — also injected into your preamble, and recent threads.
+- The forum — `forum_brief` gives the live workspace digest; also scan recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): the current
 vs. target version, which declarations already build under the target and which remain broken, key

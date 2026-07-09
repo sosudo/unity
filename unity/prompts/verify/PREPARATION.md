@@ -14,7 +14,7 @@ Survey, in this order:
 - The Lean project — the verification artifact so far: what builds, what is incomplete (`sorry`,
   `axiom`, errors). Prefer Axle's `check` over the lean-lsp equivalent.
 - `.unity/logs/` — the latest run logs: what was attempted and what failed.
-- The forum — `forum_brief` — also injected into your preamble, and recent threads.
+- The forum — `forum_brief` gives the live workspace digest; also scan recent threads.
 
 Then update **only the State section** of `.unity/UNITY.md` (add it at the bottom if absent): what is
 modeled, which properties are proven and verified, what remains, key decisions and constraints, current

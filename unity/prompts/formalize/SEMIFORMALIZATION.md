@@ -40,7 +40,7 @@ structure that a formalizer can implement it faithfully. Do not hand-write a top
 system toposorts the DAG.
 
 Work collaboratively via the forum: agree on scope and chunk boundaries, divide the material, and converge
-before finalizing. Tag cross-cutting calls with `forum_tag(name="decision", ...)`.
+before finalizing. Record cross-cutting calls with `forum_decision(topic, choice, rationale)`.
 
 **Determination:** chunk exactly what's needed to close the in-scope gaps, faithfully and at the right
 granularity. If part of the source is ambiguous, or the scope is unclear, propose a resolution on the

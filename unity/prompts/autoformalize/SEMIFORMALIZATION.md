@@ -42,8 +42,8 @@ structure that a formalizer can implement it faithfully from the chunk; note the
 covers. Do not hand-write a topological ordering — the system toposorts the DAG.
 
 Work collaboratively via the forum: agree on chunk boundaries and the modeling of key definitions, divide
-the source among you, and converge before finalizing. Tag cross-cutting calls with
-`forum_tag(name="decision", ...)`.
+the source among you, and converge before finalizing. Record cross-cutting calls with
+`forum_decision(topic, choice, rationale)`.
 
 **Determination:** chunk at the right granularity — faithful to the source's structure, small enough to
 formalize independently, with correct dependencies. If part of the source is ambiguous or you're unsure

@@ -20,7 +20,7 @@ For each target chunk, in priority order:
    `https://export.arxiv.org/api/query?search_query=...`, Semantic Scholar
    `https://api.semanticscholar.org/graph/v1/paper/search?query=...`) and save it under `.unity/`.
 
-Post a summary and tag key calls with `forum_tag(name="decision", ...)` so the proving phase inherits
+Post a summary and record each binding call with `forum_decision(topic, choice, rationale)` so the proving phase inherits
 them.
 
 **Determination:** dig for the lemma that actually closes the goal rather than guessing — a good premise

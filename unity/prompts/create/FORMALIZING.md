@@ -26,7 +26,8 @@ the forum (`forum_brief` — also injected into your preamble).
 - Commit in your worktree, one commit per chunk. If your worktree is missing or corrupted, recreate it
   (`git worktree add` from the main branch) and continue.
 
-**Reach consensus and merge.** When a chunk has multiple candidate implementations, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`) (correctness, faithfulness to the spec, clean design); the primary breaks ties. The **primary**
+**Reach consensus and merge.** When a chunk has multiple candidate implementations, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`, weighing correctness,
+faithfulness to the spec, and clean design); the primary breaks ties. The **primary**
 squash-merges each winning chunk into the main branch with the commit message exactly
 `UNITY: merge chunk <id>`. After a merge, sync your worktree and move to the next ready chunks.
 

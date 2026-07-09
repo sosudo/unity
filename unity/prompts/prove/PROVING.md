@@ -26,8 +26,8 @@ Read first: `.unity/UNITY.md`, `.unity/dag.json`, the existing Lean project, and
 - Commit in your worktree, one commit per chunk. If your worktree is missing or corrupted, recreate it
   (`git worktree add` from the main branch) and continue.
 
-**Reach consensus and merge.** When a chunk has multiple candidate proofs, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`)
-(correctness, style); the **primary breaks ties**. The **primary** squash-merges each winning chunk into
+**Reach consensus and merge.** When a chunk has multiple candidate proofs, the team reviews the candidates' `forum_result`s and endorses or objects (`forum_endorse` / `forum_object`, weighing correctness and
+style); the **primary breaks ties**. The **primary** squash-merges each winning chunk into
 the main branch with the commit message exactly `UNITY: merge chunk <id>`. After a merge, sync your
 worktree with the main branch and move to the next ready chunks.
 

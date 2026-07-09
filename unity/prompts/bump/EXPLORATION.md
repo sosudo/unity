@@ -18,7 +18,7 @@ Where to look, per declaration/dependency the project relies on:
 3. **If a symbol was removed with no direct replacement**, find the closest equivalent or the API the
    project should build itself; record the plan.
 
-Post a summary of the migration map and tag key calls with `forum_tag(name="decision", ...)` so the
+Post a summary of the migration map and record each binding call with `forum_decision(topic, choice, rationale)` so the
 bumping phase inherits them.
 
 **Determination:** dig for the real replacement rather than guessing a name — a wrong lemma name wastes a
