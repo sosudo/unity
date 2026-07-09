@@ -1645,7 +1645,7 @@ def api_run_stop():
 
 
 
-APP_HTML = """\
+APP_HTML = r"""
 <!DOCTYPE html>
 <html>
 <head>
