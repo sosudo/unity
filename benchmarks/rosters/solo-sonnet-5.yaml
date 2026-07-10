@@ -1,7 +1,0 @@
-# Condition A baseline (autoformalize / bump / optimize — preserves Pro budget).
-agents:
-  - names: [solo]
-    model: claude-sonnet-5
-    backend: claude_code
-    provider: anthropic
-    strength: 8

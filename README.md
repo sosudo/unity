@@ -3,8 +3,9 @@
 Multi-agent proving, solving, autoformalization, formalization, and optimization harness for Lean 4.
 
 A roster of heterogeneous agents (different models, providers, and backends — Claude Agent SDK or
-Codex) collaborates through a persistent forum: agents sign up for chunks of work, attack them in
-per-agent git worktrees, vote on candidate solutions, and consensus-merge winners into your project.
+Codex) collaborates through a typed shared workspace: agents claim chunks of work, attack them in
+per-agent git worktrees, endorse or object to each other's results, and consensus-merge winners
+into your project.
 
 ## Prerequisites
 
@@ -15,7 +16,13 @@ per-agent git worktrees, vote on candidate solutions, and consensus-merge winner
 ## Install
 
 ```bash
-git clone <repository-url> unity && cd unity
+curl -fsSL https://raw.githubusercontent.com/sosudo/unity/main/install.sh | sh
+```
+
+or manually:
+
+```bash
+git clone https://github.com/sosudo/unity && cd unity
 uv tool install .
 ```
 

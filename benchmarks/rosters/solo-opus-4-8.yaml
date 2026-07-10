@@ -1,7 +1,0 @@
-# Condition A baseline (solve / formalize / verify / create).
-agents:
-  - names: [solo]
-    model: claude-opus-4-8
-    backend: claude_code
-    provider: anthropic
-    strength: 9

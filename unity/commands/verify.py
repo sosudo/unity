@@ -15,6 +15,7 @@ from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase,
 async def verify(targets, continue_):
     """For software/program verification"""
     paths = load_paths()
+    (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
     roster = load_roster(paths.agents_yaml)
     mcp = build_mcp(paths)
     root = paths.project_root

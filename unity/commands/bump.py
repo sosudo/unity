@@ -13,6 +13,7 @@ from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase,
 async def bump(version, continue_):
     """Bump Lean/Mathlib to VERSION (e.g. v4.16.0; omit to use the target in .unity/UNITY.md)."""
     paths = load_paths()
+    (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
     target = f"version '{version}'" if version else "the target version in .unity/UNITY.md"
     roster = load_roster(paths.agents_yaml)
     mcp = build_mcp(paths)

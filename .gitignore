@@ -15,3 +15,14 @@ wheels/
 .mcp.json
 .DS_Store
 uv.lock
+
+# Project state (never publish)
+.unity/
+
+# Local research material (kept out of the public repo)
+benchmarks/
+BENCHMARKS.md
+CHANGES*.md
+changes*.md
+FORUM2.md
+.python-version
