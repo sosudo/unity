@@ -15,7 +15,7 @@ _COMMANDS = (
 )
 
 
-@click.group()
+@click.group(context_settings={"max_content_width": 120})
 def cli():
     """Unity — multi-agent autoformalization for Lean 4."""
 

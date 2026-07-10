@@ -2283,8 +2283,8 @@ async function loadOverview() {
 
 let BP = {tree: 'main', view: 'list', cy: null, dagreWired: false};
 async function loadBlueprint() {
-  const d = await J('/api/blueprint?tree=' + encodeURIComponent(BP.tree));
-  if (d.error) { BP.tree = 'main'; return loadBlueprint(); }
+  const d = await J('/api/blueprint');
+  if (d.error) return;
   const counts = ' — ' + d.total + ' declarations' +
     (d.sorries ? ' · <span style="color:#e53935">' + d.sorries + ' sorry</span>' : '') +
     (d.axioms ? ' · <span style="color:#fb8c00">' + d.axioms + ' axiom</span>' : '') +
@@ -2296,9 +2296,7 @@ async function loadBlueprint() {
   if (d.refreshing) setTimeout(() => { if ($('tab-blueprint').style.display !== 'none') loadBlueprint(); }, 8000);
   let h = '<section><div class="row" style="margin:0">' +
     '<h2 style="margin:0">Lean blueprint' + counts + ' ' + src + refr + '</h2><span style="flex:1"></span>' +
-    '<span class="who">tree:</span> <select id="bp-tree">' +
-    (d.trees || ['main']).map(t => '<option' + (t === d.tree ? ' selected' : '') + '>' + esc(t) + '</option>').join('') +
-    '</select><button class="act" id="bp-toggle">' + (BP.view === 'list' ? 'graph view' : 'list view') + '</button></div></section>';
+    '<button class="act" id="bp-toggle">' + (BP.view === 'list' ? 'graph view' : 'list view') + '</button></div></section>';
   if (!d.files.length) {
     h += '<section style="margin-top:12px"><div class="empty">no Lean declarations found in this tree</div></section>';
     $('tab-blueprint').innerHTML = h;
@@ -2320,7 +2318,6 @@ async function loadBlueprint() {
     $('tab-blueprint').innerHTML = h;
     buildBpGraph(d);
   }
-  $('bp-tree').onchange = e => { BP.tree = e.target.value; loadBlueprint(); };
   $('bp-toggle').onclick = () => { BP.view = BP.view === 'list' ? 'graph' : 'list'; loadBlueprint(); };
 }
 function buildBpGraph(d) {
@@ -2397,7 +2394,7 @@ async function agSyncCards() {  // raw -> cards mirror
 async function loadAgents() {
   const d = await J('/api/agents');
   $('tab-agents').innerHTML =
-    '<section><h2>agents.yaml — blocks and raw stay in sync; save writes whichever you last edited</h2>' +
+    '<section><h2>agents</h2>' +
     '<div id="agent-cards"></div>' +
     '<div class="row"><button class="act" id="ag-add">+ group</button>' +
     '<button class="act primary" id="ag-save">save</button>' +
@@ -2437,7 +2434,7 @@ function agentCard(g, i, F) {
 
 async function loadPrompt() {
   const d = await J('/api/unityfile?name=UNITY.md');
-  $('tab-prompt').innerHTML = '<section><h2>UNITY.md — goal and state</h2>' +
+  $('tab-prompt').innerHTML = '<section><h2>unity.md</h2>' +
     '<textarea id="um-text"></textarea><div class="row">' +
     '<button class="act primary" id="um-save">save</button><span class="savemsg" id="um-msg"></span></div></section>';
   $('um-text').value = d.content;
