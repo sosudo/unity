@@ -16,7 +16,7 @@ _console = Console()
 _PROMPTS = Path(__file__).parent / "prompts"
 
 
-def _mark_phase(command: str, phase: str) -> None:
+def mark_phase(command: str, phase: str) -> None:
     """Record the running phase (.unity/state.json, for the web navbar) and print a
     timestamped delimiter banner (lands in the web run log)."""
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -36,7 +36,7 @@ def load_prompt(name: str) -> str:
     # every command gets phase tracking without per-command bookkeeping.
     if "/" in name:
         cmd, phase = name.split("/", 1)
-        _mark_phase(cmd, phase.lower())
+        mark_phase(cmd, phase.lower())
     return (_PROMPTS / f"{name}.md").read_text()
 
 

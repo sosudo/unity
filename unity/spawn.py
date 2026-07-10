@@ -67,6 +67,9 @@ _RETRY_SLEEP = 600.0
 # so benchmark runs can compare cost across rosters.
 _last_run_stats: dict[str, dict] = {}
 
+# Per-agent buffer assembling codex token deltas into whole log lines.
+_delta_buf: dict[str, str] = {}
+
 
 def _ts() -> str:
     import time
@@ -119,9 +122,15 @@ def _log(name: str, msg, cwd=None) -> None:
     if method:  # codex Notification: typed payload objects
         payload = getattr(msg, "payload", None)
         if method == "item/agentMessage/delta":
+            # providers stream token-level deltas; buffer per agent and emit whole lines
             delta = str(getattr(payload, "delta", "") or "")
-            if delta.strip():
-                _console.print(f"[dim]{_ts()} \\[{name}][/dim] {delta[:300]}")
+            buf = _delta_buf.get(name, "") + delta
+            while "\n" in buf or len(buf) >= 300:
+                cut = buf.find("\n") if "\n" in buf else 300
+                line, buf = buf[:cut], buf[cut:].lstrip("\n")
+                if line.strip():
+                    _console.print(f"[dim]{_ts()} \\[{name}][/dim] {line[:300]}")
+            _delta_buf[name] = buf
         elif method == "item/started":
             root = getattr(getattr(payload, "item", None), "root", None)
             rtype = getattr(root, "type", "")
@@ -138,6 +147,9 @@ def _log(name: str, msg, cwd=None) -> None:
             elif rtype and rtype not in ("agentMessage", "reasoning", "error"):
                 _tool_log(cwd, name, rtype)
         elif method == "turn/completed":
+            tail = _delta_buf.pop(name, "")
+            if tail.strip():
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] {tail[:300]}")
             _console.print(f"[green]{_ts()} \\[{name}] ✓ turn complete[/green]")
         return
     text = getattr(msg, "text", None) or getattr(msg, "message", None)

@@ -4,7 +4,7 @@ import asyncclick as click
 
 from ..config import load_paths
 from ..roster import load_roster
-from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase, toposort, read_approved
+from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase, toposort, read_approved, mark_phase
 
 
 @click.command(name="formalize")
@@ -21,6 +21,15 @@ async def formalize(targets, continue_):
     if continue_:
         await dispatch([roster.primary], roster, load_prompt("formalize/PREPARATION"),
                        "Analyze the current project state and latest logs; update .unity/UNITY.md with context for continuing.",
+                       root, mcp)
+    else:
+        # Fresh run: bootstrap LeanArchitect (version-guarded; skips cleanly when no
+        # toolchain-matching release exists or the dependency breaks the build).
+        mark_phase("formalize", "architect")
+        await dispatch([roster.primary], roster, load_prompt("ARCHITECT"),
+                       "Fresh-run bootstrap: add LeanArchitect as a project dependency pinned to the "
+                       "ref matching lean-toolchain, verify with lake build (revert + skip on any "
+                       "breakage), so later phases can annotate declarations with @[blueprint].",
                        root, mcp)
     
     await dispatch(roster.agents, roster, load_prompt("formalize/EXPLORATION"),

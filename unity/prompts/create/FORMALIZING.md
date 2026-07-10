@@ -45,3 +45,11 @@ a chunk is mis-scoped — add/split chunks, keep dependencies correct.
 **Norms:** operate only within your worktree, the Lean project, and `.unity/`; never scan or modify
 outside. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Consult the global unity library
 (`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you before claiming new chunks; record verified tricks with `ledger_add`. Subagents share your worktree — they don't get their own.
+
+**Blueprint annotations (when LeanArchitect is a dependency).** If the lakefile requires
+LeanArchitect (the architect bootstrap posted `forum_decision(topic="leanarchitect")` — check your
+brief), keep `import Architect` at the top of Lean files you touch and tag every declaration you
+add or complete with `@[blueprint "<its chunk id>"]`, with a docstring giving the informal
+statement (and a proof sketch for theorems). Labels = chunk ids keeps the machine-readable
+blueprint in lockstep with `.unity/dag.json`. Preserve existing annotations when editing others'
+declarations. If LeanArchitect is not a dependency, skip this entirely.

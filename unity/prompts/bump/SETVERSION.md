@@ -19,3 +19,9 @@ question in `.unity/UNITY.md` rather than guessing a version.
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). Do not edit any
 Lean declarations in this step. Leave `.unity/critic.json` untouched. Consult the global unity library
 (`~/.unity/library/`) for prior bump notes.
+
+If the lakefile requires **LeanArchitect**, bump its pinned rev to the tag/branch matching the new
+toolchain in the same commit (check `git ls-remote --tags --heads
+https://github.com/hanwenzhu/LeanArchitect.git`); if no matching ref exists yet for the new
+toolchain, remove the requirement (and its `import Architect` lines if that breaks the build) and
+record the removal with `forum_decision(topic="leanarchitect", choice="removed", rationale=...)`.
