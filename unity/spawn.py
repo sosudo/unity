@@ -263,10 +263,28 @@ def _write_codex_agents(home: Path, subagents) -> None:
         (adir / f'{s["name"]}.toml').write_text(toml)
 
 
+# codex >=0.117 does not expose MCP tools to custom Responses-API providers
+# (openai/codex#19871, #23186, #26977) — codex agents call them via `unity mcp` instead.
+_CODEX_MCP_NOTE = (
+    "\n\nIMPORTANT — MCP tools on this backend: your model does NOT receive MCP tools natively. "
+    "Every MCP tool in this prompt (forum_*, ledger_*, lean_*, axle, aristotle) is instead called "
+    "through the shell:\n"
+    "    unity mcp <server> <tool> '<json-args>'\n"
+    "Examples:\n"
+    "    unity mcp unity-forum forum_brief '{\"author\": \"<your agent name>\"}'\n"
+    "    unity mcp unity-forum forum_claim '{\"chunk\": \"chunk-1\", \"author\": \"<you>\", \"strategy\": \"...\"}'\n"
+    "    unity mcp lean-lsp lean_goal '{\"file_path\": \"...\", \"line\": 12}'\n"
+    "Servers: unity-forum (all forum_*/ledger_* tools), lean-lsp, axle and aristotle when "
+    "configured. Read every forum/tool instruction in this prompt as 'run it via unity mcp'. "
+    "The forum contract is not optional on this backend — use it through this command.\n")
+
+
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                         mcp_servers: dict, *, permission: str = "bypassPermissions",
                         idle_timeout: float = 600.0, subagents=()) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
+
+    system_prompt = system_prompt + _CODEX_MCP_NOTE
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
     # from a worktree cwd, the agent still needs write access to the main project (.unity/)

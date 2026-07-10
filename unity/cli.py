@@ -5,13 +5,13 @@ import asyncclick as click
 from .commands import (
     new, init, autoformalize, formalize, prove, optimize, create, solve, verify, bump,
     serve, update, doctor, help, agent, version, reset, clean,
-    complete, uninstall, source, metric,
+    complete, uninstall, source, metric, mcp,
 )
 
 _COMMANDS = (
     new, init, autoformalize, formalize, prove, optimize, create, solve, verify, bump,
     serve, update, doctor, help, agent, version, reset, clean,
-    complete, uninstall, source, metric,
+    complete, uninstall, source, metric, mcp,
 )
 
 
