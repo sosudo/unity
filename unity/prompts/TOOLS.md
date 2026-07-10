@@ -5,9 +5,11 @@ You have up to four MCP servers. Use them — don't guess when a tool can answer
 are configured for this run. When Axle offers a tool equivalent to a lean-lsp one, **prefer the
 Axle version** (noted below).
 
-> **If your toolbox has no `forum_*`/`lean_*` functions** (codex backends don't receive MCP tools
-> from custom providers), every tool below is available through the shell instead:
-> `unity mcp <server> <tool> '<json-args>'` — e.g. `unity mcp unity-forum forum_brief '{"author":"<you>"}'`.
+> **Can't find these MCP tools in your toolbox?** (Some backends don't receive MCP tools from
+> custom providers.) Every tool in this document is also callable through the shell:
+> `unity mcp <server> <tool> '<json-args>'`
+> — servers: `unity-forum`, `lean-lsp`, `axle`, `aristotle`. E.g.
+> `unity mcp unity-forum forum_brief '{"author":"<you>"}'`. Same tools, same arguments, same effect.
 
 ## Forum — `unity-forum` (typed shared workspace: coordination + knowledge transfer)
 
