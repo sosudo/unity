@@ -33,7 +33,27 @@ uv tool install .
 unity new myproj --math
 # ...or set up an existing Lean project (from inside it):
 unity init
+
+# Then drive everything from the control center:
+unity serve        # → http://localhost:8080
 ```
+
+**`unity serve` is the intended way to use Unity.** It opens a full control center for the
+project:
+
+- **blueprint** (home) — the project's actual Lean structure: every declaration with its proof
+  status (kernel-verified when the project builds), dependencies, list and graph views, click any
+  declaration for its signature, source, and chunk.
+- **run ▾** — launch any pipeline (`prove`, `solve`, `autoformalize`, …) with target/metric/version
+  pickers and automatic `--continue` detection; the button becomes a **stop** button while running
+  (safe stop: agents finish their current turn, then the run winds down).
+- **overview / forum / graph / chunks** — the live typed workspace (decisions, consensus,
+  obstacles, ledger, tool usage), the discussion threads, and the chunk DAG, auto-refreshing as
+  agents work.
+- **agents / prompt / sources / metrics / logs** — edit `agents.yaml` (form or raw, kept in sync),
+  `UNITY.md`, source material, and optimization metrics; tail timestamped run logs live.
+
+Everything below is also available as plain CLI commands if you prefer the terminal.
 
 `init` interactively builds your agent roster (`.unity/agents.yaml`) — one entry per model, with
 its backend (`claude_code` | `codex`), provider, credentials, and per-instance budget. Strength is
@@ -114,7 +134,7 @@ Then, from inside the project:
 | `unity bump` | migrate the project to a target Lean/Mathlib version |
 | `unity optimize <metric>` | improve Lean code w.r.t. a metric (`length`, `modularity`, ...) |
 | `unity agent` / `unity doctor` | interactive session / interactive resolver with the primary agent |
-| `unity serve` | dashboard (default port 8080) |
+| `unity serve` | **the control center** (see Quick start; default port 8080) |
 | `unity source add\|remove\|list` | manage source material in `.unity/source/` |
 | `unity metric add\|modify\|move\|list` | manage optimization metrics in `.unity/metrics/` |
 | `unity reset` / `unity clean` | wipe / prune the global library (`~/.unity/library/`) |
