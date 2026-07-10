@@ -33,11 +33,13 @@ class Paths:
 
 
 def find_unity_dir(start: Path | None = None) -> Path | None:
-    """Walk up from `start` (default: cwd) looking for a `.unity/` directory."""
+    """Walk up from `start` (default: cwd) looking for a project `.unity/` directory.
+    The global home `~/.unity` (the cross-run library) is never a project dir."""
+    home_unity = (Path.home() / UNITY_DIRNAME).resolve()
     here = (start or Path.cwd()).resolve()
     for d in (here, *here.parents):
         candidate = d / UNITY_DIRNAME
-        if candidate.is_dir():
+        if candidate.is_dir() and candidate.resolve() != home_unity:
             return candidate
     return None
 

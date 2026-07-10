@@ -10,11 +10,11 @@ from ..library import ensure_library
 _DEFAULT_METRICS = Path(__file__).parent.parent / "defaults" / "metrics"
 
 _ENV_DEFAULT = (
-    "RECORDING=true\n"
-    "SILENT=false\n"
-    "FORUM_PORT=8080\n"
-    "LEAN_LSP_PORT=8888\n"
+    "# Critic-loop cap per run\n"
     "MAX_ATTEMPTS=5\n"
+    "# Set to off to disable workspace-brief injection (ablation)\n"
+    "UNITY_FORUM_BRIEF=on\n"
+    "# Optional service keys — unlock extra agent tools when set\n"
     "AXLE_API_KEY=\n"
     "ARISTOTLE_API_KEY=\n"
 )
@@ -33,38 +33,27 @@ def _seed_default_metrics(metrics_dir: Path) -> None:
             shutil.copy2(src, dest)
 
 
-async def _collect_agent(idx: int) -> dict:
-    label = "primary agent" if idx == 0 else f"agent #{idx + 1}"
-    click.echo(f"\n── {label} ──")
-    names = [n.strip() for n in (await click.prompt("names (comma-separated)")).split(",") if n.strip()]
-    backend = await click.prompt("backend", type=click.Choice(["claude_code", "codex"]), default="claude_code")
-    model = await click.prompt("model")
-    provider = await click.prompt("provider", default="")
-    budget = await click.prompt("budget USD per instance (blank = unlimited)", default="")
-    base_url = await click.prompt("base_url", default="")
-    api_key = await click.prompt("api_key", default="", hide_input=True, show_default=False)
-    auth_token = await click.prompt("auth_token", default="", hide_input=True, show_default=False)
-
-    agent = {"names": names, "model": model, "backend": backend}
-    if provider:
-        agent["provider"] = provider
-    if budget:
-        agent["budget"] = float(budget)
-    if base_url:
-        agent["base_url"] = base_url
-    if api_key:
-        agent["api_key"] = api_key
-    if auth_token:
-        agent["auth_token"] = auth_token
-    return agent
+_AGENTS_TEMPLATE = """\
+# Unity roster — add agents here or (easier) in the web UI: `unity serve` -> agents tab.
+# One group per model; `names` spawns one agent instance per name.
+# The PRIMARY agent (mark a group with `primary: true`; default: the first group) runs the
+# solo phases: preparation, architect bootstrap, the critic, and the retrospective — make it
+# your strongest model. Strength is learned automatically per model (autostrength); set
+# `strength:` only to override. `budget`: USD per agent instance.
+#
+# agents:
+# - names: [Ada]
+#   model: claude-opus-4-6
+#   backend: claude_code        # claude_code | codex
+#   provider: anthropic
+#   primary: true
+#   budget: 10
+agents: []
+"""
 
 
-def _write_agents_yaml(path: Path, agents: list[dict]) -> None:
-    with path.open("w") as f:
-        f.write("# First agent is the primary (preparation, critic, retrospective).\n")
-        f.write("# strength is learned automatically per model (autostrength); set it here only to override.\n")
-        f.write("# budget: USD per instance (not shared across instances of a model).\n\n")
-        yaml.safe_dump({"agents": agents}, f, sort_keys=False)
+def _write_agents_yaml(path: Path) -> None:
+    path.write_text(_AGENTS_TEMPLATE)
 
 
 async def run_init(root: Path) -> None:
@@ -85,18 +74,10 @@ async def run_init(root: Path) -> None:
     _seed_default_metrics(unity / "metrics")
     ensure_library()
 
-    agents = []
-    while True:
-        agents.append(await _collect_agent(len(agents)))
-        if not click.confirm("Add another agent?", default=False):
-            break
-
-    goal = await click.prompt("\nOne-line goal (optional)", default="")
-
     paths.env.write_text(_ENV_DEFAULT)
-    _write_agents_yaml(paths.agents_yaml, agents)
+    _write_agents_yaml(paths.agents_yaml)
     paths.unity_md.write_text(
-        f"# Goal\n\n{goal or '<what to formalize / prove / create>'}\n\n"
+        "# Goal\n\n<what to formalize / prove / create>\n\n"
         "## State\n\n<maintained across runs by the primary agent>\n"
     )
 
@@ -108,7 +89,9 @@ async def run_init(root: Path) -> None:
                 f.write("\n")
             f.write(".unity/\n")
 
-    click.echo(f"\nInitialized {unity} ({len(agents)} agent group(s))")
+    click.echo(f"\nInitialized {unity}")
+    click.echo("Next: `unity serve` -> agents tab to set up your roster (presets included),")
+    click.echo("edit the goal under the prompt tab, then hit run.")
     click.echo("Fetching build cache...")
     lake.cache_get(root)
     click.echo("Building project...")
@@ -117,7 +100,7 @@ async def run_init(root: Path) -> None:
 
 @click.command(name="init")
 async def init():
-    """Interactively prepare .unity/ for an existing Lean project."""
+    """Prepare .unity/ for an existing Lean project (roster is configured in `unity serve`)."""
     await run_init(Path.cwd())
 
 

@@ -1338,7 +1338,7 @@ _run_state: dict = {"proc": None}
 
 _COMMANDS: dict = {
     # command -> which extra inputs it takes
-    "autoformalize": {"targets": True, "metric": False, "version": False},
+    "autoformalize": {"targets": False, "metric": False, "version": False},
     "formalize":     {"targets": True, "metric": False, "version": False},
     "prove":         {"targets": True, "metric": False, "version": False},
     "solve":         {"targets": False, "metric": False, "version": False},
@@ -1455,6 +1455,18 @@ def api_file_put(payload: dict = Body(...)):
     return {"ok": True}
 
 
+@app.get("/api/env")
+def api_env_get():
+    q = ROOT_DIR / ".env"
+    return {"content": q.read_text() if q.exists() else ""}
+
+
+@app.put("/api/env")
+def api_env_put(payload: dict = Body(...)):
+    (ROOT_DIR / ".env").write_text(payload.get("content", ""))
+    return {"ok": True}
+
+
 @app.get("/api/agents")
 def api_agents_get():
     q = ROOT_DIR / "agents.yaml"
@@ -1474,10 +1486,10 @@ def _serialize_groups(groups: list) -> str:
     clean = []
     for g in groups:
         entry = {}
-        for k in ("names", "model", "backend", "provider", "strength", "budget",
-                  "base_url", "api_key", "auth_token"):
+        for k in ("names", "model", "backend", "provider", "primary", "strength",
+                  "budget", "base_url", "api_key", "auth_token"):
             v = g.get(k)
-            if v in (None, "", []):
+            if v in (None, "", [], False):
                 continue
             entry[k] = v
         clean.append(entry)
@@ -1732,7 +1744,8 @@ def _kernel_cache_path() -> Path:
 
 def _src_stamp(base: Path) -> float:
     stamp = 0.0
-    for p in base.rglob("*.lean"):
+    extra = [base / n for n in ("lakefile.toml", "lakefile.lean", "lean-toolchain", "lake-manifest.json")]
+    for p in list(base.rglob("*.lean")) + extra:
         if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
             continue
         try:
@@ -1769,9 +1782,10 @@ def _kernel_extract(base: Path) -> dict | None:
 def _kernel_refresh(stamp: float) -> None:
     data = _kernel_extract(_project_root())
     with _KERNEL_LOCK:
-        _KERNEL.update(running=False, stamp=stamp, data=data)
+        _KERNEL.update(running=False, stamp=stamp, data=data, attempt_ts=time.time())
     try:
-        _kernel_cache_path().write_text(json.dumps({"stamp": stamp, "decls": data}))
+        _kernel_cache_path().write_text(json.dumps({"stamp": stamp, "decls": data,
+                                                    "attempt_ts": time.time()}))
     except OSError:
         pass
 
@@ -1785,11 +1799,15 @@ def _kernel_data() -> tuple[dict | None, bool]:
         if "stamp" not in _KERNEL:  # first call after serve start: load persisted cache
             try:
                 saved = json.loads(_kernel_cache_path().read_text())
-                _KERNEL.update(stamp=saved.get("stamp", 0.0), data=saved.get("decls"))
+                _KERNEL.update(stamp=saved.get("stamp", 0.0), data=saved.get("decls"),
+                               attempt_ts=saved.get("attempt_ts", 0.0))
             except (OSError, json.JSONDecodeError):
-                _KERNEL.update(stamp=0.0, data=None)
+                _KERNEL.update(stamp=0.0, data=None, attempt_ts=0.0)
         if _KERNEL["stamp"] == stamp:
-            return _KERNEL["data"], _KERNEL["running"]
+            # a failed extraction (e.g. project mid-build) retries after a cooldown
+            if _KERNEL["data"] is not None or _KERNEL["running"] or \
+                    time.time() - _KERNEL.get("attempt_ts", 0.0) < 120:
+                return _KERNEL["data"], _KERNEL["running"]
         if not _KERNEL["running"]:
             _KERNEL["running"] = True
             threading.Thread(target=_kernel_refresh, args=(stamp,), daemon=True).start()
@@ -2085,65 +2103,80 @@ APP_HTML = r"""
 <meta charset="utf-8">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: #fafafa; color: #111; }
-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 20px; border-bottom: 1px solid #e4e4e4; background: #fafafa; position: sticky; top: 0; z-index: 5; }
-header h1 { font-size: 14px; font-weight: 600; letter-spacing: 0.14em; }
-.tabs { display: flex; gap: 2px; border: 1px solid #e0e0e0; border-radius: 5px; overflow: hidden; }
-.tabs button { background: none; border: none; border-left: 1px solid #e0e0e0; cursor: pointer; font: inherit; font-size: 12px; padding: 4px 12px; color: #666; }
-.tabs button:first-child { border-left: none; }
-.tabs button.active { background: #111; color: #fff; }
-nav { display: flex; gap: 14px; align-items: center; }
-nav a { font-size: 12px; color: #888; text-decoration: none; }
-nav a:hover { color: #111; }
+:root { --bg:#f6f6f4; --card:#ffffff; --ink:#1c1c1c; --mut:#8a8a86; --line:#e7e6e2; --acc:#3d5afe; --acc-ink:#fff; --ok-bg:#e6f4ea; --ok-ink:#1e6b34; --bad-bg:#fdeaea; --bad-ink:#a52222; --warn-bg:#fdf3dd; --warn-ink:#8a6100; }
+body { font-family: ui-monospace, 'Cascadia Code', 'Fira Code', 'Menlo', monospace; font-size: 13px; background: var(--bg); color: var(--ink); }
+header { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; padding: 10px 20px; border-bottom: 1px solid var(--line); background: var(--bg); position: sticky; top: 0; z-index: 5; }
+header h1 { font-size: 14px; font-weight: 700; letter-spacing: 0.14em; white-space: nowrap; }
+.tabs { display: flex; gap: 4px; background: #ececea; border-radius: 8px; padding: 3px; overflow-x: auto; max-width: 100%; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tabs button { background: none; border: none; cursor: pointer; font: inherit; font-size: 12px; padding: 5px 12px; color: #6b6b67; border-radius: 6px; white-space: nowrap; }
+.tabs button:hover { color: var(--ink); }
+.tabs button.active { background: var(--card); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,0.08); font-weight: 600; }
+nav { display: flex; gap: 10px; align-items: center; }
 .runwrap { position: relative; }
-#runbtn { background: #111; color: #fff; border: none; border-radius: 5px; font: inherit; font-size: 12px; padding: 5px 14px; cursor: pointer; }
-#runbtn.running { background: #b71c1c; }
-#runbtn.stopping { background: #b7791f; }
-.runmenu { display: none; position: absolute; right: 0; top: 110%; background: #fff; border: 1px solid #e0e0e0; border-radius: 6px; min-width: 150px; box-shadow: 0 4px 14px rgba(0,0,0,0.08); z-index: 20; }
+#runbtn { background: var(--acc); color: var(--acc-ink); border: none; border-radius: 7px; font: inherit; font-size: 12px; font-weight: 600; padding: 6px 16px; cursor: pointer; box-shadow: 0 1px 3px rgba(61,90,254,0.35); }
+#runbtn:hover { filter: brightness(1.06); }
+#runbtn.running { background: #c62828; box-shadow: 0 1px 3px rgba(198,40,40,0.35); }
+#runbtn.stopping { background: #c07f00; box-shadow: none; }
+#gearbtn { background: none; border: 1px solid var(--line); border-radius: 7px; font: inherit; font-size: 13px; padding: 5px 9px; cursor: pointer; color: #6b6b67; }
+#gearbtn:hover { color: var(--ink); border-color: #c9c8c4; }
+.runmenu { display: none; position: absolute; right: 0; top: 112%; background: var(--card); border: 1px solid var(--line); border-radius: 8px; min-width: 160px; box-shadow: 0 8px 24px rgba(0,0,0,0.10); z-index: 20; overflow: hidden; }
 .runwrap:hover .runmenu { display: block; }
 .runwrap.running .runmenu { display: none; }
-.runmenu div { padding: 7px 14px; cursor: pointer; font-size: 12px; color: #444; }
-.runmenu div:hover { background: #f2f2f2; color: #111; }
-#status { font-size: 11px; color: #bbb; }
+.runmenu div { padding: 8px 15px; cursor: pointer; font-size: 12px; color: #55554f; }
+.runmenu div:hover { background: #f2f2ef; color: var(--ink); }
+#status { font-size: 11px; color: var(--mut); white-space: nowrap; }
 main { padding: 0; }
-.pane { padding: 18px 20px; }
-.framewrap iframe { display: block; width: 100%; height: calc(100vh - 54px); border: none; background: #fff; }
+.pane { padding: 18px 20px; max-width: 1280px; margin: 0 auto; }
+.framewrap iframe { display: block; width: 100%; height: calc(100vh - 56px); border: none; background: var(--card); }
+.toolbar { display: flex; gap: 8px; align-items: center; padding: 7px 20px; border-bottom: 1px solid var(--line); background: var(--bg); }
+.framewrap .toolbar + iframe { height: calc(100vh - 96px); }
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 16px; align-items: start; }
-section { background: #fff; border: 1px solid #e4e4e4; border-radius: 6px; padding: 12px 14px; min-width: 0; overflow-wrap: anywhere; }
-section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: #bbb; margin-bottom: 8px; }
-.item { padding: 6px 0; border-top: 1px solid #f2f2f2; line-height: 1.45; overflow-wrap: anywhere; word-break: break-word; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; min-width: 0; overflow-wrap: anywhere; box-shadow: 0 1px 2px rgba(0,0,0,0.03); }
+section h2 { font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: #a6a5a0; margin-bottom: 10px; font-weight: 700; }
+.item { padding: 7px 0; border-top: 1px solid #f2f1ee; line-height: 1.5; overflow-wrap: anywhere; word-break: break-word; }
 .item:first-of-type { border-top: none; }
-.who { color: #999; font-size: 11px; }
-.badge { display: inline-block; font-size: 10px; border-radius: 4px; padding: 1px 6px; margin-left: 6px; }
-.ok { background: #e8f5e9; color: #1b5e20; } .blocked { background: #ffebee; color: #b71c1c; } .pending { background: #f5f5f5; color: #888; }
-.kind { font-size: 10px; text-transform: uppercase; color: #888; margin-right: 6px; }
-textarea { width: 100%; min-height: 320px; font: inherit; font-size: 12.5px; border: 1px solid #e0e0e0; border-radius: 6px; padding: 10px; background: #fff; resize: vertical; }
-input, select { font: inherit; font-size: 12px; border: 1px solid #e0e0e0; border-radius: 5px; padding: 4px 8px; background: #fff; }
-button.act { font: inherit; font-size: 12px; border: 1px solid #d8d8d8; background: #fff; border-radius: 5px; padding: 4px 12px; cursor: pointer; color: #333; }
-button.act:hover { border-color: #999; }
-button.primary { background: #111; color: #fff; border-color: #111; }
-.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
-.agent-card { border: 1px solid #e8e8e8; border-radius: 6px; padding: 10px 12px; margin-bottom: 10px; }
-.agent-card .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(160px, 1fr)); gap: 8px; }
-.agent-card label { font-size: 10px; text-transform: uppercase; color: #aaa; display: block; margin-bottom: 2px; }
-.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-.chip { font-size: 11px; border: 1px solid #ddd; border-radius: 10px; padding: 1px 9px; cursor: pointer; color: #555; }
-.chip.on { background: #111; color: #fff; border-color: #111; }
-.modal { position: fixed; inset: 0; background: rgba(0,0,0,0.28); display: none; align-items: center; justify-content: center; z-index: 40; }
+.who { color: #a1a09b; font-size: 11px; }
+.badge { display: inline-block; font-size: 10px; border-radius: 5px; padding: 2px 7px; margin-left: 6px; font-weight: 600; }
+.ok { background: var(--ok-bg); color: var(--ok-ink); } .blocked { background: var(--bad-bg); color: var(--bad-ink); } .pending { background: #f0efec; color: #82817c; }
+.kind { font-size: 10px; text-transform: uppercase; color: #98978f; margin-right: 6px; font-weight: 600; }
+textarea { width: 100%; min-height: 320px; font: inherit; font-size: 12.5px; border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: var(--card); resize: vertical; line-height: 1.55; }
+textarea:focus, input:focus, select:focus { outline: none; border-color: var(--acc); box-shadow: 0 0 0 3px rgba(61,90,254,0.12); }
+input, select { font: inherit; font-size: 12px; border: 1px solid var(--line); border-radius: 7px; padding: 5px 9px; background: var(--card); }
+button.act { font: inherit; font-size: 12px; border: 1px solid #dddcd7; background: var(--card); border-radius: 7px; padding: 5px 13px; cursor: pointer; color: #45443f; }
+button.act:hover { border-color: #b9b8b2; color: var(--ink); }
+button.primary { background: var(--acc); color: var(--acc-ink); border-color: var(--acc); font-weight: 600; }
+button.primary:hover { filter: brightness(1.06); }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0 2px; }
+.agent-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: #fcfcfb; position: relative; }
+.agent-card.is-primary { border-color: var(--acc); box-shadow: 0 0 0 1px var(--acc) inset; }
+.agent-card .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); gap: 10px; }
+.agent-card label { font-size: 10px; text-transform: uppercase; color: #adaca6; display: block; margin-bottom: 3px; font-weight: 600; letter-spacing: 0.06em; }
+.pbadge { position: absolute; top: -9px; left: 12px; background: var(--acc); color: #fff; font-size: 9px; font-weight: 700; letter-spacing: 0.1em; padding: 2px 8px; border-radius: 5px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.chip { font-size: 11px; border: 1px solid #dddcd7; border-radius: 12px; padding: 2px 10px; cursor: pointer; color: #63625c; background: var(--card); }
+.chip.on { background: var(--acc); color: #fff; border-color: var(--acc); }
+.modal { position: fixed; inset: 0; background: rgba(20,20,18,0.35); display: none; align-items: center; justify-content: center; z-index: 40; backdrop-filter: blur(1.5px); }
 .modal.open { display: flex; }
-.modal .box { background: #fff; border-radius: 8px; padding: 18px 20px; width: min(680px, 92vw); max-height: 84vh; overflow-y: auto; }
-.modal h3 { font-size: 13px; margin-bottom: 10px; }
-pre.log { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-radius: 6px; max-height: 50vh; overflow: auto; white-space: pre-wrap; }
-.filelist td { padding: 5px 10px 5px 0; border-top: 1px solid #f2f2f2; font-size: 12px; }
-.empty { color: #ccc; padding: 8px 0; }
-.savemsg { font-size: 11px; color: #2d7a2d; margin-left: 8px; }
-.bp-decl { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-top: 1px solid #f4f4f4; font-size: 12px; }
+.modal .box { background: var(--card); border-radius: 12px; padding: 20px 22px; width: min(700px, 92vw); max-height: 86vh; overflow-y: auto; box-shadow: 0 16px 48px rgba(0,0,0,0.18); }
+.modal h3 { font-size: 13px; margin-bottom: 12px; font-weight: 700; }
+pre.log { background: #17171a; color: #d6d6d2; font-size: 11px; padding: 12px; border-radius: 8px; max-height: 50vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.filelist { width: 100%; border-collapse: collapse; }
+.filelist td { padding: 6px 12px 6px 0; border-top: 1px solid #f2f1ee; font-size: 12px; }
+.filelist tr:first-child td { border-top: none; }
+.empty { color: #c6c5c0; padding: 8px 0; }
+.savemsg { font-size: 11px; color: #1e6b34; margin-left: 8px; }
+.bp-decl { display: flex; gap: 8px; align-items: baseline; padding: 5px 0; border-top: 1px solid #f4f3f0; font-size: 12px; }
 .bp-decl:first-of-type { border-top: none; }
+.bp-decl:hover { background: #fafaf8; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: none; align-self: center; }
-.dot.complete { background: #43a047; } .dot.sorry { background: #e53935; } .dot.axiom { background: #fb8c00; } .dot.tainted { background: #fbc02d; }
-.bp-kind { color: #aaa; font-size: 10px; text-transform: uppercase; width: 68px; flex: none; }
-.bp-deps { color: #bbb; font-size: 11px; margin-left: auto; text-align: right; }
-pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border-radius: 6px; height: 58vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.dot.complete { background: #34a853; } .dot.sorry { background: #e53935; } .dot.axiom { background: #fb8c00; } .dot.tainted { background: #f4b400; }
+.bp-kind { color: #b0afa9; font-size: 10px; text-transform: uppercase; width: 68px; flex: none; font-weight: 600; }
+.bp-deps { color: #c0bfb9; font-size: 11px; margin-left: auto; text-align: right; }
+pre.tail { background: #17171a; color: #d6d6d2; font-size: 11px; padding: 12px; border-radius: 8px; height: 58vh; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+#toast { position: fixed; bottom: 22px; right: 22px; background: #1c1c1c; color: #fff; font-size: 12px; padding: 9px 16px; border-radius: 8px; box-shadow: 0 6px 20px rgba(0,0,0,0.25); opacity: 0; transform: translateY(6px); transition: all .18s ease; pointer-events: none; z-index: 60; }
+#toast.show { opacity: 1; transform: translateY(0); }
+@media (max-width: 900px) { header { padding: 8px 12px; } .pane { padding: 14px 12px; } .tabs button { padding: 5px 9px; } }
 </style>
 </head>
 <body>
@@ -2153,7 +2186,6 @@ pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border
     <button data-tab="blueprint" class="active">blueprint</button>
     <button data-tab="overview">overview</button>
     <button data-tab="forum">forum</button>
-    <button data-tab="graph">graph</button>
     <button data-tab="chunks">chunks</button>
     <button data-tab="agents">agents</button>
     <button data-tab="prompt">prompt</button>
@@ -2167,13 +2199,16 @@ pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border
       <button id="runbtn">run ▾</button>
       <div class="runmenu" id="runmenu"></div>
     </div>
+    <button id="gearbtn" title="settings (.unity/.env)">⚙</button>
   </nav>
 </header>
 <main>
   <div id="tab-blueprint" class="pane"></div>
   <div id="tab-overview" class="pane grid" style="display:none"></div>
-  <div id="tab-forum" class="framewrap" style="display:none"><iframe data-src="/forum"></iframe></div>
-  <div id="tab-graph" class="framewrap" style="display:none"><iframe data-src="/graph"></iframe></div>
+  <div id="tab-forum" class="framewrap" style="display:none">
+    <div class="toolbar"><button class="act" id="forum-view-toggle">graph view</button></div>
+    <iframe id="forum-frame" data-src="/forum"></iframe>
+  </div>
   <div id="tab-chunks" class="framewrap" style="display:none"><iframe data-src="/dag"></iframe></div>
   <div id="tab-agents" class="pane" style="display:none"></div>
   <div id="tab-prompt" class="pane" style="display:none"></div>
@@ -2206,6 +2241,16 @@ pre.tail { background: #111; color: #ddd; font-size: 11px; padding: 12px; border
   <div class="row"><button class="act" onclick="document.getElementById('viewmodal').classList.remove('open')">close</button></div>
 </div></div>
 
+<div class="modal" id="envmodal"><div class="box">
+  <h3>settings — .unity/.env</h3>
+  <div class="who" style="margin-bottom:8px">run flags (MAX_ATTEMPTS, UNITY_FORUM_BRIEF) and service keys (AXLE_API_KEY, ARISTOTLE_API_KEY — unlock extra agent tools)</div>
+  <textarea id="env-text" style="min-height:220px"></textarea>
+  <div class="row"><button class="act primary" id="env-save">save</button>
+    <button class="act" onclick="document.getElementById('envmodal').classList.remove('open')">close</button></div>
+</div></div>
+
+<div id="toast"></div>
+
 <div class="modal" id="declmodal"><div class="box">
   <h3 id="dm-title"></h3>
   <div class="who" id="dm-meta" style="margin-bottom:10px; line-height:1.6"></div>
@@ -2224,7 +2269,7 @@ const J = (url, opts) => fetch(url, opts).then(r => r.json());
 const put = (url, body) => J(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 const post = (url, body) => J(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 
-const TABS = ['blueprint','overview','forum','graph','chunks','agents','prompt','sources','metrics','logs'];
+const TABS = ['blueprint','overview','forum','chunks','agents','prompt','sources','metrics','logs'];
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
@@ -2245,6 +2290,20 @@ function reltime(ts) {
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') document.querySelectorAll('.modal.open').forEach(m => m.classList.remove('open'));
 });
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast'); el.textContent = msg; el.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 1800);
+}
+$('gearbtn').onclick = async () => {
+  const d = await J('/api/env'); $('env-text').value = d.content; $('envmodal').classList.add('open');
+};
+$('env-save').onclick = async () => { await put('/api/env', {content: $('env-text').value}); toast('settings saved'); };
+$('forum-view-toggle').onclick = () => {
+  const fr = $('forum-frame'), toGraph = !fr.src.includes('/graph');
+  fr.src = toGraph ? '/graph' : '/forum';
+  $('forum-view-toggle').textContent = toGraph ? 'forum view' : 'graph view';
+};
 
 function badge(r) {
   if (r.mergeable) return '<span class="badge ok">mergeable</span>';
@@ -2372,12 +2431,29 @@ function agCollect() {
   return [...document.querySelectorAll('.agent-card')].map(c => {
     const g = {names: c.querySelector('[data-f=names]').value.split(',').map(x => x.trim()).filter(Boolean)};
     AG_F.forEach(f => { const v = c.querySelector('[data-f=' + f + ']').value.trim(); if (v) g[f] = (f === 'budget' ? parseFloat(v) : v); });
+    if (c.dataset.primary === '1') g.primary = true;
     return g;
   });
 }
+const AG_PRESETS = {
+  'Claude (subscription)': {names:['Ada'], model:'claude-opus-4-6', backend:'claude_code', provider:'anthropic', budget:10},
+  'Claude (API key)': {names:['Grace'], model:'claude-sonnet-5', backend:'claude_code', provider:'anthropic', api_key:'${ANTHROPIC_API_KEY}', budget:5},
+  'Codex (OpenAI)': {names:['Kurt'], model:'gpt-5.5-codex', backend:'codex', provider:'openai', api_key:'${OPENAI_API_KEY}'},
+  'OpenRouter — Claude': {names:['Emmy'], model:'anthropic/claude-sonnet-5', backend:'codex', provider:'openrouter', base_url:'https://openrouter.ai/api/v1', api_key:'${OPENROUTER_API_KEY}'},
+  'OpenRouter — free model': {names:['Alan'], model:'qwen/qwen3-coder:free', backend:'codex', provider:'openrouter', base_url:'https://openrouter.ai/api/v1', api_key:'${OPENROUTER_API_KEY}'},
+  'FreeInference': {names:['Sophie'], model:'glm-5.1', backend:'codex', provider:'freeinference', base_url:'https://freeinference.org/v1', api_key:'${FREEINFERENCE_API_KEY}'},
+  'Local vLLM': {names:['Henri'], model:'my-model', backend:'codex', provider:'vllm', base_url:'http://localhost:8000/v1', api_key:'unity'},
+};
 function agRenderCards(groups) {
-  $('agent-cards').innerHTML = (groups || []).map((g, i) => agentCard(g, i, AG_F)).join('');
+  groups = groups || [];
+  if (groups.length && !groups.some(g => g.primary)) groups[0].primary = true;  // default: first
+  $('agent-cards').innerHTML = groups.map((g, i) => agentCard(g, i, AG_F)).join('');
   document.querySelectorAll('.ag-del').forEach(b => b.onclick = () => { b.closest('.agent-card').remove(); agSyncRaw(); });
+  document.querySelectorAll('.ag-primary').forEach(b => b.onclick = () => {
+    const gs = agCollect(); gs.forEach(g => delete g.primary);
+    gs[[...document.querySelectorAll('.agent-card')].indexOf(b.closest('.agent-card'))].primary = true;
+    agRenderCards(gs); agSyncRaw();
+  });
 }
 async function agSyncRaw() {  // cards -> raw mirror
   agLastEdited = 'cards';
@@ -2395,8 +2471,11 @@ async function loadAgents() {
   const d = await J('/api/agents');
   $('tab-agents').innerHTML =
     '<section><h2>agents</h2>' +
+    '<div class="who" style="margin-bottom:12px">The <b>primary</b> agent leads the run: it prepares context, reviews as the critic, merges consensus results, and writes the retrospective — make it your strongest model. One group per model; each name in <b>names</b> spawns one agent instance.</div>' +
     '<div id="agent-cards"></div>' +
-    '<div class="row"><button class="act" id="ag-add">+ group</button>' +
+    '<div class="row"><select id="ag-preset"><option value="">add from preset…</option>' +
+    Object.keys(AG_PRESETS).map(k => '<option>' + esc(k) + '</option>').join('') + '</select>' +
+    '<button class="act" id="ag-add">+ blank</button>' +
     '<button class="act primary" id="ag-save">save</button>' +
     '<button class="act" id="ag-raw-toggle">raw</button>' +
     '<span class="savemsg" id="ag-msg"></span><span class="who" id="ag-err" style="color:#b71c1c"></span></div>' +
@@ -2405,17 +2484,19 @@ async function loadAgents() {
   $('ag-raw-text').value = d.raw;
   $('agent-cards').addEventListener('input', () => { clearTimeout(agTimer); agTimer = setTimeout(agSyncRaw, 350); });
   $('ag-raw-text').addEventListener('input', () => { clearTimeout(agTimer); agTimer = setTimeout(agSyncCards, 500); });
-  $('ag-add').onclick = () => {
-    $('agent-cards').insertAdjacentHTML('beforeend', agentCard({names:['agent']}, Date.now(), AG_F));
-    document.querySelectorAll('.ag-del').forEach(b => b.onclick = () => { b.closest('.agent-card').remove(); agSyncRaw(); });
-    agSyncRaw();
+  $('ag-add').onclick = () => { agRenderCards([...agCollect(), {names:['agent']}]); agSyncRaw(); };
+  $('ag-preset').onchange = e => {
+    const g = AG_PRESETS[e.target.value]; e.target.value = '';
+    if (!g) return;
+    agRenderCards([...agCollect(), JSON.parse(JSON.stringify(g))]); agSyncRaw();
+    toast('preset added — fill in the ${...} key or set the env var');
   };
   $('ag-raw-toggle').onclick = () => { const r = $('ag-raw'); r.style.display = r.style.display === 'none' ? 'block' : 'none'; };
   $('ag-save').onclick = async () => {
     clearTimeout(agTimer);
     if (agLastEdited === 'raw') await put('/api/agents', {raw: $('ag-raw-text').value});
     else await put('/api/agents', {groups: agCollect()});
-    $('ag-msg').textContent = 'saved'; setTimeout(() => { $('ag-msg').textContent = ''; }, 1500);
+    toast('agents saved');
     const wasOpen = $('ag-raw').style.display !== 'none';
     await loadAgents();
     if (wasOpen) $('ag-raw').style.display = 'block';
@@ -2423,12 +2504,16 @@ async function loadAgents() {
 }
 function agentCard(g, i, F) {
   const inp = (f, v, type) => '<div><label>' + f + '</label><input data-f="' + f + '" value="' + esc(String(v ?? '')) + '"' + (type ? ' type="' + type + '"' : '') + ' style="width:100%"></div>';
-  let h = '<div class="agent-card"><div class="fields">';
+  const prim = !!g.primary;
+  let h = '<div class="agent-card' + (prim ? ' is-primary' : '') + '" data-primary="' + (prim ? '1' : '0') + '">';
+  if (prim) h += '<span class="pbadge">PRIMARY</span>';
+  h += '<div class="fields">';
   h += inp('names', (g.names || []).join(', '));
   h += inp('model', g.model); h += inp('backend', g.backend || 'claude_code'); h += inp('provider', g.provider);
   h += inp('budget', g.budget); h += inp('base_url', g.base_url);
   h += inp('api_key', g.api_key, 'password'); h += inp('auth_token', g.auth_token, 'password');
-  h += '</div><div class="row"><button class="act ag-del">remove</button></div></div>';
+  h += '</div><div class="row">' + (prim ? '' : '<button class="act ag-primary">set as primary</button>') +
+       '<button class="act ag-del">remove</button></div></div>';
   return h;
 }
 
@@ -2439,7 +2524,7 @@ async function loadPrompt() {
     '<button class="act primary" id="um-save">save</button><span class="savemsg" id="um-msg"></span></div></section>';
   $('um-text').value = d.content;
   $('um-save').onclick = async () => { await put('/api/unityfile', {name: 'UNITY.md', content: $('um-text').value});
-    $('um-msg').textContent = 'saved'; setTimeout(() => $('um-msg').textContent = '', 1500); };
+    toast('prompt saved'); };
 }
 
 async function loadSources() {
@@ -2460,11 +2545,12 @@ async function loadSources() {
       const b64 = await new Promise(res => { const r = new FileReader(); r.onload = () => res(r.result.split(',')[1]); r.readAsDataURL(file); });
       await post('/api/sources/file', {name: file.name, content_b64: b64});
     }
+    toast(e.target.files.length + ' file(s) uploaded');
     loadSources();
   };
   $('src-save').onclick = async () => {
     await put('/api/sources/file', {name: $('src-edit-name').textContent, content: $('src-text').value});
-    $('src-msg').textContent = 'saved'; setTimeout(() => $('src-msg').textContent = '', 1500);
+    toast('source saved');
   };
 }
 async function editSource(name) {
@@ -2474,7 +2560,7 @@ async function editSource(name) {
 }
 async function delSource(name) {
   await fetch('/api/sources/file?name=' + encodeURIComponent(name), {method: 'DELETE'});
-  loadSources();
+  toast('source removed'); loadSources();
 }
 
 async function loadMetrics() {
@@ -2492,18 +2578,18 @@ async function loadMetrics() {
        '<span class="savemsg" id="mt-msg"></span></div></div></section>';
   $('tab-metrics').innerHTML = h;
   $('mt-new').onclick = async () => { const n = $('mt-new-name').value.trim(); if (!n) return;
-    await post('/api/metrics/new', {name: n}); loadMetrics(); };
+    await post('/api/metrics/new', {name: n}); toast('metric created'); loadMetrics(); };
   $('mt-save').onclick = async () => {
     await put('/api/metrics/file', {name: $('mt-edit-name').textContent, content: $('mt-text').value});
-    $('mt-msg').textContent = 'saved'; setTimeout(() => $('mt-msg').textContent = '', 1500);
+    toast('metric saved');
   };
 }
 async function editMetric(name) {
   const d = await J('/api/metrics/file?name=' + encodeURIComponent(name));
   $('mt-editor').style.display = 'block'; $('mt-edit-name').textContent = name; $('mt-text').value = d.content;
 }
-async function setActive(name) { await post('/api/metrics/active', {name}); loadMetrics(); }
-async function unsetActive() { await post('/api/metrics/active', {clear: true}); loadMetrics(); }
+async function setActive(name) { await post('/api/metrics/active', {name}); toast('active metric: ' + name.replace(/[.]md$/, '')); loadMetrics(); }
+async function unsetActive() { await post('/api/metrics/active', {clear: true}); toast('active metric cleared'); loadMetrics(); }
 
 let LOG_OPEN = null;
 async function loadLogs() {
@@ -2530,7 +2616,7 @@ async function openLog(name) {
   el.textContent = d.text || '(empty)';
   if (stick) el.scrollTop = el.scrollHeight;
 }
-async function delMetric(name) { await fetch('/api/metrics/file?name=' + encodeURIComponent(name), {method: 'DELETE'}); loadMetrics(); }
+async function delMetric(name) { await fetch('/api/metrics/file?name=' + encodeURIComponent(name), {method: 'DELETE'}); toast('metric removed'); loadMetrics(); }
 
 function buildRunMenu() {
   $('runmenu').innerHTML = Object.keys(PROJECT.commands).map(c => '<div data-c="' + c + '">' + c + '</div>').join('');
@@ -2568,6 +2654,7 @@ $('rm-start').onclick = async () => {
   const r = await post('/api/run', body);
   if (r.error) { $('rm-err').textContent = r.error; return; }
   $('runmodal').classList.remove('open');
+  toast('run started: unity ' + r.argv.join(' '));
   pollRun();
 };
 let RUN = {running: false, stopping: false, log: null};
@@ -2575,8 +2662,10 @@ $('runbtn').onclick = async () => {
   if (!RUN.running) return;  // idle: the hover menu launches runs
   if (!RUN.stopping) {
     await post('/api/run/stop', {mode: 'safe'});  // agents end their current turn, run winds down
+    toast('safe stop requested — agents finish their current turn');
   } else if (confirm('Force stop? This kills the whole run immediately.')) {
     await post('/api/run/stop', {mode: 'force'});
+    toast('run force-stopped');
   }
   pollRun();
 };

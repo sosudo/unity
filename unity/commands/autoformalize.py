@@ -8,9 +8,8 @@ from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase,
 
 
 @click.command(name="autoformalize")
-@click.option("--targets", default="All", help="What to autoformalize.")
 @click.option("--continue", "continue_", is_flag=True, default=False, help="Run a reprompt cycle first.")
-async def autoformalize(targets, continue_):
+async def autoformalize(continue_):
     """Autoformalize source (whole paper/book autoformalization from scratch)."""
     paths = load_paths()
     (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
@@ -39,7 +38,7 @@ async def autoformalize(targets, continue_):
                    root, mcp)
 
     await dispatch(roster.agents, roster, load_prompt("autoformalize/SEMIFORMALIZATION"),
-                   f"Semiformalize the source in .unity/source/ (scope: {targets}) into a faithful dependency DAG "
+                   "Semiformalize the whole source in .unity/source/ into a faithful dependency DAG "
                    f"of chunks — each theorem/lemma/definition and its proof a chunk with its dependencies; write "
                    f".unity/dag.json.",
                    root, mcp)

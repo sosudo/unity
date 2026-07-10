@@ -34,7 +34,8 @@ unity new myproj --math    # --version <toolchain> to pin a Lean version
 # ...or set up an existing Lean project (from inside it):
 unity init
 
-# Then drive everything from the control center:
+# Then, FROM INSIDE THE PROJECT, open the control center:
+cd myproj
 unity serve        # → http://localhost:8080
 ```
 
@@ -47,18 +48,22 @@ project:
 - **run ▾** — launch any pipeline (`prove`, `solve`, `autoformalize`, …) with target/metric/version
   pickers and automatic `--continue` detection; the button becomes a **stop** button while running
   (safe stop: agents finish their current turn, then the run winds down).
-- **overview / forum / graph / chunks** — the live typed workspace (decisions, consensus,
-  obstacles, ledger, tool usage), the discussion threads, and the chunk DAG, auto-refreshing as
-  agents work.
+- **overview / forum / chunks** — the live typed workspace (decisions, consensus, obstacles,
+  ledger, tool usage), the discussion threads (with an in-place graph view), and the chunk DAG,
+  auto-refreshing as agents work.
 - **agents / prompt / sources / metrics / logs** — edit `agents.yaml` (form or raw, kept in sync),
-  `UNITY.md`, source material, and optimization metrics; tail timestamped run logs live.
+  `UNITY.md`, source material, and optimization metrics; tail timestamped run logs live. The ⚙
+  settings button edits `.unity/.env` (run flags, Axle/Aristotle keys).
 
 Everything below is also available as plain CLI commands if you prefer the terminal.
 
-`init` interactively builds your agent roster (`.unity/agents.yaml`) — one entry per model, with
-its backend (`claude_code` | `codex`), provider, credentials, and per-instance budget. Strength is
-learned automatically per model across runs (autostrength); set `strength:` only to override. The
-first agent is the **primary**. All Unity state lives in a gitignored `.unity/`.
+`init` scaffolds a gitignored `.unity/` (empty roster, prompt, metrics, env) and warms the build.
+Configure your roster in the **agents tab** of `unity serve` — one-click presets cover the common
+setups (Claude subscription, OpenAI/Codex, OpenRouter, FreeInference, local vLLM), or edit the
+YAML directly. Mark your strongest model with **set as primary**: the primary agent leads the run —
+it prepares context, acts as the critic, merges consensus results, and writes the retrospective
+(default: the first group). Strength is learned automatically per model across runs (autostrength);
+set `strength:` only to override.
 
 ### Roster examples
 
@@ -68,11 +73,12 @@ references resolve from the environment (or `.unity/.env`).
 ```yaml
 agents:
 # 1. Claude via your Claude subscription (claude_code backend, no credentials:
-#    uses your existing `claude` CLI login). First group = the primary agent.
+#    uses your existing `claude` CLI login). primary: true = leads the run.
 - names: [Ada]
   model: claude-opus-4-6
   backend: claude_code
   provider: anthropic
+  primary: true
   budget: 10          # USD per agent instance
 
 # 2. Claude via an Anthropic API key instead of the subscription
@@ -119,13 +125,13 @@ Notes: the `codex` backend always needs an `api_key` (for custom `base_url` prov
 the provider key; the endpoint must speak the OpenAI **Responses API**, which vLLM, OpenRouter, and
 FreeInference all do). The `claude_code` backend accepts `api_key`, `auth_token`, and `base_url`
 (`ANTHROPIC_*` equivalents) — omit all three to ride your subscription login. Mixed rosters are the
-point: put your strongest model first (primary) and fill the swarm with cheap or free workers.
+point: mark your strongest model `primary: true` and fill the swarm with cheap or free workers.
 
 Then, from inside the project:
 
 | Command | Flags | What it does |
 |---|---|---|
-| `unity autoformalize` | `--targets <scope>`, `--continue` | whole paper/book (in `.unity/source/`) → Lean, faithfully |
+| `unity autoformalize` | `--continue` | whole paper/book (in `.unity/source/`) → Lean, faithfully |
 | `unity formalize` | `--targets <scope>`, `--continue` | formalize source material into an existing project's gaps |
 | `unity prove` | `--targets <scope>`, `--continue` | fill in the project's `sorry`s and `axiom`s |
 | `unity solve` | `--continue` | solve a natural-language problem from `UNITY.md`, then formalize the proof |
@@ -143,6 +149,32 @@ Then, from inside the project:
 | `unity update` / `unity uninstall` | — | manage the installation |
 
 `--targets` narrows a run's scope (declaration/chunk names or a description; default: everything in scope). `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists.
+
+## Common workflows
+
+Everything below happens in `unity serve` — set up once (agents tab → your roster; prompt tab →
+your goal in `UNITY.md`), then:
+
+- **Autoformalize a paper/book from scratch** — upload the source (PDF/tex/markdown) in the
+  **sources** tab, add any special instructions in **prompt**, then **run → autoformalize**. The
+  swarm semiformalizes it into a chunk DAG and formalizes chunk by chunk, faithfully.
+- **Fill in missing proofs (`sorry`s / `axiom`s)** — optionally add reference material under
+  **sources** and guidance in **prompt**, then **run → prove** (narrow with targets if you only
+  want specific declarations).
+- **Formalize parts of a paper into an existing project** — upload the paper in **sources**, say
+  which parts go where in **prompt**, then **run → formalize**.
+- **Solve an open problem end-to-end** — state the problem in **prompt**, **run → solve**: the
+  team writes a rigorous LaTeX proof first, then formalizes it.
+- **Build a new Lean library from a description** — describe the library in **prompt**,
+  **run → create**: spec first, then implementation.
+- **Verify a program** — put the code in **sources**, the properties in **prompt**,
+  **run → verify**.
+- **Migrate Lean/Mathlib versions** — **run → bump** with the target version.
+- **Make the code better** — pick/edit a metric in **metrics** (length, modularity, …), set it
+  active, **run → optimize**.
+
+Watch progress live in **blueprint** (proof status per declaration), **overview** (decisions,
+consensus, obstacles), and **logs**; stop safely anytime with the run button.
 
 ## Configuration
 

@@ -31,7 +31,7 @@ class Roster:
 
     @property
     def primary(self) -> Agent:
-        return self.agents[0]
+        return next((a for a in self.agents if a.is_primary), self.agents[0])
 
 
 def _interp(value, where: str):
@@ -57,6 +57,9 @@ def load_roster(path: Path) -> Roster:
     groups = doc.get("agents")
     if not groups:
         raise ValueError("agents.yaml: 'agents' is empty or missing")
+
+    # The primary group: explicit `primary: true` flag, else the first group.
+    primary_idx = next((i for i, g in enumerate(groups) if g.get("primary")), 0)
 
     agents: list[Agent] = []
     for i, g in enumerate(groups):
@@ -97,7 +100,7 @@ def load_roster(path: Path) -> Roster:
         else:
             strength = float(raw_strength)
 
-        for name in names:
+        for j, name in enumerate(names):
             agents.append(Agent(
                 name=name,
                 model=model,
@@ -108,7 +111,7 @@ def load_roster(path: Path) -> Roster:
                 api_key=api_key,
                 auth_token=auth_token,
                 budget=budget,
-                is_primary=(len(agents) == 0),
+                is_primary=(i == primary_idx and j == 0),
             ))
 
     return Roster(agents=agents)
