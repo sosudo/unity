@@ -36,8 +36,70 @@ unity init
 ```
 
 `init` interactively builds your agent roster (`.unity/agents.yaml`) — one entry per model, with
-its backend (`claude_code` | `codex`), provider, credentials, `strength` tier, and per-instance
-budget. The first agent is the **primary**. All Unity state lives in a gitignored `.unity/`.
+its backend (`claude_code` | `codex`), provider, credentials, and per-instance budget. Strength is
+learned automatically per model across runs (autostrength); set `strength:` only to override. The
+first agent is the **primary**. All Unity state lives in a gitignored `.unity/`.
+
+### Roster examples
+
+`.unity/agents.yaml` — one group per model; `names` spawns one agent instance per name. `${VAR}`
+references resolve from the environment (or `.unity/.env`).
+
+```yaml
+agents:
+# 1. Claude via your Claude subscription (claude_code backend, no credentials:
+#    uses your existing `claude` CLI login). First group = the primary agent.
+- names: [Ada]
+  model: claude-opus-4-6
+  backend: claude_code
+  provider: anthropic
+  budget: 10          # USD per agent instance
+
+# 2. Claude via an Anthropic API key instead of the subscription
+- names: [Grace]
+  model: claude-sonnet-5
+  backend: claude_code
+  provider: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  budget: 5
+
+# 3. Your default Codex model (codex backend, official OpenAI auth via API key)
+- names: [Kurt]
+  model: gpt-5.5-codex
+  backend: codex
+  provider: openai
+  api_key: ${OPENAI_API_KEY}
+
+# 4. Any OpenAI-compatible provider through codex — OpenRouter
+- names: [Emmy, Alan]                    # two instances of the same model
+  model: qwen/qwen3-coder:free
+  backend: codex
+  provider: openrouter
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${OPENROUTER_API_KEY}
+
+# 5. FreeInference
+- names: [Sophie]
+  model: glm-5.1
+  backend: codex
+  provider: freeinference
+  base_url: https://freeinference.org/v1
+  api_key: ${FREEINFERENCE_API_KEY}
+
+# 6. A self-hosted vLLM server (any key string vLLM was started with)
+- names: [Henri]
+  model: leanstral-24b
+  backend: codex
+  provider: vllm
+  base_url: http://localhost:8004/v1
+  api_key: unity
+```
+
+Notes: the `codex` backend always needs an `api_key` (for custom `base_url` providers it's sent as
+the provider key; the endpoint must speak the OpenAI **Responses API**, which vLLM, OpenRouter, and
+FreeInference all do). The `claude_code` backend accepts `api_key`, `auth_token`, and `base_url`
+(`ANTHROPIC_*` equivalents) — omit all three to ride your subscription login. Mixed rosters are the
+point: put your strongest model first (primary) and fill the swarm with cheap or free workers.
 
 Then, from inside the project:
 
@@ -52,7 +114,7 @@ Then, from inside the project:
 | `unity bump` | migrate the project to a target Lean/Mathlib version |
 | `unity optimize <metric>` | improve Lean code w.r.t. a metric (`length`, `modularity`, ...) |
 | `unity agent` / `unity doctor` | interactive session / interactive resolver with the primary agent |
-| `unity serve` | forum + DAG dashboard (default port 8080) |
+| `unity serve` | dashboard (default port 8080) |
 | `unity source add\|remove\|list` | manage source material in `.unity/source/` |
 | `unity metric add\|modify\|move\|list` | manage optimization metrics in `.unity/metrics/` |
 | `unity reset` / `unity clean` | wipe / prune the global library (`~/.unity/library/`) |
