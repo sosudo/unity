@@ -30,7 +30,7 @@ uv tool install .
 
 ```bash
 # Create a new Lean project (with Mathlib) and set it up for Unity:
-unity new myproj --math
+unity new myproj --math    # --version <toolchain> to pin a Lean version
 # ...or set up an existing Lean project (from inside it):
 unity init
 
@@ -123,30 +123,32 @@ point: put your strongest model first (primary) and fill the swarm with cheap or
 
 Then, from inside the project:
 
-| Command | What it does |
-|---|---|
-| `unity autoformalize` | whole paper/book (in `.unity/source/`) → Lean, faithfully |
-| `unity formalize` | formalize source material into an existing project's gaps |
-| `unity prove` | fill in the project's `sorry`s and `axiom`s |
-| `unity solve` | solve a natural-language problem from `UNITY.md`, then formalize the proof |
-| `unity create` | build a Lean library from a natural-language description in `UNITY.md` |
-| `unity verify` | program verification: model code from `.unity/source/`, prove properties |
-| `unity bump` | migrate the project to a target Lean/Mathlib version |
-| `unity optimize <metric>` | improve Lean code w.r.t. a metric (`length`, `modularity`, ...) |
-| `unity agent` / `unity doctor` | interactive session / interactive resolver with the primary agent |
-| `unity serve` | **the control center** (see Quick start; default port 8080) |
-| `unity source add\|remove\|list` | manage source material in `.unity/source/` |
-| `unity metric add\|modify\|move\|list` | manage optimization metrics in `.unity/metrics/` |
-| `unity reset` / `unity clean` | wipe / prune the global library (`~/.unity/library/`) |
-| `unity complete` | remove Unity artifacts from a finished project |
-| `unity update` / `unity uninstall` | manage the installation |
+| Command | Flags | What it does |
+|---|---|---|
+| `unity autoformalize` | `--targets <scope>`, `--continue` | whole paper/book (in `.unity/source/`) → Lean, faithfully |
+| `unity formalize` | `--targets <scope>`, `--continue` | formalize source material into an existing project's gaps |
+| `unity prove` | `--targets <scope>`, `--continue` | fill in the project's `sorry`s and `axiom`s |
+| `unity solve` | `--continue` | solve a natural-language problem from `UNITY.md`, then formalize the proof |
+| `unity create` | `--continue` | build a Lean library from a natural-language description in `UNITY.md` |
+| `unity verify` | `--targets <scope>`, `--continue` | program verification: model code from `.unity/source/`, prove properties |
+| `unity bump [version]` | `--continue` | migrate to a Lean/Mathlib version (e.g. `v4.31.0`; omit to use `UNITY.md`'s target) |
+| `unity optimize <metric>` | `--targets <scope>`, `--continue` | improve Lean code w.r.t. a metric (`length`, `modularity`, ...) |
+| `unity agent` / `unity doctor` | — | interactive session / interactive resolver with the primary agent |
+| `unity serve` | `--port <n>` (default 8080) | **the control center** (see Quick start) |
+| `unity mcp <server> <tool> [json]` | — | call any agent MCP tool from the shell (e.g. `unity mcp unity-forum forum_stats '{}'`) |
+| `unity source add <path>` / `remove <name>` / `list` | — | manage source material in `.unity/source/` |
+| `unity metric add\|modify\|remove <name>` / `move <file>` / `list` | — | manage optimization metrics in `.unity/metrics/` |
+| `unity reset` / `unity clean` | — | wipe / prune the global library (`~/.unity/library/`) |
+| `unity complete` | — | remove Unity artifacts from a finished project |
+| `unity update` / `unity uninstall` | — | manage the installation |
 
-Most pipeline commands accept `--continue` (re-orient from the previous run before continuing).
+`--targets` narrows a run's scope (declaration/chunk names or a description; default: everything in scope). `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists.
 
 ## Configuration
 
-- `.unity/.env` — run flags (`RECORDING`, `SILENT`, `FORUM_PORT`, `LEAN_LSP_PORT`, `MAX_ATTEMPTS`)
-  and optional service keys (`AXLE_API_KEY`, `ARISTOTLE_API_KEY`) that unlock extra agent tools.
+- `.unity/.env` — run flags: `MAX_ATTEMPTS` (critic-loop cap, default 5), `UNITY_FORUM_BRIEF=off`
+  (disable workspace-brief injection), and optional service keys (`AXLE_API_KEY`,
+  `ARISTOTLE_API_KEY`) that unlock extra agent tools.
 - `.unity/agents.yaml` — the roster. Per-agent credentials (`api_key` / `auth_token` / `base_url`)
   live here, not in `.env`; `${VAR}` references are resolved from the environment. The `codex`
   backend requires `api_key`.
