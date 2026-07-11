@@ -2322,9 +2322,7 @@ async function loadOverview() {
   try {
     const [w, r] = await Promise.all([J('/api/workspace'), J('/api/run')]);
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
-    const ctx = r.running ? ('running · unity ' + esc(r.command) + ' · ' + mins + 'm')
-      : (r.command ? 'last run · ' + esc(r.command) : 'no runs yet');
-    let h = pagehead('Overview', ctx);
+    let h = pagehead('Overview', '');
     // top row: run status + obstacles
     const big = r.running ? esc(r.phase || 'running') : 'idle';
     const sub = r.running ? ('unity ' + esc(r.command) + ' · ' + mins + 'm' + (r.stopping ? ' · stopping…' : ''))
