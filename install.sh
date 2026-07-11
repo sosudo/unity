@@ -19,7 +19,7 @@ ask() {
 }
 
 # ── dependency checks ─────────────────────────────────────────────────────────
-have git  || { say "git is required — install it (e.g. xcode-select --install / apt install git) and re-run"; exit 1; }
+have git  || { say "git is required — install it; and re-run"; exit 1; }
 have curl || { say "curl is required — install it and re-run"; exit 1; }
 
 if ! have uv; then

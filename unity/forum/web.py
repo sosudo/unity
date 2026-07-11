@@ -1304,6 +1304,14 @@ async def _value_error_handler(request: Request, exc: ValueError):
     return _JR({"error": str(exc)}, status_code=400)
 
 
+@app.middleware("http")
+async def _no_cache_html(request: Request, call_next):
+    resp = await call_next(request)
+    if resp.headers.get("content-type", "").startswith("text/html"):
+        resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 def _project_root() -> Path:
     return ROOT_DIR.parent
 
@@ -2372,7 +2380,7 @@ async function loadBlueprint() {
     : '<span class="srcchip" title="textual approximation — kernel data appears once the project builds">regex approx.</span>';
   const refr = d.refreshing ? ' <span class="who">kernel extraction running…</span>' : '';
   if (d.refreshing) setTimeout(() => { if ($('tab-blueprint').style.display !== 'none') loadBlueprint(); }, 8000);
-  let h = pagehead('Blueprint', 'main · ' + (d.source === 'kernel' ? 'kernel' : 'regex'));
+  let h = pagehead('Blueprint', '');
   h += '<div class="card" style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">' +
     '<span class="mono">' + d.total + ' declarations</span>' +
     (d.sorries ? '<span class="mono" style="color:#e53935">· ' + d.sorries + ' sorry</span>' : '') +
