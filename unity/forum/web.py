@@ -2212,7 +2212,7 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
   <div id="rm-metric-row" class="row" style="display:none">metric:
     <select id="rm-metric"></select></div>
   <div id="rm-version-row" class="row" style="display:none">version:
-    <input id="rm-version" placeholder="e.g. v4.16.0 (blank = from UNITY.md)" style="flex:1"></div>
+    <input id="rm-version" placeholder="e.g. v4.16.0" style="flex:1"></div>
   <div id="rm-targets-row" style="display:none">
     <div class="who">targets — one per line (empty = all)</div>
     <textarea id="rm-targets" style="min-height:90px"></textarea>
