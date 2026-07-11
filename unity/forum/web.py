@@ -510,7 +510,7 @@ header nav a:hover { color: var(--ink); }
   <nav><a href="/">← app</a></nav>
 </header>
 <div class="pane">
-  <div class="pagehead"><h1>Forum</h1><span class="ctx">agent consensus threads · <span id="live">connecting…</span></span></div>
+  <div class="pagehead"><h1>Forum</h1><span class="ctx"><button onclick="location.href='/graph'" style="font:inherit;font-size:13px;border:1px solid #dcdbe0;background:#fff;border-radius:999px;padding:5px 15px;cursor:pointer;color:#4c4a52">graph view</button></span></div>
   <div class="layout">
     <div class="card side"><h2>threads</h2><div id="threads"></div></div>
     <div class="card main"><div class="title" id="tt"></div><div id="posts"><div class="empty">select a thread</div></div></div>
@@ -560,9 +560,9 @@ async function loadPosts() {
 }
 function connect() {
   const es = new EventSource('/api/events');
-  es.onopen = () => { $('live').textContent = 'live'; };
+  es.onopen = () => {};
   es.onmessage = () => { loadThreads(); loadPosts(); };
-  es.onerror = () => { $('live').textContent = 'reconnecting…'; es.close(); setTimeout(connect, 3000); };
+  es.onerror = () => { es.close(); setTimeout(connect, 3000); };
 }
 loadThreads(); connect();
 </script>
@@ -641,6 +641,7 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
     </div>
   </div>
 </header>
+<div style="position:fixed;top:12px;right:14px;z-index:30"><button onclick="location.href='/forum'" style="font:inherit;font-size:13px;border:1px solid #dcdbe0;background:#fff;border-radius:999px;padding:5px 15px;cursor:pointer;color:#4c4a52">forum view</button></div>
 <main>
   <div id="cy"></div>
   <div id="info-panel">
@@ -988,7 +989,6 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
 <div style="display:flex;align-items:baseline;gap:14px;padding:18px 26px 4px">
   <span style="font-size:24px;font-weight:700">Chunks</span>
   <span id="hlegend" style="display:flex;gap:16px;font-size:12.5px;color:#6e6c75;align-items:center"></span>
-  <span style="margin-left:auto;font-family:ui-monospace,Menlo,monospace;font-size:12.5px;color:#8e8c94">proof DAG · edges show dependencies</span>
 </div>
 <main style="padding:0 26px 20px">
   <div id="cy" style="background:#fff;border:1px solid #e8e7ea;border-radius:14px"></div>
@@ -1024,7 +1024,7 @@ function updateHeaderLegend(data) {
   (data.chunks||[]).forEach(c => { const k = c.status === 'blue' ? 'yellow' : c.status; if (k in counts) counts[k]++; });
   const el = document.getElementById('hlegend');
   if (el) el.innerHTML = LEGEND.map(([k, label, col]) =>
-    '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+col+';margin-right:6px"></span><b>'+label+'</b> '+counts[k]+'</span>').join('');
+    '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+col+';margin-right:6px"></span>'+label+' '+counts[k]+'</span>').join('');
 }
 
 let cy = null, chunks = {};
@@ -2188,10 +2188,7 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
 <main>
   <div id="tab-overview" class="pane"></div>
   <div id="tab-blueprint" class="pane" style="display:none"></div>
-  <div id="tab-forum" class="framewrap" style="display:none">
-    <div class="toolbar"><button class="act" id="forum-view-toggle">graph view</button></div>
-    <iframe id="forum-frame" data-src="/forum"></iframe>
-  </div>
+  <div id="tab-forum" class="framewrap" style="display:none"><iframe id="forum-frame" data-src="/forum"></iframe></div>
   <div id="tab-chunks" class="framewrap" style="display:none"><iframe data-src="/dag"></iframe></div>
   <div id="tab-agents" class="pane" style="display:none"></div>
   <div id="tab-prompt" class="pane" style="display:none"></div>
@@ -2311,33 +2308,21 @@ $('env-save').onclick = async () => {
   await put('/api/env', {content: lines.join('\n') + '\n'});
   toast('settings saved');
 };
-$('forum-view-toggle').onclick = () => {
-  const fr = $('forum-frame'), toGraph = !fr.src.includes('/graph');
-  fr.src = toGraph ? '/graph' : '/forum';
-  $('forum-view-toggle').textContent = toGraph ? 'forum view' : 'graph view';
-};
 
 // ── overview ──────────────────────────────────────────────────────────────────
 async function loadOverview() {
   try {
-    const [w, r, bp] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/blueprint')]);
+    const [w, r] = await Promise.all([J('/api/workspace'), J('/api/run')]);
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
     const ctx = r.running ? ('running · unity ' + esc(r.command) + ' · ' + mins + 'm')
       : (r.command ? 'last run · ' + esc(r.command) : 'no runs yet');
     let h = pagehead('Overview', ctx);
     // top row: run status + obstacles
-    const verified = bp.total - bp.sorries - bp.axioms - (bp.tainted || 0);
-    const warn = (bp.tainted || 0) + bp.axioms, bad = bp.sorries;
-    const pct = bp.total ? Math.round(100 * verified / bp.total) : 0;
     const big = r.running ? esc(r.phase || 'running') : 'idle';
     const sub = r.running ? ('unity ' + esc(r.command) + ' · ' + mins + 'm' + (r.stopping ? ' · stopping…' : ''))
       : (r.command ? 'last: unity ' + esc(r.command) + (r.exit_code === null ? '' : ' (exit ' + r.exit_code + ')') : 'press run to start');
     h += '<div class="ov-top"><div class="card"><h2>run status</h2>' +
-      '<div class="stat-big">' + big + '</div><div class="stat-sub">' + sub + '</div>' +
-      (bp.total ? '<div class="leg" style="margin-top:16px"><span><span class="dotc" style="background:#34a853"></span><b>' + verified + '</b> verified</span>' +
-        (warn ? '<span><span class="dotc" style="background:#f4b400"></span><b>' + warn + '</b> pending</span>' : '') +
-        (bad ? '<span><span class="dotc" style="background:#e53935"></span><b>' + bad + '</b> sorry</span>' : '') +
-        '<span class="who">' + pct + '% of ' + bp.total + ' declarations</span></div>' : '') + '</div>';
+      '<div class="stat-big">' + big + '</div><div class="stat-sub">' + sub + '</div></div>';
     const attn = w.chunks.flatMap(c => c.obstacles.map(o => ({...o, chunk: c.chunk, color: '#e53935'})))
       .concat(w.questions.map(q => ({...q, chunk: q.chunk || '', color: '#f4b400'})));
     h += '<div class="card"><h2>open obstacles & questions</h2>' + (attn.length ? attn.slice(0, 6).map(o =>
