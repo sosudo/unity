@@ -2057,13 +2057,12 @@ header { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; padding
 .brand b { font-family: var(--mono); font-size: 15px; font-weight: 700; }
 .brand .sep { width: 1px; height: 18px; background: #d8d7dc; }
 .brand .proj { font-family: var(--mono); font-size: 13px; color: var(--mut); }
-.tabs { display: flex; gap: 2px; overflow-x: auto; max-width: 100%; scrollbar-width: none; margin-left: auto; }
+.tabs { display: flex; gap: 2px; overflow-x: auto; max-width: 100%; scrollbar-width: none; margin: 0 auto; }
 .tabs::-webkit-scrollbar { display: none; }
 .tabs button { background: none; border: 1px solid transparent; cursor: pointer; font: inherit; font-size: 13px; padding: 5px 13px; color: #6e6c75; border-radius: 999px; white-space: nowrap; }
 .tabs button:hover { color: var(--ink); }
 .tabs button.active { background: var(--card); color: var(--ink); border-color: var(--line); box-shadow: 0 1px 3px rgba(0,0,0,0.07); font-weight: 600; }
-nav { display: flex; gap: 10px; align-items: center; margin-left: auto; }
-.tabs + nav { margin-left: 0; }
+nav { display: flex; gap: 10px; align-items: center; }
 #status { font-family: var(--mono); font-size: 12px; color: var(--mut); white-space: nowrap; }
 #runbtn { background: var(--acc); color: #fff; border: none; border-radius: 999px; font: inherit; font-size: 13px; font-weight: 600; padding: 6px 18px; cursor: pointer; }
 #runbtn:hover { filter: brightness(1.07); }
@@ -2230,8 +2229,8 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
   <div class="who" style="margin-bottom:14px">stored in <span class="mono">.unity/.env</span></div>
   <div class="envfield"><label>max attempts</label><input id="env-MAX_ATTEMPTS" type="number" min="1">
     <div class="hint">critic-loop cap per run (default 5)</div></div>
-  <div class="envfield"><label>forum brief</label><select id="env-UNITY_FORUM_BRIEF"><option>on</option><option>off</option></select>
-    <div class="hint">inject the workspace brief into every agent dispatch</div></div>
+  <div class="envfield"><label>lean lsp port</label><input id="env-LEAN_LSP_PORT" type="number" min="1">
+    <div class="hint">port for the lean-lsp server (default 8888)</div></div>
   <div class="envfield"><label>axle api key</label><input id="env-AXLE_API_KEY" type="password" autocomplete="off">
     <div class="hint">unlocks Axle Lean verification tools for all agents</div></div>
   <div class="envfield"><label>aristotle api key</label><input id="env-ARISTOTLE_API_KEY" type="password" autocomplete="off">
@@ -2291,7 +2290,7 @@ function pagehead(title, ctx) {
 }
 
 // ── settings (.env form) ──────────────────────────────────────────────────────
-const ENV_KEYS = ['MAX_ATTEMPTS', 'UNITY_FORUM_BRIEF', 'AXLE_API_KEY', 'ARISTOTLE_API_KEY'];
+const ENV_KEYS = ['MAX_ATTEMPTS', 'LEAN_LSP_PORT', 'AXLE_API_KEY', 'ARISTOTLE_API_KEY'];
 let envExtra = [];
 $('gearbtn').onclick = async () => {
   const d = await J('/api/env');
@@ -2302,7 +2301,7 @@ $('gearbtn').onclick = async () => {
     else if (line.trim() && !line.trim().startsWith('#')) envExtra.push(line);
   });
   $('env-MAX_ATTEMPTS').value = vals.MAX_ATTEMPTS || '5';
-  $('env-UNITY_FORUM_BRIEF').value = (vals.UNITY_FORUM_BRIEF || 'on').toLowerCase() === 'off' ? 'off' : 'on';
+  $('env-LEAN_LSP_PORT').value = vals.LEAN_LSP_PORT || '8888';
   $('env-AXLE_API_KEY').value = vals.AXLE_API_KEY || '';
   $('env-ARISTOTLE_API_KEY').value = vals.ARISTOTLE_API_KEY || '';
   $('envmodal').classList.add('open');
@@ -2335,17 +2334,14 @@ async function loadOverview() {
       : (r.command ? 'last: unity ' + esc(r.command) + (r.exit_code === null ? '' : ' (exit ' + r.exit_code + ')') : 'press run to start');
     h += '<div class="ov-top"><div class="card"><h2>run status</h2>' +
       '<div class="stat-big">' + big + '</div><div class="stat-sub">' + sub + '</div>' +
-      (bp.total ? '<div class="pbar">' +
-        '<div style="width:' + (100 * verified / bp.total) + '%;background:#34a853"></div>' +
-        '<div style="width:' + (100 * warn / bp.total) + '%;background:#f4b400"></div>' +
-        '<div style="width:' + (100 * bad / bp.total) + '%;background:#e53935"></div></div>' +
-        '<div class="leg"><span><span class="dotc" style="background:#34a853"></span><b>' + verified + '</b> verified</span>' +
+      (bp.total ? '<div class="leg" style="margin-top:16px"><span><span class="dotc" style="background:#34a853"></span><b>' + verified + '</b> verified</span>' +
         (warn ? '<span><span class="dotc" style="background:#f4b400"></span><b>' + warn + '</b> pending</span>' : '') +
         (bad ? '<span><span class="dotc" style="background:#e53935"></span><b>' + bad + '</b> sorry</span>' : '') +
         '<span class="who">' + pct + '% of ' + bp.total + ' declarations</span></div>' : '') + '</div>';
-    const obs = w.chunks.flatMap(c => c.obstacles.map(o => ({...o, chunk: c.chunk})));
-    h += '<div class="card"><h2>open obstacles</h2>' + (obs.length ? obs.slice(0, 5).map(o =>
-      '<div class="item"><span class="dotc" style="background:#e53935"></span><b class="mono">' + esc(o.chunk) + '</b>' +
+    const attn = w.chunks.flatMap(c => c.obstacles.map(o => ({...o, chunk: c.chunk, color: '#e53935'})))
+      .concat(w.questions.map(q => ({...q, chunk: q.chunk || '', color: '#f4b400'})));
+    h += '<div class="card"><h2>open obstacles & questions</h2>' + (attn.length ? attn.slice(0, 6).map(o =>
+      '<div class="item"><span class="dotc" style="background:' + o.color + '"></span>' + (o.chunk ? '<b class="mono">' + esc(o.chunk) + '</b>' : '') +
       '<div class="who" style="margin-top:2px">' + esc(o.content).slice(0, 160) + '</div></div>').join('')
       : '<div class="empty">none open</div>') + '</div></div>';
     // agents
@@ -2362,22 +2358,9 @@ async function loadOverview() {
       : '<div class="card"><div class="empty">no agents yet — set up your roster in the agents tab</div></div>';
     // bottom row
     h += '<div class="grid" style="margin-top:26px">';
-    h += '<section><h2>chunk consensus</h2>' + (w.chunks.length ? w.chunks.map(c => {
-      const merged = c.results.some(x => x.mergeable);
-      const blocked = c.results.some(x => x.open_objections.length);
-      return '<div class="item"><b class="mono">' + esc(c.chunk) + '</b>' +
-        (merged ? '<span class="badge ok">MERGEABLE</span>' : blocked ? '<span class="badge blocked">BLOCKED</span>' : c.results.length ? '<span class="badge lav">ACTIVE</span>' : '<span class="badge pending">CLAIMED</span>') +
-        c.results.map(x => '<div class="who">' + esc(x.author) + ' · ' + esc(x.status) + (x.build_ok ? ' · build ✓' : '') +
-          (!x.mergeable && !x.open_objections.length ? ' <span class="badge amber">needs endorsement</span>' : '') + '</div>').join('') +
-        (c.claims.length ? '<div class="who">claims: ' + c.claims.map(cl => esc(cl.author)).join(', ') + '</div>' : '') + '</div>';
-    }).join('') : '<div class="empty">no chunk activity yet</div>') + '</section>';
     h += '<section><h2>recent decisions</h2>' + (w.decisions.length ? w.decisions.slice(0, 5).map(x =>
       '<div class="item"><b class="mono">' + esc(x.topic) + '</b><div style="font-size:12.5px;margin-top:2px">' + esc(x.choice) + '</div>' +
       '<div class="who">' + esc(x.author) + ' · ' + reltime(x.ts) + '</div></div>').join('') : '<div class="empty">none yet</div>') + '</section>';
-    h += '<section><h2>open questions</h2>' + (w.questions.length ? w.questions.map(q =>
-      '<div class="item">' + esc(q.content) + '</div>').join('') : '<div class="empty">none open</div>') + '</section>';
-    h += '<section><h2>ledger</h2>' + (w.ledger.length ? w.ledger.slice(0, 6).map(l =>
-      '<div class="item"><span class="kind">' + esc(l.kind) + '</span>' + esc(l.content).slice(0, 140) + '</div>').join('') : '<div class="empty">no verified knowledge yet</div>') + '</section>';
     const tl = await J('/api/tools');
     h += '<section><h2>tool usage</h2>' + (tl.rows.length ?
       '<table class="filelist">' + tl.rows.slice(0, 12).map(x =>
@@ -2411,9 +2394,10 @@ async function loadBlueprint() {
     (d.tainted ? '<span class="mono" style="color:#b8860b">· ' + d.tainted + ' tainted</span>' : '') +
     (d.axioms ? '<span class="mono" style="color:#fb8c00">· ' + d.axioms + ' axiom</span>' : '') +
     src + refr + '<span style="flex:1"></span>' +
-    '<span class="seg" id="bp-filter">' +
-    ['all', 'verified', 'sorry'].map(f => '<button data-f="' + f + '"' + (BP.filter === f ? ' class="on"' : '') + '>' + f[0].toUpperCase() + f.slice(1) + '</button>').join('') +
-    '</span><button class="act" id="bp-toggle">' + (BP.view === 'list' ? 'graph view' : 'list view') + '</button></div>';
+    (BP.view === 'list' ? '<span class="seg" id="bp-filter">' +
+      ['all', 'verified', 'sorry'].map(f => '<button data-f="' + f + '"' + (BP.filter === f ? ' class="on"' : '') + '>' + f[0].toUpperCase() + f.slice(1) + '</button>').join('') +
+      '</span>' : '') +
+    '<button class="act" id="bp-toggle">' + (BP.view === 'list' ? 'graph view' : 'list view') + '</button></div>';
   if (!d.files.length) {
     h += '<div class="card" style="margin-top:14px"><div class="empty">no Lean declarations found</div></div>';
     $('tab-blueprint').innerHTML = h;
@@ -2511,7 +2495,7 @@ function agCollect() {
   });
 }
 function agentCard(g) {
-  const full = !!g._full;
+  const full = !!g._full;  // "+ new" seeds every field once; unused ones drop on save
   const inp = (f, v, type, label) => '<div><label>' + (label || f.replace('_', ' ')) + '</label><input data-f="' + f + '" value="' + esc(String(v ?? '')) + '"' + (type ? ' type="' + type + '"' : '') + ' style="width:100%"></div>';
   const prim = !!g.primary;
   const api = API_LABEL[g.backend] || 'anthropic';
@@ -2529,7 +2513,6 @@ function agentCard(g) {
   if (show('api_key')) h += inp('api_key', g.api_key, 'password', 'api key');
   if (show('auth_token')) h += inp('auth_token', g.auth_token, 'password', full ? 'auth token' : 'api key');
   h += '</div><div class="row">' + (prim ? '' : '<button class="act ag-primary">set as primary</button>') +
-       (full ? '' : '<button class="act ag-more">all fields</button>') +
        '<button class="act ag-del">remove</button></div></div>';
   return h;
 }
@@ -2542,10 +2525,6 @@ function agRenderCards(groups) {
   document.querySelectorAll('.ag-primary').forEach(b => b.onclick = () => {
     const gs = agCollect(); gs.forEach(g => delete g.primary); gs[cardIdx(b)].primary = true;
     agRenderCards(gs); agSyncRaw();
-  });
-  document.querySelectorAll('.ag-more').forEach(b => b.onclick = () => {
-    const gs = agCollect(); gs[cardIdx(b)]._full = true;
-    agRenderCards(gs);
   });
 }
 function agClean(gs) { return gs.map(g => { const x = {...g}; delete x._full; return x; }); }
@@ -2564,7 +2543,6 @@ async function agSyncCards() {
 async function loadAgents() {
   const d = await J('/api/agents');
   $('tab-agents').innerHTML = pagehead('Agents', (d.groups || []).length + ' configured') +
-    '<div class="who" style="margin:-8px 0 16px">The <b>primary</b> agent leads the run: it prepares context, reviews as the critic, merges consensus results, and writes the retrospective — make it your strongest model. Add agents from a preset, then fill in the key (or set the env var it references).</div>' +
     '<div id="agent-cards"></div>' +
     '<div class="row"><select id="ag-preset"><option value="">add from preset…</option>' +
     Object.keys(AG_PRESETS).map(k => '<option>' + esc(k) + '</option>').join('') + '</select>' +
@@ -2577,7 +2555,7 @@ async function loadAgents() {
   $('ag-raw-text').value = d.raw;
   $('agent-cards').addEventListener('input', () => { clearTimeout(agTimer); agTimer = setTimeout(agSyncRaw, 350); });
   $('ag-raw-text').addEventListener('input', () => { clearTimeout(agTimer); agTimer = setTimeout(agSyncCards, 500); });
-  $('ag-add').onclick = () => { agRenderCards([...agCollect(), {name: 'agent', _full: true}]); agSyncRaw(); };
+  $('ag-add').onclick = () => { agRenderCards([...agCollect(), {name: 'agent', model: '', provider: '', base_url: '', api_key: '', auth_token: '', _full: true}]); agSyncRaw(); };
   $('ag-preset').onchange = e => {
     const g = AG_PRESETS[e.target.value]; e.target.value = '';
     if (!g) return;
