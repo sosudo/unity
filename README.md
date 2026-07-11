@@ -1,11 +1,8 @@
 # Unity
 
-Multi-agent proving, solving, autoformalization, formalization, and optimization harness for Lean 4.
+A multi-agentic harness for Lean 4.
 
-A roster of heterogeneous agents (different models, providers, and backends — Claude Agent SDK or
-Codex) collaborates through a typed shared workspace: agents claim chunks of work, attack them in
-per-agent git worktrees, endorse or object to each other's results, and consensus-merge winners
-into your project.
+Unity uses a roster of heterogeneous agents (different models) to work on Lean projects collaboratively.
 
 ## Prerequisites
 
@@ -29,113 +26,128 @@ uv tool install .
 ## Quick start
 
 ```bash
-# Create a new Lean project (with Mathlib) and set it up for Unity:
-unity new myproj --math    # --version <toolchain> to pin a Lean version
-# ...or set up an existing Lean project (from inside it):
+# Create and enter a new Lean project (with Mathlib) with Unity setup:
+unity new [project] --math    # --version <toolchain> to pin a Lean version
+cd [project]
+# ...or set up an existing Lean project to work with Unity (from inside it):
+cd [project]
 unity init
 
-# Then, FROM INSIDE THE PROJECT, open the control center:
-cd myproj
+# Then, from inside the project, open the control center:
 unity serve        # → http://localhost:8080
 ```
 
-**`unity serve` is the intended way to use Unity.** It opens a full control center for the
-project:
+`unity serve` will launch the dashboard, where you will be able to do anything you'd want to do with Unity! Alternatively, there is a `unity` cli tool, the commands of which are described in the table in the [CLI Commands](#cli-commands) section.
 
-- **blueprint** (home) — the project's actual Lean structure: every declaration with its proof
-  status (kernel-verified when the project builds), dependencies, list and graph views, click any
-  declaration for its signature, source, and chunk.
-- **run ▾** — launch any pipeline (`prove`, `solve`, `autoformalize`, …) with target/metric/version
-  pickers and automatic `--continue` detection; the button becomes a **stop** button while running
-  (safe stop: agents finish their current turn, then the run winds down).
-- **overview / forum / chunks** — the live typed workspace (decisions, consensus, obstacles,
-  ledger, tool usage), the discussion threads (with an in-place graph view), and the chunk DAG,
-  auto-refreshing as agents work.
-- **agents / prompt / sources / metrics / logs** — edit `agents.yaml` (form or raw, kept in sync),
-  `UNITY.md`, source material, and optimization metrics; tail timestamped run logs live. The ⚙
-  settings button edits `.unity/.env` (run flags, Axle/Aristotle keys).
+Unity has 8 core commands: 
+- [`autoformalize`](#autoformalize) to automatically formalize a whole paper/book into a newly created or empty Lean project
+- [`formalize`](#formalize) to formalize natural language content into missing sections of an existing Lean project
+- [`prove`](#prove) to fill in target `sorry`s and `axiom`s automatically
+- [`solve`](#solve) to solve a natural language problem first and then formalize the solution in Lean
+- [`create`](#create) to build a Lean library from a natural language description
+- [`verify`](#verify) for program verification of some source code
+- [`bump`](#bump) to migrate a Lean project to a different version
+- [`optimize`](#optimize) to improve Lean code with respect to some metric (re: [ImProver](https://github.com/riyazahuja/ImProver))
 
-Everything below is also available as plain CLI commands if you prefer the terminal.
+The below subsections will get you quickly started with using any of the commands, so you can hit the ground running with Unity! (You can also click on the command you want to run above...)
 
-`init` scaffolds a gitignored `.unity/` (empty roster, prompt, metrics, env) and warms the build.
-Configure your roster in the **agents tab** of `unity serve` — one-click presets cover the common
-setups (Claude subscription, OpenAI/Codex, OpenRouter, FreeInference, local vLLM), or edit the
-YAML directly. Mark your strongest model with **set as primary**: the primary agent leads the run —
-it prepares context, acts as the critic, merges consensus results, and writes the retrospective
-(default: the first group). Strength is learned automatically per model across runs (autostrength);
-set `strength:` only to override.
+### Autoformalize
 
-### Roster examples
+First, go to the sources tab and add the documents you want formalized.
 
-`.unity/agents.yaml` — one entry per agent. `${VAR}` references resolve from the environment (or
-`.unity/.env`). The agents tab in `unity serve` builds this for you (with presets).
+Next, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
 
-```yaml
-agents:
-# 1. Claude via your Claude subscription (no credentials: uses your `claude` CLI
-#    login). primary: true = leads the run (default: the first agent).
-- name: Ada
-  model: claude-opus-4-6
-  backend: anthropic       # anthropic | openai (which API the agent speaks)
-  primary: true
-  budget: 10               # USD for this agent
+Then, go to the prompt tab, and type in any specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're autoformalizing anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
 
-# 2. Claude via an Anthropic API key instead of the subscription
-- name: Grace
-  model: claude-sonnet-5
-  backend: anthropic
-  api_key: ${ANTHROPIC_API_KEY}
-  budget: 5
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the autoformalization loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with autoformalization.
 
-# 3. Codex via your ChatGPT/Codex subscription (no credentials: uses `codex login`)
-- name: Kurt
-  model: gpt-5.5-codex
-  backend: openai
+Once you're ready, hover over the `run` button, press `autoformalize`, and press the `start` button!
 
-# 4. Codex via an OpenAI API key
-- name: Karl
-  model: gpt-5.5-codex
-  backend: openai
-  api_key: ${OPENAI_API_KEY}
+### Formalize
 
-# 5. Claude through OpenRouter (Anthropic wire; the OpenRouter key rides as auth_token)
-- name: Emmy
-  model: anthropic/claude-sonnet-5
-  backend: anthropic
-  base_url: https://openrouter.ai/api
-  auth_token: ${OPENROUTER_API_KEY}
+First, go to the sources tab and add the documents you want formalized.
 
-# 6. Any non-Claude OpenRouter model (OpenAI wire)
-- name: Alan
-  model: qwen/qwen3-coder:free
-  backend: openai
-  base_url: https://openrouter.ai/api/v1
-  api_key: ${OPENROUTER_API_KEY}
+Next, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
 
-# 7. FreeInference
-- name: Sophie
-  model: glm-5.1
-  backend: openai
-  base_url: https://freeinference.org/v1
-  api_key: ${FREEINFERENCE_API_KEY}
+Then, go to the prompt tab, and type in any specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're formalizing anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
 
-# 8. A self-hosted vLLM server (any key string vLLM was started with)
-- name: Henri
-  model: leanstral-24b
-  backend: openai
-  base_url: http://localhost:8004/v1
-  api_key: unity
-```
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the formalization loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with formalization.
 
-Notes: `backend` says which API the agent speaks — `anthropic` (Claude Code runtime) or `openai`
-(Codex runtime); the legacy values `claude_code`/`codex` still work. With no credentials, an agent
-rides your local subscription login (`claude` or `codex login`). `openai` agents with a custom
-`base_url` need an `api_key`, and the endpoint must speak the OpenAI **Responses API** (vLLM,
-OpenRouter, and FreeInference all do); `anthropic` agents take `api_key`/`auth_token`/`base_url`
-(`ANTHROPIC_*` equivalents). Mixed rosters are the point: mark your strongest model
-`primary: true` and fill the swarm with cheap or free workers.
+When you're ready, hover over the `run` button, press `formalize`, and press the `start` button. In the `targets` box, you can put in any specific Lean declarations you want fixed or specific theorems/lemmas/definitions/section from your sources you want formalized (you can also leave it blank and the agents will treat everything as a target).
 
-Then, from inside the project:
+### Prove
+
+First, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
+
+Then, go to the prompt tab, and type in any specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're proving anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
+
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the proving loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with proving.
+
+When you're ready, hover over the `run` button, press `prove`, and press the `start` button. In the `targets` box, you can put in any specific Lean declarations you want proven (you can also leave it blank and the agents will treat every `sorry` and `axiom` as a target).
+
+### Solve
+
+First, go to the sources tab and add any documents with the problem you're trying to solve or any auxiliary information. If you don't have any documents, it's ok to skip this step!
+
+Then, go to the prompt tab, and type in an overview of your problem and any specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). Also, if you added sources in the previous step, make sure you add something in the prompt saying there are resources in the sources for the agents to use. No need to tell the agents that they're solving anything, Unity's pipeline will handle that for you. Remember to save before continuing!
+
+Next, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Again, make sure to save your agents before continuing!
+
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the solving and formalization loops are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with formalization.
+
+When you're ready, hover over the `run` button, press `solve`, and press the `start` button.
+
+### Create
+
+First, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
+
+Then, go to the prompt tab, and type in a description of the library you want created and any other specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're creating anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
+
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the creating loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with creating.
+
+When you're ready, hover over the `run` button, press `create`, and press the `start` button.
+
+### Verify
+
+First, go to the sources tab and add the code sources you want verified.
+
+Next, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
+
+Then, go to the prompt tab, and type in any specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're verifying anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
+
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the verification loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with verifying.
+
+Once you're ready, hover over the `run` button, press `verify`, and press the `start` button! In the `targets` box, you can put in specific functions/files from your source code you want verified (you can also leave it blank and the agents will treat everything as a target).
+
+### Bump
+
+First, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
+
+Then, go to the prompt tab, and type in any other specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're bumping anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
+
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the bumping loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with bumping.
+
+When you're ready, hover over the `run` button, press `bump`, put in your target Lean version, and press the `start` button.
+
+### Optimize
+
+First, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
+Make sure to save your agents before continuing!
+
+Then, go to the prompt tab, and type in any specialized instructions you want (such as telling specific agents of stuff they may not be allowed to do or if you have a specific file structure in mind). No need to tell the agents that they're optimizing anything, Unity's pipeline will handle that for you. Again, remember to save before continuing!
+
+Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the optimizing loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with optimizing.
+
+When you're ready, hover over the `run` button, press `optimize`, set the metric you want to optimize for, and press the `start` button. In the `targets` box, you can put in any specific Lean declarations you want optimized (you can also leave it blank and the agents will treat all declarations as targets). If you want to edit the existing metrics or add new metrics, go to the metrics tab!
+
+## CLI Commands
 
 | Command | Flags | What it does |
 |---|---|---|
@@ -158,39 +170,103 @@ Then, from inside the project:
 
 `--targets` narrows a run's scope (declaration/chunk names or a description; default: everything in scope). `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists.
 
-## Common workflows
+## Roster Configuration
 
-Everything below happens in `unity serve` — set up once (agents tab → your roster; prompt tab →
-your goal in `UNITY.md`), then:
+Your roster lives in `.unity/agents.yaml` — one entry per agent. The easiest way to build it is the agents tab in the webview (presets + a form), but here's what the fields mean if you're filling them in yourself:
 
-- **Autoformalize a paper/book from scratch** — upload the source (PDF/tex/markdown) in the
-  **sources** tab, add any special instructions in **prompt**, then **run → autoformalize**. The
-  swarm semiformalizes it into a chunk DAG and formalizes chunk by chunk, faithfully.
-- **Fill in missing proofs (`sorry`s / `axiom`s)** — optionally add reference material under
-  **sources** and guidance in **prompt**, then **run → prove** (narrow with targets if you only
-  want specific declarations).
-- **Formalize parts of a paper into an existing project** — upload the paper in **sources**, say
-  which parts go where in **prompt**, then **run → formalize**.
-- **Solve an open problem end-to-end** — state the problem in **prompt**, **run → solve**: the
-  team writes a rigorous LaTeX proof first, then formalizes it.
-- **Build a new Lean library from a description** — describe the library in **prompt**,
-  **run → create**: spec first, then implementation.
-- **Verify a program** — put the code in **sources**, the properties in **prompt**,
-  **run → verify**.
-- **Migrate Lean/Mathlib versions** — **run → bump** with the target version.
-- **Make the code better** — pick/edit a metric in **metrics** (length, modularity, …), set it
-  active, **run → optimize**.
+| Field | What it is |
+|---|---|
+| `name` | the agent's name (each agent needs a unique one) |
+| `model` | the model this agent runs (e.g. `claude-opus-4-6`, `gpt-5.5-codex`, `qwen/qwen3-coder:free`) |
+| `backend` | which API the agent speaks: `anthropic` (Claude Code runtime) or `openai` (Codex runtime) |
+| `primary` | `true` marks this agent as the primary (defaults to the first agent) |
+| `budget` | USD cap for this agent per run (optional; only enforced on the `anthropic` backend) |
+| `base_url` | a custom endpoint, for providers like OpenRouter, FreeInference, or a self-hosted vLLM server (optional) |
+| `api_key` / `auth_token` | credentials for the model (optional — see below); `${VAR}` references resolve from your environment or `.unity/.env` |
 
-Watch progress live in **blueprint** (proof status per declaration), **overview** (decisions,
-consensus, obstacles), and **logs**; stop safely anytime with the run button.
+The **primary** agent leads the run: it prepares context on continuations, acts as the critic, merges consensus results, and writes the retrospective — so make it your strongest model.
+
+A few rules of thumb for credentials:
+- **No credentials at all?** The agent rides your local subscription login — `claude` login for `anthropic` agents, `codex login` for `openai` agents. This is the cheapest way to get started!
+- **`openai` agents with a custom `base_url`** (OpenRouter, FreeInference, vLLM, ...) need an `api_key`, and the endpoint must speak the OpenAI Responses API (all three of those do).
+- **`anthropic` agents** take `api_key`/`auth_token`/`base_url` (they map to the `ANTHROPIC_*` env vars) — notably, Claude models through OpenRouter go on the `anthropic` backend with your OpenRouter key as the `auth_token`.
+
+You may also set `strength` (a capability tier used for chunk allocation) on any agent, but you usually shouldn't: Unity learns per-model strengths automatically across runs (autostrength) and an explicit value just overrides the learned one.
+
+Here's a full example showing every setup the presets cover:
+
+```yaml
+agents:
+- name: Ada                    # Claude via your Claude Code subscription
+  model: claude-opus-4-6
+  backend: anthropic
+  primary: true
+  budget: 10
+
+- name: Grace                  # Claude via an Anthropic API key
+  model: claude-sonnet-5
+  backend: anthropic
+  api_key: ${ANTHROPIC_API_KEY}
+  budget: 5
+
+- name: Kurt                   # Codex via your ChatGPT/Codex subscription
+  model: gpt-5.5-codex
+  backend: openai
+
+- name: Karl                   # Codex via an OpenAI API key
+  model: gpt-5.5-codex
+  backend: openai
+  api_key: ${OPENAI_API_KEY}
+
+- name: Emmy                   # Claude through OpenRouter
+  model: anthropic/claude-sonnet-5
+  backend: anthropic
+  base_url: https://openrouter.ai/api
+  auth_token: ${OPENROUTER_API_KEY}
+
+- name: Alan                   # any non-Claude OpenRouter model
+  model: qwen/qwen3-coder:free
+  backend: openai
+  base_url: https://openrouter.ai/api/v1
+  api_key: ${OPENROUTER_API_KEY}
+
+- name: Sophie                 # FreeInference
+  model: glm-5.1
+  backend: openai
+  base_url: https://freeinference.org/v1
+  api_key: ${FREEINFERENCE_API_KEY}
+
+- name: Henri                  # a self-hosted vLLM server
+  model: leanstral-24b
+  backend: openai
+  base_url: http://localhost:8004/v1
+  api_key: unity
+```
+
+Mixed rosters are the point: mark your strongest model as the primary and fill the swarm out with cheap or free workers!
+
+## Webview Page Descriptions
+
+- **overview** — the home page: the current run status (idle, or the running command and its phase), your agents with what each one is working on right now, open obstacles & questions, and recent decisions. It auto-refreshes while a run is going, so this is the page to sit on.
+- **blueprint** — the actual Lean structure of your project: every declaration with its proof status (green = verified, yellow = complete but resting on a `sorry`, red = `sorry`, orange = `axiom`), filterable, with a list view and a dependency-graph view. Click any declaration to see its signature, source, and the chunk it belongs to. Statuses are kernel-verified when the project builds (you'll see a `kernel-verified` chip) and fall back to a textual approximation when it doesn't.
+- **forum** — the agents' shared workspace, as threads: claims, results, obstacles, questions, decisions, endorsements. The `graph view` button shows the same posts as a reply graph.
+- **chunks** — the run's chunk DAG (how the agents split up the work), colored by status: merged, active, pending, blocked. Click a node for its details.
+- **agents** — your roster (see [Roster Configuration](#roster-configuration)). Add agents from presets or the `new` button, set one as primary, and edit the raw yaml directly if you prefer — the form and the yaml stay in sync.
+- **prompt** — `UNITY.md`, the specialized instructions that go to every agent. State your goal or any constraints here.
+- **sources** — the documents your agents work from (papers to formalize, code to verify, reference material). Upload, edit, or remove them here; they land in `.unity/source/`.
+- **metrics** — the optimization metrics for `optimize` runs. Edit the built-ins, create your own, and set one as active.
+- **logs** — every run's timestamped log, with phase delimiters. The live run's log tails automatically.
+- **⚙ (settings)** — max attempts, the Lean LSP port, and your Axle / Aristotle Agent API keys.
+- **run** — hover to pick a command, fill in the options (targets, metric, version — whatever that command takes), and start. While a run is going the button becomes a `stop` button: one press asks the agents to finish their current turn and wind down safely; a second press force-kills the run.
 
 ## Configuration
 
 - `.unity/.env` — run flags: `MAX_ATTEMPTS` (critic-loop cap, default 5), `UNITY_FORUM_BRIEF=off`
   (disable workspace-brief injection), and optional service keys (`AXLE_API_KEY`,
   `ARISTOTLE_API_KEY`) that unlock extra agent tools.
-- `.unity/agents.yaml` — the roster. Per-agent credentials (`api_key` / `auth_token` / `base_url`)
-  live here, not in `.env`; `${VAR}` references are resolved from the environment. The `codex`
-  backend requires `api_key`.
+- `.unity/agents.yaml` — the roster (see [Roster Configuration](#roster-configuration)). Per-agent
+  credentials (`api_key` / `auth_token` / `base_url`) live here, not in `.env`; `${VAR}` references
+  are resolved from the environment. Only `openai` agents with a custom `base_url` require an
+  `api_key` — with no credentials, an agent rides your subscription login.
 - `~/.unity/library/` — the global library (tactics, lemmas, references, skills, subagents) that
   every agent sees and the retrospective phase grows across runs.
