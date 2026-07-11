@@ -208,6 +208,13 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
     and workspace-write sandbox tuning. Returns the provider id to pass as
     model_provider, or None for the default openai provider."""
     home.mkdir(parents=True, exist_ok=True)
+    # No api_key -> ride the user's Codex subscription: copy their login into this
+    # agent's isolated CODEX_HOME.
+    if not agent.api_key:
+        user_auth = Path.home() / ".codex" / "auth.json"
+        if user_auth.exists():
+            import shutil
+            shutil.copy2(user_auth, home / "auth.json")
     lines: list[str] = []
     # Unity agents run under workspace_write: they need network (lake, arXiv, MCP)
     # and, from a worktree cwd, write access to the main project (.unity/dag.json).

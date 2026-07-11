@@ -8,6 +8,9 @@ from pathlib import Path
 import yaml
 
 BACKENDS = {"claude_code", "codex"}
+# user-facing aliases: the yaml (and web UI) may say which API an agent speaks
+_BACKEND_ALIASES = {"anthropic": "claude_code", "openai": "codex",
+                    "claude_code": "claude_code", "codex": "codex"}
 _VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 
 
@@ -64,17 +67,15 @@ def load_roster(path: Path) -> Roster:
     agents: list[Agent] = []
     for i, g in enumerate(groups):
         where = f"agents.yaml: group #{i + 1}"
-        names = g.get("names")
+        # `name: X` (one agent per entry, the default) or legacy `names: [X, Y]`
+        names = g.get("names") or ([g["name"]] if g.get("name") else None)
         if not names or not isinstance(names, list):
-            raise ValueError(f"{where}: 'names' must be a non-empty list")
+            raise ValueError(f"{where}: 'name' (or 'names') is required")
 
-        instances = g.get("instances", len(names))
-        if instances != len(names):
-            raise ValueError(f"{where}: 'instances' ({instances}) != len(names) ({len(names)})")
-
-        backend = g.get("backend")
+        backend = _BACKEND_ALIASES.get(str(g.get("backend", "")).lower())
         if backend not in BACKENDS:
-            raise ValueError(f"{where}: 'backend' must be one of {sorted(BACKENDS)}")
+            raise ValueError(f"{where}: 'backend' must be one of "
+                             f"{sorted(BACKENDS)} (or aliases 'anthropic'/'openai')")
 
         model = g.get("model")
         if not model:
@@ -84,9 +85,10 @@ def load_roster(path: Path) -> Roster:
         base_url = _interp(g.get("base_url"), where)
         auth_token = _interp(g.get("auth_token"), where)
 
-        # codex authenticates via login_api_key/CODEX_API_KEY; auth_token is not used there.
-        if backend == "codex" and not api_key:
-            raise ValueError(f"{where}: codex backend requires 'api_key'")
+        # codex: custom providers need api_key; without one, the agent rides the
+        # user's ChatGPT/Codex subscription login (~/.codex/auth.json).
+        if backend == "codex" and g.get("base_url") and not api_key:
+            raise ValueError(f"{where}: codex with a custom base_url requires 'api_key'")
 
         budget = g.get("budget")
         budget = float(budget) if budget not in (None, "") else None

@@ -67,65 +67,73 @@ set `strength:` only to override.
 
 ### Roster examples
 
-`.unity/agents.yaml` — one group per model; `names` spawns one agent instance per name. `${VAR}`
-references resolve from the environment (or `.unity/.env`).
+`.unity/agents.yaml` — one entry per agent. `${VAR}` references resolve from the environment (or
+`.unity/.env`). The agents tab in `unity serve` builds this for you (with presets).
 
 ```yaml
 agents:
-# 1. Claude via your Claude subscription (claude_code backend, no credentials:
-#    uses your existing `claude` CLI login). primary: true = leads the run.
-- names: [Ada]
+# 1. Claude via your Claude subscription (no credentials: uses your `claude` CLI
+#    login). primary: true = leads the run (default: the first agent).
+- name: Ada
   model: claude-opus-4-6
-  backend: claude_code
-  provider: anthropic
+  backend: anthropic       # anthropic | openai (which API the agent speaks)
   primary: true
-  budget: 10          # USD per agent instance
+  budget: 10               # USD for this agent
 
 # 2. Claude via an Anthropic API key instead of the subscription
-- names: [Grace]
+- name: Grace
   model: claude-sonnet-5
-  backend: claude_code
-  provider: anthropic
+  backend: anthropic
   api_key: ${ANTHROPIC_API_KEY}
   budget: 5
 
-# 3. Your default Codex model (codex backend, official OpenAI auth via API key)
-- names: [Kurt]
+# 3. Codex via your ChatGPT/Codex subscription (no credentials: uses `codex login`)
+- name: Kurt
   model: gpt-5.5-codex
-  backend: codex
-  provider: openai
+  backend: openai
+
+# 4. Codex via an OpenAI API key
+- name: Karl
+  model: gpt-5.5-codex
+  backend: openai
   api_key: ${OPENAI_API_KEY}
 
-# 4. Any OpenAI-compatible provider through codex — OpenRouter
-- names: [Emmy, Alan]                    # two instances of the same model
+# 5. Claude through OpenRouter (Anthropic wire; the OpenRouter key rides as auth_token)
+- name: Emmy
+  model: anthropic/claude-sonnet-5
+  backend: anthropic
+  base_url: https://openrouter.ai/api
+  auth_token: ${OPENROUTER_API_KEY}
+
+# 6. Any non-Claude OpenRouter model (OpenAI wire)
+- name: Alan
   model: qwen/qwen3-coder:free
-  backend: codex
-  provider: openrouter
+  backend: openai
   base_url: https://openrouter.ai/api/v1
   api_key: ${OPENROUTER_API_KEY}
 
-# 5. FreeInference
-- names: [Sophie]
+# 7. FreeInference
+- name: Sophie
   model: glm-5.1
-  backend: codex
-  provider: freeinference
+  backend: openai
   base_url: https://freeinference.org/v1
   api_key: ${FREEINFERENCE_API_KEY}
 
-# 6. A self-hosted vLLM server (any key string vLLM was started with)
-- names: [Henri]
+# 8. A self-hosted vLLM server (any key string vLLM was started with)
+- name: Henri
   model: leanstral-24b
-  backend: codex
-  provider: vllm
+  backend: openai
   base_url: http://localhost:8004/v1
   api_key: unity
 ```
 
-Notes: the `codex` backend always needs an `api_key` (for custom `base_url` providers it's sent as
-the provider key; the endpoint must speak the OpenAI **Responses API**, which vLLM, OpenRouter, and
-FreeInference all do). The `claude_code` backend accepts `api_key`, `auth_token`, and `base_url`
-(`ANTHROPIC_*` equivalents) — omit all three to ride your subscription login. Mixed rosters are the
-point: mark your strongest model `primary: true` and fill the swarm with cheap or free workers.
+Notes: `backend` says which API the agent speaks — `anthropic` (Claude Code runtime) or `openai`
+(Codex runtime); the legacy values `claude_code`/`codex` still work. With no credentials, an agent
+rides your local subscription login (`claude` or `codex login`). `openai` agents with a custom
+`base_url` need an `api_key`, and the endpoint must speak the OpenAI **Responses API** (vLLM,
+OpenRouter, and FreeInference all do); `anthropic` agents take `api_key`/`auth_token`/`base_url`
+(`ANTHROPIC_*` equivalents). Mixed rosters are the point: mark your strongest model
+`primary: true` and fill the swarm with cheap or free workers.
 
 Then, from inside the project:
 
