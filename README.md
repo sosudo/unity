@@ -4,6 +4,8 @@ A multi-agentic harness for Lean 4.
 
 Unity uses a roster of heterogeneous agents (different models) to work on Lean projects collaboratively.
 
+If you have any issues/concerns or contributions, please make a GitHub issue or reach out to me at [shivansg@andrew.cmu.edu](mailto:shivansg@andrew.cmu.edu). A technical writeup detailing exactly how Unity works will be put out soon!
+
 ## Prerequisites
 
 - Python 3.13+ and [uv](https://docs.astral.sh/uv/)
