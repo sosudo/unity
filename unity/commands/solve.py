@@ -63,6 +63,13 @@ async def solve(continue_):
             verdict = json.loads((paths.unity / "solved.json").read_text()).get("verdict", "stalled")
         except (OSError, json.JSONDecodeError):
             verdict = "stalled"
+        # Archive the round: later rounds rewrite PROOF.tex, and a stalled round's
+        # partial results must never be lost (VERDICT.md points back into these).
+        proof = paths.unity / "source" / "PROOF.tex"
+        if proof.exists():
+            rounds = paths.unity / "rounds"
+            rounds.mkdir(exist_ok=True)
+            (rounds / f"round-{s + 1}-{verdict}.tex").write_text(proof.read_text())
         if verdict in ("solved", "advanced"):
             break
 
