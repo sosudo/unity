@@ -43,7 +43,7 @@ async def solve(continue_):
 
     # Adjudicated solving loop: the primary referees each round; a stalled round is
     # re-attacked with the verdict's directives instead of sliding into formalization.
-    solve_attempts = int(os.getenv("SOLVE_ATTEMPTS", "3"))
+    solve_attempts = max_attempts  # same knob as the formalization/critic loop
     verdict = "stalled"
     for s in range(solve_attempts):
         reboot = "" if s == 0 else (
