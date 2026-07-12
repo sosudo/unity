@@ -27,25 +27,34 @@ found, the approaches burned, and directives for this round.
 - Compute many small examples; identify edge cases and trivial cases; generate data and ask what
   patterns or invariants appear — and whether they can be proved.
 - Build on the exploration phase's frontier map (`.unity/source/`, binding `forum_decision`s in your
-  brief): every known partial result, the technique behind it, and exactly where it stops.
+  brief): every known partial result, the technique behind it, and exactly where it stops — and
+  borrow proof ideas from similar solved problems wherever the shapes match.
+- **Locate the barrier**: take the strongest known technique, push it until it breaks, and
+  characterize precisely what it would need to go further — that missing piece is a concrete target.
+- Find the simplest nontrivial open case and attack that specifically; interpolate a parametrized
+  family between the solved cases and the open one and find the exact threshold where proofs stop
+  working.
 - Weaken or strengthen the problem to where it *can* be solved; solve that; then walk it back
   toward the original, generalizing or specializing the proof step by step.
 - Attempt structural reduction: characterize minimal/maximal counterexamples, extremal, primitive,
   or irreducible objects, and prove properties they must have.
-- Repeatedly ask: *what lemma would make this substantially easier?* Then ask the same of that
-  lemma, recursively — build a dependency graph of useful intermediate results and attack the leaves.
-- Ask what you would *like* to be true to make the goal easy, and try to prove (or refute) that first.
+- Repeatedly ask: *what lemma (or what fact you'd simply like to be true) would make this
+  substantially easier?* Try to prove or refute it — then ask the same of that lemma, recursively;
+  build a dependency graph of auxiliary targets and attack the leaves.
 - Assume the theorem is true: what consequences follow, and which are easier to prove? Assume a
   counterexample exists: what must it look like? Run a genuine counterexample search.
-- Generate auxiliary conjectures whose resolution would help, and attack those.
-- Search for similar known results and borrow proof ideas wherever the shapes match.
 - Ask: can local behavior determine global behavior? Can global constraints force local structure?
 - Estimate: densities, expectations, random-model behavior, heuristic probabilities — random models
   often suggest the right conjecture and the right invariant.
 - Find and exploit symmetries. Ask whether entropy, compression, encoding, or counting arguments apply.
+- **Stress-test every proof before it enters PROOF.tex**: run it on small cases, check where each
+  hypothesis is actually used (a proof that never uses one is broken), and name the step that gets
+  past the known barrier — if your argument makes an open problem look easy, find the error first.
 - Learn from every failed attempt, explicitly: why did it fail? which assumption broke? which lemma
   was missing? was the induction wrong? is there a counterexample to the approach? is there a
   stronger or weaker invariant? what would repair the argument? Record the autopsy in the ledger.
+- **As a team, diversify**: spread across fundamentally different approaches instead of piling onto
+  one; converge only when an approach shows real traction (record it with a `forum_decision`).
 
 **Research reboot.** Whenever an approach appears exhausted, do not stop. Forget the current proof
 strategy, reread the problem statement, list every fact established so far, and deliberately
