@@ -44,25 +44,49 @@ async def solve(continue_):
     # Adjudicated solving loop: the primary referees each round; a stalled round is
     # re-attacked with the verdict's directives instead of sliding into formalization.
     solve_attempts = max_attempts  # same knob as the formalization/critic loop
+    # Panel of judges: the primary + the strongest non-primary agent (when one exists) —
+    # a round only counts as solved if every judge independently agrees.
+    judges = [roster.primary]
+    others = sorted((a for a in roster.agents if not a.is_primary), key=lambda a: -a.strength)
+    if others:
+        judges.append(others[0])
     verdict = "stalled"
     for s in range(solve_attempts):
+        if s == 0:
+            # Independent drafts before the shared document: prevents anchoring on the
+            # first idea posted.
+            await dispatch(roster.agents, roster, load_prompt("solve/DRAFTING"),
+                           "Independently (no forum reading first) write your own attack plan and strongest "
+                           "initial results to .unity/source/drafts/<your name>.md. Do not edit PROOF.tex.",
+                           root, mcp)
         reboot = "" if s == 0 else (
             " A previous round was adjudicated as stalled — read .unity/VERDICT.md, perform a research "
             "reboot (reread the problem, list every established fact, generate at least five "
             "fundamentally different attack plans before choosing one), and attack again.")
+        drafts = " Start from the independent drafts in .unity/source/drafts/ — mine every one of them for lines of attack." if s == 0 else ""
         await dispatch(roster.agents, roster, load_prompt("solve/SOLVING"),
                        "Collaboratively solve the problem in .unity/UNITY.md and write the full solution and proof "
-                       "as a paper to .unity/source/PROOF.tex." + reboot,
+                       "as a paper to .unity/source/PROOF.tex." + drafts + reboot,
                        root, mcp)
-        (paths.unity / "solved.json").write_text(json.dumps({"verdict": "stalled"}))
-        await dispatch([roster.primary], roster, load_prompt("solve/ADJUDICATION"),
-                       "Adjudicate this solving round: judge .unity/source/PROOF.tex against the original problem, "
-                       "write .unity/VERDICT.md, and set .unity/solved.json to solved/advanced/stalled.",
+        vdir = paths.unity / "verdicts"
+        import shutil
+        shutil.rmtree(vdir, ignore_errors=True)
+        vdir.mkdir()
+        await dispatch(judges, roster, load_prompt("solve/ADJUDICATION"),
+                       "Independently adjudicate this solving round: judge .unity/source/PROOF.tex against the "
+                       "original problem and write .unity/verdicts/<your name>.json and .md.",
                        root, mcp)
-        try:
-            verdict = json.loads((paths.unity / "solved.json").read_text()).get("verdict", "stalled")
-        except (OSError, json.JSONDecodeError):
-            verdict = "stalled"
+        # Merge: most conservative verdict wins; every judge's report goes into VERDICT.md.
+        rank = {"stalled": 0, "advanced": 1, "solved": 2}
+        got = []
+        for jf in sorted(vdir.glob("*.json")):
+            try:
+                got.append(json.loads(jf.read_text()).get("verdict", "stalled"))
+            except (OSError, json.JSONDecodeError):
+                got.append("stalled")
+        verdict = min(got, key=lambda v: rank.get(v, 0)) if got else "stalled"
+        reports = "\n\n---\n\n".join(f"# Judge: {m.stem}\n\n{m.read_text()}" for m in sorted(vdir.glob("*.md")))
+        (paths.unity / "VERDICT.md").write_text(f"Merged verdict: {verdict}\n\n{reports}\n")
         # Archive the round: later rounds rewrite PROOF.tex, and a stalled round's
         # partial results must never be lost (VERDICT.md points back into these).
         proof = paths.unity / "source" / "PROOF.tex"

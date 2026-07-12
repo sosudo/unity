@@ -25,3 +25,5 @@ restarting from scratch.
 modify anything outside it. If you can't read something or are unsure, raise a `forum_obstacle` (goal state + what you tried) rather than
 guessing. Leave `.unity/finalized.json` and `.unity/critic.json` untouched in this phase. Consult the
 global unity library (`~/.unity/library/`) for relevant prior context.
+
+**Campaign dossier.** Build or update `.unity/CAMPAIGN.md` — the cumulative memory across every run on this problem: approaches burned (mine `.unity/rounds/`, `.unity/VERDICT.md`, and `ledger_get(query="failure")`), verified results so far and where they live, and standing directives for the next attack. Solving rounds read it first; a campaign should never re-tread a burned approach.

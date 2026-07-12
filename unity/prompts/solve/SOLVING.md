@@ -19,7 +19,7 @@ that descopes the problem ("just formalize the statement", "only the known speci
 not bind you: no decision may take the problem off the table. Re-proving or cataloguing known
 results is research context, not progress — progress means mathematics that was not known before.
 
-If `.unity/VERDICT.md` exists, read it first: it is the adjudication of a previous round — the gaps
+If `.unity/CAMPAIGN.md` exists, read it first — it is the campaign's cumulative memory (approaches burned across all previous runs, verified results, standing directives). If `.unity/source/drafts/` exists, mine every draft in it for lines of attack. If `.unity/VERDICT.md` exists, read it too: it is the adjudication of a previous round — the gaps
 found, the approaches burned, and directives for this round.
 
 **The playbook.** Work through these deliberately; post what each yields to the forum:

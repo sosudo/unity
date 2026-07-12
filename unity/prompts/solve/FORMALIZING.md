@@ -52,3 +52,5 @@ add or complete with `@[blueprint "<its chunk id>"]`, with a docstring giving th
 statement (and a proof sketch for theorems). Labels = chunk ids keeps the machine-readable
 blueprint in lockstep with `.unity/dag.json`. Preserve existing annotations when editing others'
 declarations. If LeanArchitect is not a dependency, skip this entirely.
+
+**Formalization as the lie detector.** When a PROOF.tex step resists formalization because the *mathematics* is wrong or gappy (not a Lean-skill issue), record it immediately: `ledger_add(kind="failure", title=<the lemma>, content=<the precise mathematical gap>, evidence=<the failing Lean goal/error>)` and a `forum_obstacle` — the resolving phase and future solving rounds inherit these machine-checked autopsies. Do not paper over a mathematical gap with `sorry`.

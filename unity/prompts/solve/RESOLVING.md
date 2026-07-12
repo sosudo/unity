@@ -21,3 +21,5 @@ actually false or unprovable, say so and give a rigorous disproof / impossibilit
 modify anything outside it. If you're unsure or blocked, ask a `forum_question` — teammates see it in their brief and must answer. Don't touch
 `.unity/finalized.json` or `.unity/critic.json` (the primary manages those). Consult the global unity
 library (`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you before claiming new chunks; record verified tricks with `ledger_add`.
+
+Before revising, run `ledger_get(query="failure")`: the formalization phase records machine-checked autopsies of exactly which PROOF.tex steps broke and why — fix the mathematics those point at, not just the wording.
