@@ -106,7 +106,11 @@ def _preamble(agent, roster, ranking: dict | None = None) -> str:
         f"Standings are dynamic: effective capability re-ranks from forum credit as the run "
         f"progresses — strong contributions raise your standing, and chunk sign-ups should follow "
         f"current standings, not the initial ordering.\n"
-        f"The primary agent is '{roster.primary.name}'.\n\n"
+        f"The primary agent is '{roster.primary.name}'.\n"
+        f"Persistence norm: end your turn only when your phase's deliverable is complete or you are "
+        f"hard-blocked (post the forum_obstacle first). Running low on ideas is not completion — post "
+        f"your state, pick the next approach, and continue; an early quit wastes the whole team's "
+        f"work.\n\n"
     )
 
 

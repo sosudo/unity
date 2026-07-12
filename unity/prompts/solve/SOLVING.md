@@ -5,25 +5,72 @@ self-contained paper to `.unity/source/PROOF.tex`. This document is the source o
 phases chunk and formalize in Lean, so the proof must be **rigorous, complete, and correct** — every
 step justified, no hand-waving, no gaps a formalizer couldn't fill.
 
+**This phase is Lean-agnostic.** Solve the mathematics in natural language. Do not write Lean, do
+not search Mathlib, do not plan formalization — that all happens later, only once the mathematics
+is done. (Writing code to compute examples, search for counterexamples, or test conjectures is
+encouraged; that's mathematics, not formalization.)
+
+**The problem being open is the mission, not an obstacle.** You were dispatched precisely because
+no known solution exists — "it's open" and "it's hard" are the starting conditions, never a
+conclusion. Genuinely attack it and advance the frontier. Never abandon the research objective
+because the problem is open; if one approach fails, try another — every failure generates useful,
+informative artifacts for the next attempt. If an earlier phase or a previous round left a decision
+that descopes the problem ("just formalize the statement", "only the known special case"), it does
+not bind you: no decision may take the problem off the table. Re-proving or cataloguing known
+results is research context, not progress — progress means mathematics that was not known before.
+
+If `.unity/VERDICT.md` exists, read it first: it is the adjudication of a previous round — the gaps
+found, the approaches burned, and directives for this round.
+
+**The playbook.** Work through these deliberately; post what each yields to the forum:
+- Restate the problem in several equivalent forms; search for formulations that are easier to attack.
+- Compute many small examples; identify edge cases and trivial cases; generate data and ask what
+  patterns or invariants appear — and whether they can be proved.
+- Build on the exploration phase's frontier map (`.unity/source/`, binding `forum_decision`s in your
+  brief): every known partial result, the technique behind it, and exactly where it stops.
+- Weaken or strengthen the problem to where it *can* be solved; solve that; then walk it back
+  toward the original, generalizing or specializing the proof step by step.
+- Attempt structural reduction: characterize minimal/maximal counterexamples, extremal, primitive,
+  or irreducible objects, and prove properties they must have.
+- Repeatedly ask: *what lemma would make this substantially easier?* Then ask the same of that
+  lemma, recursively — build a dependency graph of useful intermediate results and attack the leaves.
+- Ask what you would *like* to be true to make the goal easy, and try to prove (or refute) that first.
+- Assume the theorem is true: what consequences follow, and which are easier to prove? Assume a
+  counterexample exists: what must it look like? Run a genuine counterexample search.
+- Generate auxiliary conjectures whose resolution would help, and attack those.
+- Search for similar known results and borrow proof ideas wherever the shapes match.
+- Ask: can local behavior determine global behavior? Can global constraints force local structure?
+- Estimate: densities, expectations, random-model behavior, heuristic probabilities — random models
+  often suggest the right conjecture and the right invariant.
+- Find and exploit symmetries. Ask whether entropy, compression, encoding, or counting arguments apply.
+- Learn from every failed attempt, explicitly: why did it fail? which assumption broke? which lemma
+  was missing? was the induction wrong? is there a counterexample to the approach? is there a
+  stronger or weaker invariant? what would repair the argument? Record the autopsy in the ledger.
+
+**Research reboot.** Whenever an approach appears exhausted, do not stop. Forget the current proof
+strategy, reread the problem statement, list every fact established so far, and deliberately
+generate at least **five fundamentally different attack plans** before choosing the next one. Favor
+diversity over incremental variations of the failed attempt.
+
 **Work as a team on one shared document.** `.unity/source/PROOF.tex` is shared. Coordinate on the
-forum: agree on the overall proof structure, then claim sections (`forum_claim` with the section as the chunk) so two agents don't edit the
-same part at once and clobber each other. Build on the exploration findings (binding `forum_decision`s in your brief,
-`.unity/source/`). Discuss competing approaches and converge — record an endorsed `forum_decision` when the team
-disagrees on strategy.
+forum: agree on the overall structure, then claim sections (`forum_claim` with the section as the
+chunk) so two agents don't clobber each other. Discuss competing approaches and converge — record
+an endorsed `forum_decision` when the team disagrees on strategy.
 
-Aim for a proof that will formalize cleanly: prefer constructions and lemmas that exist in Mathlib
-(verify names with `lean_local_search` / Axle), state intermediate lemmas explicitly, and keep the
-dependencies between results clear (this becomes the chunk DAG next).
+Write for formalization even though you write no Lean: state intermediate lemmas explicitly, keep
+dependencies between results clear (this becomes the chunk DAG next), and prefer constructions a
+formalizer could realize.
 
-**Determination — this is the hard part, and your job is to actually solve it.** If the problem is
-difficult or open, do not give up: try multiple strategies, build partial results, and push as far as
-you can. If, after genuine effort, you conclude that **no solution exists** (the statement is false or
-unprovable), then *prove that* — give a rigorous disproof or impossibility argument in `PROOF.tex`
-(Axle's `disprove` can help explore the negation). A well-justified "no, and here is why" is a valid,
-valuable result; an unsupported "we couldn't do it" is not.
+**If, after genuine sustained effort, the full problem still stands:** maximize *verified new
+progress* — novel lemmas, improved bounds, new equivalences or reductions, structural
+characterizations, a disproof of a natural strengthening — written up rigorously in `PROOF.tex`
+with complete proofs, and an honest statement of what remains open and why each attack fell short.
+"We believe there cannot be a proof" is not a valid reason to stop; running out of listed ideas is
+what the research reboot is for. A rigorous "no, and here is why" (a disproof) is a full solution.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't do something (read the source or a reference) or are unsure,
-raise a `forum_obstacle` (goal state + what you tried) and ask rather than guessing or fabricating a step. Don't touch
-`.unity/finalized.json` or `.unity/critic.json`. Consult the global unity library (`~/.unity/library/`).
-Call `forum_brief` frequently; answer questions addressed to you; record verified tricks with `ledger_add`.
+modify anything outside it. If you can't do something or are unsure, raise a `forum_obstacle` (what
+you tried + where it broke) or a `forum_question` rather than guessing. Don't touch
+`.unity/finalized.json` or `.unity/critic.json`. Consult the global unity library
+(`~/.unity/library/`). Call `forum_brief` frequently; answer questions addressed to you; record
+verified tricks and failure autopsies with `ledger_add`.

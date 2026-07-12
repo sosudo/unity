@@ -36,14 +36,35 @@ async def solve(continue_):
                        root, mcp)
 
     await dispatch(roster.agents, roster, load_prompt("solve/EXPLORATION"),
-                   "Research proof strategies, formalization approaches, and any papers or resources that help "
-                   "solve and later formalize the problem in .unity/UNITY.md.",
+                   "Map the mathematical frontier of the problem in .unity/UNITY.md: known partial results and "
+                   "their techniques, equivalent formulations, analogous solved problems, and published "
+                   "data/computations. Research only — no solving, no Lean, no descoping decisions.",
                    root, mcp)
 
-    await dispatch(roster.agents, roster, load_prompt("solve/SOLVING"),
-                   "Collaboratively solve the problem in .unity/UNITY.md and write the full solution and proof "
-                   "as a paper to .unity/source/PROOF.tex.",
-                   root, mcp)
+    # Adjudicated solving loop: the primary referees each round; a stalled round is
+    # re-attacked with the verdict's directives instead of sliding into formalization.
+    solve_attempts = int(os.getenv("SOLVE_ATTEMPTS", "3"))
+    verdict = "stalled"
+    for s in range(solve_attempts):
+        reboot = "" if s == 0 else (
+            " A previous round was adjudicated as stalled — read .unity/VERDICT.md, perform a research "
+            "reboot (reread the problem, list every established fact, generate at least five "
+            "fundamentally different attack plans before choosing one), and attack again.")
+        await dispatch(roster.agents, roster, load_prompt("solve/SOLVING"),
+                       "Collaboratively solve the problem in .unity/UNITY.md and write the full solution and proof "
+                       "as a paper to .unity/source/PROOF.tex." + reboot,
+                       root, mcp)
+        (paths.unity / "solved.json").write_text(json.dumps({"verdict": "stalled"}))
+        await dispatch([roster.primary], roster, load_prompt("solve/ADJUDICATION"),
+                       "Adjudicate this solving round: judge .unity/source/PROOF.tex against the original problem, "
+                       "write .unity/VERDICT.md, and set .unity/solved.json to solved/advanced/stalled.",
+                       root, mcp)
+        try:
+            verdict = json.loads((paths.unity / "solved.json").read_text()).get("verdict", "stalled")
+        except (OSError, json.JSONDecodeError):
+            verdict = "stalled"
+        if verdict in ("solved", "advanced"):
+            break
 
     await dispatch(roster.agents, roster, load_prompt("solve/CHUNKING"),
                    "Separate .unity/source/PROOF.tex into chunks — each theorem/lemma/proposition/definition a "
