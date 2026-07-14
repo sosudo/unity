@@ -308,8 +308,14 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
     sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
 
+    # Prefer the user's installed codex CLI (kept current by its own updater) over the
+    # SDK's pinned bundled binary — newest models often require a newer runtime.
+    import shutil as _sh
+    codex_bin = _sh.which("codex")
     for attempt in range(_MAX_API_RETRIES):
-        codex = AsyncCodex(config=CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
+        cfg = (CodexConfig(cwd=str(cwd), env=_agent_env(agent, home), codex_bin=codex_bin)
+               if codex_bin else CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
+        codex = AsyncCodex(config=cfg)
         try:
             # login_api_key is OpenAI-official auth only; custom providers (base_url set)
             # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
