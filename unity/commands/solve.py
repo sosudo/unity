@@ -94,7 +94,8 @@ async def solve(continue_):
             rounds = paths.unity / "rounds"
             rounds.mkdir(exist_ok=True)
             (rounds / f"round-{s + 1}-{verdict}.tex").write_text(proof.read_text())
-        if verdict in ("solved", "advanced"):
+        # if verdict in ("solved", "advanced"):
+        if verdict in ("solved"):
             break
 
     await dispatch(roster.agents, roster, load_prompt("solve/CHUNKING"),
