@@ -146,6 +146,11 @@ def _log(name: str, msg, cwd=None) -> None:
                 _tool_log(cwd, name, label)
             elif rtype and rtype not in ("agentMessage", "reasoning", "error"):
                 _tool_log(cwd, name, rtype)
+        elif method in ("error", "turn/failed"):
+            payload_err = getattr(payload, "error", None)
+            msg_txt = (getattr(payload_err, "message", None) or getattr(payload, "message", None)
+                       or str(payload)[:200])
+            _console.print(f"[red]{_ts()} \\[{name}] ✗ {method}: {str(msg_txt)[:300]}[/red]")
         elif method == "turn/completed":
             tail = _delta_buf.pop(name, "")
             if tail.strip():
