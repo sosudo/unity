@@ -18,7 +18,7 @@ async def bump(version, continue_):
     roster = load_roster(paths.agents_yaml)
     mcp = build_mcp(paths)
     root = paths.project_root
-    max_attempts = int(os.getenv("MAX_ATTEMPTS", "5"))
+    max_attempts = float(os.getenv("MAX_ATTEMPTS") or "inf")  # blank/unset = indefinite
 
     if continue_:
         await dispatch([roster.primary], roster, load_prompt("bump/PREPARATION"),

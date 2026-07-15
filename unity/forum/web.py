@@ -2233,7 +2233,7 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
   <h3>settings</h3>
   <div class="who" style="margin-bottom:14px">stored in <span class="mono">.unity/.env</span></div>
   <div class="envfield"><label>max attempts</label><input id="env-MAX_ATTEMPTS" type="number" min="1">
-    <div class="hint">critic-loop cap per run (default 5)</div></div>
+    <div class="hint">cap on solving/critic loop rounds — blank = indefinite</div></div>
   <div class="envfield"><label>lean lsp port</label><input id="env-LEAN_LSP_PORT" type="number" min="1">
     <div class="hint">port for the lean-lsp server (default 8888)</div></div>
   <div class="envfield"><label>axle api key</label><input id="env-AXLE_API_KEY" type="password" autocomplete="off">
@@ -2305,7 +2305,7 @@ $('gearbtn').onclick = async () => {
     if (m && ENV_KEYS.includes(m[1])) vals[m[1]] = m[2];
     else if (line.trim() && !line.trim().startsWith('#')) envExtra.push(line);
   });
-  $('env-MAX_ATTEMPTS').value = vals.MAX_ATTEMPTS || '5';
+  $('env-MAX_ATTEMPTS').value = vals.MAX_ATTEMPTS || '';
   $('env-LEAN_LSP_PORT').value = vals.LEAN_LSP_PORT || '8888';
   $('env-AXLE_API_KEY').value = vals.AXLE_API_KEY || '';
   $('env-ARISTOTLE_API_KEY').value = vals.ARISTOTLE_API_KEY || '';

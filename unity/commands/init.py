@@ -10,8 +10,8 @@ from ..library import ensure_library
 _DEFAULT_METRICS = Path(__file__).parent.parent / "defaults" / "metrics"
 
 _ENV_DEFAULT = (
-    "# Critic-loop cap per run\n"
-    "MAX_ATTEMPTS=5\n"
+    "# Cap on solving/critic loop rounds (blank = indefinite)\n"
+    "MAX_ATTEMPTS=\n"
     "# Set to off to disable workspace-brief injection (ablation)\n"
     "UNITY_FORUM_BRIEF=on\n"
     "# Optional service keys — unlock extra agent tools when set\n"

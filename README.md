@@ -263,7 +263,7 @@ Mixed rosters are the point: mark your strongest model as the primary and fill t
 
 ## Configuration
 
-- `.unity/.env` — run flags: `MAX_ATTEMPTS` (critic-loop cap, default 5), `UNITY_FORUM_BRIEF=off`
+- `.unity/.env` — run flags: `MAX_ATTEMPTS` (cap on solving/critic loop rounds; blank/unset = indefinite), `UNITY_FORUM_BRIEF=off`
   (disable workspace-brief injection), and optional service keys (`AXLE_API_KEY`,
   `ARISTOTLE_API_KEY`) that unlock extra agent tools.
 - `.unity/agents.yaml` — the roster (see [Roster Configuration](#roster-configuration)). Per-agent

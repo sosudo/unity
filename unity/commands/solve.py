@@ -19,7 +19,7 @@ async def solve(continue_):
     roster = load_roster(paths.agents_yaml)
     mcp = build_mcp(paths)
     root = paths.project_root
-    max_attempts = int(os.getenv("MAX_ATTEMPTS", "5"))
+    max_attempts = float(os.getenv("MAX_ATTEMPTS") or "inf")  # blank/unset = indefinite
 
     if continue_:
         await dispatch([roster.primary], roster, load_prompt("solve/PREPARATION"),
@@ -54,7 +54,8 @@ async def solve(continue_):
     # progress — "advanced" banks progress but does not pass the gate.
     verdict = "stalled"
     s = 0
-    while True:
+    solving = True
+    while solving:
         if s == 0:
             # Independent drafts before the shared document: prevents anchoring on the
             # first idea posted.
@@ -101,6 +102,8 @@ async def solve(continue_):
         if verdict == "solved":
             break
         if stop_requested(root):
+            break
+        if s >= max_attempts:
             break
 
     await dispatch(roster.agents, roster, load_prompt("solve/CHUNKING"),
