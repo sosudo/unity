@@ -70,12 +70,15 @@ Write for formalization even though you write no Lean: state intermediate lemmas
 dependencies between results clear (this becomes the chunk DAG next), and prefer constructions a
 formalizer could realize.
 
-**If, after genuine sustained effort, the full problem still stands:** maximize *verified new
-progress* — novel lemmas, improved bounds, new equivalences or reductions, structural
-characterizations, a disproof of a natural strengthening — written up rigorously in `PROOF.tex`
-with complete proofs, and an honest statement of what remains open and why each attack fell short.
-"We believe there cannot be a proof" is not a valid reason to stop; running out of listed ideas is
-what the research reboot is for. A rigorous "no, and here is why" (a disproof) is a full solution.
+**There is no fallback deliverable.** This phase repeats until the problem is FULLY solved — the
+pipeline will not formalize partial progress, and "this is the best we can do" does not exist here.
+Partial results are fuel, not products: bank every verified lemma, bound, reduction, and failure
+autopsy in `PROOF.tex` and the ledger so the next round starts further up the mountain, then keep
+climbing. "We believe there cannot be a proof" is not a valid reason to stop; running out of listed
+ideas is what the research reboot is for. A rigorous disproof ("no, and here is why") is a full
+solution. Run yourselves as a research program: use the forum to coordinate directions, allocate
+strategies and compute across agents, split conjectures and lemmas among the team, and keep ONE
+cohesive `PROOF.tex` converging toward the complete solution.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
 modify anything outside it. If you can't do something or are unsure, raise a `forum_obstacle` (what

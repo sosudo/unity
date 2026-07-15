@@ -4,7 +4,7 @@ The problem is in `.unity/UNITY.md`. This phase is **pure mathematical research*
 frontier of knowledge around the problem so the solving phase starts from the strongest possible
 position. You do not solve the problem here, and you do not write or plan any Lean. **This phase is
 Lean-agnostic** — no Mathlib searches, no formalization strategies, no statement-shape choices;
-formalization is planned only after the mathematics is fully solved.
+formalization is planned only after the mathematics is fully solved. Never create or edit `.lean` files in this phase.
 
 **Map the frontier.** Dig for:
 - every known partial result, with its precise statement and source;

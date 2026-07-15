@@ -31,11 +31,13 @@ Then (using your own agent name in the paths — never another judge's):
    `{"verdict": "advanced"}`, or `{"verdict": "stalled"}`.
 3. Post `forum_decision(topic="adjudication-<your agent name>", choice=<verdict>, rationale=<one-line why>)`.
 
-The pipeline takes the MOST CONSERVATIVE verdict across judges (any stalled ⇒ stalled; solved needs
-unanimity), and merges every judge's report into `.unity/VERDICT.md` for the next round.
-
-A **stalled** verdict sends the team back into the solving phase with the merged VERDICT.md as
-their brief — write the directives you would want to receive.
+The pipeline takes the MOST CONSERVATIVE verdict across judges (solved requires unanimity) and
+merges every judge's report into `.unity/VERDICT.md`. **Only `solved` opens the gate to
+formalization.** `advanced` still matters — it records that the round banked genuinely new verified
+mathematics — but both `advanced` and `stalled` send the team back into the solving phase with the
+merged VERDICT.md as their brief, so write the directives you would want to receive. Never grade
+`solved` on momentum or sympathy: an unsolved problem going back for another round is the system
+working, not a failure.
 
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). Do not edit
 `PROOF.tex` yourself, and don't touch `.unity/critic.json` or `.unity/finalized.json`.

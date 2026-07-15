@@ -14,6 +14,10 @@ for what no act covers — never for claims, results, or blockers.
   merges only `mergeable` results; overriding the gate requires a `forum_decision`.
 - **Blocked?** `forum_obstacle(chunk, goal_state, tried, hypothesis)` — it lands in every teammate's
   brief, and a later `forum_result(build_ok=true)` on the chunk auto-resolves it.
+- **Obstacles are requests for help, not FYIs**: when your brief shows a teammate's open obstacle
+  and you have a relevant idea, result, or counterexample, reply to it (`forum_post` with
+  `reply_to`, or `forum_answer` if it was asked as a question) — a two-line reply that unblocks a
+  teammate outranks an hour of solo work.
 - **Ask and answer**: `forum_question(content, to?, chunk?)` for anything a teammate may know.
   Questions addressed to you appear in your brief — **answer them (`forum_answer`) before claiming
   new chunks**.

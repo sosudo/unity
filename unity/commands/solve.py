@@ -7,7 +7,7 @@ import asyncclick as click
 
 from ..config import load_paths
 from ..roster import load_roster
-from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase, toposort, read_approved, read_finalized, mark_phase
+from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase, toposort, read_approved, read_finalized, mark_phase, stop_requested
 
 
 @click.command(name="solve")
@@ -43,15 +43,18 @@ async def solve(continue_):
 
     # Adjudicated solving loop: the primary referees each round; a stalled round is
     # re-attacked with the verdict's directives instead of sliding into formalization.
-    solve_attempts = max_attempts  # same knob as the formalization/critic loop
     # Panel of judges: the primary + the strongest non-primary agent (when one exists) —
     # a round only counts as solved if every judge independently agrees.
     judges = [roster.primary]
     others = sorted((a for a in roster.agents if not a.is_primary), key=lambda a: -a.strength)
     if others:
         judges.append(others[0])
+    # Solving gates on a FULL solution: rounds repeat until the panel is unanimous on
+    # "solved" (or a safe stop is requested). Formalization never starts on partial
+    # progress — "advanced" banks progress but does not pass the gate.
     verdict = "stalled"
-    for s in range(solve_attempts):
+    s = 0
+    while True:
         if s == 0:
             # Independent drafts before the shared document: prevents anchoring on the
             # first idea posted.
@@ -60,7 +63,7 @@ async def solve(continue_):
                            "initial results to .unity/source/drafts/<your name>.md. Do not edit PROOF.tex.",
                            root, mcp)
         reboot = "" if s == 0 else (
-            " A previous round was adjudicated as stalled — read .unity/VERDICT.md, perform a research "
+            " A previous round did not fully solve the problem — read .unity/VERDICT.md, perform a research "
             "reboot (reread the problem, list every established fact, generate at least five "
             "fundamentally different attack plans before choosing one), and attack again.")
         drafts = " Start from the independent drafts in .unity/source/drafts/ — mine every one of them for lines of attack." if s == 0 else ""
@@ -94,8 +97,10 @@ async def solve(continue_):
             rounds = paths.unity / "rounds"
             rounds.mkdir(exist_ok=True)
             (rounds / f"round-{s + 1}-{verdict}.tex").write_text(proof.read_text())
-        # if verdict in ("solved", "advanced"):
-        if verdict in ("solved"):
+        s += 1
+        if verdict == "solved":
+            break
+        if stop_requested(root):
             break
 
     await dispatch(roster.agents, roster, load_prompt("solve/CHUNKING"),
