@@ -47,6 +47,12 @@ found, the approaches burned, and directives for this round.
 - Estimate: densities, expectations, random-model behavior, heuristic probabilities — random models
   often suggest the right conjecture and the right invariant.
 - Find and exploit symmetries. Ask whether entropy, compression, encoding, or counting arguments apply.
+- **Turn computations into theorems**: when a verified computation covers all cases up to a bound,
+  hunt for the complementary tail argument (growth, monotonicity, descent, density) that settles
+  everything beyond it — finite check + tail argument is a complete proof.
+- **Write the skeleton top-down**: draft the full chain of lemmas that WOULD prove the theorem,
+  sorry-free in structure even where steps are unproven, then attack the weakest link first — it
+  exposes exactly which gap is load-bearing.
 - **Stress-test every proof before it enters PROOF.tex**: run it on small cases, check where each
   hypothesis is actually used (a proof that never uses one is broken), and name the step that gets
   past the known barrier — if your argument makes an open problem look easy, find the error first.
