@@ -44,7 +44,7 @@ fi
 
 # ── unity itself ──────────────────────────────────────────────────────────────
 say "installing unity from $REPO"
-uv tool install --force "git+$REPO"
+uv tool install --force --prerelease=allow "git+$REPO"
 
 if ! have unity; then
   say "installed, but 'unity' is not on your PATH yet — run: uv tool update-shell, then restart your shell"
