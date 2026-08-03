@@ -72,6 +72,18 @@ forum: agree on the overall structure, then claim sections (`forum_claim` with t
 chunk) so two agents don't clobber each other. Discuss competing approaches and converge — record
 an endorsed `forum_decision` when the team disagrees on strategy.
 
+**Conversation policy** (lab-validated: this drives the dense coordination that makes teams work —
+follow it literally):
+- Work in many SHORT forum turns, never monologues. Each cycle: read what's new (`forum_read` /
+  `forum_brief`) → **reply to at least one teammate post you haven't engaged** (`reply_to` its id:
+  agree, extend, object with a reason, or answer it) → only then post your own new contribution.
+- Keep conversational posts short (~120 words), address teammates by name, and end with a question
+  or a concrete handoff ("X, can you check step 3?") whenever you want input back.
+- Verify every post landed — the tool returns a post_id; if a call errors, fix it and retry. Never
+  continue as if you posted something that didn't land.
+- Argue disagreements out in replies until someone concedes or a compromise emerges, then record
+  the outcome with `forum_decision`.
+
 Write for formalization even though you write no Lean: state intermediate lemmas explicitly, keep
 dependencies between results clear (this becomes the chunk DAG next), and prefer constructions a
 formalizer could realize.

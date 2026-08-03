@@ -2461,15 +2461,17 @@ async function showDecl(file, name) {
 
 // ── agents ────────────────────────────────────────────────────────────────────
 const AG_F = ['model', 'backend', 'provider', 'budget', 'base_url', 'api_key', 'auth_token'];
-const API_LABEL = {claude_code: 'anthropic', anthropic: 'anthropic', codex: 'openai', openai: 'openai'};
+const API_LABEL = {claude_code: 'anthropic', anthropic: 'anthropic', codex: 'openai', openai: 'openai', antigravity: 'antigravity', gemini: 'antigravity'};
 const AG_PRESETS = {
   'Claude (subscription)': {name: 'Ada', model: 'claude-opus-4-6', backend: 'anthropic', budget: 10},
   'Claude (API key)': {name: 'Grace', model: 'claude-sonnet-5', backend: 'anthropic', api_key: '${ANTHROPIC_API_KEY}', budget: 5},
   'Codex (subscription)': {name: 'Kurt', model: 'gpt-5.5-codex', backend: 'openai'},
   'Codex (OpenAI API)': {name: 'Karl', model: 'gpt-5.5-codex', backend: 'openai', api_key: '${OPENAI_API_KEY}'},
+  'Antigravity — Gemini (subscription)': {name: 'Nova', model: 'gemini-3.1-pro-high', backend: 'antigravity'},
+  'Antigravity — Claude/GPT (subscription)': {name: 'Iris', model: 'claude-opus-4-6-thinking', backend: 'antigravity'},
   'OpenRouter — Claude': {name: 'Emmy', model: 'anthropic/claude-sonnet-5', backend: 'anthropic', base_url: 'https://openrouter.ai/api', auth_token: '${OPENROUTER_API_KEY}'},
   'OpenRouter — non-Claude model': {name: 'Alan', model: 'qwen/qwen3-coder:free', backend: 'openai', base_url: 'https://openrouter.ai/api/v1', api_key: '${OPENROUTER_API_KEY}'},
-  'FreeInference': {name: 'Sophie', model: 'glm-5.1', backend: 'openai', base_url: 'https://freeinference.org/v1', api_key: '${FREEINFERENCE_API_KEY}'},
+  'FreeInference': {name: 'Sophie', model: 'deepseek-v4-flash', backend: 'openai', base_url: 'https://freeinference.org/v1', api_key: '${FREEINFERENCE_API_KEY}'},
   'Local vLLM': {name: 'Henri', model: 'my-model', backend: 'openai', base_url: 'http://localhost:8000/v1', api_key: 'unity'},
 };
 let agTimer = null, agLastEdited = 'cards';
@@ -2496,7 +2498,7 @@ function agentCard(g) {
   h += inp('name', g.name || (g.names || []).join(', '));
   h += inp('model', g.model);
   h += '<div><label>api</label><select data-f="backend" style="width:100%">' +
-    ['anthropic', 'openai'].map(o => '<option' + (o === api ? ' selected' : '') + '>' + o + '</option>').join('') + '</select></div>';
+    ['anthropic', 'openai', 'antigravity'].map(o => '<option' + (o === api ? ' selected' : '') + '>' + o + '</option>').join('') + '</select></div>';
   h += inp('budget', g.budget, '', 'budget (usd)');
   const show = f => full || g[f] !== undefined;
   if (show('provider')) h += inp('provider', g.provider);

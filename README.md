@@ -215,6 +215,10 @@ agents:
   model: gpt-5.5-codex
   backend: openai
 
+- name: Nova                   # Google Antigravity subscription (`agy` login;
+  model: gemini-3.1-pro-high   #  Gemini pool and Claude/GPT pool — see `agy models`)
+  backend: antigravity
+
 - name: Karl                   # Codex via an OpenAI API key
   model: gpt-5.5-codex
   backend: openai
@@ -233,7 +237,7 @@ agents:
   api_key: ${OPENROUTER_API_KEY}
 
 - name: Sophie                 # FreeInference
-  model: glm-5.1
+  model: deepseek-v4-flash
   backend: openai
   base_url: https://freeinference.org/v1
   api_key: ${FREEINFERENCE_API_KEY}

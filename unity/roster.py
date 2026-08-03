@@ -7,9 +7,10 @@ from pathlib import Path
 
 import yaml
 
-BACKENDS = {"claude_code", "codex"}
+BACKENDS = {"claude_code", "codex", "antigravity"}
 # user-facing aliases: the yaml (and web UI) may say which API an agent speaks
 _BACKEND_ALIASES = {"anthropic": "claude_code", "openai": "codex",
+                    "antigravity": "antigravity", "gemini": "antigravity",
                     "claude_code": "claude_code", "codex": "codex"}
 _VAR = re.compile(r"\$\{(\w+)\}|\$(\w+)")
 
@@ -75,7 +76,7 @@ def load_roster(path: Path) -> Roster:
         backend = _BACKEND_ALIASES.get(str(g.get("backend", "")).lower())
         if backend not in BACKENDS:
             raise ValueError(f"{where}: 'backend' must be one of "
-                             f"{sorted(BACKENDS)} (or aliases 'anthropic'/'openai')")
+                             f"{sorted(BACKENDS)} (or aliases 'anthropic'/'openai'/'antigravity')")
 
         model = g.get("model")
         if not model:

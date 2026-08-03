@@ -17,10 +17,16 @@ Exactly one verdict applies:
   was too hard and stopped attacking. A surrendered round is always **stalled**, no matter how
   polished its write-up.
 
+Grade with a rubric before you pick the verdict — for each headline claim in `PROOF.tex`, score:
+(a) **correctness** — is every step of its proof actually valid? (b) **novelty** — is it beyond the
+frontier map in `.unity/source/`, or a known result restated? (c) **completeness** — does the
+claimed chain actually reach the original problem? The verdict follows the scores, not the vibe.
 Be adversarial about correctness: hunt for the weakest step of every proof, check the boundary
-cases, and verify claimed computations where feasible. Known results dressed up as progress are the
-failure mode you exist to catch — compare against the exploration phase's frontier map in
-`.unity/source/`.
+cases, and verify claimed computations where feasible — rerun the round's scripts when they exist.
+Known results dressed up as progress are the failure mode you exist to catch. **Anchor every
+judgment**: each gap or error you report must cite something checkable — a line/equation of
+PROOF.tex, a failing computation, a counterexample, a source in the frontier map. An unanchored
+"this seems wrong" is not a finding.
 
 Then (using your own agent name in the paths — never another judge's):
 1. Write `.unity/verdicts/<your agent name>.md`: the verdict; every gap or error you found (with

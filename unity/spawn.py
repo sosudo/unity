@@ -57,18 +57,55 @@ async def _idle_guard(aiter, timeout: float):
         yield item
 
 
-# Transient API failures (rate limits, overloads) are retried with a long sleep;
-# a hard cap stops a permanently-broken agent (bad key, dead provider) from
-# spinning forever inside asyncio.gather.
-_MAX_API_RETRIES = 6
-_RETRY_SLEEP = 600.0
+# Transient API failures are retried; the cap follows the MAX_ATTEMPTS env flag
+# (blank/unset = retry indefinitely). Rate limits get a short backoff; other
+# failures (overloads, dead providers) wait longer between attempts.
+def _max_retries() -> float:
+    return float(os.getenv("MAX_ATTEMPTS") or "inf")
+
+
+def _retry_sleep(exc) -> float:
+    s = str(exc).lower()
+    if "429" in s or "rate" in s or "too many" in s:
+        return 60.0
+    return 600.0
+
+
+# Signatures of permanent failures (dead CLI, bad/exhausted credentials): retrying
+# these forever just burns wall-clock — give up after two attempts regardless of
+# the MAX_ATTEMPTS-driven cap for transient errors.
+_PERMANENT = ("exit code 1", "usage limit", "upgrade to", "authentication", "unauthorized",
+              "401", "invalid api key", "login", "requires a newer version")
+
+
+def _give_up(exc, attempt: int) -> bool:
+    s = str(exc).lower()
+    if any(sig in s for sig in _PERMANENT):
+        return attempt >= 2
+    return attempt >= _max_retries()
 
 # Last-run accounting per agent name, harvested by spawn() into .unity/logs/run.jsonl
 # so benchmark runs can compare cost across rosters.
 _last_run_stats: dict[str, dict] = {}
 
-# Per-agent buffer assembling codex token deltas into whole log lines.
+# Per-agent buffer assembling streamed token deltas into whole log lines.
 _delta_buf: dict[str, str] = {}
+
+
+def _emit_delta(name: str, delta: str) -> None:
+    buf = _delta_buf.get(name, "") + delta
+    while "\n" in buf or len(buf) >= 300:
+        cut = buf.find("\n") if "\n" in buf else 300
+        line, buf = buf[:cut], buf[cut:].lstrip("\n")
+        if line.strip():
+            _console.print(f"[dim]{_ts()} \\[{name}][/dim] {line[:300]}")
+    _delta_buf[name] = buf
+
+
+def _flush_delta(name: str) -> None:
+    tail = _delta_buf.pop(name, "")
+    if tail.strip():
+        _console.print(f"[dim]{_ts()} \\[{name}][/dim] {tail[:300]}")
 
 
 def _ts() -> str:
@@ -183,7 +220,9 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         max_budget_usd=agent.budget,
         env=_agent_env(agent),
     )
-    for attempt in range(_MAX_API_RETRIES):
+    attempt = 0
+    while True:
+        attempt += 1
         try:
             final = None
             async for msg in _idle_guard(query(prompt=prompt, options=options), idle_timeout):
@@ -201,10 +240,11 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                     return final
             return final
         except Exception as e:
-            if attempt == _MAX_API_RETRIES - 1:
+            if _give_up(e, attempt):
                 raise
-            _log(agent.name, f"API Error ({e}), retrying in 10 minutes...")
-            await asyncio.sleep(_RETRY_SLEEP)
+            wait = _retry_sleep(e)
+            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await asyncio.sleep(wait)
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
@@ -312,7 +352,9 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     # SDK's pinned bundled binary — newest models often require a newer runtime.
     import shutil as _sh
     codex_bin = _sh.which("codex")
-    for attempt in range(_MAX_API_RETRIES):
+    attempt = 0
+    while True:
+        attempt += 1
         cfg = (CodexConfig(cwd=str(cwd), env=_agent_env(agent, home), codex_bin=codex_bin)
                if codex_bin else CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
         codex = AsyncCodex(config=cfg)
@@ -354,16 +396,103 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
             return final
         except Exception as e:
-            if attempt == _MAX_API_RETRIES - 1:
+            if _give_up(e, attempt):
                 raise
-            _log(agent.name, f"API Error ({e}), retrying in 10 minutes...")
-            await asyncio.sleep(_RETRY_SLEEP)
+            wait = _retry_sleep(e)
+            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await asyncio.sleep(wait)
         finally:
             # close() can hang after an aborted turn; don't let cleanup wedge the agent.
             try:
                 await asyncio.wait_for(codex.close(), timeout=15)
             except (asyncio.TimeoutError, Exception):
                 pass
+
+
+async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
+                              mcp_servers: dict, *, permission: str = "bypassPermissions",
+                              idle_timeout: float = 600.0, subagents=()) -> str | None:
+    """Google Antigravity backend: drives the user's installed `agy` CLI in print mode
+    (subscription auth; serves both the Gemini pool and the Claude/GPT pool). MCP tools
+    reach the model through the `unity mcp` shell bridge, like codex."""
+    import json as _json
+    import shutil as _sh
+    agy = _sh.which("agy")
+    if agy is None:
+        raise RuntimeError("antigravity backend needs the `agy` CLI installed and logged in "
+                           "(https://antigravity.google)")
+    from .config import find_unity_dir
+    unity_dir = find_unity_dir(Path(cwd))
+    full = system_prompt + _CODEX_MCP_NOTE + "\n\n---\n\nTASK:\n" + prompt
+    cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
+           "--dangerously-skip-permissions", "--print-timeout", "72h"]
+    if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
+        cmd += ["--add-dir", str(unity_dir.parent)]
+
+    attempt = 0
+    while True:
+        attempt += 1
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL)
+
+        async def _lines():
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    return
+                yield line
+
+        try:
+            final = None
+            usage = None
+            failed = None
+            async for raw in _idle_guard(_lines(), idle_timeout):
+                try:
+                    e = _json.loads(raw)
+                except _json.JSONDecodeError:
+                    continue
+                ev = e.get("event")
+                if ev == "step_update":
+                    su = e.get("step_update", {})
+                    st = su.get("step_type", "")
+                    if st == "agent_response" and su.get("text_delta"):
+                        _emit_delta(agent.name, su["text_delta"])
+                    elif (su.get("state") == "DONE"
+                          and st not in ("agent_response", "checkpoint", "user_input", "unknown", "")):
+                        _console.print(f"[dim]{_ts()} \\[{agent.name}][/dim] [cyan]⚙ {st[:80]}[/cyan]")
+                        _tool_log(cwd, agent.name, st)
+                elif ev == "result":
+                    r = e.get("result", {})
+                    final = r.get("response") or final
+                    usage = r.get("usage")
+                    if r.get("status") not in (None, "SUCCESS"):
+                        failed = r.get("status")
+                        _console.print(f"[red]{_ts()} \\[{agent.name}] ✗ agy result: {failed}[/red]")
+                if _stop_requested(cwd):
+                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                    proc.terminate()
+                    break
+            rc = await proc.wait()
+            if failed:
+                raise RuntimeError(f"agy turn failed: {failed}")
+            if final is None and rc not in (0, -15):
+                raise RuntimeError(f"agy exited with code {rc} and no response")
+            _flush_delta(agent.name)
+            _console.print(f"[green]{_ts()} \\[{agent.name}] ✓ turn complete[/green]")
+            _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
+            return final
+        except Exception as e:
+            if proc.returncode is None:
+                proc.kill()
+            if _give_up(e, attempt):
+                raise
+            wait = _retry_sleep(e)
+            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await asyncio.sleep(wait)
+        finally:
+            if proc.returncode is None:
+                proc.kill()
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -393,7 +522,8 @@ def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=()) -> str | None:
-    backend = claude_spawner if agent.backend == "claude_code" else codex_spawner
+    backend = {"claude_code": claude_spawner, "codex": codex_spawner,
+               "antigravity": antigravity_spawner}[agent.backend]
     import time
     t0 = time.monotonic()
     try:

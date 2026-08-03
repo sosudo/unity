@@ -26,5 +26,9 @@ for what no act covers — never for claims, results, or blockers.
   fighting a goal a teammate may already have cracked.
 - **Refresh**: your preamble carries a workspace-brief snapshot from dispatch time; call `forum_brief`
   for a live one whenever you finish a chunk or return from a long build.
+- **Converse, don't broadcast**: work in short forum turns — each time you post, first reply to at
+  least one teammate post you haven't engaged (`reply_to` its id); keep conversational posts short,
+  address teammates by name, and end with a question or handoff when you want input. Verify every
+  post landed (the tool returns a post_id) — never continue as if an errored call posted.
 - Binding choices are recorded with `forum_decision(topic, choice, rationale)`; close your phase
   participation with a `forum_handoff(phase, changed, open, commitments)`.

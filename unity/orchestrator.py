@@ -31,6 +31,34 @@ def mark_phase(command: str, phase: str) -> None:
         pass
 
 
+def resume_point(paths, command: str, continue_: bool) -> str | None:
+    """Where to resume when --continue picks up a run that died mid-command: the phase
+    that was live when it died (phases before it completed; it reruns). Fresh runs
+    clear any stale state. Deaths during preparation/architect resume as a normal
+    continue. Returns None when there is nothing to resume."""
+    sp = paths.unity / "state.json"
+    if not continue_:
+        sp.unlink(missing_ok=True)
+        return None
+    try:
+        st = json.loads(sp.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    phase = st.get("phase")
+    if st.get("command") != command or phase in (None, "", "done", "preparation", "architect"):
+        return None
+    return phase
+
+
+def mark_done(paths, command: str) -> None:
+    """Record clean completion so the next --continue starts fresh instead of resuming."""
+    try:
+        (paths.unity / "state.json").write_text(
+            json.dumps({"command": command, "phase": "done", "ts": time.time()}))
+    except OSError:
+        pass
+
+
 def load_prompt(name: str) -> str:
     # A "command/PHASE" prompt load is exactly a phase transition — mark it here so
     # every command gets phase tracking without per-command bookkeeping.

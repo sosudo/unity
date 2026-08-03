@@ -28,3 +28,17 @@ no change at all.
 **Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
 whether a score is honest or a statement was preserved, raise it with `forum_obstacle` before deciding. Consult the
 global unity library (`~/.unity/library/`).
+
+**Verdict.** Alongside the approval flag, grade the round into `.unity/critic.json` as
+`{"approved": <bool>, "verdict": "<VERDICT>"}` where `<VERDICT>` is exactly one of:
+- `"optimized"` — every in-scope target is genuinely complete (this always accompanies
+  `"approved": true`, and never accompanies false);
+- `"advanced"` — not complete, but this round made real verified progress (new chunks merged,
+  sorries closed, statements corrected);
+- `"stalled"` — no real progress, or regressions, or cheating found.
+When the verdict is not `"optimized"`, your `.unity/CRITIC.md` must carry directives the next
+round can act on — separate **checker-wrong** issues (the statement/spec/chunk is wrong and must
+be revised) from **actor-wrong** issues (the statement is right and the implementation failed),
+name the exact declarations, and say which approaches look exhausted. Ground every claim in an
+anchor the next round can check: a build error, a failing declaration name, a diff — never just
+an impression.
