@@ -87,6 +87,16 @@ def _give_up(exc, attempt: int) -> bool:
 # Last-run accounting per agent name, harvested by spawn() into .unity/logs/run.jsonl
 # so benchmark runs can compare cost across rosters.
 _last_run_stats: dict[str, dict] = {}
+_completed_run_stats: dict[str, dict] = {}
+_task_context: dict[str, tuple[str, str]] = {}  # agent -> (task_id, run_dir)
+
+
+def set_task_context(agent_name: str, task_id: str, run_dir: Path) -> None:
+    _task_context[agent_name] = (task_id, str(Path(run_dir)))
+
+
+def clear_task_context(agent_name: str) -> None:
+    _task_context.pop(agent_name, None)
 
 # Per-agent buffer assembling streamed token deltas into whole log lines.
 _delta_buf: dict[str, str] = {}
@@ -135,6 +145,13 @@ def _tool_log(cwd, name: str, tool: str, detail: str = "") -> None:
             entry["detail"] = detail[:160]
         with (logs / "tools.jsonl").open("a") as f:
             f.write(json.dumps(entry) + "\n")
+        context = _task_context.get(name)
+        if context:
+            try:
+                from .prove_runtime import RuntimeStore
+                RuntimeStore(Path(context[1])).heartbeat(context[0], name, tool_calls=1)
+            except (OSError, ValueError, KeyError, json.JSONDecodeError):
+                pass
     except OSError:
         pass
 
@@ -507,16 +524,35 @@ def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
     try:
         logs = unity / "logs"
         logs.mkdir(exist_ok=True)
+        stats = _last_run_stats.pop(agent.name, {})
         entry = {
             "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "agent": agent.name, "model": agent.model, "backend": agent.backend,
             "seconds": round(seconds, 1),
-            **_last_run_stats.pop(agent.name, {}),
+            **stats,
         }
+        _completed_run_stats[agent.name] = {**stats, "seconds": seconds}
         with (logs / "run.jsonl").open("a") as f:
             f.write(json.dumps(entry) + "\n")
+        # Prove telemetry is run-scoped; retain the legacy project log too for
+        # compatibility with the existing dashboard and other pipelines.
+        try:
+            from .prove_runtime import active_run_dir
+            run_dir = active_run_dir(unity)
+            if run_dir is not None:
+                run_logs = run_dir / "logs"
+                run_logs.mkdir(parents=True, exist_ok=True)
+                with (run_logs / "models.jsonl").open("a") as f:
+                    f.write(json.dumps(entry) + "\n")
+        except (ImportError, OSError):
+            pass
     except OSError:
         pass
+
+
+def get_completed_stats(agent_name: str) -> dict:
+    """Consume accounting for the last completed turn of an agent."""
+    return _completed_run_stats.pop(agent_name, {})
 
 
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,

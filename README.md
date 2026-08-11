@@ -256,6 +256,8 @@ Mixed rosters are the point: mark your strongest model as the primary and fill t
 - **overview** — the home page: the current run status (idle, or the running command and its phase), your agents with what each one is working on right now, open obstacles & questions, and recent decisions. It auto-refreshes while a run is going, so this is the page to sit on.
 - **blueprint** — the actual Lean structure of your project: every declaration with its proof status (green = verified, yellow = complete but resting on a `sorry`, red = `sorry`, orange = `axiom`), filterable, with a list view and a dependency-graph view. Click any declaration to see its signature, source, and the chunk it belongs to. Statuses are kernel-verified when the project builds (you'll see a `kernel-verified` chip) and fall back to a textual approximation when it doesn't.
 - **forum** — the agents' shared workspace, as threads: claims, results, obstacles, questions, decisions, endorsements. The `graph view` button shows the same posts as a reply graph.
+- **proof search** — during `prove`, the live goal → task → candidate/finding graph, including owners,
+  cancellations, deterministic verification, objections, revisions, and accepted candidates.
 - **chunks** — the run's chunk DAG (how the agents split up the work), colored by status: merged, active, pending, blocked. Click a node for its details.
 - **agents** — your roster (see [Roster Configuration](#roster-configuration)). Add agents from presets or the `new` button, set one as primary, and edit the raw yaml directly if you prefer — the form and the yaml stay in sync.
 - **prompt** — `UNITY.md`, the specialized instructions that go to every agent. State your goal or any constraints here.
@@ -274,5 +276,8 @@ Mixed rosters are the point: mark your strongest model as the primary and fill t
   credentials (`api_key` / `auth_token` / `base_url`) live here, not in `.env`; `${VAR}` references
   are resolved from the environment. Only `openai` agents with a custom `base_url` require an
   `api_key` — with no credentials, an agent rides your subscription login.
+- `.unity/runs/<run-id>/` — event-driven `prove` state, run forum, content-addressed artifacts,
+  immutable candidate metadata/diffs, verification records, and telemetry. Worktrees share this
+  control plane through `.unity/current-run.json`; their source changes remain isolated.
 - `~/.unity/library/` — the global library (tactics, lemmas, references, skills, subagents) that
   every agent sees and the retrospective phase grows across runs.

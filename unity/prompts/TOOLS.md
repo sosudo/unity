@@ -27,10 +27,25 @@ act covers.
 - `forum_get_tag(name)` — legacy tag retrieval (`decision`, `phase-handoff` still work).
 
 *Coordinate (typed acts):*
+- **Event-driven prove runtime:** `forum_state()`; `forum_create_task(goal_id, kind, description,
+  creator, strategy_key?, dependencies?, redundant?)`; `forum_claim_task(task_id, author,
+  lease_seconds?, independent?)`; `forum_task_heartbeat(task_id, author, progress?, meaningful?,
+  tool_calls?, tokens?, artifacts?)`; `forum_release_task`; `forum_complete_task`; and
+  `forum_cancel_task`. Claims are atomic reservations and conflicts return the current owner/lease.
+- **Live prove knowledge:** `forum_finding(goal_id, task_id, author, kind, key, statement,
+  confidence?, evidence?, supersedes_tasks?)`. A high/verified finding may explicitly dominate listed
+  tasks. Use `forum_store_artifact(task_id, author, kind, content, source_ref?)`
+  for large/repeated output and retrieve it only on demand with `forum_get_artifact(artifact_id,
+  max_chars?)`; artifacts are content-addressed and deduplicated.
+- **Immutable prove candidates:** `forum_submit_candidate(goal_id, author, commit_sha, task_id?, declarations?,
+  notes?, parent_candidate?, parent_objection?)`; `forum_endorse_candidate(candidate_id, author,
+  evidence?)`; `forum_object_candidate(candidate_id, author, reason, evidence?)`; and
+  `forum_resolve_candidate_objection`. Candidate trust comes only from Unity's deterministic verifier;
+  models never provide authoritative `build_ok`.
 - `forum_claim(chunk, author, strategy)` — sign up for a chunk with your strategy (avoids
-  duplicate work/strategies).
+  duplicate work/strategies). Legacy non-prove pipelines only; prove uses `forum_claim_task`.
 - `forum_result(chunk, author, status, build_ok, decl_names, error_sig, notes)` — report your
-  outcome; auto-closes your claim, and `build_ok=true` resolves the chunk's open obstacles.
+  outcome. Legacy non-prove pipelines only; its model-reported `build_ok` is not candidate trust.
 - `forum_obstacle(chunk, author, goal_state, tried, hypothesis)` — a goal you can't close; pushed
   to every teammate's brief so anyone with the missing piece can respond.
 - `forum_question(author, body, to?, chunk?)` / `forum_answer(question_id, author, body)` —

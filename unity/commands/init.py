@@ -36,10 +36,11 @@ def _seed_default_metrics(metrics_dir: Path) -> None:
 _AGENTS_TEMPLATE = """\
 # Unity roster — add agents here or (easier) in the web UI: `unity serve` -> agents tab.
 # One group per model; `names` spawns one agent instance per name.
-# The PRIMARY agent (mark a group with `primary: true`; default: the first group) runs the
-# solo phases: preparation, architect bootstrap, the critic, and the retrospective — make it
-# your strongest model. Strength is learned automatically per model (autostrength); set
-# `strength:` only to override. `budget`: USD per agent instance.
+# The PRIMARY agent (mark a group with `primary: true`; default: the first group) runs solo
+# phases in legacy non-prove pipelines. `prove` treats this roster as available capacity and
+# routes fresh workers per task/review instead of keeping personas alive. Strength is learned
+# automatically per model (autostrength); set `strength:` only to override. `budget`: USD per turn.
+# Optional `cost:` is a provider-agnostic relative routing cost used by event-driven prove.
 #
 # agents:
 # - names: [Ada]

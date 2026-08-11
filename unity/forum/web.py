@@ -31,6 +31,23 @@ _GRAPH_PALETTE = [
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+def _forum_dir() -> Path:
+    """Follow the active/last prove run pointer so a long-lived UI sees its forum."""
+    try:
+        try:
+            control = json.loads((ROOT_DIR / "state.json").read_text())
+        except (OSError, ValueError):
+            control = {}
+        if control.get("command") not in (None, "prove"):
+            return FORUM_DIR
+        pointer = json.loads((ROOT_DIR / "current-run.json").read_text())
+        run_dir = Path(pointer["path"]).resolve()
+        if run_dir.parent == (ROOT_DIR / "runs").resolve() and (run_dir / "forum").is_dir():
+            return run_dir / "forum"
+    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        pass
+    return FORUM_DIR
+
 def _hot(post: dict) -> float:
     score = post.get("upvotes", 0) - post.get("downvotes", 0)
     sign = 1 if score > 0 else (-1 if score < 0 else 0)
@@ -48,7 +65,7 @@ def _sorted_posts(posts: list[dict], sort: str) -> list[dict]:
 
 
 def _load_thread(thread_id: str) -> dict | None:
-    path = FORUM_DIR / f"{thread_id}.json"
+    path = _forum_dir() / f"{thread_id}.json"
     if not path.exists():
         return None
     try:
@@ -65,7 +82,7 @@ _LEGACY_DIMENSIONS = ["correctness", "faithfulness", "style_alignment",
 
 
 def _load_config() -> dict:
-    path = FORUM_DIR / "config.json"
+    path = _forum_dir() / "config.json"
     if not path.exists():
         return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
     try:
@@ -140,7 +157,7 @@ def _chunk_status(chunk: dict, merged: set | None = None) -> str:
         return "yellow"
     # 3) typed forum acts on the chunk's thread
     for tid in dict.fromkeys([cid, f"chunk-{cid}"]):
-        thread_path = FORUM_DIR / f"{tid}.json"
+        thread_path = _forum_dir() / f"{tid}.json"
         if not thread_path.exists():
             continue
         try:
@@ -167,7 +184,7 @@ def _chunk_status(chunk: dict, merged: set | None = None) -> str:
 def list_threads():
     """Returns threads, active dimensions, pending proposals, tags, and leaderboard."""
     threads = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_forum_dir().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -186,7 +203,7 @@ def list_threads():
     # Pinned first, then by last_activity
     threads.sort(key=lambda t: (not t["pinned"], -t["last_activity"]))
     config = _load_config()
-    balances_path = FORUM_DIR / "balances.json"
+    balances_path = _forum_dir() / "balances.json"
     leaderboard = []
     if balances_path.exists():
         try:
@@ -242,7 +259,7 @@ def get_graph():
     thread_colors: dict[str, str] = {}
     nodes = []
     edges = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_forum_dir().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -286,7 +303,7 @@ def get_tag(name: str):
     tag = tags[name]
     post_ids = set(tag["post_ids"])
     posts = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_forum_dir().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -327,7 +344,7 @@ async def events():
             await asyncio.sleep(1)
             try:
                 mtime = max(
-                    (p.stat().st_mtime for p in FORUM_DIR.glob("*.json")),
+                    (p.stat().st_mtime for p in _forum_dir().glob("*.json")),
                     default=0.0,
                 )
                 dag_file = ROOT_DIR / "dag.json"
@@ -348,6 +365,49 @@ async def events():
 # ── Forum HTML ────────────────────────────────────────────────────────────────
 
 
+def _prove_state() -> dict | None:
+    """Load the current run-scoped proof-search graph for visualization."""
+    try:
+        pointer = json.loads((ROOT_DIR / "current-run.json").read_text())
+        run_dir = Path(pointer["path"]).resolve()
+        if run_dir.parent != (ROOT_DIR / "runs").resolve():
+            return None
+        return json.loads((run_dir / "state" / "runtime.json").read_text())
+    except (OSError, KeyError, ValueError, json.JSONDecodeError):
+        return None
+
+
+@app.get("/api/proof-search")
+def get_proof_search():
+    """Live GOAL -> TASK -> candidate/finding graph for event-driven prove."""
+    state = _prove_state()
+    if state is None:
+        return {"active": False, "goals": [], "tasks": [], "findings": [],
+                "candidates": [], "workers": [], "edges": []}
+    goals = list(state["goals"].values())
+    tasks = list(state["tasks"].values())
+    findings = list(state["findings"].values())
+    candidates = list(state["candidates"].values())
+    edges = []
+    for task in tasks:
+        edges.append({"source": task["goal_id"], "target": task["id"], "kind": "task"})
+        for dep in task.get("dependencies", []):
+            edges.append({"source": dep, "target": task["id"], "kind": "dependency"})
+        if task.get("parent_candidate"):
+            edges.append({"source": task["parent_candidate"], "target": task["id"], "kind": "followup"})
+    for finding in findings:
+        edges.append({"source": finding["task_id"], "target": finding["id"], "kind": "finding"})
+    for candidate in candidates:
+        edges.append({"source": candidate["goal_id"], "target": candidate["id"], "kind": "candidate"})
+        if candidate.get("parent_candidate"):
+            edges.append({"source": candidate["parent_candidate"], "target": candidate["id"], "kind": "revision"})
+    return {"active": state.get("status") == "running", "run_id": state["run_id"],
+            "status": state["status"], "goals": goals, "tasks": tasks,
+            "findings": findings, "candidates": candidates,
+            "workers": list(state["workers"].values()), "edges": edges,
+            "telemetry": state["telemetry"]}
+
+
 @app.get("/api/workspace")
 def get_workspace():
     """Typed-workspace state: decisions, handoffs, per-chunk consensus, obstacles,
@@ -358,7 +418,7 @@ def get_workspace():
     questions: list = []
     ledger: list = []
     by_act: dict = {}
-    for tp in sorted(FORUM_DIR.glob("*.json")):
+    for tp in sorted(_forum_dir().glob("*.json")):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
         try:
@@ -397,11 +457,19 @@ def get_workspace():
                 ledger.append({"author": post["author"], "kind": f.get("kind"), "title": f.get("title"),
                                "goal_shape": f.get("goal_shape", ""), "content": post["content"],
                                "ts": post["timestamp"]})
+    proof = _prove_state()
+    proof_view = None if proof is None else {
+        "run_id": proof["run_id"], "status": proof["status"],
+        "goals": list(proof["goals"].values()), "tasks": list(proof["tasks"].values()),
+        "findings": sorted(proof["findings"].values(), key=lambda f: -f["updated_at"])[:20],
+        "candidates": sorted(proof["candidates"].values(), key=lambda c: -c["submitted_at"]),
+        "workers": list(proof["workers"].values()), "telemetry": proof["telemetry"],
+    }
     return {"decisions": sorted(decisions.values(), key=lambda d: -d["ts"]),
             "handoffs": handoffs[-3:][::-1],
             "chunks": sorted(chunks.values(), key=lambda c: c["chunk"]),
             "questions": questions, "ledger": ledger[::-1][:20], "by_act": by_act,
-            "agents": _agent_statuses(chunks)}
+            "agents": _agent_statuses(chunks), "proof": proof_view}
 
 
 def _agent_statuses(chunks: dict) -> list:
@@ -1205,6 +1273,7 @@ section h2 { font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase;
     <nav>
       <a href="/">← app</a>
       <a href="/forum">forum →</a>
+      <a href="/proof-search">proof search →</a>
       <a href="/graph">graph →</a>
       <a href="/dag">dag →</a>
     </nav>
@@ -1224,6 +1293,41 @@ async function refresh() {
     const d = await (await fetch('/api/workspace')).json();
     document.getElementById('status').textContent = 'live';
     let h = '';
+    if (d.proof) {
+      const p = d.proof;
+      h += '<section><h2>Proof goals — ' + esc(p.status) + '</h2>' + (p.goals.length ? p.goals.map(g =>
+        '<div class="item"><b>' + esc(g.declaration) + '</b><span class="badge ' +
+        (g.status === 'closed' ? 'ok' : g.status === 'review' ? 'pending' : 'blocked') + '">' +
+        esc(g.status) + '</span><div class="who">' + esc(g.id) + ' · ' + esc(g.file) + ':' + g.line +
+        (g.accepted_candidate ? ' · accepted ' + esc(g.accepted_candidate) : '') + '</div></div>').join('') :
+        '<div class="empty">no goals</div>') + '</section>';
+      h += '<section><h2>Proof-search tasks</h2>' + (p.tasks.length ? p.tasks.map(t =>
+        '<div class="item"><span class="kind">' + esc(t.kind) + '</span>' + esc(t.description) +
+        '<span class="badge ' + (t.status === 'complete' ? 'ok' :
+          ['cancelled','dominated','superseded','failed'].includes(t.status) ? 'blocked' : 'pending') + '">' +
+        esc(t.status) + '</span><div class="who">' + esc(t.id) + ' · owner ' + esc(t.owner || '—') +
+        (t.supersession_reason ? ' · ' + esc(t.supersession_reason) : '') + '</div></div>').join('') :
+        '<div class="empty">no tasks</div>') + '</section>';
+      h += '<section><h2>Immutable candidates</h2>' + (p.candidates.length ? p.candidates.map(c =>
+        '<div class="item"><b>' + esc(c.id) + '</b><span class="badge ' +
+        (c.status === 'accepted' || c.status === 'acceptable' ? 'ok' :
+          c.status === 'blocked' || c.status === 'failed' ? 'blocked' : 'pending') + '">' + esc(c.status) +
+        '</span><div class="who">' + esc(c.author) + ' · commit ' + esc(c.commit_sha.slice(0,12)) +
+        ' · source ' + esc(c.source_hash.slice(0,12)) + ' · machine ' +
+        ((c.verification || {}).passed ? 'verified' : 'unverified') + '</div>' +
+        (c.objections || []).filter(o => o.status === 'open').map(o =>
+          '<div class="who">⛔ ' + esc(o.author) + ': ' + esc(o.reason) + '</div>').join('') + '</div>').join('') :
+        '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>Live findings</h2>' + (p.findings.length ? p.findings.map(f =>
+        '<div class="item"><span class="kind">' + esc(f.kind) + '</span><b>' + esc(f.title) + '</b>: ' +
+        esc(f.statement) + '<div class="who">' + esc(f.confidence) + ' · ' + esc(f.author) + '</div></div>').join('') :
+        '<div class="empty">none yet</div>') + '</section>';
+      h += '<section><h2>Adaptive workers</h2>' + (p.workers.length ? p.workers.map(w =>
+        '<div class="item"><b>' + esc(w.agent) + '</b><span class="badge ' +
+        (w.status === 'active' ? 'ok' : 'pending') + '">' + esc(w.status) + '</span>' +
+        '<div class="who">' + esc(w.model || '') + (w.task_id ? ' · ' + esc(w.task_id) : '') +
+        '</div></div>').join('') : '<div class="empty">all capacity idle</div>') + '</section>';
+    }
     h += '<section><h2>Binding decisions</h2>' + (d.decisions.length ? d.decisions.map(x =>
       '<div class="item"><b>' + esc(x.topic) + '</b>: ' + esc(x.choice) +
       (x.rationale ? ' — <span class="who">' + esc(x.rationale) + '</span>' : '') +
@@ -1269,6 +1373,43 @@ setInterval(refresh, 3000);
 @app.get("/workspace", response_class=HTMLResponse)
 def workspace():
     return _embeddable(WORKSPACE_HTML)
+
+
+PROOF_SEARCH_HTML = """\
+<!doctype html><html><head><meta charset="utf-8"><title>unity — proof search</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/cytoscape/3.28.1/cytoscape.min.js"></script>
+<style>
+*{box-sizing:border-box}body{margin:0;font:12px ui-monospace,Menlo,monospace;background:#fafafa;color:#222}
+header{height:44px;padding:12px 18px;border-bottom:1px solid #ddd;display:flex;justify-content:space-between}
+nav a{color:#777;text-decoration:none;margin-left:14px}#cy{height:calc(100vh - 44px)}
+#legend{position:fixed;left:14px;bottom:14px;background:#fff;border:1px solid #ddd;padding:8px 12px;z-index:4}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin:0 5px 0 10px}.dot:first-child{margin-left:0}
+</style></head><body><header><b>live proof-search graph</b><nav><a href="/">app</a><a href="/workspace">workspace</a><a href="/forum">forum</a></nav></header>
+<div id="cy"></div><div id="legend"><span class="dot" style="background:#4e79a7"></span>goal
+<span class="dot" style="background:#f28e2b"></span>task <span class="dot" style="background:#59a14f"></span>candidate
+<span class="dot" style="background:#b07aa1"></span>finding</div><script>
+let cy;
+function color(type,status){if(type==='goal')return status==='closed'?'#2e9d58':'#4e79a7';
+if(type==='candidate')return status==='accepted'?'#16833d':status==='failed'||status==='blocked'?'#d95a5a':'#59a14f';
+if(type==='finding')return '#b07aa1';return ['cancelled','dominated','superseded','failed'].includes(status)?'#aaa':'#f28e2b'}
+async function refresh(){const d=await(await fetch('/api/proof-search')).json();let nodes=[];
+d.goals.forEach(x=>nodes.push({data:{id:x.id,label:x.declaration,type:'goal',status:x.status,color:color('goal',x.status),detail:JSON.stringify(x,null,2)}}));
+d.tasks.forEach(x=>nodes.push({data:{id:x.id,label:x.kind+'\\n'+x.status,type:'task',status:x.status,color:color('task',x.status),detail:JSON.stringify(x,null,2)}}));
+d.candidates.forEach(x=>nodes.push({data:{id:x.id,label:x.id.replace('candidate-','cand ')+'\\n'+x.status,type:'candidate',status:x.status,color:color('candidate',x.status),detail:JSON.stringify(x,null,2)}}));
+d.findings.forEach(x=>nodes.push({data:{id:x.id,label:x.title,type:'finding',status:x.status,color:color('finding',x.status),detail:JSON.stringify(x,null,2)}}));
+const edges=d.edges.map((e,i)=>({data:{id:'e'+i,source:e.source,target:e.target,label:e.kind}}));
+if(cy)cy.destroy();cy=cytoscape({container:document.getElementById('cy'),elements:[...nodes,...edges],
+style:[{selector:'node',style:{'background-color':'data(color)','label':'data(label)','font-size':10,'text-wrap':'wrap','text-max-width':110,'width':34,'height':34}},
+{selector:'edge',style:{'curve-style':'bezier','target-arrow-shape':'triangle','width':1,'line-color':'#bbb','target-arrow-color':'#bbb','label':'data(label)','font-size':8}},
+{selector:'node[type="goal"]',style:{'shape':'round-rectangle','width':80,'height':42}},
+{selector:'node[type="candidate"]',style:{'shape':'diamond'}}],layout:{name:'breadthfirst',directed:true,padding:30,spacingFactor:1.35}});
+cy.on('tap','node',e=>alert(e.target.data('detail')))}refresh();setInterval(refresh,3000);
+</script></body></html>"""
+
+
+@app.get("/proof-search", response_class=HTMLResponse)
+def proof_search():
+    return _embeddable(PROOF_SEARCH_HTML)
 
 
 
@@ -1324,7 +1465,7 @@ def _safe_unity_path(rel: str) -> Path:
 
 
 def _forum_nonempty() -> bool:
-    for tp in FORUM_DIR.glob("*.json"):
+    for tp in _forum_dir().glob("*.json"):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
         try:
@@ -1333,6 +1474,21 @@ def _forum_nonempty() -> bool:
         except Exception:
             continue
     return False
+
+
+def _prove_resume_available() -> bool:
+    """Whether ``unity prove --continue`` has useful authoritative state.
+
+    Forum posts are discussion, not the prove runtime's source of truth.  In
+    particular, a stopped or exhausted run can have no posts at all while still
+    containing tasks, findings, and candidates that should be resumed.
+    """
+    state = _prove_state()
+    if state is None or state.get("command") != "prove":
+        return False
+    return state.get("status") != "complete" and any(
+        goal.get("status") != "closed" for goal in state.get("goals", {}).values()
+    )
 
 
 def _active_metric() -> str:
@@ -1382,6 +1538,7 @@ def api_project():
             pass
     return {"name": _project_root().name,
             "continue": _forum_nonempty(),
+            "continue_by_command": {"prove": _prove_resume_available()},
             "has_dag": dag.exists(), "chunks": chunk_ids,
             "active_metric": _active_metric(),
             "commands": _COMMANDS,
@@ -1993,7 +2150,7 @@ def api_run_start(payload: dict = Body(...)):
         argv += ["--targets", ", ".join(t.strip() for t in targets.splitlines() if t.strip())]
     cont = payload.get("continue")
     if cont is None:
-        cont = _forum_nonempty()
+        cont = _prove_resume_available() if command == "prove" else _forum_nonempty()
     if cont:
         argv.append("--continue")
 
@@ -2175,6 +2332,7 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
   <div class="brand"><b>unity</b><span class="sep"></span><span class="proj" id="title"></span></div>
   <div class="tabs" id="tabs">
     <button data-tab="overview" class="active">overview</button>
+    <button data-tab="proof-search">proof search</button>
     <button data-tab="blueprint">blueprint</button>
     <button data-tab="forum">forum</button>
     <button data-tab="chunks">chunks</button>
@@ -2195,6 +2353,7 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
 </header>
 <main>
   <div id="tab-overview" class="pane"></div>
+  <div id="tab-proof-search" class="framewrap" style="display:none"><iframe data-src="/proof-search"></iframe></div>
   <div id="tab-blueprint" class="pane" style="display:none"></div>
   <div id="tab-forum" class="framewrap" style="display:none"><iframe id="forum-frame" data-src="/forum"></iframe></div>
   <div id="tab-chunks" class="framewrap" style="display:none"><iframe data-src="/dag"></iframe></div>
@@ -2264,7 +2423,7 @@ const J = (url, opts) => fetch(url, opts).then(r => r.json());
 const put = (url, body) => J(url, {method:'PUT', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 const post = (url, body) => J(url, {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)});
 
-const TABS = ['overview','blueprint','forum','chunks','agents','prompt','sources','metrics','logs'];
+const TABS = ['overview','proof-search','blueprint','forum','chunks','agents','prompt','sources','metrics','logs'];
 document.querySelectorAll('#tabs button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#tabs button').forEach(x => x.classList.remove('active'));
   b.classList.add('active');
@@ -2679,8 +2838,12 @@ let RUN_CMD = null;
 function openRunModal(cmd) {
   RUN_CMD = cmd;
   $('rm-title').textContent = 'run: unity ' + cmd;
-  $('rm-continue').checked = PROJECT['continue'];
-  $('rm-continue-note').textContent = PROJECT['continue'] ? '(auto-detected: forum has prior state)' : '(fresh run: forum empty)';
+  const commandResume = (PROJECT.continue_by_command || {})[cmd];
+  const shouldContinue = commandResume === undefined ? PROJECT['continue'] : commandResume;
+  $('rm-continue').checked = shouldContinue;
+  $('rm-continue-note').textContent = cmd === 'prove'
+    ? (shouldContinue ? '(resume unresolved proof-search state)' : '(start a fresh proof-search run)')
+    : (shouldContinue ? '(auto-detected: forum has prior state)' : '(fresh run: forum empty)');
   const spec = PROJECT.commands[cmd];
   $('rm-metric-row').style.display = spec.metric ? 'flex' : 'none';
   if (spec.metric) {

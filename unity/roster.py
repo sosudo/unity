@@ -27,6 +27,7 @@ class Agent:
     auth_token: str | None
     budget: float | None  # USD per instance; None = unlimited
     is_primary: bool
+    cost: float = 1.0  # relative per-turn routing cost; provider-agnostic
 
 
 @dataclass
@@ -52,7 +53,7 @@ def _interp(value, where: str):
     return _VAR.sub(sub, value)
 
 
-def load_roster(path: Path) -> Roster:
+def load_roster(path: Path, *, use_learned_strength: bool = True) -> Roster:
     """Load and validate `agents.yaml`, flattening groups into per-instance agents."""
     if not path.is_file():
         raise ValueError(f"agents.yaml not found at {path}")
@@ -93,13 +94,19 @@ def load_roster(path: Path) -> Roster:
 
         budget = g.get("budget")
         budget = float(budget) if budget not in (None, "") else None
+        cost = float(g.get("cost", g.get("cost_tier", 1.0)))
 
         # Autostrength: learned per-model (EMA of forum credit across runs); an explicit
         # strength in agents.yaml overrides.
         raw_strength = g.get("strength")
         if raw_strength in (None, ""):
-            from .library import learned_strength
-            strength = learned_strength(model)
+            if use_learned_strength:
+                from .library import learned_strength
+                strength = learned_strength(model)
+            else:
+                # Event-driven prove keeps Forum/ICRL activity telemetry-only.
+                # An explicit configured strength remains a valid routing signal.
+                strength = 1.0
         else:
             strength = float(raw_strength)
 
@@ -115,6 +122,7 @@ def load_roster(path: Path) -> Roster:
                 auth_token=auth_token,
                 budget=budget,
                 is_primary=(i == primary_idx and j == 0),
+                cost=cost,
             ))
 
     return Roster(agents=agents)

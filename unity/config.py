@@ -64,3 +64,29 @@ def load_paths(start: Path | None = None) -> Paths:
     unity = require_unity_dir(start)
     load_env(unity)
     return Paths.from_unity_dir(unity)
+
+
+def active_forum_dir(paths: Paths) -> Path:
+    """Forum for the active run, falling back to the legacy project forum.
+
+    Prove worktrees never need an uncommitted ``.unity`` copy: their MCP bridge
+    follows this project-global pointer to the run-scoped control plane.
+    """
+    try:
+        import json
+        try:
+            control = json.loads((paths.unity / "state.json").read_text())
+        except (OSError, ValueError):
+            control = {}
+        if control.get("command") not in (None, "prove"):
+            return paths.forum
+        from .prove_runtime import active_run_dir
+        run_dir = active_run_dir(paths.unity)
+        state_path = run_dir / "state" / "runtime.json" if run_dir is not None else None
+        if state_path is not None and state_path.exists():
+            state = json.loads(state_path.read_text())
+            if state.get("status") != "complete" or control.get("phase") != "done":
+                return run_dir / "forum"
+    except (ImportError, OSError, ValueError, KeyError):
+        pass
+    return paths.forum

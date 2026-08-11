@@ -76,13 +76,17 @@ def stop_requested(cwd) -> bool:
     return u is not None and (u / "stop-requested").exists()
 
 
-def build_mcp(paths) -> dict:
+def build_mcp(paths, forum_dir: Path | None = None) -> dict:
     """MCP servers every agent attaches to (stdio; forum is file-backed + flock-safe)."""
+    if forum_dir is None:
+        # Legacy pipelines remain on the project forum. Event-driven prove passes
+        # its run forum explicitly, avoiding cross-command state leakage.
+        forum_dir = paths.forum
     servers = {
         "lean-lsp": {"command": "uvx", "args": ["lean-lsp-mcp"]},
         "unity-forum": {
             "command": sys.executable,
-            "args": ["-m", "unity.forum.server", "--forum-dir", str(paths.forum)],
+            "args": ["-m", "unity.forum.server", "--forum-dir", str(forum_dir)],
         },
     }
     axle_key = os.getenv("AXLE_API_KEY")

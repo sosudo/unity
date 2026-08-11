@@ -12,19 +12,26 @@ def _safe(name: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", name)
 
 
-def create_worktree(name: str, project_path: Path) -> Path:
+def create_worktree(name: str, project_path: Path, startpoint: str = "HEAD") -> Path:
     """Create a git worktree for `name` under <project>/.worktrees/; return its path.
     Tolerates leftovers from a crashed run: stale worktrees/branches are pruned first."""
     safe = _safe(name)
     worktree_path = project_path / ".worktrees" / safe
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
-    gitignore = project_path / ".gitignore"
-    existing = gitignore.read_text() if gitignore.exists() else ""
-    if ".worktrees/" not in existing.splitlines():
-        with gitignore.open("a") as f:
-            if existing and not existing.endswith("\n"):
-                f.write("\n")
-            f.write(".worktrees/\n")
+    # Keep operational worktrees out of status without mutating the user's source
+    # tree.  .git/info/exclude is repository-local and never becomes a candidate.
+    git_dir = subprocess.run(["git", "rev-parse", "--git-dir"], cwd=project_path,
+                             capture_output=True, text=True).stdout.strip()
+    if git_dir:
+        exclude = (project_path / git_dir / "info" / "exclude").resolve()
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude.read_text() if exclude.exists() else ""
+        missing = [entry for entry in (".worktrees/", ".unity") if entry not in existing.splitlines()]
+        if missing:
+            with exclude.open("a") as f:
+                if existing and not existing.endswith("\n"):
+                    f.write("\n")
+                f.write("\n".join(missing) + "\n")
 
     # Clear stale state from a previous crashed run before re-adding.
     if worktree_path.exists():
@@ -36,7 +43,8 @@ def create_worktree(name: str, project_path: Path) -> Path:
         subprocess.run(["git", "branch", "-D", f"worktree/{safe}"],
                        cwd=project_path, capture_output=True)
 
-    lake.run(["git", "worktree", "add", "-b", f"worktree/{safe}", str(worktree_path)], cwd=project_path)
+    lake.run(["git", "worktree", "add", "-b", f"worktree/{safe}", str(worktree_path), startpoint],
+             cwd=project_path)
     return worktree_path
 
 
@@ -50,6 +58,14 @@ def symlink_lake_cache(worktree_path: Path, project_path: Path) -> None:
     packages_link = lake_dir / "packages"
     if not packages_link.exists():
         packages_link.symlink_to(packages_src.resolve())
+
+
+def link_shared_unity(worktree_path: Path, unity_dir: Path) -> None:
+    """Expose static config plus the run pointer without copying runtime state."""
+    link = worktree_path / ".unity"
+    if link.exists() or link.is_symlink():
+        return
+    link.symlink_to(Path(unity_dir).resolve(), target_is_directory=True)
 
 
 def detect_main_branch(project_path: Path) -> str:

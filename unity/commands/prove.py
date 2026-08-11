@@ -1,80 +1,75 @@
-import os
+"""The event-driven ``unity prove`` command."""
+
 import json
+import os
+
 import asyncclick as click
 
 from ..config import load_paths
+from ..orchestrator import load_prompt, mark_done
+from ..prove_runtime import RuntimeStore, active_run_dir, discover_goals, missing_requested_targets
+from ..prove_scheduler import ProveScheduler, deterministic_setup
 from ..roster import load_roster
-from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase, toposort, mark_phase, stop_requested, resume_point, mark_done
 
 
 @click.command(name="prove")
-@click.option("--targets", default="All", help="What to prove.")
-@click.option("--continue", "continue_", is_flag=True, default=False, help="Run a reprompt cycle first.")
-async def prove(targets, continue_):
-    """Prove all sorrys and axioms."""
+@click.option("--targets", default="All", help="Declarations to prove (comma-separated), or All.")
+@click.option("--continue", "continue_", is_flag=True, default=False,
+              help="Resume the active prove runtime and its structured state.")
+async def prove(targets: str, continue_: bool):
+    """Prove targets with adaptive tasks, immutable candidates, and deterministic checks."""
     paths = load_paths()
-    (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
-    roster = load_roster(paths.agents_yaml)
-    mcp = build_mcp(paths)
-    resume = resume_point(paths, "prove", continue_)
-    _order = ["preparation", "architect", "chunking", "exploration", "proving", "critic", "retrospective"]
-    def _do(phase: str) -> bool:
-        return resume is None or _order.index(phase) >= _order.index(resume)
-    if resume is not None:
-        click.echo(f"resuming from phase: {resume}")
-    root = paths.project_root
-    max_attempts = float(os.getenv("MAX_ATTEMPTS") or "inf")  # blank/unset = indefinite
+    (paths.unity / "stop-requested").unlink(missing_ok=True)
 
-    if resume is None:
-        if continue_:
-            await dispatch([roster.primary], roster, load_prompt("prove/PREPARATION"),
-                           "Analyze the current project state and latest logs; update .unity/UNITY.md with context for continuing.",
-                           root, mcp)
-        else:
-            # Fresh run: bootstrap LeanArchitect (version-guarded; skips cleanly when no
-            # toolchain-matching release exists or the dependency breaks the build).
-            mark_phase("prove", "architect")
-            await dispatch([roster.primary], roster, load_prompt("ARCHITECT"),
-                           "Fresh-run bootstrap: add LeanArchitect as a project dependency pinned to the "
-                           "ref matching lean-toolchain, verify with lake build (revert + skip on any "
-                           "breakage), so later phases can annotate declarations with @[blueprint].",
-                           root, mcp)
+    click.echo("deterministic setup: inspecting toolchain/project and validating the build")
+    setup = deterministic_setup(paths.project_root)
 
-    if _do("chunking"):
-        await dispatch(roster.agents, roster, load_prompt("prove/CHUNKING"),
-                       f"Every sorry and axiom in scope ({targets}) becomes a chunk with its dependencies; write .unity/dag.json.",
-                       root, mcp)
-        toposort(paths)
+    store = None
+    current = active_run_dir(paths.unity) if continue_ else None
+    if current is not None:
+        candidate_store = RuntimeStore(current)
+        try:
+            state = candidate_store.load()
+            if state.get("command") == "prove" and state.get("status") != "complete":
+                store = candidate_store
+                store.mark_status("running")
+                click.echo(f"resuming prove runtime: {state['run_id']}")
+        except (OSError, json.JSONDecodeError, KeyError):
+            store = None
 
-    if _do("exploration"):
-        await dispatch(roster.agents, roster, load_prompt("prove/EXPLORATION"),
-                       "Resolve external dependencies and gather helper material for the chunks.",
-                       root, mcp)
+    if store is None:
+        missing = missing_requested_targets(paths.project_root, targets)
+        if missing:
+            raise click.ClickException("requested Lean declaration(s) not found: " + ", ".join(missing))
+        goals = discover_goals(paths.project_root, targets)
+        quorum = int(os.getenv("UNITY_PROVE_REVIEW_QUORUM", "1"))
+        store = RuntimeStore.create(paths.unity, paths.project_root, goals,
+                                    review_quorum=quorum)
+        (store.run_dir / "artifacts" / "setup.json").write_text(json.dumps(setup, indent=2))
+        click.echo(f"discovered {len(goals)} target goal(s) without LLM chunking")
 
-    if resume != "retrospective":
-        i = 0
-        approved = False
-        while (not approved) and (i < max_attempts) and not stop_requested(root):
-            await run_worktree_phase(roster, paths, mcp, load_prompt("prove/PROVING"), "Prove")
-            (paths.unity / "critic.json").write_text(json.dumps({"approved": False, "verdict": "stalled"}))
-            await dispatch([roster.primary], roster, load_prompt("prove/CRITIC"),
-                           "Review the project. Spot-fix trivial issues; write .unity/CRITIC.md with the remaining "
-                           "issues; set .unity/critic.json to {\"approved\": true} only if every target is fully "
-                           "proven (no sorry/axiom in scope, builds clean, no cheating), otherwise false.",
-                           root, mcp)
-            try:
-                _c = json.loads((paths.unity / "critic.json").read_text())
-            except (OSError, json.JSONDecodeError):
-                _c = {}
-            approved = bool(_c.get("approved", False))
-            verdict = _c.get("verdict", "stalled")
-            click.echo(f"critic verdict: {verdict} (approved={approved})")
-            i += 1
+    initial = store.load()
+    if not initial["goals"]:
+        store.mark_status("complete")
+        mark_done(paths, "prove")
+        click.echo("prove runtime complete: no unresolved targets (0 model calls)")
+        return
 
-    await dispatch([roster.primary], roster, load_prompt("prove/RETROSPECTIVE"),
-                   "Distill lessons from this run into the library.",
-                   root, mcp)
-    mark_done(paths, "prove")
+    # Loading this single prompt records the only model phase: continuous PROVE.
+    roster = load_roster(paths.agents_yaml, use_learned_strength=False)
+    prompt = load_prompt("prove/PROVE") + "\n\n" + load_prompt("TOOLS")
+    scheduler = ProveScheduler(roster, paths, store, prompt)
+    final = await scheduler.run()
+    closed = sum(g["status"] == "closed" for g in final["goals"].values())
+    total = len(final["goals"])
+    click.echo(f"prove runtime {final['status']}: {closed}/{total} goal(s) closed")
+    click.echo(f"state: {store.path}")
+    if final["status"] == "complete":
+        mark_done(paths, "prove")
+    elif final["status"] == "exhausted":
+        raise click.ClickException(
+            "prove exhausted configured attempts/capacity with unresolved goals; "
+            "inspect forum_brief and the run state, then resume after adding capacity or tasks")
 
 
 command = prove

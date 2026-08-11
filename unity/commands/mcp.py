@@ -30,8 +30,9 @@ async def mcp(server, tool, args):
 
     paths = load_paths()
     if server in ("unity-forum", "forum"):
+        from ..config import active_forum_dir
         from ..forum import server as fsrv
-        fsrv.FORUM_DIR = paths.forum
+        fsrv.FORUM_DIR = active_forum_dir(paths)
         client = Client(fsrv.mcp)  # in-process: no subprocess, same flock-safe storage
     else:
         specs = build_mcp(paths)

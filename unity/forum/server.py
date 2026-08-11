@@ -684,7 +684,7 @@ def forum_log_attempt(
         _save(data)
 
     rec = _credit(author, 0.2, "forum_log_attempt", thread_id, what[:100])
-    return {
+    result = {
         "post_id": post["post_id"],
         "thread_id": thread_id,
         "chunk_id": chunk_id,
@@ -692,6 +692,11 @@ def forum_log_attempt(
         "icrl_balance": rec["balance"],
         "icrl_delta": +0.2,
     }
+    store = _runtime_store()
+    if store is not None and chunk_id in store.load()["tasks"]:
+        result["task_progress"] = store.heartbeat(
+            chunk_id, author, f"{outcome}: {what}", meaningful=outcome in {"success", "partial"})
+    return result
 
 
 @mcp.tool()
@@ -1153,6 +1158,202 @@ def _chunk_thread(chunk: str) -> str:
     return chunk if chunk.startswith("chunk-") else f"chunk-{chunk}"
 
 
+def _runtime_store():
+    """Return the adjacent prove control-plane, if this is a run forum."""
+    try:
+        from ..prove_runtime import state_for_forum
+        return state_for_forum(FORUM_DIR)
+    except (ImportError, OSError, ValueError):
+        return None
+
+
+def _runtime_goal_id(store, reference: str) -> str | None:
+    state = store.load()
+    for goal in state["goals"].values():
+        if reference in (goal["id"], goal["declaration"], goal["declaration"].split(".")[-1]):
+            return goal["id"]
+    return None
+
+
+# ── Event-driven prove control plane ─────────────────────────────────────────
+# These tools coexist with the Forum 2.0 speech acts below.  Other pipelines keep
+# their legacy chunk/result contract; prove gets atomic tasks and immutable
+# candidates without making raw discussion posts authoritative.
+
+@mcp.tool()
+def forum_state() -> dict:
+    """Return compact authoritative prove state (goals/tasks/candidates/findings/workers).
+
+    Full event history is intentionally excluded: it is telemetry, not model memory.
+    """
+    store = _runtime_store()
+    if store is None:
+        return {"active": False, "reason": "no event-driven prove run is active"}
+    state = store.load()
+    return {k: state[k] for k in (
+        "schema", "run_id", "status", "policy", "goals", "tasks", "findings",
+        "candidates", "workers", "telemetry",
+    )}
+
+
+@mcp.tool()
+def forum_create_task(goal_id: str, kind: str, description: str, creator: str,
+                      strategy_key: str = "", dependencies: list[str] | None = None,
+                      parent_task: str = "", parent_candidate: str = "",
+                      parent_objection: str = "", redundant: bool = False) -> dict:
+    """Create ephemeral proof-search work with structured duplicate detection.
+
+    Tasks are created as proof search reveals them; set ``redundant=true`` only for
+    a deliberately independent attempt at the same normalized strategy.
+    """
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.create_task(goal_id, kind, description, creator,
+                             strategy_key=strategy_key, dependencies=dependencies,
+                             parent_task=parent_task or None,
+                             parent_candidate=parent_candidate or None,
+                             parent_objection=parent_objection or None,
+                             redundant=redundant)
+
+
+@mcp.tool()
+def forum_claim_task(task_id: str, author: str, lease_seconds: int = 0,
+                     independent: bool = False) -> dict:
+    """Atomically reserve a task; conflicts return its current owner and lease.
+
+    ``independent=true`` creates an explicit redundant sibling instead of allowing
+    two owners to race on the same task.
+    """
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.claim_task(task_id, author, lease_seconds=lease_seconds or None,
+                            independent=independent)
+
+
+@mcp.tool()
+def forum_task_heartbeat(task_id: str, author: str, progress: str = "",
+                         meaningful: bool = False, tool_calls: int = 0,
+                         tokens: int = 0, artifacts: list[str] | None = None) -> dict:
+    """Renew a task lease and report bounded progress/accounting.
+
+    A false response with ``cancelled=true`` is a binding instruction to stop work.
+    """
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.heartbeat(task_id, author, progress, meaningful=meaningful,
+                           tool_calls=tool_calls, tokens=tokens, artifacts=artifacts)
+
+
+@mcp.tool()
+def forum_release_task(task_id: str, author: str, reason: str = "") -> dict:
+    """Release an owned task back to the runnable queue."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.finish_task(task_id, author, "pending", reason)
+
+
+@mcp.tool()
+def forum_complete_task(task_id: str, author: str, status: str = "complete",
+                        reason: str = "") -> dict:
+    """Finish owned work as ``complete`` or ``failed``."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.finish_task(task_id, author, status, reason)
+
+
+@mcp.tool()
+def forum_cancel_task(task_id: str, author: str, reason: str) -> dict:
+    """Cancel work made unnecessary; cancellation is idempotent and authoritative."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    result = store.cancel_task(task_id, f"{author}: {reason}")
+    return {**result, "cancelled_by": author}
+
+
+@mcp.tool()
+def forum_finding(goal_id: str, task_id: str, author: str, kind: str, key: str,
+                  statement: str, confidence: str = "tentative", evidence: str = "",
+                  supersedes_tasks: list[str] | None = None) -> dict:
+    """Publish live proof-search knowledge; verified reusable items may enter the ledger later."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.add_finding(goal_id, task_id, author, kind, key, statement,
+                             confidence, evidence, supersedes_tasks)
+
+
+@mcp.tool()
+def forum_store_artifact(task_id: str, author: str, kind: str, content: str,
+                         source_ref: str = "") -> dict:
+    """Store large/repeated output by content hash and return a compact reusable reference."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.put_artifact(task_id, author, kind, content, source_ref)
+
+
+@mcp.tool()
+def forum_get_artifact(artifact_id: str, max_chars: int = 12000) -> dict:
+    """Retrieve artifact detail on demand; model briefs contain only references."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.get_artifact(artifact_id, max(1, min(max_chars, 100_000)))
+
+
+@mcp.tool()
+def forum_submit_candidate(goal_id: str, author: str, commit_sha: str,
+                           task_id: str = "", declarations: list[str] | None = None, notes: str = "",
+                           parent_candidate: str = "", parent_objection: str = "") -> dict:
+    """Submit an immutable Git revision for deterministic Unity verification.
+
+    There is deliberately no ``build_ok`` input.  Unity captures the exact commit,
+    tree, target source hash and diff; only the scheduler can machine-verify it.
+    """
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.submit_candidate(goal_id, author, commit_sha,
+                                  task_id=task_id or None, declarations=declarations, notes=notes,
+                                  parent_candidate=parent_candidate or None,
+                                  parent_objection=parent_objection or None)
+
+
+@mcp.tool()
+def forum_endorse_candidate(candidate_id: str, author: str, evidence: str = "") -> dict:
+    """Independently endorse the exact commit+source hash after semantic review."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.endorse(candidate_id, author, evidence)
+
+
+@mcp.tool()
+def forum_object_candidate(candidate_id: str, author: str, reason: str,
+                           evidence: str = "") -> dict:
+    """Block a candidate with a concrete objection and create an actionable fix task."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.object(candidate_id, author, reason, evidence)
+
+
+@mcp.tool()
+def forum_resolve_candidate_objection(candidate_id: str, objection_id: str,
+                                       author: str, resolution: str) -> dict:
+    """Resolve a specific objection with evidence; candidate acceptance is recomputed."""
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.resolve_objection(candidate_id, objection_id, author, resolution)
+
+
 @mcp.tool()
 def forum_claim(chunk: str, author: str, strategy: str = "") -> dict:
     """Claim a chunk you are signing up to work on, stating your intended strategy.
@@ -1207,18 +1408,32 @@ def forum_obstacle(chunk: str, author: str, goal_state: str,
     content = (f"OBSTACLE {chunk}: {goal_state[:300]}"
                + (f" | tried: {', '.join(tried or [])[:200]}" if tried else "")
                + (f" | hypothesis: {hypothesis[:200]}" if hypothesis else ""))
-    return _typed_post(tid, chunk, author, "obstacle",
-                       {"chunk": chunk, "goal_state": goal_state, "tried": tried or [],
-                        "hypothesis": hypothesis, "status": "open"}, content)
+    result = _typed_post(tid, chunk, author, "obstacle",
+                         {"chunk": chunk, "goal_state": goal_state, "tried": tried or [],
+                          "hypothesis": hypothesis, "status": "open"}, content)
+    store = _runtime_store()
+    goal_id = _runtime_goal_id(store, chunk) if store is not None else None
+    if goal_id:
+        result["task"] = store.create_task(
+            goal_id, "debugging", f"Resolve obstacle {result['post_id']}: {goal_state[:300]}",
+            author, strategy_key=f"obstacle-{result['post_id']}")
+    return result
 
 
 @mcp.tool()
 def forum_question(author: str, body: str, to: str = "", chunk: str = "") -> dict:
     """Ask the team (or a specific agent via `to`) a question. Open questions addressed
     to an agent appear in their brief; answer with forum_answer(question_id, ...)."""
-    return _typed_post("qa", "Questions & Answers", author, "question",
-                       {"to": to, "chunk": chunk, "status": "open"},
-                       f"QUESTION{f' @{to}' if to else ''}{f' [{chunk}]' if chunk else ''}: {body}")
+    result = _typed_post("qa", "Questions & Answers", author, "question",
+                         {"to": to, "chunk": chunk, "status": "open"},
+                         f"QUESTION{f' @{to}' if to else ''}{f' [{chunk}]' if chunk else ''}: {body}")
+    store = _runtime_store()
+    goal_id = _runtime_goal_id(store, chunk) if store is not None and chunk else None
+    if goal_id:
+        result["task"] = store.create_task(
+            goal_id, "api_search", f"Answer question {result['post_id']}: {body[:300]}",
+            author, strategy_key=f"question-{result['post_id']}")
+    return result
 
 
 @mcp.tool()
@@ -1231,8 +1446,17 @@ def forum_answer(question_id: str, author: str, body: str) -> dict:
             if p["post_id"] == question_id and p.get("act") == "question":
                 (p.get("fields") or {}).update(status="answered")
         _save(data)
-    return _typed_post("qa", "Questions & Answers", author, "answer",
-                       {"question_id": question_id}, f"ANSWER: {body}", [question_id])
+    result = _typed_post("qa", "Questions & Answers", author, "answer",
+                         {"question_id": question_id}, f"ANSWER: {body}", [question_id])
+    store = _runtime_store()
+    if store is not None:
+        strategy = re.sub(r"[^a-z0-9]+", "-", f"question-{question_id}".lower()).strip("-")
+        for task in store.load()["tasks"].values():
+            if (task["strategy_key"] == strategy
+                    and task["status"] not in {"complete", "cancelled", "superseded", "dominated", "failed"}):
+                store.cancel_task(task["id"], f"question answered by {author}", "superseded")
+                result["superseded_task"] = task["id"]
+    return result
 
 
 @mcp.tool()
@@ -1370,6 +1594,9 @@ def ledger_get(query: str = "", chunk: str = "", limit: int = 8) -> dict:
 def build_brief(author: str, chunk: str = "") -> str:
     """Compact digest of the workspace for one agent (also used by the dispatch
     injection). Empty string when there is nothing to show (e.g. a fresh run)."""
+    store = _runtime_store()
+    if store is not None:
+        return _build_prove_brief(store, author, chunk)
     lines: list[str] = []
     decisions = _acts("global", "decision")
     if decisions:
@@ -1409,11 +1636,113 @@ def build_brief(author: str, chunk: str = "") -> str:
     return "\n".join(lines)
 
 
+def _build_prove_brief(store, author: str, goal_filter: str = "") -> str:
+    """Bounded current-state memory for event-driven prove workers.
+
+    Ordering is intentional: candidates and blockers appear before assignments so
+    a stale worker cannot miss that the goal is already solved or under review.
+    """
+    state = store.load()
+    goals = list(state["goals"].values())
+    if goal_filter:
+        goals = [g for g in goals if goal_filter in (g["id"], g["declaration"])] or goals
+    goal_ids = {g["id"] for g in goals}
+    lines = [f"PROVE RUN {state['run_id']} — {state['status']} (authoritative current state)"]
+
+    lines.append("1. Exact goal status:")
+    for goal in goals[:12]:
+        lines.append(f"  - {goal['id']} {goal['declaration']} [{goal['status']}] {goal['file']}:{goal['line']}")
+
+    candidates = [c for c in state["candidates"].values() if c["goal_id"] in goal_ids]
+    candidates.sort(key=lambda c: c["submitted_at"], reverse=True)
+    lines.append("2. Best submitted/verified candidates:")
+    if not candidates:
+        lines.append("  - none")
+    for cand in candidates[:6]:
+        verified = bool((cand.get("verification") or {}).get("passed"))
+        lines.append(
+            f"  - {cand['id']} [{cand['status']}] goal={cand['goal_id']} author={cand['author']} "
+            f"commit={cand['commit_sha'][:12]} source={cand['source_hash'][:12]} machine_verified={verified}"
+        )
+
+    blockers = [(cand, obj) for cand in candidates for obj in cand.get("objections", [])
+                if obj.get("status") == "open"]
+    lines.append("3. Actionable candidate blockers:")
+    if not blockers:
+        lines.append("  - none")
+    for cand, obj in blockers[:6]:
+        lines.append(f"  - {obj['id']} on {cand['id']} by {obj['author']}: {obj['reason'][:240]}")
+
+    mine = [t for t in state["tasks"].values()
+            if _canonical_author(t.get("owner") or "") == _canonical_author(author)
+            and t["status"] == "claimed"]
+    lines.append("4. Your assigned task:")
+    if not mine:
+        lines.append("  - none; do not invent work—claim/create a structured runnable task")
+    for task in mine[:3]:
+        lines.append(f"  - {task['id']} [{task['kind']}] goal={task['goal_id']}: {task['description'][:260]}")
+
+    active = [t for t in state["tasks"].values()
+              if t["goal_id"] in goal_ids and t["status"] in {"pending", "claimed", "stale"}]
+    active.sort(key=lambda t: (t["status"] != "claimed", t["created_at"]))
+    lines.append("5. Active relevant tasks and owners:")
+    if not active:
+        lines.append("  - none")
+    for task in active[:12]:
+        lines.append(f"  - {task['id']} [{task['status']}/{task['kind']}] owner={task.get('owner') or '-'} "
+                     f"strategy={task['strategy_key'][:80]}")
+
+    findings = [f for f in state["findings"].values()
+                if f["goal_id"] in goal_ids and f["status"] == "live"]
+    findings.sort(key=lambda f: f["updated_at"], reverse=True)
+    lines.append("6. High-value recent findings:")
+    if not findings:
+        lines.append("  - none")
+    for finding in findings[:8]:
+        lines.append(f"  - {finding['id']} [{finding['confidence']}/{finding['kind']}] "
+                     f"{finding['title']}: {finding['statement'][:220]}")
+
+    # Preserve Forum 2.0 obstacle/question/ledger/decision primitives, but bound each.
+    obstacles = []
+    for goal in goals:
+        if goal["status"] != "open":
+            continue
+        for tid in (_chunk_thread(goal["id"]), _chunk_thread(goal["declaration"])):
+            obstacles.extend(p for p in _acts(tid, "obstacle")
+                             if (p.get("fields") or {}).get("status") == "open")
+    lines.append("7. Open obstacles:")
+    lines.extend([f"  - {p['content'][:220]}" for p in obstacles[-4:]] or ["  - none"])
+
+    me = _canonical_author(author)
+    questions = [p for p in _acts("qa", "question")
+                 if (p.get("fields") or {}).get("status") == "open"
+                 and (_canonical_author((p.get("fields") or {}).get("to", "")) == me
+                      or (p.get("fields") or {}).get("chunk") in goal_ids)]
+    lines.append("8. Relevant questions:")
+    lines.extend([f"  - [{p['post_id']}] {p['content'][:200]}" for p in questions[-4:]] or ["  - none"])
+
+    ledger = _acts("ledger", "ledger")
+    lines.append("9. Relevant ledger entries:")
+    lines.extend([f"  - {p['content'][:200]}" for p in ledger[-5:]] or ["  - none"])
+
+    decisions = _acts("global", "decision")
+    latest: dict[str, dict] = {}
+    for post in decisions:
+        latest[(post.get("fields") or {}).get("topic", "?")] = post
+    lines.append("10. Binding decisions:")
+    lines.extend([f"  - {p['content'][:200]}" for p in list(latest.values())[-5:]] or ["  - none"])
+
+    text = "\n".join(lines)
+    # Hard cap protects contexts even if individual state fields reach their own caps.
+    if len(text) > 8_000:
+        text = text[:7_940] + "\n… brief truncated; use forum_state or artifact paths for detail"
+    store.record_brief_size(len(text.encode()))
+    return text
+
+
 @mcp.tool()
 def forum_brief(author: str, chunk: str = "") -> str:
-    """One-call compact digest: binding decisions, the latest handoff, open obstacles and
-    claims on your chunk, questions addressed to you, and relevant ledger entries. Call
-    this instead of reading raw threads."""
+    """One-call bounded digest of current structured state; raw threads are on-demand detail."""
     return build_brief(author, chunk) or "(workspace empty — nothing binding yet)"
 
 
