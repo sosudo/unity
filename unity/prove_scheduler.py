@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import os
 import subprocess
 import time
@@ -102,21 +101,6 @@ def deterministic_setup(project_root: Path, *, build: bool = True) -> dict:
     return info
 
 
-def _max_task_attempts() -> int:
-    explicit = os.getenv("UNITY_PROVE_TASK_ATTEMPTS")
-    if explicit:
-        return max(1, int(explicit))
-    raw = os.getenv("MAX_ATTEMPTS", "").strip()
-    if raw:
-        try:
-            value = float(raw)
-            if math.isfinite(value):
-                return max(1, int(value))
-        except ValueError:
-            pass
-    return 3
-
-
 def _agent_preamble(agent: Agent, roster: Roster) -> str:
     capacity = ", ".join(f"{a.name} ({a.model})" for a in roster.agents)
     return (
@@ -138,7 +122,6 @@ class ProveScheduler:
         self.prompt = prompt
         self.mcp = build_mcp(paths, store.run_dir / "forum")
         self.running: dict[str, RunningWorker] = {}
-        self.max_task_attempts = _max_task_attempts()
         self.poll_seconds = float(os.getenv("UNITY_PROVE_POLL_SECONDS", "0.5"))
         configured_limit = os.getenv("UNITY_PROVE_SWARM_LIMIT", "").strip()
         try:
@@ -229,16 +212,18 @@ class ProveScheduler:
         return True
 
     async def _finish_worker(self, name: str, worker: RunningWorker) -> None:
-        cancelled = worker.future.cancelled()
+        cancelled = False
         error = ""
-        if not cancelled:
-            try:
-                worker.future.result()
-            except asyncio.CancelledError:
-                cancelled = True
-            except Exception as exc:
-                error = repr(exc)
-                _console.print(f"[red]prove worker {name} failed: {exc!r}[/red]")
+        try:
+            # Awaiting is safe for an already-completed future and necessary for
+            # a just-cancelled one. Calling result() while cancellation is still
+            # being delivered raises InvalidStateError and obscures shutdown.
+            await worker.future
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception as exc:
+            error = repr(exc)
+            _console.print(f"[red]prove worker {name} failed: {exc!r}[/red]")
         elapsed = time.monotonic() - worker.started
         state = self.store.load()
         task = state["tasks"].get(worker.task_id)
@@ -283,23 +268,6 @@ class ProveScheduler:
                 if result.get("ok"):
                     _console.print(f"[green]accepted {candidate['id']} for {result['goal_id']}[/green]")
                 await self._cancel_obsolete()
-
-    def _ensure_followup_work(self) -> None:
-        state = self.store.load()
-        for goal in state["goals"].values():
-            if goal["status"] in {"closed", "review"}:
-                continue
-            related = [t for t in state["tasks"].values() if t["goal_id"] == goal["id"]]
-            active_speculative = any(t["kind"] not in {"review", "verification"}
-                                     and t["status"] in {"pending", "claimed", "stale"} for t in related)
-            live_candidate = any(c["goal_id"] == goal["id"] and c["status"] not in
-                                 {"failed", "rejected", "superseded"} for c in state["candidates"].values())
-            attempts = sum(1 for t in related if t["kind"] == "proof_attempt")
-            if not active_speculative and not live_candidate and attempts < self.max_task_attempts:
-                self.store.create_task(
-                    goal["id"], "proof_attempt", f"Prove {goal['declaration']} (escalation {attempts + 1})",
-                    "runtime", strategy_key=f"direct-proof-escalation-{attempts + 1}",
-                )
 
     async def _enforce_budgets(self) -> None:
         state = self.store.load()
@@ -349,15 +317,19 @@ class ProveScheduler:
         seeded = 0
         for index, goal in enumerate(goals):
             desired = max(1, base + (1 if index < remainder else 0))
-            related = [t for t in state["tasks"].values()
-                       if t["goal_id"] == goal["id"]
-                       and t["kind"] not in {"review", "verification", "debugging"}]
-            live = [t for t in related if t["status"] not in TASK_TERMINAL]
-            if len(live) >= desired:
+            related = [t for t in state["tasks"].values() if t["goal_id"] == goal["id"]]
+            # Count scheduler slots over the whole run, not only live tasks. Agents
+            # may create follow-up work themselves; the scheduler must not refill a
+            # completed/failed swarm forever. The strategy-prefix fallback upgrades
+            # run state written before the scheduler_slot field existed.
+            slots = [t for t in related if t.get("scheduler_slot") or (
+                t.get("creator") == "runtime"
+                and t.get("strategy_key", "").startswith("self-organized-attempt-"))]
+            if len(slots) >= desired:
                 continue
             used = {t.get("strategy_key", "") for t in related}
             slot = 1
-            while len(live) < desired:
+            while len(slots) < desired:
                 strategy = f"self-organized-attempt-{slot}"
                 slot += 1
                 if strategy in used:
@@ -367,10 +339,10 @@ class ProveScheduler:
                     f"Coordinate an independent proof search for {goal['declaration']}; "
                     "choose and reserve the concrete strategy through the Forum",
                     "runtime", strategy_key=strategy, redundant=True,
-                    coordination_slot=True,
+                    coordination_slot=True, scheduler_slot=True,
                 )
                 if result.get("ok"):
-                    live.append(result["task"])
+                    slots.append(result["task"])
                     used.add(strategy)
                     seeded += 1
         if seeded:
@@ -430,15 +402,13 @@ class ProveScheduler:
                 if any(a.name.lower() != str(cand.get("author", "")).lower() for a in self.roster.agents):
                     return False
             return True
-        for goal in state["goals"].values():
-            attempts = sum(1 for t in state["tasks"].values()
-                           if t["goal_id"] == goal["id"] and t["kind"] == "proof_attempt")
-            if goal["status"] == "open" and attempts < self.max_task_attempts:
-                return False
         return True
 
     async def run(self) -> dict:
         terminal_status: str | None = None
+        retried = self.store.requeue_infrastructure_verification_failures()
+        if retried:
+            _console.print(f"[cyan]requeued {len(retried)} candidate(s) rejected by verifier v1[/cyan]")
         try:
             while True:
                 if (self.paths.unity / "stop-requested").exists():
@@ -451,7 +421,6 @@ class ProveScheduler:
                 await self._process_candidates()
                 self.store.expire_stale_claims()
                 await self._enforce_budgets()
-                self._ensure_followup_work()
                 await self._allocate()
                 state = self.store.load()
                 if all(g["status"] == "closed" for g in state["goals"].values()):

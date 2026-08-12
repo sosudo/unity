@@ -24,6 +24,7 @@ from typing import Any, Callable
 
 
 SCHEMA_VERSION = 1
+VERIFIER_VERSION = 2
 TASK_KINDS = {
     "library_search", "api_search", "proof_attempt", "formalization", "debugging",
     "decomposition", "verification", "review", "counterexample_search",
@@ -35,6 +36,11 @@ SPECULATIVE_KINDS = {
     "decomposition", "counterexample_search", "dependency_resolution",
 }
 FORBIDDEN_DEFAULT = ("sorry", "admit", "native_decide")
+REQUIRED_VERIFICATION_CHECKS = {
+    "source_hash", "target_exists", "signature_preserved", "target_not_axiom",
+    "target_no_forbidden", "diff_no_forbidden", "no_new_axioms", "lake_build",
+    "axioms_inspected", "no_unexpected_axioms",
+}
 
 _DECL_RE = re.compile(
     r"(?m)^[ \t]*(?P<kind>theorem|lemma|def|abbrev|opaque|instance|axiom)"
@@ -365,7 +371,7 @@ class RuntimeStore:
                 goal["id"], "proof_attempt",
                 f"Coordinate an independent proof search for {goal['declaration']}",
                 creator="runtime", strategy_key="self-organized-attempt-1",
-                coordination_slot=True,
+                coordination_slot=True, scheduler_slot=True,
             )
             initial_tasks[goal["id"]] = created["task"]["id"]
         def wire_dependencies(current: dict) -> None:
@@ -410,7 +416,7 @@ class RuntimeStore:
         strategy_key: str = "", dependencies: list[str] | None = None,
         parent_task: str | None = None, parent_candidate: str | None = None,
         parent_objection: str | None = None, redundant: bool = False,
-        coordination_slot: bool = False,
+        coordination_slot: bool = False, scheduler_slot: bool = False,
     ) -> dict:
         if kind not in TASK_KINDS:
             raise ValueError(f"kind must be one of {sorted(TASK_KINDS)}")
@@ -439,6 +445,7 @@ class RuntimeStore:
                 "parent_task": parent_task, "parent_candidate": parent_candidate,
                 "parent_objection": parent_objection, "redundant": redundant,
                 "coordination_slot": coordination_slot,
+                "scheduler_slot": scheduler_slot,
                 "planned_at": None if coordination_slot else now,
                 "supersession_reason": "", "claim_history": [], "strategy_history": [],
             }
@@ -826,6 +833,37 @@ class RuntimeStore:
         )
         return set(_AXIOM_RE.findall(proc.stdout)) if proc.returncode in (0, 1) else set()
 
+    def requeue_infrastructure_verification_failures(self) -> list[str]:
+        """Retry immutable candidates rejected only by the pre-build axiom bug.
+
+        This narrowly migrates runs produced by verifier v1. Genuine source or
+        build failures remain failed.
+        """
+        retried: list[str] = []
+
+        def op(state: dict) -> None:
+            for candidate in state["candidates"].values():
+                record = candidate.get("verification") or {}
+                checks = record.get("checks") or {}
+                false_checks = {key for key, value in checks.items() if value is False}
+                if (candidate["status"] == "failed"
+                        and record.get("verifier_version", 1) < VERIFIER_VERSION
+                        and checks.get("lake_build") is True
+                        and false_checks == {"axioms_inspected"}):
+                    candidate["status"] = "submitted"
+                    candidate["updated_at"] = _now()
+                    task = state["tasks"].get(candidate.get("verification_task"))
+                    if task:
+                        task.update(status="claimed", owner="runtime", updated_at=_now(),
+                                    progress="requeued after verifier infrastructure fix")
+                    retried.append(candidate["id"])
+
+        self._mutate(op)
+        for candidate_id in retried:
+            self.event("candidate_verification_requeued", candidate_id=candidate_id,
+                       reason="verifier-v1-prebuild-axiom-inspection")
+        return retried
+
     def verify_candidate(self, candidate_id: str, *, build_timeout: int = 900) -> dict:
         """Verify the exact submitted commit in a fresh detached worktree."""
         state = self.load()
@@ -879,36 +917,61 @@ class RuntimeStore:
             )
             if add.returncode:
                 raise RuntimeError(add.stderr.strip() or "could not create verification worktree")
-            # Ask Lean itself for the exact target's axiom dependencies. Appending
-            # the command to the target file avoids guessing arbitrary Lake module
-            # roots; restore the exact bytes before the normal project build.
-            target_path = verify_dir / goal["file"]
-            exact_bytes = target_path.read_bytes()
-            with target_path.open("ab") as fh:
-                fh.write(f"\n#print axioms _root_.{goal['declaration']}\n".encode())
-            axiom_proc = subprocess.run(
-                ["lake", "env", "lean", goal["file"]], cwd=verify_dir,
-                text=True, capture_output=True, timeout=build_timeout,
-            )
-            axiom_output = (axiom_proc.stdout or "") + (axiom_proc.stderr or "")
-            target_path.write_bytes(exact_bytes)
-            checks["axioms_inspected"] = axiom_proc.returncode == 0
-            mentioned: set[str] = set()
-            for listing in re.findall(r"depends on axioms:\s*\[([^\]]*)\]", axiom_output):
-                mentioned.update(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", listing))
-            allowed_axioms = set(state["policy"].get(
-                "allowed_axioms", ["propext", "Classical.choice", "Quot.sound"]))
-            unexpected = sorted(mentioned - allowed_axioms)
-            checks["no_unexpected_axioms"] = not unexpected and "sorryAx" not in axiom_output
-            if unexpected or "sorryAx" in axiom_output:
-                messages.append(f"unexpected target axioms: {unexpected or ['sorryAx']}")
+            # Reuse only Lake's dependency cache; candidate source and local build
+            # outputs remain in this detached worktree.
+            from .worktree import symlink_lake_cache
+            symlink_lake_cache(verify_dir, root)
+
+            # Build the exact immutable revision before inspecting its Lean
+            # environment. The previous order made all Mathlib imports unavailable
+            # in a fresh verification worktree.
             proc = subprocess.run(
                 ["lake", "build"], cwd=verify_dir, text=True, capture_output=True,
                 timeout=build_timeout,
             )
             build_rc = proc.returncode
-            build_output = axiom_output + "\n" + (proc.stdout or "") + (proc.stderr or "")
+            build_output = (proc.stdout or "") + (proc.stderr or "")
             checks["lake_build"] = build_rc == 0
+            if build_rc == 0:
+                # Append the query to the target file to avoid guessing module
+                # roots, then restore the exact candidate bytes immediately.
+                target_path = verify_dir / goal["file"]
+                exact_bytes = target_path.read_bytes()
+                axiom_proc = None
+                axiom_output = ""
+                try:
+                    with target_path.open("ab") as fh:
+                        fh.write(f"\n#print axioms _root_.{goal['declaration']}\n".encode())
+                    try:
+                        axiom_proc = subprocess.run(
+                            ["lake", "env", "lean", goal["file"]], cwd=verify_dir,
+                            text=True, capture_output=True, timeout=build_timeout,
+                        )
+                        axiom_output = (axiom_proc.stdout or "") + (axiom_proc.stderr or "")
+                    except subprocess.TimeoutExpired as exc:
+                        axiom_output = (
+                            ((exc.stdout or "") if isinstance(exc.stdout, str) else "")
+                            + ((exc.stderr or "") if isinstance(exc.stderr, str) else ""))
+                        messages.append(f"Lean axiom inspection timed out after {build_timeout}s")
+                finally:
+                    target_path.write_bytes(exact_bytes)
+                build_output += "\n" + axiom_output
+                checks["axioms_inspected"] = axiom_proc is not None and axiom_proc.returncode == 0
+                mentioned: set[str] = set()
+                for listing in re.findall(r"depends on axioms:\s*\[([^\]]*)\]", axiom_output):
+                    mentioned.update(re.findall(r"[A-Za-z_]\w*(?:\.\w+)*", listing))
+                allowed_axioms = set(state["policy"].get(
+                    "allowed_axioms", ["propext", "Classical.choice", "Quot.sound"]))
+                unexpected = sorted(mentioned - allowed_axioms)
+                checks["no_unexpected_axioms"] = not unexpected and "sorryAx" not in axiom_output
+                if unexpected or "sorryAx" in axiom_output:
+                    messages.append(f"unexpected target axioms: {unexpected or ['sorryAx']}")
+                if axiom_proc is not None and axiom_proc.returncode:
+                    messages.append("Lean axiom inspection failed after the candidate build")
+            else:
+                checks["axioms_inspected"] = False
+                checks["no_unexpected_axioms"] = False
+                messages.append("axiom inspection skipped because the candidate build failed")
         except subprocess.TimeoutExpired as exc:
             messages.append(f"lake build timed out after {build_timeout}s")
             build_output = ((exc.stdout or "") if isinstance(exc.stdout, str) else "") + ((exc.stderr or "") if isinstance(exc.stderr, str) else "")
@@ -923,10 +986,11 @@ class RuntimeStore:
             subprocess.run(["git", "worktree", "prune"], cwd=root, capture_output=True)
 
         (artifact_dir / "verification.log").write_text(build_output)
-        passed = bool(checks) and all(checks.values())
+        passed = all(checks.get(key) is True for key in REQUIRED_VERIFICATION_CHECKS)
         record = {
             "candidate_id": candidate_id, "commit_sha": candidate["commit_sha"],
             "source_hash": candidate["source_hash"], "started_at": started,
+            "verifier_version": VERIFIER_VERSION,
             "finished_at": _now(), "passed": passed, "checks": checks,
             "build_returncode": build_rc,
             "log_artifact": str((artifact_dir / "verification.log").relative_to(self.run_dir)),
@@ -947,6 +1011,17 @@ class RuntimeStore:
                     else "deterministic verification failed")
             goal_state = current["goals"][cand["goal_id"]]
             if passed:
+                for other in current["candidates"].values():
+                    if (other["id"] != candidate_id and other["goal_id"] == cand["goal_id"]
+                            and other["status"] == "submitted"):
+                        other["status"] = "superseded"
+                        other["superseded_by"] = candidate_id
+                        other["updated_at"] = _now()
+                        other_task = current["tasks"].get(other.get("verification_task"))
+                        if other_task:
+                            other_task.update(status="superseded", owner=None,
+                                              supersession_reason=f"verified candidate {candidate_id}",
+                                              updated_at=_now())
                 parent_id = cand.get("parent_candidate")
                 parent = current["candidates"].get(parent_id) if parent_id else None
                 if parent and parent["status"] not in {"accepted", "rejected"}:
