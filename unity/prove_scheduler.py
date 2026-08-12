@@ -121,7 +121,9 @@ def _agent_preamble(agent: Agent, roster: Roster) -> str:
     capacity = ", ".join(f"{a.name} ({a.model})" for a in roster.agents)
     return (
         f"You are {agent.name}, using {agent.model}. The configured roster ({capacity}) is available "
-        "capacity, not a fixed team that must all stay active. You have one assigned proof-search task. "
+        "proof-search capacity. For an unresolved goal the scheduler may activate independent coordination "
+        "slots across the roster; agents choose and reserve the actual plans through the Forum. You own "
+        "exactly one of those tasks. "
         "Authoritative state, leases, cancellation, candidates and reviews are controlled through the "
         "Forum tools. A cancelled heartbeat is binding: stop promptly. Do not infer current state from "
         "old conversation or shell transcript.\n\n"
@@ -138,6 +140,12 @@ class ProveScheduler:
         self.running: dict[str, RunningWorker] = {}
         self.max_task_attempts = _max_task_attempts()
         self.poll_seconds = float(os.getenv("UNITY_PROVE_POLL_SECONDS", "0.5"))
+        configured_limit = os.getenv("UNITY_PROVE_SWARM_LIMIT", "").strip()
+        try:
+            requested_capacity = int(configured_limit) if configured_limit else len(roster.agents)
+        except ValueError as exc:
+            raise click.ClickException("UNITY_PROVE_SWARM_LIMIT must be an integer") from exc
+        self.swarm_capacity = min(len(roster.agents), max(1, requested_capacity))
 
     def _available_agents(self) -> list[Agent]:
         busy = set(self.running)
@@ -169,7 +177,11 @@ class ProveScheduler:
             f"Description: {task['description']}\nStrategy: {task['strategy_key']}\n"
             f"Parent candidate: {task.get('parent_candidate') or '-'}\n"
             f"Parent objection: {task.get('parent_objection') or '-'}\n\n"
-            "Call forum_task_heartbeat immediately and after long tool/build operations. Publish reusable "
+            "Call forum_task_heartbeat immediately. Read the current brief, then call forum_plan_task to "
+            "atomically publish a theorem-specific task kind, normalized strategy key, and description before "
+            "substantive work. If it reports a strategy conflict, coordinate with that owner or choose an "
+            "uncovered approach. Re-plan through the same tool when changing direction. After long tool/build "
+            "operations heartbeat again. Publish reusable "
             "intermediate knowledge with forum_finding. You may create genuinely independent tasks with "
             "forum_create_task; exact normalized duplicates will be rejected. Exploration, library/API "
             "search, scratch Lean, debugging and proof writing all happen in this one PROVE runtime.\n\n"
@@ -314,7 +326,59 @@ class ProveScheduler:
                 self.store.event("task_stagnant", task_id=task["id"], reason=reason)
         await self._cancel_obsolete()
 
+    def _ensure_swarm_work(self) -> None:
+        """Seed unplanned coordination slots so one goal can use the whole roster.
+
+        The scheduler decides only how many workers are useful.  It does not assign
+        proof strategies: each owner selects one atomically through the Forum after
+        seeing the other live plans.  This also upgrades an older one-task run when
+        resumed.  Candidate processing precedes fan-out in the control loop.
+        """
+        state = self.store.load()
+        goals = [g for g in state["goals"].values()
+                 if g["status"] == "open"
+                 and all(state["goals"].get(dep, {}).get("status") == "closed"
+                         for dep in g.get("dependencies", []))]
+        if not goals:
+            return
+
+        # Divide capacity across independent runnable goals. If there are more
+        # goals than workers, each goal already has one coordination slot and
+        # allocation naturally admits only the available number of workers.
+        base, remainder = divmod(self.swarm_capacity, len(goals))
+        seeded = 0
+        for index, goal in enumerate(goals):
+            desired = max(1, base + (1 if index < remainder else 0))
+            related = [t for t in state["tasks"].values()
+                       if t["goal_id"] == goal["id"]
+                       and t["kind"] not in {"review", "verification", "debugging"}]
+            live = [t for t in related if t["status"] not in TASK_TERMINAL]
+            if len(live) >= desired:
+                continue
+            used = {t.get("strategy_key", "") for t in related}
+            slot = 1
+            while len(live) < desired:
+                strategy = f"self-organized-attempt-{slot}"
+                slot += 1
+                if strategy in used:
+                    continue
+                result = self.store.create_task(
+                    goal["id"], "proof_attempt",
+                    f"Coordinate an independent proof search for {goal['declaration']}; "
+                    "choose and reserve the concrete strategy through the Forum",
+                    "runtime", strategy_key=strategy, redundant=True,
+                    coordination_slot=True,
+                )
+                if result.get("ok"):
+                    live.append(result["task"])
+                    used.add(strategy)
+                    seeded += 1
+        if seeded:
+            self.store.event("swarm_fanout", tasks=seeded, capacity=self.swarm_capacity,
+                             runnable_goals=len(goals))
+
     async def _allocate(self) -> None:
+        self._ensure_swarm_work()
         state = self.store.load()
         tasks = [t for t in state["tasks"].values() if t["status"] in {"pending", "stale"}
                  and all(state["tasks"].get(dep, {}).get("status") == "complete"

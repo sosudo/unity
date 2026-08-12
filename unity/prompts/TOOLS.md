@@ -29,7 +29,8 @@ act covers.
 *Coordinate (typed acts):*
 - **Event-driven prove runtime:** `forum_state()`; `forum_create_task(goal_id, kind, description,
   creator, strategy_key?, dependencies?, redundant?)`; `forum_claim_task(task_id, author,
-  lease_seconds?, independent?)`; `forum_task_heartbeat(task_id, author, progress?, meaningful?,
+  lease_seconds?, independent?)`; `forum_plan_task(task_id, author, kind, strategy_key, description?)`;
+  `forum_task_heartbeat(task_id, author, progress?, meaningful?,
   tool_calls?, tokens?, artifacts?)`; `forum_release_task`; `forum_complete_task`; and
   `forum_cancel_task`. Claims are atomic reservations and conflicts return the current owner/lease.
 - **Live prove knowledge:** `forum_finding(goal_id, task_id, author, kind, key, statement,

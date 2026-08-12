@@ -362,8 +362,10 @@ class RuntimeStore:
         initial_tasks: dict[str, str] = {}
         for goal in goals:
             created = store.create_task(
-                goal["id"], "proof_attempt", f"Prove {goal['declaration']}",
-                creator="runtime", strategy_key="direct-proof",
+                goal["id"], "proof_attempt",
+                f"Coordinate an independent proof search for {goal['declaration']}",
+                creator="runtime", strategy_key="self-organized-attempt-1",
+                coordination_slot=True,
             )
             initial_tasks[goal["id"]] = created["task"]["id"]
         def wire_dependencies(current: dict) -> None:
@@ -408,6 +410,7 @@ class RuntimeStore:
         strategy_key: str = "", dependencies: list[str] | None = None,
         parent_task: str | None = None, parent_candidate: str | None = None,
         parent_objection: str | None = None, redundant: bool = False,
+        coordination_slot: bool = False,
     ) -> dict:
         if kind not in TASK_KINDS:
             raise ValueError(f"kind must be one of {sorted(TASK_KINDS)}")
@@ -435,7 +438,9 @@ class RuntimeStore:
                 "tool_calls": 0, "tokens": 0, "cost_usd": 0.0, "wall_seconds": 0.0,
                 "parent_task": parent_task, "parent_candidate": parent_candidate,
                 "parent_objection": parent_objection, "redundant": redundant,
-                "supersession_reason": "", "claim_history": [],
+                "coordination_slot": coordination_slot,
+                "planned_at": None if coordination_slot else now,
+                "supersession_reason": "", "claim_history": [], "strategy_history": [],
             }
             state["tasks"][task_id] = task
             return {"ok": True, "task": task}
@@ -444,6 +449,60 @@ class RuntimeStore:
         self.event("task_created" if result["ok"] else "duplicate_task_prevented",
                    goal_id=goal_id, task_kind=kind,
                    task_id=(result.get("task") or result["conflict"])["id"])
+        return result
+
+    def plan_task(
+        self, task_id: str, owner: str, kind: str, strategy_key: str,
+        description: str = "",
+    ) -> dict:
+        """Atomically turn a claimed coordination slot into self-chosen work.
+
+        Strategy selection belongs to the agents and the Forum, not the scheduler.
+        Exact structured collisions are rejected while both tasks are live so two
+        workers cannot unknowingly adopt the same plan.
+        """
+        if kind not in TASK_KINDS:
+            raise ValueError(f"kind must be one of {sorted(TASK_KINDS)}")
+        strategy = _norm(strategy_key)
+        if not strategy:
+            raise ValueError("strategy_key must be non-empty")
+        now = _now()
+
+        def op(state: dict) -> dict:
+            task = state["tasks"].get(task_id)
+            if not task:
+                raise ValueError(f"unknown task {task_id}")
+            if task["status"] != "claimed" or task.get("owner") != owner:
+                return {"ok": False, "reason": "not_owner", "conflict": {
+                    "task_id": task_id, "owner": task.get("owner"), "status": task["status"],
+                }}
+            fingerprint = f"{task['goal_id']}:{kind}:{strategy}"
+            for other in state["tasks"].values():
+                if (other["id"] != task_id and other["fingerprint"] == fingerprint
+                        and other["status"] not in TASK_TERMINAL):
+                    state["telemetry"]["duplicate_claim_attempts"] += 1
+                    state["telemetry"]["duplicate_claims_prevented"] += 1
+                    return {"ok": False, "reason": "strategy_conflict", "conflict": {
+                        "task_id": other["id"], "owner": other.get("owner"),
+                        "status": other["status"], "strategy_key": other["strategy_key"],
+                        "lease_expires_at": other.get("lease_expires_at"),
+                    }}
+            old = {"kind": task["kind"], "strategy_key": task["strategy_key"],
+                   "description": task["description"], "at": now}
+            task.setdefault("strategy_history", []).append(old)
+            task.update(kind=kind, strategy_key=strategy, fingerprint=fingerprint,
+                        coordination_slot=False, planned_at=now, updated_at=now,
+                        last_progress_at=now)
+            if description.strip():
+                task["description"] = description.strip()[:500]
+            task["meaningful_progress"] += 1
+            task["lease_expires_at"] = now + state["policy"]["lease_seconds"]
+            return {"ok": True, "task": task}
+
+        result = self._mutate(op)
+        self.event("task_planned" if result["ok"] else "task_strategy_conflict",
+                   task_id=task_id, owner=owner, task_kind=kind,
+                   strategy_key=strategy, reason=result.get("reason", ""))
         return result
 
     def claim_task(
@@ -472,7 +531,8 @@ class RuntimeStore:
                              "created_at": now, "updated_at": now, "claimed_at": now,
                              "lease_expires_at": now + lease, "claim_history": [],
                              "model_calls": 1, "tool_calls": 0, "tokens": 0,
-                             "cost_usd": 0.0, "wall_seconds": 0.0}
+                             "cost_usd": 0.0, "wall_seconds": 0.0,
+                             "strategy_history": list(task.get("strategy_history", []))}
                     clone["claim_history"].append({"owner": owner, "status": "claimed", "at": now})
                     state["tasks"][clone_id] = clone
                     return {"ok": True, "task": clone, "redundant_of": task_id}

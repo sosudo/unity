@@ -350,6 +350,14 @@ async def events():
                 dag_file = ROOT_DIR / "dag.json"
                 if dag_file.exists():
                     mtime = max(mtime, dag_file.stat().st_mtime)
+                try:
+                    pointer = json.loads((ROOT_DIR / "current-run.json").read_text())
+                    run_dir = Path(pointer["path"]).resolve()
+                    runtime = run_dir / "state" / "runtime.json"
+                    if run_dir.parent == (ROOT_DIR / "runs").resolve() and runtime.exists():
+                        mtime = max(mtime, runtime.stat().st_mtime)
+                except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                    pass
                 if mtime > last_mtime:
                     last_mtime = mtime
                     yield "data: update\n\n"
@@ -543,6 +551,19 @@ header nav a:hover { color: var(--ink); }
 .pagehead .ctx { margin-left: auto; font-family: var(--mono); font-size: 12.5px; color: var(--mut); }
 .layout { display: grid; grid-template-columns: 300px 1fr; gap: 18px; align-items: start; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px 14px; box-shadow: 0 1px 2px rgba(20,18,26,0.04); }
+.runtime { margin-bottom: 18px; padding: 16px 18px; }
+.runtime-head { display:flex; align-items:center; gap:10px; margin-bottom:12px; flex-wrap:wrap; }
+.runtime-head h2 { font-size:11px; letter-spacing:.13em; text-transform:uppercase; color:#8e8c94; }
+.runtime-head a { margin-left:auto; color:var(--acc-ink); text-decoration:none; font-size:12px; }
+.runtime-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(250px,1fr)); gap:14px; }
+.runtime-col h3 { font-size:10px; letter-spacing:.1em; text-transform:uppercase; color:#aaa8b0; margin-bottom:6px; }
+.runtime-item { border-top:1px solid #f1f0f3; padding:7px 0; line-height:1.4; }
+.runtime-item:first-of-type { border-top:none; }
+.runtime-meta { color:var(--mut); font-size:11px; font-family:var(--mono); margin-top:2px; }
+.status-chip { display:inline-block; font-size:10px; border-radius:6px; padding:2px 7px; margin-left:6px; background:#f0eff2; color:#6e6c75; }
+.status-chip.live { background:#e6f4ea; color:#2e7d32; }
+.status-chip.blocked { background:#fdeaea; color:#b91c1c; }
+.choosing { color:#b45309; }
 .side h2 { font-size: 11px; letter-spacing: 0.13em; text-transform: uppercase; color: #a3a1a9; margin: 2px 8px 10px; font-weight: 700; }
 .th { display: flex; align-items: center; gap: 8px; padding: 7px 10px; border-radius: 9px; cursor: pointer; font-family: var(--mono); font-size: 12.5px; color: #55535b; }
 .th:hover { background: #f4f3f6; }
@@ -579,6 +600,7 @@ header nav a:hover { color: var(--ink); }
 </header>
 <div class="pane">
   <div class="pagehead"><h1>Forum</h1><span class="ctx"><button onclick="location.href='/graph'" style="font:inherit;font-size:13px;border:1px solid #dcdbe0;background:#fff;border-radius:999px;padding:5px 15px;cursor:pointer;color:#4c4a52">graph view</button></span></div>
+  <div class="card runtime" id="runtime" style="display:none"></div>
   <div class="layout">
     <div class="card side"><h2>threads</h2><div id="threads"></div></div>
     <div class="card main"><div class="title" id="tt"></div><div id="posts"><div class="empty">select a thread</div></div></div>
@@ -597,6 +619,46 @@ function reltime(ts) {
   return Math.round(s / 86400) + 'd ago';
 }
 function net(vbd, dim) { const c = (vbd || {})[dim] || {}; return (c.up || 0) - (c.down || 0); }
+function proofChip(status) {
+  const good = ['running','claimed','reviewable','acceptable','accepted','closed','complete'].includes(status);
+  const bad = ['failed','blocked','rejected','cancelled','dominated','superseded','stale'].includes(status);
+  return '<span class="status-chip ' + (good ? 'live' : bad ? 'blocked' : '') + '">' + esc(status) + '</span>';
+}
+async function loadProofRuntime() {
+  try {
+    const d = await (await fetch('/api/proof-search')).json();
+    const box = $('runtime');
+    if (!d.run_id) { box.style.display = 'none'; return; }
+    const terminal = new Set(['complete','cancelled','dominated','superseded','failed']);
+    const tasks = (d.tasks || []).filter(t => !terminal.has(t.status));
+    const findings = (d.findings || []).filter(f => f.status !== 'superseded')
+      .sort((a,b) => (b.updated_at || 0) - (a.updated_at || 0)).slice(0,6);
+    const candidates = (d.candidates || []).slice()
+      .sort((a,b) => (b.submitted_at || 0) - (a.submitted_at || 0)).slice(0,5);
+    const workers = (d.workers || []).filter(w => w.status === 'active');
+    const goals = (d.goals || []).map(g => '<div class="runtime-item"><b class="mono">' + esc(g.declaration) + '</b>' +
+      proofChip(g.status) + '<div class="runtime-meta">' + esc(g.id) + '</div></div>').join('') || '<div class="empty">no goals</div>';
+    const plans = tasks.map(t => {
+      const pendingPlan = !!t.coordination_slot;
+      return '<div class="runtime-item"><b>' + esc(t.owner || 'unclaimed') + '</b>' + proofChip(t.status) +
+        '<div class="' + (pendingPlan ? 'choosing' : '') + '">' +
+        (pendingPlan ? 'choosing a plan through Forum…' : '<span class="mono">' + esc(t.kind) + ' · ' + esc(t.strategy_key) + '</span>') +
+        '</div><div>' + esc(t.description || '') + '</div>' +
+        (t.progress ? '<div class="runtime-meta">progress: ' + esc(t.progress) + '</div>' : '') + '</div>';
+    }).join('') || '<div class="empty">no active tasks</div>';
+    let knowledge = findings.map(f => '<div class="runtime-item"><b>' + esc(f.title) + '</b>: ' + esc(f.statement) +
+      '<div class="runtime-meta">' + esc(f.author) + ' · ' + esc(f.kind) + ' · ' + esc(f.confidence) + '</div></div>').join('');
+    knowledge += candidates.map(c => '<div class="runtime-item"><b class="mono">' + esc(c.id) + '</b>' + proofChip(c.status) +
+      '<div class="runtime-meta">candidate by ' + esc(c.author) + ' · machine ' + ((c.verification || {}).passed ? 'verified' : 'pending') + '</div></div>').join('');
+    if (!knowledge) knowledge = '<div class="empty">no findings or candidates yet</div>';
+    box.innerHTML = '<div class="runtime-head"><h2>authoritative prove coordination</h2>' + proofChip(d.status) +
+      '<span class="runtime-meta">' + workers.length + ' active worker(s)</span><a href="/proof-search">open proof-search graph →</a></div>' +
+      '<div class="runtime-grid"><div class="runtime-col"><h3>Goals</h3>' + goals + '</div>' +
+      '<div class="runtime-col"><h3>Agent plans & progress</h3>' + plans + '</div>' +
+      '<div class="runtime-col"><h3>Shared findings & candidates</h3>' + knowledge + '</div></div>';
+    box.style.display = 'block';
+  } catch (_) {}
+}
 async function loadThreads() {
   const d = await (await fetch('/api/threads')).json();
   const ths = d.threads.filter(t => t.post_count || !t.thread_id.startsWith('_'));
@@ -629,10 +691,11 @@ async function loadPosts() {
 function connect() {
   const es = new EventSource('/api/events');
   es.onopen = () => {};
-  es.onmessage = () => { loadThreads(); loadPosts(); };
+  es.onmessage = () => { loadProofRuntime(); loadThreads(); loadPosts(); };
   es.onerror = () => { es.close(); setTimeout(connect, 3000); };
 }
-loadThreads(); connect();
+loadProofRuntime(); loadThreads(); connect();
+setInterval(loadProofRuntime, 2000);
 </script>
 </body>
 </html>

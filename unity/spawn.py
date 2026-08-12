@@ -341,7 +341,7 @@ _CODEX_MCP_NOTE = (
     "    unity mcp <server> <tool> '<json-args>'\n"
     "Examples:\n"
     "    unity mcp unity-forum forum_brief '{\"author\": \"<your agent name>\"}'\n"
-    "    unity mcp unity-forum forum_claim '{\"chunk\": \"chunk-1\", \"author\": \"<you>\", \"strategy\": \"...\"}'\n"
+    "    unity mcp unity-forum forum_plan_task '{\"task_id\": \"<assigned task>\", \"author\": \"<you>\", \"kind\": \"proof_attempt\", \"strategy_key\": \"<your plan>\"}'\n"
     "    unity mcp lean-lsp lean_goal '{\"file_path\": \"...\", \"line\": 12}'\n"
     "Servers: unity-forum (all forum_*/ledger_* tools), lean-lsp, axle and aristotle when "
     "configured. Read every forum/tool instruction in this prompt as 'run it via unity mcp'. "

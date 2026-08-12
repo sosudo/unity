@@ -1233,6 +1233,21 @@ def forum_claim_task(task_id: str, author: str, lease_seconds: int = 0,
 
 
 @mcp.tool()
+def forum_plan_task(task_id: str, author: str, kind: str, strategy_key: str,
+                    description: str = "") -> dict:
+    """Atomically publish the strategy for an assigned proof-search slot.
+
+    Read ``forum_brief`` first, then choose a theorem-specific kind and normalized
+    strategy key.  A conflict identifies the live task/owner already pursuing that
+    strategy; choose a different plan or coordinate with that owner instead.
+    """
+    store = _runtime_store()
+    if store is None:
+        raise ValueError("no event-driven prove run is active")
+    return store.plan_task(task_id, author, kind, strategy_key, description)
+
+
+@mcp.tool()
 def forum_task_heartbeat(task_id: str, author: str, progress: str = "",
                          meaningful: bool = False, tool_calls: int = 0,
                          tokens: int = 0, artifacts: list[str] | None = None) -> dict:
