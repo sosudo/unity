@@ -170,7 +170,7 @@ When you're ready, hover over the `run` button, press `optimize`, set the metric
 | `unity complete` | — | remove Unity artifacts from a finished project |
 | `unity update` / `unity uninstall` | — | manage the installation |
 
-`--targets` narrows a run's scope (declaration/chunk names or a description; default: everything in scope). `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists.
+`--targets` narrows a run's scope (default: everything in scope). For `prove`, pass exact unresolved declaration names or Lean file paths, separated by commas or newlines; its target DAG is extracted mechanically rather than interpreted by a model. `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists.
 
 ## Roster Configuration
 

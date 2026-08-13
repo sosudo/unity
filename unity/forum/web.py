@@ -18,7 +18,16 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+
+from .. import artifacts as artifact_store
+from ..blueprint import (
+    apply_kernel as _apply_kernel_shared,
+    kernel_extract as _kernel_extract_shared,
+    scan_blueprint as _scan_blueprint_shared,
+    source_stamp as _source_stamp_shared,
+)
+from ..prove_state import load_state as _load_prove_state
 
 app = FastAPI(title="unity-forum")
 FORUM_DIR: Path = Path("forum")
@@ -77,6 +86,14 @@ def _load_config() -> dict:
         return cfg
     except Exception:
         return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
+
+
+def _icrl_visible() -> bool:
+    """ICRL is not part of the prove workspace, including after a prove run ends."""
+    try:
+        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") != "prove"
+    except (OSError, json.JSONDecodeError):
+        return True
 
 
 _SORRY_RE = re.compile(r'\bsorry\b')
@@ -188,7 +205,7 @@ def list_threads():
     config = _load_config()
     balances_path = FORUM_DIR / "balances.json"
     leaderboard = []
-    if balances_path.exists():
+    if _icrl_visible() and balances_path.exists():
         try:
             balances = json.loads(balances_path.read_text())
             leaderboard = sorted(
@@ -404,6 +421,48 @@ def get_workspace():
             "agents": _agent_statuses(chunks)}
 
 
+@app.get("/api/prove-state")
+def get_prove_state():
+    """Authoritative live goal, strategy, finding, and candidate state for prove."""
+    return _load_prove_state(FORUM_DIR)
+
+
+@app.get("/api/artifacts")
+def api_artifacts(limit: int = 200):
+    """Recent immutable run artifacts and aggregate stored-byte telemetry."""
+    records = artifact_store.list_artifacts(ROOT_DIR / "artifacts", limit=limit)
+    return {"artifacts": records, **artifact_store.artifact_stats(ROOT_DIR / "artifacts")}
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+def api_artifact_download(artifact_id: str):
+    """Download exact artifact bytes without routing them through model context."""
+    try:
+        payload = artifact_store.artifact_bytes(ROOT_DIR / "artifacts", artifact_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+    return Response(
+        payload,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{artifact_id}.txt"'},
+    )
+
+
+@app.get("/api/artifacts/{artifact_id}")
+def api_artifact_get(
+    artifact_id: str,
+    offset: int = 0,
+    limit: int = artifact_store.MAX_READ_LIMIT,
+):
+    """Return one bounded page for the web artifact viewer."""
+    try:
+        return artifact_store.read_artifact(
+            ROOT_DIR / "artifacts", artifact_id, offset=offset, limit=limit
+        )
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=404)
+
+
 def _agent_statuses(chunks: dict) -> list:
     """Roster + live status for the overview: working (recent tool call), reviewing
     (primary during critic), else idle. Activity from the agent's open claim."""
@@ -432,6 +491,13 @@ def _agent_statuses(chunks: dict) -> list:
     for c in chunks.values():
         for cl in c.get("claims", []):
             claims[cl["author"]] = {"chunk": c["chunk"], "strategy": cl.get("strategy", "")}
+    prove = _load_prove_state(FORUM_DIR)
+    for strategy in prove.get("strategies", {}).values():
+        if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+            claims[strategy["owner"]] = {
+                "chunk": strategy.get("decl", ""),
+                "strategy": strategy.get("description", ""),
+            }
     out = []
     primary_seen = any(g.get("primary") for g in groups)
     for gi, g in enumerate(groups):
@@ -517,7 +583,7 @@ header nav a:hover { color: var(--ink); }
   </div>
 </div>
 <script>
-const esc = t => (t || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const esc = t => String(t || '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
 const $ = id => document.getElementById(id);
 let CUR = null;
 function reltime(ts) {
@@ -1614,17 +1680,6 @@ def api_metric_new(payload: dict = Body(...)):
     return {"ok": True, "name": f"{name}.md"}
 
 
-import re as _re
-
-_DECL_RE = _re.compile(
-    r"^(?:@\[[^\]]*\]\s*)?(?:private\s+|protected\s+|noncomputable\s+|partial\s+|unsafe\s+|scoped\s+)*"
-    r"(theorem|lemma|def|abbrev|structure|inductive|class|instance|opaque|axiom)\s+([A-Za-z0-9_.'₀-₉]+)",
-    _re.M)
-
-
-_IDENT_RE = _re.compile(r"[A-Za-z_][A-Za-z0-9_.'₀-₉]*")
-
-
 def _blueprint_trees() -> list[str]:
     """Selectable sources for the blueprint: the main checkout + live agent worktrees."""
     trees = ["main"]
@@ -1644,40 +1699,7 @@ def _blueprint_base(tree: str) -> Path:
 
 
 def _scan_blueprint(base: Path) -> list[tuple[str, list[dict], dict]]:
-    """Parse `base`'s .lean files into (relpath, decls, bodies-by-name) triples."""
-    parsed = []
-    for p in sorted(base.rglob("*.lean")):
-        if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
-            continue
-        try:
-            text = p.read_text(errors="replace")
-        except OSError:
-            continue
-        matches = list(_DECL_RE.finditer(text))
-        decls, bodies = [], {}
-        for i, m in enumerate(matches):
-            body = text[m.start():matches[i + 1].start() if i + 1 < len(matches) else len(text)]
-            kind, name = m.group(1), m.group(2)
-            status = ("axiom" if kind == "axiom"
-                      else "sorry" if _re.search(r"\bsorry\b|\badmit\b", body) else "complete")
-            decls.append({"name": name, "kind": kind, "status": status,
-                          "line": text.count("\n", 0, m.start()) + 1})
-            bodies[name] = body
-        if decls:
-            parsed.append((str(p.relative_to(base)), decls, bodies))
-    # naive in-project deps: identifiers in a decl's body that name another project decl
-    all_names = {d["name"] for _, decls, _ in parsed for d in decls}
-    used_by: dict = {}
-    for _, decls, bodies in parsed:
-        for d in decls:
-            deps = sorted((set(_IDENT_RE.findall(bodies[d["name"]])) & all_names) - {d["name"]})
-            d["deps"] = deps[:12]
-            for n in deps:
-                used_by.setdefault(n, []).append(d["name"])
-    for _, decls, _ in parsed:
-        for d in decls:
-            d["used_by"] = len(used_by.get(d["name"], []))
-    return parsed
+    return _scan_blueprint_shared(base)
 
 
 # ── Kernel-exact blueprint (LeanArchitect's mechanism without its annotations) ────
@@ -1697,40 +1719,13 @@ def _kernel_cache_path() -> Path:
 
 
 def _src_stamp(base: Path) -> float:
-    stamp = 0.0
-    extra = [base / n for n in ("lakefile.toml", "lakefile.lean", "lean-toolchain", "lake-manifest.json")]
-    for p in list(base.rglob("*.lean")) + extra:
-        if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
-            continue
-        try:
-            stamp = max(stamp, p.stat().st_mtime)
-        except OSError:
-            pass
-    return stamp
+    return _source_stamp_shared(base)
 
 
 def _kernel_extract(base: Path) -> dict | None:
     """Run the bundled extractor; None when the project isn't built, the toolchain is
     too old for the script, or anything else fails (caller keeps the regex scan)."""
-    mods = []
-    for p in base.rglob("*.lean"):
-        if any(part in (".lake", ".unity", ".worktrees", "lake-packages", "build") for part in p.parts):
-            continue
-        mods.append(".".join(p.relative_to(base).with_suffix("").parts))
-    if not mods:
-        return None
-    script = Path(__file__).parent.parent / "blueprint_extract.lean"
-    env = dict(os.environ)
-    env["PATH"] = env.get("PATH", "") + os.pathsep + str(Path.home() / ".elan" / "bin")
-    try:
-        r = subprocess.run(["lake", "env", "lean", "--run", str(script)] + sorted(mods),
-                           cwd=base, capture_output=True, text=True, timeout=300, env=env)
-        if r.returncode != 0:
-            return None
-        rows = json.loads(r.stdout.strip().splitlines()[-1])
-        return {row["name"]: row for row in rows}
-    except Exception:
-        return None
+    return _kernel_extract_shared(base)
 
 
 def _kernel_refresh(stamp: float) -> None:
@@ -1772,55 +1767,7 @@ def _apply_kernel(files: list, kernel: dict) -> None:
     """Overlay kernel-exact deps + status onto the regex scan. Kernel names are fully
     qualified; regex names are as written — match exactly or by unique '.name' suffix.
     Adds the 'tainted' status: proof complete but transitively resting on a sorry/axiom."""
-    regex_names = {d["name"] for f in files for d in f["decls"]}
-    to_regex: dict = {}
-    for kname in kernel:
-        if kname in regex_names:
-            to_regex[kname] = kname
-        else:
-            tails = [r for r in regex_names if kname.endswith("." + r)]
-            if len(tails) == 1:
-                to_regex[kname] = tails[0]
-    to_kernel = {v: k for k, v in to_regex.items()}
-
-    def direct_bad(k: str) -> bool:
-        return kernel[k]["sorried"] or kernel[k]["kind"] == "axiom"
-
-    memo: dict = {}
-
-    def tainted(k: str, seen: tuple = ()) -> bool:
-        if k in memo:
-            return memo[k]
-        if k in seen:
-            return False
-        bad = any(direct_bad(d) or tainted(d, seen + (k,))
-                  for d in kernel[k]["deps"] if d in kernel)
-        memo[k] = bad
-        return bad
-
-    for f in files:
-        for d in f["decls"]:
-            k = to_kernel.get(d["name"])
-            if not k:
-                continue
-            row = kernel[k]
-            d["deps"] = sorted({to_regex[x] for x in row["deps"] if x in to_regex})
-            if row["sorried"]:
-                d["status"] = "sorry"
-            elif row["kind"] == "axiom":
-                d["status"] = "axiom"
-            elif tainted(k):
-                d["status"] = "tainted"
-            else:
-                d["status"] = "complete"
-    counts: dict = {}
-    for f in files:
-        for d in f["decls"]:
-            for x in d["deps"]:
-                counts[x] = counts.get(x, 0) + 1
-    for f in files:
-        for d in f["decls"]:
-            d["used_by"] = counts.get(d["name"], 0)
+    _apply_kernel_shared(files, kernel)
 
 
 def _blueprint_files(tree: str):
@@ -1868,7 +1815,7 @@ def _chunk_for_decl(name: str) -> dict | None:
             return {"id": c.get("id"), "title": c.get("title", ""), "status": c.get("status", "")}
     for c in chunks:  # weaker match: the decl name inside the chunk id or statement
         if short and (short.lower() in str(c.get("id", "")).lower()
-                      or _re.search(r"\b" + _re.escape(short) + r"\b", str(c.get("statement", "")))):
+                      or re.search(r"\b" + re.escape(short) + r"\b", str(c.get("statement", "")))):
             return {"id": c.get("id"), "title": c.get("title", ""), "status": c.get("status", "")}
     return None
 
@@ -1886,7 +1833,7 @@ def api_blueprint_decl(name: str, file: str, tree: str = "main"):
                 continue
             body = bodies[(file, name)]
             # signature: decl head up to the proof/definition body
-            sig_end = _re.search(r":=|\bby\b|\bwhere\b", body)
+            sig_end = re.search(r":=|\bby\b|\bwhere\b", body)
             signature = body[:sig_end.start()].rstrip() if sig_end else body.splitlines()[0]
             used_by = sorted({x["name"] for f2 in files for x in f2["decls"]
                               if name in x["deps"]})
@@ -2226,7 +2173,8 @@ pre.tail { background: #1b1a20; color: #d8d6de; font-size: 11.5px; padding: 13px
 <div class="modal" id="viewmodal"><div class="box">
   <h3 id="view-name"></h3>
   <pre class="log" id="view-body" style="background:#fafafb;color:var(--ink);border:1px solid var(--line)"></pre>
-  <div class="row"><button class="act" onclick="document.getElementById('viewmodal').classList.remove('open')">close</button></div>
+  <div class="row"><a class="act" id="view-download" style="display:none" download>download full artifact</a>
+    <button class="act" onclick="document.getElementById('viewmodal').classList.remove('open')">close</button></div>
 </div></div>
 
 <div class="modal" id="envmodal"><div class="box">
@@ -2294,6 +2242,19 @@ function pagehead(title, ctx) {
   return '<div class="pagehead"><h1>' + title + '</h1><span class="ctx">' + (ctx || '') + '</span></div>';
 }
 
+function artifactButton(id) {
+  return id ? '<button class="act mono" onclick="openArtifact(\'' + esc(id) + '\')">' + esc(id) + '</button>' : '';
+}
+async function openArtifact(id) {
+  const d = await J('/api/artifacts/' + encodeURIComponent(id));
+  if (d.error) { toast(d.error); return; }
+  $('view-name').textContent = id + ' · ' + d.kind + ' · ' + d.total_bytes + ' bytes';
+  $('view-body').textContent = d.content + (d.next_offset !== null ? '\n\n… bounded preview; download for full output' : '');
+  const link = $('view-download'); link.style.display = 'inline-block';
+  link.href = '/api/artifacts/' + encodeURIComponent(id) + '/download';
+  $('viewmodal').classList.add('open');
+}
+
 // ── settings (.env form) ──────────────────────────────────────────────────────
 const ENV_KEYS = ['MAX_ATTEMPTS', 'LEAN_LSP_PORT', 'AXLE_API_KEY', 'ARISTOTLE_API_KEY'];
 let envExtra = [];
@@ -2320,7 +2281,7 @@ $('env-save').onclick = async () => {
 // ── overview ──────────────────────────────────────────────────────────────────
 async function loadOverview() {
   try {
-    const [w, r] = await Promise.all([J('/api/workspace'), J('/api/run')]);
+    const [w, r, p, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/artifacts')]);
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
     let h = pagehead('Overview', '');
     // top row: run status + obstacles
@@ -2335,6 +2296,34 @@ async function loadOverview() {
       '<div class="item"><span class="dotc" style="background:' + o.color + '"></span>' + (o.chunk ? '<b class="mono">' + esc(o.chunk) + '</b>' : '') +
       '<div class="who" style="margin-top:2px">' + esc(o.content).slice(0, 160) + '</div></div>').join('')
       : '<div class="empty">none open</div>') + '</div></div>';
+    // authoritative prove search state
+    const goals = Object.values(p.declarations || {}),
+      strategies = Object.values(p.strategies || {}).sort((a,b) => (a.created_at || 0) - (b.created_at || 0)),
+      findings = Object.values(p.findings || {}).filter(x => x.status === 'active')
+        .sort((a,b) => (b.confidence || 0) - (a.confidence || 0) || (b.updated_at || 0) - (a.updated_at || 0)),
+      candidates = Object.values(p.candidates || {}).sort((a,b) => (a.created_at || 0) - (b.created_at || 0));
+    if (goals.length) {
+      const solved = goals.filter(x => x.status === 'solved').length;
+      h += '<div class="sechead">proof search<span class="r">revision ' + (p.revision || 0) + ' · ' + a.count + ' artifacts · ' + a.stored_bytes + ' bytes</span></div>';
+      h += '<div class="grid"><section><h2>goals · ' + solved + '/' + goals.length + ' solved</h2>' + goals.map(x =>
+        '<div class="item"><b class="mono">' + esc(x.decl) + '</b><span class="badge ' + (x.status === 'solved' ? 'ok' : x.status === 'candidate_pending' ? 'amber' : 'pending') + '">' + esc(x.status) + '</span>' +
+        (x.merged_commit ? '<div class="who mono">main ' + esc(x.merged_commit.slice(0, 12)) + '</div>' : '') + '</div>').join('') + '</section>';
+      h += '<section><h2>strategies</h2>' + (strategies.length ? strategies.slice(-10).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.strategy_id) + '</b><span class="badge pending">' + esc(x.status) + '</span>' +
+        '<div>' + esc(x.description).slice(0, 150) + '</div><div class="who">' + esc(x.decl || 'general') + ' · owner ' + esc(x.owner || 'none') + '</div>' +
+        artifactButton(x.evidence_artifact_id) + '</div>').join('') : '<div class="empty">none registered</div>') + '</section>';
+      h += '<section><h2>live findings</h2>' + (findings.length ? findings.slice(0, 10).map(x =>
+        '<div class="item"><b>' + esc(x.title) + '</b><span class="badge pending">' + esc(x.confidence) + '/100</span>' +
+        '<div>' + esc(x.content).slice(0, 180) + '</div><div class="who">' + esc(x.kind) + ' · ' + esc(x.decl || 'general') + ' · ' + esc(x.author) + '</div>' +
+        artifactButton(x.evidence_artifact_id) + '</div>').join('') : '<div class="empty">none active</div>') + '</section>';
+      h += '<section><h2>candidates</h2>' + (candidates.length ? candidates.slice(-8).reverse().map(x => {
+        const objections = (x.objections || []).filter(o => o.status === 'open');
+        return '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'merged' ? 'ok' : ['blocked','failed','rejected'].includes(x.status) ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
+          '<div class="who mono">' + esc(x.commit_sha.slice(0, 12)) + ' · ' + esc(x.author) + '</div>' +
+          '<div class="who">' + (x.endorsements || []).length + ' endorsements · ' + objections.length + ' objections</div>' +
+          artifactButton((x.merge_build || {}).artifact_id) + (x.objections || []).map(o => artifactButton(o.evidence_artifact_id)).join('') + '</div>';
+      }).join('') : '<div class="empty">none submitted</div>') + '</section></div>';
+    }
     // agents
     const ags = w.agents || [];
     const nWork = ags.filter(a => a.status === 'working').length, nRev = ags.filter(a => a.status === 'reviewing').length;

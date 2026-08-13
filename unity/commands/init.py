@@ -14,6 +14,10 @@ _ENV_DEFAULT = (
     "MAX_ATTEMPTS=\n"
     "# Set to off to disable workspace-brief injection (ablation)\n"
     "UNITY_FORUM_BRIEF=on\n"
+    "# Large tool/command output is retained as shared artifacts\n"
+    "UNITY_ARTIFACT_THRESHOLD_BYTES=16384\n"
+    "UNITY_ARTIFACT_PREVIEW_BYTES=4096\n"
+    "UNITY_ARTIFACT_READ_LIMIT_BYTES=12000\n"
     "# Optional service keys — unlock extra agent tools when set\n"
     "AXLE_API_KEY=\n"
     "ARISTOTLE_API_KEY=\n"
@@ -71,6 +75,7 @@ async def run_init(root: Path) -> None:
     paths = Paths.from_unity_dir(unity)
     paths.forum.mkdir(exist_ok=True)
     paths.logs.mkdir(exist_ok=True)
+    paths.artifacts.mkdir(exist_ok=True)
     _seed_default_metrics(unity / "metrics")
     ensure_library()
 

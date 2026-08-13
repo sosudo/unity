@@ -31,6 +31,7 @@ def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
             "ANTHROPIC_DEFAULT_OPUS_MODEL": agent.model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": agent.model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": agent.model,
+            "UNITY_AGENT_NAME": agent.name,
         }.items() if v}
 
     # codex: the child env is replaced wholesale, so start from os.environ and
@@ -40,6 +41,7 @@ def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
         env["CODEX_API_KEY"] = agent.api_key
     if codex_home is not None:
         env["CODEX_HOME"] = str(codex_home)
+    env["UNITY_AGENT_NAME"] = agent.name
     return env
 
 
@@ -225,19 +227,25 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         attempt += 1
         try:
             final = None
-            async for msg in _idle_guard(query(prompt=prompt, options=options), idle_timeout):
-                _log(agent.name, msg, cwd)
-                if type(msg).__name__ == "ResultMessage":
-                    final = getattr(msg, "result", None)
-                    _last_run_stats[agent.name] = {
-                        "cost_usd": getattr(msg, "total_cost_usd", None),
-                        "num_turns": getattr(msg, "num_turns", None),
-                    }
-                if _stop_requested(cwd):
-                    # Safe stop: wind down at the next stream item instead of being killed
-                    # mid-write; abandoning the iterator disconnects the SDK client cleanly.
-                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                    return final
+            stream = query(prompt=prompt, options=options)
+            try:
+                async for msg in _idle_guard(stream, idle_timeout):
+                    _log(agent.name, msg, cwd)
+                    if type(msg).__name__ == "ResultMessage":
+                        final = getattr(msg, "result", None)
+                        _last_run_stats[agent.name] = {
+                            "cost_usd": getattr(msg, "total_cost_usd", None),
+                            "num_turns": getattr(msg, "num_turns", None),
+                        }
+                    if _stop_requested(cwd):
+                        # Safe stop: wind down at the next stream item instead of being killed
+                        # mid-write; abandoning the iterator disconnects the SDK client cleanly.
+                        _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                        return final
+            finally:
+                close = getattr(stream, "aclose", None)
+                if close is not None:
+                    await close()
             return final
         except Exception as e:
             if _give_up(e, attempt):
@@ -324,7 +332,8 @@ _CODEX_MCP_NOTE = (
     "    unity mcp <server> <tool> '<json-args>'\n"
     "Examples:\n"
     "    unity mcp unity-forum forum_brief '{\"author\": \"<your agent name>\"}'\n"
-    "    unity mcp unity-forum forum_claim '{\"chunk\": \"chunk-1\", \"author\": \"<you>\", \"strategy\": \"...\"}'\n"
+    "    unity mcp unity-forum register_strategy '{\"decl\": \"My.theorem\", \"author\": \"<you>\", \"description\": \"...\"}'\n"
+    "    unity mcp unity-forum claim_strategy '{\"strategy_id\": \"strategy-...\", \"author\": \"<you>\"}'\n"
     "    unity mcp lean-lsp lean_goal '{\"file_path\": \"...\", \"line\": 12}'\n"
     "Servers: unity-forum (all forum_*/ledger_* tools), lean-lsp, axle and aristotle when "
     "configured. Read every forum/tool instruction in this prompt as 'run it via unity mcp'. "
@@ -434,7 +443,8 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         attempt += 1
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL)
+            stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
+            env=_agent_env(agent))
 
         async def _lines():
             while True:

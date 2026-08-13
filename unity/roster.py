@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 BACKENDS = {"claude_code", "codex", "antigravity"}
+DEFAULT_STRENGTH = 5.0
 # user-facing aliases: the yaml (and web UI) may say which API an agent speaks
 _BACKEND_ALIASES = {"anthropic": "claude_code", "openai": "codex",
                     "antigravity": "antigravity", "gemini": "antigravity",
@@ -52,7 +53,7 @@ def _interp(value, where: str):
     return _VAR.sub(sub, value)
 
 
-def load_roster(path: Path) -> Roster:
+def load_roster(path: Path, *, use_learned_strength: bool = True) -> Roster:
     """Load and validate `agents.yaml`, flattening groups into per-instance agents."""
     if not path.is_file():
         raise ValueError(f"agents.yaml not found at {path}")
@@ -98,8 +99,11 @@ def load_roster(path: Path) -> Roster:
         # strength in agents.yaml overrides.
         raw_strength = g.get("strength")
         if raw_strength in (None, ""):
-            from .library import learned_strength
-            strength = learned_strength(model)
+            if use_learned_strength:
+                from .library import learned_strength
+                strength = learned_strength(model)
+            else:
+                strength = DEFAULT_STRENGTH
         else:
             strength = float(raw_strength)
 

@@ -19,6 +19,7 @@ setups, use a separate --forum-dir per run or archive each run's forum/.
 
 import argparse
 import fcntl
+import hashlib
 import json
 import math
 import re
@@ -29,8 +30,14 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from .. import artifacts as artifact_store
+from .. import prove_state as prove_store
+from .. import worktree
+
 mcp = FastMCP("unity-forum")
 FORUM_DIR: Path = Path("forum")
+PROJECT_ROOT: Path | None = None
+ICRL_ENABLED: bool = True
 
 # @-mentions must be preceded by start-of-string or whitespace, so Lean code
 # snippets like `@MeasureTheory.foo` inside post bodies do NOT register as
@@ -176,6 +183,8 @@ def _save_balances(balances: dict) -> None:
 
 
 def _credit(author: str, delta: float, event: str, thread_id: str, excerpt: str = "") -> dict:
+    if not ICRL_ENABLED:
+        return {"display_name": author, "balance": 0.0, "history": [], "notifications": []}
     key = _canonical_author(author)
     balances = _load_balances()
     if key not in balances:
@@ -201,6 +210,8 @@ def _credit(author: str, delta: float, event: str, thread_id: str, excerpt: str 
 
 
 def _push_notification(author: str, delta: float, event: str, thread_id: str, post_id: str, excerpt: str, *, only_existing: bool = False) -> None:
+    if not ICRL_ENABLED:
+        return
     key = _canonical_author(author)
     balances = _load_balances()
     if key not in balances:
@@ -240,6 +251,8 @@ def _push_notification(author: str, delta: float, event: str, thread_id: str, po
 
 def _notify_all(delta: float, event: str, thread_id: str, post_id: str, excerpt: str, exclude: str = "") -> None:
     """Push a notification to every known agent except `exclude`."""
+    if not ICRL_ENABLED:
+        return
     excl_key = _canonical_author(exclude) if exclude else ""
     balances = _load_balances()
     for key in list(balances.keys()):
@@ -249,6 +262,8 @@ def _notify_all(delta: float, event: str, thread_id: str, post_id: str, excerpt:
 
 
 def _drain_notifications(author: str) -> list:
+    if not ICRL_ENABLED:
+        return []
     key = _canonical_author(author)
     balances = _load_balances()
     if key not in balances:
@@ -338,8 +353,7 @@ def forum_post(
     DAG structure — a synthesis post can reply to several arguments at once).
     Leave empty or omit for a top-level post.
 
-    Returns the new post's metadata including icrl_balance and any pending
-    icrl_notifications (vote feedback and @mention alerts since your last post).
+    Returns the new post's metadata.
     """
     if not author or not author.strip():
         raise ValueError("author must be a non-empty string")
@@ -368,26 +382,26 @@ def _forum_post_locked(thread_id: str, author: str, content: str, reply_to: list
     }
     data["posts"].append(post)
     _save(data)
-    seen_mentions: set[str] = set()
-    for m in _MENTION_RE.finditer(content):
-        mentioned = m.group(1)
-        mentioned_key = _canonical_author(mentioned)
-        if mentioned_key == _canonical_author(author) or mentioned_key in seen_mentions:
-            continue
-        seen_mentions.add(mentioned_key)
-        # only_existing=True so phantom @-strings (Lean code that slipped past
-        # _MENTION_RE, stray tokens) don't materialise ledger rows.
-        _push_notification(
-            mentioned, 0.0, "mention", thread_id, post["post_id"],
-            content[:100], only_existing=True,
-        )
-    rec = _credit(author, 0.5, "forum_post", thread_id, content[:100])
-    notifications = _drain_notifications(author)
     result = {k: v for k, v in post.items()}
-    result["icrl_balance"] = rec["balance"]
-    result["icrl_delta"] = +0.5
-    if notifications:
-        result["icrl_notifications"] = notifications
+    if ICRL_ENABLED:
+        seen_mentions: set[str] = set()
+        for m in _MENTION_RE.finditer(content):
+            mentioned = m.group(1)
+            mentioned_key = _canonical_author(mentioned)
+            if mentioned_key == _canonical_author(author) or mentioned_key in seen_mentions:
+                continue
+            seen_mentions.add(mentioned_key)
+            # only_existing=True so phantom @-strings do not materialise balance rows.
+            _push_notification(
+                mentioned, 0.0, "mention", thread_id, post["post_id"],
+                content[:100], only_existing=True,
+            )
+        rec = _credit(author, 0.5, "forum_post", thread_id, content[:100])
+        notifications = _drain_notifications(author)
+        result["icrl_balance"] = rec["balance"]
+        result["icrl_delta"] = +0.5
+        if notifications:
+            result["icrl_notifications"] = notifications
     return result
 
 
@@ -410,7 +424,7 @@ def forum_vote(
     - Opposite direction: swaps.
     - 'remove': explicitly clears your vote on that dimension.
 
-    Returns updated vote counts (total and per-dimension) and your icrl_balance.
+    Returns updated vote counts and the caller's vote.
     """
     if vote not in ("up", "down", "remove"):
         raise ValueError("vote must be 'up', 'down', or 'remove'")
@@ -444,19 +458,20 @@ def _forum_vote_locked(thread_id: str, post_id: str, vote: str, voter: str, dim_
             add_new = vote != "remove" and vote != existing
 
             if not remove_old and not add_new:
-                balances = _load_balances()
-                balance = balances.get(voter, {}).get("balance", 0.0)
-                return {
+                result = {
                     "post_id": post_id,
                     "upvotes": post["upvotes"],
                     "downvotes": post["downvotes"],
                     "votes_by_dimension": vbd,
                     "your_vote": None,
                     "dimension": dim_key,
-                    "icrl_balance": balance,
-                    "icrl_delta": 0,
                     "action": "no_op",
                 }
+                if ICRL_ENABLED:
+                    balances = _load_balances()
+                    result["icrl_balance"] = balances.get(voter, {}).get("balance", 0.0)
+                    result["icrl_delta"] = 0
+                return result
 
             dim_bucket = vbd.setdefault(dim_key, {"up": 0, "down": 0})
             author_delta = 0.0
@@ -485,7 +500,7 @@ def _forum_vote_locked(thread_id: str, post_id: str, vote: str, voter: str, dim_
 
             _save(data)
 
-            if author_delta != 0.0:
+            if ICRL_ENABLED and author_delta != 0.0:
                 event = "received_upvote" if author_delta > 0 else "received_downvote"
                 _push_notification(author, author_delta, event, thread_id, post_id, excerpt)
 
@@ -494,8 +509,6 @@ def _forum_vote_locked(thread_id: str, post_id: str, vote: str, voter: str, dim_
 
             current_vote = registry.get(reg_key)
             action = f"vote_{vote}" if add_new else f"removed_{existing}"
-            rec = _credit(voter, 0.5, f"forum_{action}", thread_id)
-
             result = {
                 "post_id": post_id,
                 "upvotes": post["upvotes"],
@@ -503,10 +516,12 @@ def _forum_vote_locked(thread_id: str, post_id: str, vote: str, voter: str, dim_
                 "votes_by_dimension": vbd,
                 "your_vote": current_vote,
                 "dimension": dim_key,
-                "icrl_balance": rec["balance"],
-                "icrl_delta": +0.5,
                 "action": action,
             }
+            if ICRL_ENABLED:
+                rec = _credit(voter, 0.5, f"forum_{action}", thread_id)
+                result["icrl_balance"] = rec["balance"]
+                result["icrl_delta"] = +0.5
             if approved_dim:
                 result["dimension_approved"] = approved_dim
             return result
@@ -517,7 +532,7 @@ def _forum_vote_locked(thread_id: str, post_id: str, vote: str, voter: str, dim_
 @mcp.tool()
 def forum_archive(thread_id: str, post_id: str, reason: str, archiver: str) -> dict:
     """Archive a post: mark it as `[ARCHIVED]` in place, append an audit-trail
-    entry to the `_archive` thread, and credit the archiver +0.5.
+    entry to the `_archive` thread.
 
     Use this for cleanup of stale, mistaken, or superseded posts. Unlike a
     hard delete, the original post stays in the graph with its post_id and
@@ -577,14 +592,16 @@ def forum_archive(thread_id: str, post_id: str, reason: str, archiver: str) -> d
     with _thread_lock(ARCHIVE_THREAD):
         _forum_post_locked(ARCHIVE_THREAD, archiver, audit_content, [])
 
-    rec = _credit(archiver, 0.5, "forum_archive", thread_id, reason[:100])
-    return {
+    result = {
         "post_id": post_id,
         "status": "archived",
         "archiver": archiver,
-        "icrl_balance": rec["balance"],
-        "icrl_delta": +0.5,
     }
+    if ICRL_ENABLED:
+        rec = _credit(archiver, 0.5, "forum_archive", thread_id, reason[:100])
+        result["icrl_balance"] = rec["balance"]
+        result["icrl_delta"] = +0.5
+    return result
 
 
 # ── Scratchpad: structured attempt logging ────────────────────────────────────
@@ -627,8 +644,7 @@ def forum_log_attempt(
     `error` and `notes` are optional. Include the verbatim error head if
     outcome is compile_error so search across attempts can match it.
 
-    Earns +0.2 ICRL (lower than forum_post so frequent fine-grained logs
-    are encouraged). Returns the post_id and current balance.
+    Returns the structured attempt's post id.
     """
     if outcome not in _ATTEMPT_OUTCOMES:
         raise ValueError(
@@ -683,15 +699,17 @@ def forum_log_attempt(
         data["posts"].append(post)
         _save(data)
 
-    rec = _credit(author, 0.2, "forum_log_attempt", thread_id, what[:100])
-    return {
+    result = {
         "post_id": post["post_id"],
         "thread_id": thread_id,
         "chunk_id": chunk_id,
         "outcome": outcome,
-        "icrl_balance": rec["balance"],
-        "icrl_delta": +0.2,
     }
+    if ICRL_ENABLED:
+        rec = _credit(author, 0.2, "forum_log_attempt", thread_id, what[:100])
+        result["icrl_balance"] = rec["balance"]
+        result["icrl_delta"] = +0.2
+    return result
 
 
 @mcp.tool()
@@ -780,6 +798,8 @@ def forum_check_balance(author: str, drain: bool = True) -> dict:
     """
     if not author or not author.strip():
         raise ValueError("author must be a non-empty string")
+    if not ICRL_ENABLED:
+        raise ValueError("forum_check_balance is unavailable because ICRL is disabled")
     key = _canonical_author(author)
     balances = _load_balances()
     if key not in balances:
@@ -823,17 +843,19 @@ def forum_list() -> dict:
             continue
 
     config = _load_config()
-    balances = _load_balances()
-    leaderboard = sorted(
-        [
-            {"author": r.get("display_name", a), "balance": r["balance"]}
-            for a, r in balances.items()
-        ],
-        key=lambda x: x["balance"],
-        reverse=True,
-    ) if balances else []
+    leaderboard = []
+    if ICRL_ENABLED:
+        balances = _load_balances()
+        leaderboard = sorted(
+            [
+                {"author": r.get("display_name", a), "balance": r["balance"]}
+                for a, r in balances.items()
+            ],
+            key=lambda x: x["balance"],
+            reverse=True,
+        ) if balances else []
 
-    return {
+    result = {
         "threads": threads,
         "active_dimensions": config["dimensions"]["active"],
         "pending_dimensions": {
@@ -844,8 +866,10 @@ def forum_list() -> dict:
             name: {"description": t["description"], "post_count": len(t["post_ids"])}
             for name, t in config.get("tags", {}).items()
         },
-        "leaderboard": leaderboard,
     }
+    if ICRL_ENABLED:
+        result["leaderboard"] = leaderboard
+    return result
 
 
 # ── Dimension management ───────────────────────────────────────────────────────
@@ -1153,6 +1177,464 @@ def _chunk_thread(chunk: str) -> str:
     return chunk if chunk.startswith("chunk-") else f"chunk-{chunk}"
 
 
+def _require_project_root() -> Path:
+    if PROJECT_ROOT is None:
+        raise ValueError("prove coordination tools require a configured project root")
+    return PROJECT_ROOT
+
+
+def _artifacts_dir() -> Path:
+    """Run-scoped shared artifact directory, available from every worktree."""
+    return FORUM_DIR.resolve().parent / "artifacts"
+
+
+def _prepare_evidence(
+    text: str,
+    *,
+    author: str,
+    kind: str,
+    metadata: dict,
+) -> dict:
+    """Keep short evidence inline and externalize large evidence automatically."""
+    compacted = artifact_store.compact_text(
+        _artifacts_dir(),
+        text,
+        kind=kind,
+        producer=author,
+        source="forum evidence",
+        metadata=metadata,
+    )
+    if isinstance(compacted, str):
+        return {
+            "evidence": compacted,
+            "evidence_artifact_id": "",
+            "evidence_sha256": "",
+            "evidence_bytes": len(compacted.encode("utf-8")),
+        }
+    return {
+        # prove_state keeps live evidence bounded at 4 KB; leave room for UTF-8 and labels.
+        "evidence": artifact_store.preview_text(text, 3500),
+        "evidence_artifact_id": compacted["artifact_id"],
+        "evidence_sha256": compacted["sha256"],
+        "evidence_bytes": compacted["bytes"],
+    }
+
+
+# ── Prove artifacts, strategies, findings, candidates, and synchronization ──
+
+@mcp.tool()
+def artifact_info(artifact_id: str) -> dict:
+    """Return immutable artifact metadata without inserting its content into context."""
+    return artifact_store.artifact_info(_artifacts_dir(), artifact_id)
+
+
+@mcp.tool()
+def artifact_read(
+    artifact_id: str,
+    offset: int = 0,
+    limit: int = artifact_store.DEFAULT_READ_LIMIT,
+) -> dict:
+    """Read one bounded page from an artifact; use next_offset for further pages."""
+    return artifact_store.read_artifact(
+        _artifacts_dir(), artifact_id, offset=offset, limit=limit
+    )
+
+
+@mcp.tool()
+def artifact_snapshot_file(
+    path: str,
+    known_sha256: str = "",
+    offset: int = 0,
+    limit: int = artifact_store.DEFAULT_READ_LIMIT,
+) -> dict:
+    """Read a bounded project file snapshot, or report that its known hash is unchanged.
+
+    Paths are restricted to the project checkout and its worktrees. Large files are
+    stored once as artifacts so subsequent detail can be retrieved in bounded pages.
+    """
+    root = _require_project_root().resolve()
+    target = Path(path)
+    if not target.is_absolute():
+        caller_root = Path.cwd().resolve()
+        base = caller_root if caller_root.is_relative_to(root) else root
+        target = base / target
+    try:
+        target = target.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"file '{path}' does not exist") from exc
+    if not target.is_relative_to(root) or not target.is_file():
+        raise ValueError("artifact_snapshot_file only reads files inside the project")
+    payload = target.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    base = {
+        "path": str(target.relative_to(root)),
+        "sha256": digest,
+        "bytes": len(payload),
+    }
+    if known_sha256 and known_sha256 == digest:
+        return {**base, "unchanged": True}
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        raise ValueError("offset must be a non-negative integer")
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("limit must be a positive integer")
+    limit = min(limit, artifact_store.MAX_READ_LIMIT)
+    text = payload.decode("utf-8", errors="replace")
+    compacted = artifact_store.compact_text(
+        _artifacts_dir(),
+        text,
+        kind="file_snapshot",
+        source=base["path"],
+        metadata={"file_sha256": digest},
+    )
+    if isinstance(compacted, dict):
+        return {
+            **base,
+            "unchanged": False,
+            "artifact_id": compacted["artifact_id"],
+            "preview": compacted["preview"],
+        }
+    start = min(offset, len(payload))
+    end = min(start + limit, len(payload))
+    return {
+        **base,
+        "unchanged": False,
+        "offset": start,
+        "returned_bytes": end - start,
+        "content": payload[start:end].decode("utf-8", errors="replace"),
+        "next_offset": end if end < len(payload) else None,
+    }
+
+@mcp.tool()
+def register_strategy(author: str, description: str, decl: str = "") -> dict:
+    """Register an agent-proposed proof strategy, optionally for one declaration.
+
+    Registration does not claim the strategy. Exact normalized duplicates for the same
+    declaration return the existing strategy instead of creating redundant work.
+    """
+    result = prove_store.register_strategy(FORUM_DIR, author, description, decl)
+    if result["status"] == "registered":
+        strategy = result["strategy"]
+        thread = _chunk_thread(decl) if decl else "global"
+        _typed_post(thread, decl or "Global Discussion", author, "strategy", strategy,
+                    f"STRATEGY {strategy['strategy_id']}"
+                    + (f" [{decl}]" if decl else " [general]")
+                    + f": {description}")
+    return result
+
+
+@mcp.tool()
+def claim_strategy(strategy_id: str, author: str) -> dict:
+    """Atomically claim one registered strategy.
+
+    A claim is rejected if another agent owns it or if the caller has not synchronized
+    its worktree to current main since its previous attempt.
+    """
+    root = _require_project_root()
+    if not worktree.worktree_matches_main(root, author):
+        return {
+            "status": "stale_worktree",
+            "strategy_id": strategy_id,
+            "message": "call sync_from_main before claiming another strategy",
+            "main_sha": worktree.main_commit(root),
+        }
+    result = prove_store.claim_strategy(
+        FORUM_DIR, strategy_id, author, worktree.main_commit(root)
+    )
+    if result["status"] == "claimed":
+        strategy = result["strategy"]
+        thread = _chunk_thread(strategy.get("decl", "")) if strategy.get("decl") else "global"
+        _typed_post(thread, strategy.get("decl") or "Global Discussion", author,
+                    "strategy_claim", {"strategy_id": strategy_id, "status": "claimed"},
+                    f"CLAIM STRATEGY {strategy_id}: {strategy['description']}")
+    return result
+
+
+@mcp.tool()
+def unclaim_strategy(strategy_id: str, author: str, reason: str = "") -> dict:
+    """Release an owned strategy so another agent may claim it."""
+    result = prove_store.unclaim_strategy(FORUM_DIR, strategy_id, author, reason)
+    strategy = result["strategy"]
+    thread = _chunk_thread(strategy.get("decl", "")) if strategy.get("decl") else "global"
+    _typed_post(thread, strategy.get("decl") or "Global Discussion", author,
+                "strategy_release", {"strategy_id": strategy_id, "reason": reason},
+                f"RELEASE STRATEGY {strategy_id}" + (f": {reason}" if reason else ""))
+    return result
+
+
+@mcp.tool()
+def mark_strategy_incorrect(
+    strategy_id: str,
+    author: str,
+    reason: str,
+    evidence: str = "",
+) -> dict:
+    """Close a strategy as invalid, preserving concrete evidence against repetition."""
+    prepared = _prepare_evidence(
+        evidence,
+        author=author,
+        kind="strategy_failure_evidence",
+        metadata={"strategy_id": strategy_id},
+    )
+    result = prove_store.mark_strategy_incorrect(
+        FORUM_DIR, strategy_id, author, reason, **prepared
+    )
+    strategy = result["strategy"]
+    thread = _chunk_thread(strategy.get("decl", "")) if strategy.get("decl") else "global"
+    _typed_post(thread, strategy.get("decl") or "Global Discussion", author,
+                "strategy_incorrect",
+                {"strategy_id": strategy_id, "reason": reason, **prepared},
+                f"INCORRECT STRATEGY {strategy_id}: {reason}"
+                + (f" | evidence: {prepared['evidence'][:500]}" if evidence else "")
+                + (f" | artifact: {prepared['evidence_artifact_id']}"
+                   if prepared["evidence_artifact_id"] else ""))
+    return result
+
+
+@mcp.tool()
+def publish_finding(
+    author: str,
+    kind: str,
+    title: str,
+    content: str,
+    confidence: int,
+    decl: str = "",
+    strategy_id: str = "",
+    evidence: str = "",
+) -> dict:
+    """Publish a concise live proof-search finding to authoritative shared state.
+
+    ``kind`` is chosen by the agent and normalized to a stable key. ``confidence`` is
+    an integer from 0 through 100; confidence 100 means directly verified and requires
+    concrete evidence or an artifact reference. Exact active duplicates are rejected.
+    """
+    prepared = _prepare_evidence(
+        evidence,
+        author=author,
+        kind="finding_evidence",
+        metadata={"decl": decl, "strategy_id": strategy_id, "title": title},
+    )
+    result = prove_store.publish_finding(
+        FORUM_DIR,
+        author,
+        kind,
+        title,
+        content,
+        confidence,
+        decl,
+        strategy_id,
+        **prepared,
+    )
+    if result["status"] == "published":
+        finding = result["finding"]
+        thread = _chunk_thread(finding["decl"]) if finding["decl"] else "global"
+        post = _typed_post(
+            thread,
+            finding["decl"] or "Global Discussion",
+            author,
+            "finding",
+            finding,
+            f"FINDING[{finding['kind']}] {finding['title']} "
+            f"(confidence={finding['confidence']}/100): {finding['content'][:500]}"
+            + (f" | evidence: {finding['evidence'][:300]}" if finding["evidence"] else "")
+            + (f" | artifact: {finding['evidence_artifact_id']}"
+               if finding.get("evidence_artifact_id") else ""),
+        )
+        result["forum_post_id"] = post["post_id"]
+    return result
+
+
+@mcp.tool()
+def supersede_finding(
+    finding_id: str,
+    author: str,
+    reason: str,
+    replacement_id: str = "",
+) -> dict:
+    """Retire a live finding that is wrong, stale, or replaced by better evidence."""
+    result = prove_store.supersede_finding(
+        FORUM_DIR, finding_id, author, reason, replacement_id
+    )
+    if not result.get("idempotent"):
+        finding = result["finding"]
+        thread = _chunk_thread(finding["decl"]) if finding["decl"] else "global"
+        _typed_post(
+            thread,
+            finding["decl"] or "Global Discussion",
+            author,
+            "finding_superseded",
+            {
+                "finding_id": finding_id,
+                "reason": reason,
+                "replacement_id": replacement_id,
+            },
+            f"SUPERSEDE FINDING {finding_id}: {reason[:500]}"
+            + (f" | replacement: {replacement_id}" if replacement_id else ""),
+        )
+    return result
+
+
+@mcp.tool()
+def emit_candidate(
+    strategy_id: str,
+    author: str,
+    commit_sha: str,
+    decl: str = "",
+    notes: str = "",
+    supersedes: str = "",
+) -> dict:
+    """Submit the exact commit produced by an owned strategy as a proof candidate.
+
+    Run ``lake build`` and commit first. Candidate identity is immutable: corrections
+    are new candidates, optionally linked through ``supersedes``.
+    """
+    resolved = worktree.verify_candidate_commit(_require_project_root(), author, commit_sha)
+    result = prove_store.emit_candidate(
+        FORUM_DIR, strategy_id, author, resolved, decl, notes, supersedes
+    )
+    candidate = result["candidate"]
+    post = _typed_post(
+        _chunk_thread(candidate["decl"]), candidate["decl"], author, "candidate", candidate,
+        f"CANDIDATE {candidate['candidate_id']} [{candidate['decl']}]"
+        f" commit={candidate['commit_sha']} strategy={strategy_id}"
+        + (f" — {notes[:500]}" if notes else ""),
+    )
+    result["forum_post_id"] = post["post_id"]
+    return result
+
+
+@mcp.tool()
+def endorse_candidate(candidate_id: str, author: str, review: str = "") -> dict:
+    """Independently endorse an exact candidate commit after reviewing it."""
+    result = prove_store.endorse_candidate(FORUM_DIR, candidate_id, author, review)
+    candidate = result["candidate"]
+    _typed_post(_chunk_thread(candidate["decl"]), candidate["decl"], author,
+                "candidate_endorsement",
+                {"candidate_id": candidate_id, "review": review},
+                f"ENDORSE CANDIDATE {candidate_id} ({candidate['commit_sha']})"
+                + (f": {review[:500]}" if review else ""))
+    return result
+
+
+@mcp.tool()
+def object_candidate(
+    candidate_id: str,
+    author: str,
+    reason: str,
+    evidence: str = "",
+) -> dict:
+    """Block an exact candidate with a concrete independent objection."""
+    prepared = _prepare_evidence(
+        evidence,
+        author=author,
+        kind="candidate_objection_evidence",
+        metadata={"candidate_id": candidate_id},
+    )
+    result = prove_store.object_candidate(
+        FORUM_DIR, candidate_id, author, reason, **prepared
+    )
+    candidate = result["candidate"]
+    _typed_post(_chunk_thread(candidate["decl"]), candidate["decl"], author,
+                "candidate_objection",
+                {"candidate_id": candidate_id, "reason": reason, **prepared},
+                f"OBJECT CANDIDATE {candidate_id}: {reason}"
+                + (f" | evidence: {prepared['evidence'][:500]}" if evidence else "")
+                + (f" | artifact: {prepared['evidence_artifact_id']}"
+                   if prepared["evidence_artifact_id"] else ""))
+    return result
+
+
+@mcp.tool()
+def resolve_candidate_objection(
+    candidate_id: str,
+    objection_id: str,
+    author: str,
+    resolution: str,
+) -> dict:
+    """Resolve your own objection after its concern has been addressed."""
+    result = prove_store.resolve_objection(
+        FORUM_DIR, candidate_id, objection_id, author, resolution
+    )
+    candidate = result["candidate"]
+    _typed_post(_chunk_thread(candidate["decl"]), candidate["decl"], author,
+                "candidate_objection_resolved",
+                {"candidate_id": candidate_id, "objection_id": objection_id,
+                 "resolution": resolution},
+                f"RESOLVE OBJECTION {objection_id} on {candidate_id}: {resolution[:500]}")
+    return result
+
+
+@mcp.tool()
+def sync_to_main(candidate_id: str, author: str) -> dict:
+    """Merge an acceptable exact candidate into main under a global lock and build it.
+
+    The operation is idempotent. Submission alone is insufficient: at least one
+    independent endorsement and zero open objections are required.
+    """
+    started = prove_store.begin_merge(FORUM_DIR, candidate_id, author)
+    if started.get("idempotent") or started.get("conflict"):
+        return started
+    candidate = started["candidate"]
+    try:
+        merged = worktree.sync_candidate_to_main(_require_project_root(), candidate)
+    except Exception as exc:
+        merged = {"ok": False, "error": f"candidate merge raised: {exc}"}
+    finished = prove_store.finish_merge(
+        FORUM_DIR,
+        candidate_id,
+        success=bool(merged.get("ok")),
+        main_sha=merged.get("main_sha", ""),
+        error=merged.get("error", ""),
+        build=merged.get("build"),
+    )
+    _typed_post(
+        _chunk_thread(candidate["decl"]), candidate["decl"], author,
+        "candidate_merged" if merged.get("ok") else "candidate_merge_failed",
+        {"candidate_id": candidate_id, **merged},
+        (f"MERGED CANDIDATE {candidate_id} as {merged['main_sha']}"
+         if merged.get("ok") else f"CANDIDATE MERGE FAILED {candidate_id}: {merged.get('error', '')[:500]}"),
+    )
+    return {**finished, "sync": merged}
+
+
+@mcp.tool()
+def sync_from_main(author: str, reason: str = "") -> dict:
+    """Discard the caller's worktree attempt and synchronize it exactly to current main."""
+    root = _require_project_root()
+    released = prove_store.release_author_claims(
+        FORUM_DIR, author, reason or "synchronizing from main"
+    )
+    synced = worktree.force_sync_from_main(root, author)
+    result = prove_store.record_sync(FORUM_DIR, author, synced["main_sha"], released)
+    _typed_post("global", "Global Discussion", author, "worktree_sync",
+                {"main_sha": synced["main_sha"], "released_strategies": released,
+                 "reason": reason},
+                f"SYNC FROM MAIN {synced['main_sha']}"
+                + (f": {reason[:300]}" if reason else ""))
+    return {**result, "worktree": synced["worktree"]}
+
+
+@mcp.tool()
+def prove_status(decl: str = "") -> dict:
+    """Return authoritative declarations, strategies, findings, candidates, and events."""
+    state = prove_store.load_state(FORUM_DIR)
+    if not decl:
+        return state
+    if decl not in state["declarations"]:
+        raise ValueError(f"unknown prove declaration '{decl}'")
+    return {
+        "revision": state["revision"],
+        "main_sha": state.get("main_sha"),
+        "declaration": state["declarations"][decl],
+        "strategies": [item for item in state["strategies"].values()
+                       if item.get("decl") in ("", decl)],
+        "findings": [item for item in state["findings"].values()
+                     if item.get("decl") in ("", decl)],
+        "candidates": [item for item in state["candidates"].values()
+                       if item.get("decl") == decl],
+        "events": [item for item in state["events"] if item.get("decl") in (None, "", decl)][-50:],
+    }
+
+
 @mcp.tool()
 def forum_claim(chunk: str, author: str, strategy: str = "") -> dict:
     """Claim a chunk you are signing up to work on, stating your intended strategy.
@@ -1371,6 +1853,100 @@ def build_brief(author: str, chunk: str = "") -> str:
     """Compact digest of the workspace for one agent (also used by the dispatch
     injection). Empty string when there is nothing to show (e.g. a fresh run)."""
     lines: list[str] = []
+    prove = prove_store.load_state(FORUM_DIR)
+    declarations = prove.get("declarations", {})
+    if declarations:
+        solved = [decl for decl, item in declarations.items() if item.get("status") == "solved"]
+        unresolved = [decl for decl, item in declarations.items() if item.get("status") != "solved"]
+        lines.append(f"Proof goals: {len(solved)}/{len(declarations)} solved.")
+        if unresolved:
+            lines.append("Unresolved: " + ", ".join(
+                f"{decl} ({declarations[decl].get('status', 'unresolved')})"
+                for decl in unresolved[:8]
+            ))
+        candidates = sorted(
+            prove.get("candidates", {}).values(),
+            key=lambda item: (
+                {"acceptable": 0, "submitted": 1, "blocked": 2, "merging": 3,
+                 "merged": 4, "failed": 5, "superseded": 6, "rejected": 7}.get(
+                     item.get("status"), 9
+                 ),
+                -item.get("updated_at", 0),
+            ),
+        )
+        relevant_candidates = [item for item in candidates
+                               if not chunk or item.get("decl") == chunk]
+        if relevant_candidates:
+            lines.append("Current candidates (review exact commit):")
+            for candidate in relevant_candidates[:5]:
+                open_objections = [item for item in candidate.get("objections", [])
+                                   if item.get("status") == "open"]
+                lines.append(
+                    f"  - {candidate['candidate_id']} {candidate['decl']} "
+                    f"{candidate['status']} commit={candidate['commit_sha'][:12]} "
+                    f"by {candidate['author']}; endorsements={len(candidate.get('endorsements', []))}, "
+                    f"open objections={len(open_objections)}"
+                )
+                for objection in open_objections[:2]:
+                    lines.append(
+                        f"    BLOCKER {objection['objection_id']} by {objection['author']}: "
+                        f"{objection['reason'][:160]}"
+                    )
+                    if objection.get("evidence_artifact_id"):
+                        lines.append(
+                            f"      evidence: {objection['evidence_artifact_id']} "
+                            f"({objection.get('evidence_bytes', 0)} bytes)"
+                        )
+                build_artifact = (candidate.get("merge_build") or {}).get("artifact_id")
+                if build_artifact:
+                    lines.append(f"    merge build output: {build_artifact}")
+        me = _canonical_author(author)
+        strategies = list(prove.get("strategies", {}).values())
+        mine = [item for item in strategies if _canonical_author(item.get("owner") or "") == me]
+        if mine:
+            lines.append("Your strategies:")
+            lines += [
+                f"  - {item['strategy_id']} [{item.get('decl') or 'general'}] "
+                f"{item['status']}: {item['description'][:140]}" for item in mine[:5]
+            ]
+        active = [item for item in strategies
+                  if item.get("status") in {"registered", "claimed", "paused"}
+                  and item not in mine and (not chunk or item.get("decl") in ("", chunk))]
+        if active:
+            lines.append("Other active strategies:")
+            lines += [
+                f"  - {item['strategy_id']} [{item.get('decl') or 'general'}] "
+                f"{item['status']} owner={item.get('owner') or 'none'}: {item['description'][:120]}"
+                for item in active[:8]
+            ]
+        unresolved_set = set(unresolved)
+        findings = [
+            item for item in prove.get("findings", {}).values()
+            if item.get("status") == "active"
+            and (
+                (chunk and item.get("decl") in ("", chunk))
+                or (not chunk and item.get("decl", "") in unresolved_set | {""})
+            )
+        ]
+        findings.sort(
+            key=lambda item: (item.get("confidence", 0), item.get("updated_at", 0)),
+            reverse=True,
+        )
+        if findings:
+            lines.append("Live findings (current proof-search knowledge):")
+            for finding in findings[:6]:
+                lines.append(
+                    f"  - {finding['finding_id']} [{finding.get('decl') or 'general'}] "
+                    f"{finding['kind']} confidence={finding['confidence']}/100 by "
+                    f"{finding['author']}: {finding['title']} — {finding['content'][:160]}"
+                )
+                if finding.get("evidence"):
+                    lines.append(f"    evidence: {finding['evidence'][:140]}")
+                if finding.get("evidence_artifact_id"):
+                    lines.append(
+                        f"    full evidence: {finding['evidence_artifact_id']} "
+                        f"({finding.get('evidence_bytes', 0)} bytes)"
+                    )
     decisions = _acts("global", "decision")
     if decisions:
         latest: dict[str, dict] = {}
@@ -1382,12 +1958,38 @@ def build_brief(author: str, chunk: str = "") -> str:
     if handoffs:
         lines.append("Latest handoff:")
         lines.append(f"  - {handoffs[-1]['content'][:220]}")
+    obstacle_targets: list[tuple[str, str]] = []
+    if chunk:
+        obstacle_targets.append((chunk, chunk))
+        declaration = declarations.get(chunk)
+        if declaration and declaration.get("chunk_id") not in (None, "", chunk):
+            obstacle_targets.append((chunk, declaration["chunk_id"]))
+    else:
+        for decl, declaration in declarations.items():
+            if declaration.get("status") == "solved":
+                continue
+            obstacle_targets.append((decl, decl))
+            if declaration.get("chunk_id") not in (None, "", decl):
+                obstacle_targets.append((decl, declaration["chunk_id"]))
+
+    obstacles: list[tuple[str, dict]] = []
+    seen_obstacles: set[str] = set()
+    for label, target in obstacle_targets:
+        for post in _acts(_chunk_thread(target), "obstacle"):
+            if (post.get("fields") or {}).get("status") != "open":
+                continue
+            if post["post_id"] in seen_obstacles:
+                continue
+            seen_obstacles.add(post["post_id"])
+            obstacles.append((label, post))
+    obstacles.sort(key=lambda item: item[1].get("timestamp", 0), reverse=True)
+    if obstacles:
+        lines.append("Open obstacles on unresolved goals:")
+        limit = 4 if chunk else 6
+        lines += [f"  - [{label}] {post['content'][:200]}" for label, post in obstacles[:limit]]
+
     if chunk:
         tid = _chunk_thread(chunk)
-        obstacles = [p for p in _acts(tid, "obstacle") if (p.get("fields") or {}).get("status") == "open"]
-        if obstacles:
-            lines.append(f"Open obstacles on {chunk}:")
-            lines += [f"  - {p['content'][:200]}" for p in obstacles[-4:]]
         claims = [p for p in _acts(tid, "claim") if (p.get("fields") or {}).get("status") == "open"]
         if claims:
             lines.append(f"Open claims on {chunk}: " +
@@ -1411,9 +2013,12 @@ def build_brief(author: str, chunk: str = "") -> str:
 
 @mcp.tool()
 def forum_brief(author: str, chunk: str = "") -> str:
-    """One-call compact digest: binding decisions, the latest handoff, open obstacles and
-    claims on your chunk, questions addressed to you, and relevant ledger entries. Call
-    this instead of reading raw threads."""
+    """Return a bounded digest of authoritative prove state and relevant Forum state.
+
+    Includes current candidates, strategies, live findings, global unresolved-goal
+    obstacles, addressed questions, relevant ledger entries, and binding decisions.
+    Call this instead of reading raw threads.
+    """
     return build_brief(author, chunk) or "(workspace empty — nothing binding yet)"
 
 
@@ -1438,10 +2043,17 @@ def forum_stats() -> dict:
 
 # ── entrypoint (must stay at end of module so all tools above are registered) ──
 
-def run(forum_dir: Path) -> None:
+def run(
+    forum_dir: Path,
+    project_root: Path | None = None,
+    *,
+    icrl_enabled: bool = True,
+) -> None:
     """Start the MCP server against `forum_dir` (programmatic entry point)."""
-    global FORUM_DIR
+    global FORUM_DIR, PROJECT_ROOT, ICRL_ENABLED
     FORUM_DIR = Path(forum_dir)
+    PROJECT_ROOT = Path(project_root).resolve() if project_root else FORUM_DIR.resolve().parent.parent
+    ICRL_ENABLED = icrl_enabled
     FORUM_DIR.mkdir(parents=True, exist_ok=True)
     mcp.run()
 
@@ -1449,8 +2061,10 @@ def run(forum_dir: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Unity Forum MCP Server")
     parser.add_argument("--forum-dir", default="forum", help="Directory for forum thread files")
+    parser.add_argument("--project-root", default=None, help="Trusted main project checkout")
+    parser.add_argument("--disable-icrl", action="store_true", help="Disable ICRL balances and credit")
     args = parser.parse_args()
-    run(args.forum_dir)
+    run(args.forum_dir, args.project_root, icrl_enabled=not args.disable_icrl)
 
 
 if __name__ == "__main__":

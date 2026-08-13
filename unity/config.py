@@ -18,6 +18,7 @@ class Paths:
     agents_yaml: Path
     forum: Path
     logs: Path
+    artifacts: Path
 
     @classmethod
     def from_unity_dir(cls, unity: Path) -> "Paths":
@@ -29,6 +30,7 @@ class Paths:
             agents_yaml=unity / "agents.yaml",
             forum=unity / "forum",
             logs=unity / "logs",
+            artifacts=unity / "artifacts",
         )
 
 

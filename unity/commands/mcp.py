@@ -7,6 +7,7 @@ subprocess); other servers get a one-shot stdio client.
 """
 
 import json
+import os
 
 import asyncclick as click
 
@@ -29,9 +30,17 @@ async def mcp(server, tool, args):
         raise click.ClickException("args must be a JSON object")
 
     paths = load_paths()
+    try:
+        run_state = json.loads((paths.unity / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        run_state = {}
     if server in ("unity-forum", "forum"):
         from ..forum import server as fsrv
         fsrv.FORUM_DIR = paths.forum
+        fsrv.PROJECT_ROOT = paths.unity.resolve().parent
+        fsrv.ICRL_ENABLED = not (
+            run_state.get("command") == "prove" and run_state.get("phase") != "done"
+        )
         client = Client(fsrv.mcp)  # in-process: no subprocess, same flock-safe storage
     else:
         specs = build_mcp(paths)
@@ -41,9 +50,27 @@ async def mcp(server, tool, args):
 
     async with client as c:
         res = await c.call_tool(tool, kwargs)
+    rendered = []
     for block in getattr(res, "content", None) or []:
         text = getattr(block, "text", None)
-        print(text if text is not None else block)
+        rendered.append(text if text is not None else str(block))
+    output = "\n".join(rendered)
+    active_prove = run_state.get("command") == "prove" and run_state.get("phase") != "done"
+    bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
+        "artifact_read", "artifact_snapshot_file",
+    }
+    if active_prove and output and not bounded_artifact_read:
+        from .. import artifacts
+        compacted = artifacts.compact_text(
+            paths.artifacts,
+            output,
+            kind="mcp_output",
+            producer=os.getenv("UNITY_AGENT_NAME", ""),
+            source=f"{server}.{tool}",
+        )
+        print(artifacts.format_compacted(compacted))
+    elif output:
+        print(output)
 
 
 command = mcp

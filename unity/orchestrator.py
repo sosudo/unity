@@ -76,13 +76,15 @@ def stop_requested(cwd) -> bool:
     return u is not None and (u / "stop-requested").exists()
 
 
-def build_mcp(paths) -> dict:
+def build_mcp(paths, *, forum_icrl: bool = True) -> dict:
     """MCP servers every agent attaches to (stdio; forum is file-backed + flock-safe)."""
     servers = {
         "lean-lsp": {"command": "uvx", "args": ["lean-lsp-mcp"]},
         "unity-forum": {
             "command": sys.executable,
-            "args": ["-m", "unity.forum.server", "--forum-dir", str(paths.forum)],
+            "args": ["-m", "unity.forum.server", "--forum-dir", str(paths.forum),
+                     "--project-root", str(paths.project_root)]
+                    + ([] if forum_icrl else ["--disable-icrl"]),
         },
     }
     axle_key = os.getenv("AXLE_API_KEY")
@@ -118,7 +120,27 @@ def _effective_ranking(roster, forum_dir) -> dict:
     }
 
 
-def _preamble(agent, roster, ranking: dict | None = None) -> str:
+def _preamble(
+    agent,
+    roster,
+    ranking: dict | None = None,
+    *,
+    icrl_enabled: bool = True,
+) -> str:
+    if not icrl_enabled:
+        team = "\n".join(
+            f"- {a.name}: {a.model} ({a.backend})"
+            f"{' [primary]' if a.is_primary else ''}"
+            for a in roster.agents
+        )
+        return (
+            f"You are agent '{agent.name}', running model '{agent.model}' "
+            f"(backend: {agent.backend}).\n"
+            f"You are collaborating with this team via the forum:\n{team}\n"
+            f"The primary agent is '{roster.primary.name}'.\n"
+            "Continue until your current proof-search work is complete or concretely blocked. "
+            "Publish the blocker and release your strategy before ending a blocked turn.\n\n"
+        )
     ranking = ranking or {a.name: float(a.strength) for a in roster.agents}
     order = sorted(roster.agents, key=lambda a: -ranking[a.name])
     standing = {a.name: i + 1 for i, a in enumerate(order)}
@@ -142,7 +164,17 @@ def _preamble(agent, roster, ranking: dict | None = None) -> str:
     )
 
 
-async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
+async def dispatch(
+    agents,
+    roster,
+    base_prompt,
+    task,
+    cwd,
+    mcp,
+    *,
+    tools_prompt="TOOLS",
+    icrl_enabled: bool = True,
+):
     """Spawn `agents` concurrently with per-agent prompts; await all, log failures.
 
     `cwd` is a single Path (shared) or a dict {agent.name: Path} (per-agent worktrees)."""
@@ -154,7 +186,7 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
         _console.print("[yellow]stop requested — skipping phase[/yellow]")
         return []
 
-    tools_ref = load_prompt("TOOLS")
+    tools_ref = load_prompt(tools_prompt)
     context = library.library_context()
     full = base_prompt + f"\n\n{tools_ref}" + (f"\n\n{context}" if context else "")
     subagents = library.library_subagents()
@@ -162,7 +194,10 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
     # Dynamic capability re-ranking: standings from forum credit, refreshed per dispatch.
     from .config import find_unity_dir
     unity_dir = find_unity_dir(Path(any_cwd))
-    ranking = _effective_ranking(roster, unity_dir / "forum") if unity_dir else None
+    ranking = (
+        _effective_ranking(roster, unity_dir / "forum")
+        if icrl_enabled and unity_dir else None
+    )
 
     def _brief(a) -> str:
         """Workspace digest injected per agent: binding decisions, latest handoff, open
@@ -180,7 +215,8 @@ async def dispatch(agents, roster, base_prompt, task, cwd, mcp):
             return ""
 
     results = await asyncio.gather(
-        *[spawn(a, _preamble(a, roster, ranking) + _brief(a) + full, task, _cwd(a), mcp,
+        *[spawn(a, _preamble(a, roster, ranking, icrl_enabled=icrl_enabled)
+                + _brief(a) + full, task, _cwd(a), mcp,
                 subagents=subagents)
           for a in agents],
         return_exceptions=True,
