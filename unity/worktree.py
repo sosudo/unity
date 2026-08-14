@@ -1,6 +1,7 @@
 """Per-agent git worktrees for formalization. Ported from unity_agent/pipeline.py."""
 
 import logging
+import json
 import re
 import subprocess
 from contextlib import contextmanager
@@ -8,7 +9,7 @@ from pathlib import Path
 
 import fcntl
 
-from . import artifacts, lake
+from . import artifacts, candidate_review, lake
 
 
 def _safe(name: str) -> str:
@@ -23,7 +24,8 @@ def agent_worktree(project_path: Path, name: str) -> Path:
     return Path(project_path) / ".worktrees" / _safe(name)
 
 
-def _ensure_git_excludes(repo_path: Path, patterns: tuple[str, ...]) -> None:
+def ensure_git_excludes(repo_path: Path, patterns: tuple[str, ...]) -> None:
+    """Add local-only ignore patterns without modifying the project's .gitignore."""
     result = subprocess.run(
         ["git", "rev-parse", "--git-path", "info/exclude"],
         cwd=repo_path, capture_output=True, text=True, check=False,
@@ -50,7 +52,7 @@ def create_worktree(name: str, project_path: Path) -> Path:
     Tolerates leftovers from a crashed run: stale worktrees/branches are pruned first."""
     safe = _safe(name)
     worktree_path = agent_worktree(project_path, name)
-    _ensure_git_excludes(project_path, (".worktrees", ".unity"))
+    ensure_git_excludes(project_path, (".worktrees", ".unity/"))
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Clear stale state from a previous crashed run before re-adding.
@@ -75,7 +77,8 @@ def link_runtime_state(worktree_path: Path, project_path: Path) -> None:
     target = Path(worktree_path) / ".unity"
     if not source.is_dir():
         return
-    _ensure_git_excludes(worktree_path, (".unity",))
+    # No trailing slash: .unity is a symlink in agent worktrees, not a directory.
+    ensure_git_excludes(worktree_path, (".unity",))
     if target.is_symlink() and target.resolve() == source.resolve():
         return
     if target.exists() or target.is_symlink():
@@ -156,15 +159,22 @@ def _merge_lock(project_path: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def sync_candidate_to_main(project_path: Path, candidate: dict) -> dict:
-    """Apply one exact candidate commit to clean main, build, and commit atomically."""
+def sync_candidate_to_main(project_path: Path, candidate: dict, declaration: dict) -> dict:
+    """Apply, build, mechanically review, and commit one exact candidate atomically."""
     project_path = Path(project_path)
     candidate_sha = candidate["commit_sha"]
     decl = candidate["decl"]
     with _merge_lock(project_path):
         dirty = _git(project_path, "status", "--porcelain", "--untracked-files=no", check=True)
         if dirty.stdout.strip():
-            return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
+            return {
+                "ok": False,
+                "blocked": True,
+                "blocker_kind": "dirty_main",
+                "error": "main has tracked changes; refusing candidate merge",
+                "main_sha": main_commit(project_path),
+                "git_status": dirty.stdout.splitlines()[:100],
+            }
         before = main_commit(project_path)
         applied = _git(project_path, "cherry-pick", "--no-commit", candidate_sha)
         if applied.returncode != 0:
@@ -210,6 +220,15 @@ def sync_candidate_to_main(project_path: Path, candidate: dict) -> dict:
                 "ok": False,
                 "error": f"lake build failed: {summary}",
                 "build": build_record,
+                "verification": {
+                    "status": "failed",
+                    "stage": "build",
+                    "candidate_id": candidate.get("candidate_id", ""),
+                    "candidate_commit": candidate_sha,
+                    "base_main_commit": before,
+                    "decl": decl,
+                    "issues": ["lake build failed in the main checkout"],
+                },
             }
         if _git(project_path, "diff", "--quiet").returncode != 0:
             _git(project_path, "reset", "--hard", before)
@@ -217,6 +236,57 @@ def sync_candidate_to_main(project_path: Path, candidate: dict) -> dict:
                 "ok": False,
                 "error": "lake build changed tracked files outside the candidate index",
                 "build": build_record,
+            }
+        try:
+            candidate_diff = _git(
+                project_path, "diff", "--cached", "--no-ext-diff", before, check=True
+            ).stdout
+            verification = candidate_review.review_candidate(
+                project_path,
+                candidate,
+                declaration,
+                base_main_sha=before,
+                candidate_diff=candidate_diff,
+            )
+            verification["build_returncode"] = build.returncode
+            verification["build_artifact_id"] = build_record.get("artifact_id")
+            stored_review = artifacts.store_text(
+                project_path / ".unity" / "artifacts",
+                json.dumps(verification, indent=2, sort_keys=True) + "\n",
+                kind="candidate_verification",
+                source="Unity mechanical declaration reviewer",
+                metadata={
+                    "candidate_id": candidate.get("candidate_id", ""),
+                    "decl": decl,
+                    "commit_sha": candidate_sha,
+                    "status": verification["status"],
+                },
+            )
+            verification["artifact_id"] = stored_review["artifact_id"]
+        except Exception as exc:
+            _git(project_path, "reset", "--hard", before)
+            return {
+                "ok": False,
+                "error": f"mechanical declaration reviewer failed: {exc}",
+                "build": build_record,
+                "verification": {
+                    "status": "failed",
+                    "stage": "reviewer_error",
+                    "candidate_id": candidate.get("candidate_id", ""),
+                    "candidate_commit": candidate_sha,
+                    "base_main_commit": before,
+                    "decl": decl,
+                    "issues": [f"mechanical declaration reviewer failed: {exc}"],
+                },
+            }
+        if verification["status"] != "passed":
+            _git(project_path, "reset", "--hard", before)
+            return {
+                "ok": False,
+                "error": "candidate declaration review failed: "
+                + "; ".join(verification["issues"]),
+                "build": build_record,
+                "verification": verification,
             }
         commit = _git(project_path, "commit", "-m", f"UNITY: merge chunk {decl}")
         if commit.returncode != 0:
@@ -228,6 +298,7 @@ def sync_candidate_to_main(project_path: Path, candidate: dict) -> dict:
             "main_sha": merged_sha,
             "previous_main_sha": before,
             "build": build_record,
+            "verification": verification,
         }
 
 

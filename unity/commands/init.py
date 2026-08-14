@@ -6,12 +6,15 @@ from pathlib import Path
 from ..config import UNITY_DIRNAME, Paths
 from .. import lake
 from ..library import ensure_library
+from ..worktree import ensure_git_excludes
 
 _DEFAULT_METRICS = Path(__file__).parent.parent / "defaults" / "metrics"
 
 _ENV_DEFAULT = (
     "# Cap on solving/critic loop rounds (blank = indefinite)\n"
     "MAX_ATTEMPTS=\n"
+    "# Set to false to skip the prove retrospective phase\n"
+    "RETROSPECTIVE=true\n"
     "# Set to off to disable workspace-brief injection (ablation)\n"
     "UNITY_FORUM_BRIEF=on\n"
     "# Large tool/command output is retained as shared artifacts\n"
@@ -86,13 +89,7 @@ async def run_init(root: Path) -> None:
         "## State\n\n<maintained across runs by the primary agent>\n"
     )
 
-    gi = root / ".gitignore"
-    existing = gi.read_text() if gi.exists() else ""
-    if ".unity/" not in existing.split():
-        with gi.open("a") as f:
-            if existing and not existing.endswith("\n"):
-                f.write("\n")
-            f.write(".unity/\n")
+    ensure_git_excludes(root, (".unity/",))
 
     click.echo(f"\nInitialized {unity}")
     click.echo("Next: `unity serve` -> agents tab to set up your roster (presets included),")

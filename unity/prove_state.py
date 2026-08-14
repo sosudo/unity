@@ -14,18 +14,19 @@ from pathlib import Path
 from typing import Iterator
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 5
 STRATEGY_STATUSES = {
     "registered", "claimed", "paused", "incorrect", "succeeded", "cancelled",
 }
 CANDIDATE_STATUSES = {
-    "submitted", "blocked", "acceptable", "merging", "merged", "failed", "superseded",
-    "rejected",
+    "submitted", "blocked", "acceptable", "verifying", "merging", "merge_blocked",
+    "merged", "failed", "superseded", "rejected",
 }
 _ACTIVE_STRATEGIES = {"registered", "claimed", "paused"}
 _TERMINAL_CANDIDATES = {"merged", "failed", "superseded", "rejected"}
 FINDING_STATUSES = {"active", "superseded"}
 
+_STRATEGY_FAMILY_MAX_LENGTH = 100
 _FINDING_KIND_MAX_LENGTH = 64
 _FINDING_TITLE_MAX_LENGTH = 200
 _FINDING_CONTENT_MAX_LENGTH = 4000
@@ -147,6 +148,10 @@ def initialize_from_dag(
                 "chunk_id": chunk.get("id", decl),
                 "title": chunk.get("title", decl),
                 "file": chunk.get("lean_file", ""),
+                "statement": chunk.get("statement", ""),
+                "kernel_type_repr": chunk.get("kernel_type_repr", ""),
+                "type_dependencies": list(chunk.get("type_dependencies", [])),
+                "declaration_kind": chunk.get("type", ""),
                 "dependencies": list(chunk.get("dependencies", [])),
                 "status": current.get("status", "unresolved"),
                 "accepted_candidate": current.get("accepted_candidate"),
@@ -163,6 +168,18 @@ def initialize_from_dag(
 
 def normalize_strategy(description: str) -> str:
     return re.sub(r"\s+", " ", description.strip()).casefold()
+
+
+def normalize_strategy_family(family: str) -> str:
+    """Return a stable collision key for an agent-chosen strategy family."""
+    normalized = re.sub(r"[^a-z0-9]+", "_", family.strip().casefold()).strip("_")
+    if family.strip() and not normalized:
+        raise ValueError("strategy_family must contain at least one letter or number")
+    if len(normalized) > _STRATEGY_FAMILY_MAX_LENGTH:
+        raise ValueError(
+            f"normalized strategy_family must be at most {_STRATEGY_FAMILY_MAX_LENGTH} characters"
+        )
+    return normalized
 
 
 def normalize_finding_kind(kind: str) -> str:
@@ -330,12 +347,19 @@ def supersede_finding(
         }
 
 
-def register_strategy(forum_dir: Path, author: str, description: str, decl: str = "") -> dict:
+def register_strategy(
+    forum_dir: Path,
+    author: str,
+    description: str,
+    decl: str = "",
+    strategy_family: str = "",
+) -> dict:
     description = re.sub(r"\s+", " ", description.strip())
     if not author.strip():
         raise ValueError("author must be non-empty")
     if not description:
         raise ValueError("description must be non-empty")
+    family_key = normalize_strategy_family(strategy_family)
     with transaction(forum_dir) as state:
         if decl and decl not in state["declarations"]:
             raise ValueError(f"unknown prove declaration '{decl}'")
@@ -344,13 +368,26 @@ def register_strategy(forum_dir: Path, author: str, description: str, decl: str 
         if decl and state["declarations"][decl].get("status") == "candidate_pending":
             pending = [candidate["candidate_id"] for candidate in state["candidates"].values()
                        if candidate.get("decl") == decl
-                       and candidate.get("status") in {"submitted", "acceptable", "merging"}]
+                       and candidate.get("status") in {
+                           "submitted", "acceptable", "verifying", "merging", "merge_blocked"
+                       }]
             return {"status": "candidate_pending", "decl": decl, "candidates": pending}
         key = normalize_strategy(description)
         for strategy in state["strategies"].values():
-            if (strategy.get("decl", "") == decl and strategy.get("strategy_key") == key
-                    and strategy.get("status") in _ACTIVE_STRATEGIES):
-                return {"status": "duplicate", "strategy": strategy}
+            if strategy.get("decl", "") != decl or strategy.get("status") not in _ACTIVE_STRATEGIES:
+                continue
+            if strategy.get("strategy_key") == key:
+                return {
+                    "status": "duplicate",
+                    "duplicate_basis": "description",
+                    "strategy": strategy,
+                }
+            if family_key and strategy.get("strategy_family") == family_key:
+                return {
+                    "status": "duplicate",
+                    "duplicate_basis": "strategy_family",
+                    "strategy": strategy,
+                }
         strategy_id = "strategy-" + uuid.uuid4().hex[:12]
         now = time.time()
         strategy = {
@@ -358,17 +395,76 @@ def register_strategy(forum_dir: Path, author: str, description: str, decl: str 
             "decl": decl,
             "description": description,
             "strategy_key": key,
+            "strategy_family": family_key or None,
             "creator": author,
             "owner": None,
             "status": "registered",
             "created_at": now,
             "updated_at": now,
             "attempts": [],
+            "assistants": {},
             "candidate_id": None,
         }
         state["strategies"][strategy_id] = strategy
-        _event(state, "strategy_registered", strategy_id=strategy_id, decl=decl, author=author)
+        _event(
+            state,
+            "strategy_registered",
+            strategy_id=strategy_id,
+            strategy_family=family_key or None,
+            decl=decl,
+            author=author,
+        )
         return {"status": "registered", "strategy": strategy}
+
+
+def assist_strategy(
+    forum_dir: Path,
+    strategy_id: str,
+    author: str,
+    contribution: str = "",
+) -> dict:
+    """Join a claimed strategy without taking its exclusive owner reservation."""
+    author = author.strip()
+    contribution = re.sub(r"\s+", " ", contribution.strip())
+    if not author:
+        raise ValueError("author must be non-empty")
+    with transaction(forum_dir) as state:
+        strategy = state["strategies"].get(strategy_id)
+        if not strategy:
+            raise ValueError(f"unknown strategy '{strategy_id}'")
+        if strategy.get("owner") == author:
+            return {"status": "owner", "strategy": strategy}
+        if strategy.get("status") != "claimed":
+            return {"status": "unavailable", "strategy": strategy}
+        decl = strategy.get("decl", "")
+        if decl and state["declarations"].get(decl, {}).get("status") in {
+            "solved", "candidate_pending",
+        }:
+            return {"status": "unavailable", "strategy": strategy}
+        assistants = strategy.setdefault("assistants", {})
+        existing = assistants.get(author)
+        if existing:
+            if contribution and contribution != existing.get("contribution", ""):
+                existing.update(contribution=contribution, updated_at=time.time())
+            return {"status": "already_assisting", "strategy": strategy}
+        now = time.time()
+        assistants[author] = {
+            "author": author,
+            "contribution": contribution,
+            "joined_at": now,
+            "updated_at": now,
+        }
+        strategy["updated_at"] = now
+        event = _event(
+            state,
+            "strategy_assisted",
+            strategy_id=strategy_id,
+            decl=decl,
+            author=author,
+            owner=strategy.get("owner"),
+            contribution=contribution,
+        )
+        return {"status": "assisting", "strategy": strategy, "event": event}
 
 
 def claim_strategy(forum_dir: Path, strategy_id: str, author: str, main_sha: str) -> dict:
@@ -488,8 +584,12 @@ def emit_candidate(
         strategy = state["strategies"].get(strategy_id)
         if not strategy:
             raise ValueError(f"unknown strategy '{strategy_id}'")
-        if strategy.get("owner") != author or strategy.get("status") != "claimed":
-            raise ValueError(f"strategy '{strategy_id}' is not actively owned by {author}")
+        participants = strategy.get("assistants", {})
+        is_participant = strategy.get("owner") == author or author in participants
+        if not is_participant or strategy.get("status") != "claimed":
+            raise ValueError(
+                f"strategy '{strategy_id}' is not actively owned or assisted by {author}"
+            )
         target = decl or strategy.get("decl", "")
         if not target:
             raise ValueError("decl is required for a general strategy")
@@ -519,8 +619,10 @@ def emit_candidate(
             "notes": notes,
             "supersedes": supersedes or None,
             "status": "submitted",
+            "verification": None,
             "endorsements": [],
             "objections": [],
+            "merge_attempts": 0,
             "created_at": now,
             "updated_at": now,
         }
@@ -544,11 +646,13 @@ def emit_candidate(
 
 
 def _recompute_candidate(state: dict, candidate: dict) -> None:
-    if candidate["status"] in _TERMINAL_CANDIDATES | {"merging"}:
+    if candidate["status"] in _TERMINAL_CANDIDATES | {"verifying", "merging"}:
         return
     open_objections = [item for item in candidate["objections"] if item["status"] == "open"]
     if open_objections:
         candidate["status"] = "blocked"
+    elif candidate.get("merge_blocker"):
+        candidate["status"] = "merge_blocked"
     elif candidate["endorsements"]:
         candidate["status"] = "acceptable"
     else:
@@ -563,7 +667,7 @@ def endorse_candidate(forum_dir: Path, candidate_id: str, author: str, review: s
             raise ValueError(f"unknown candidate '{candidate_id}'")
         if candidate["author"] == author:
             raise ValueError("candidate authors cannot endorse their own candidate")
-        if candidate["status"] in _TERMINAL_CANDIDATES | {"merging"}:
+        if candidate["status"] in _TERMINAL_CANDIDATES | {"verifying", "merging"}:
             return {"status": "unchanged", "candidate": candidate}
         existing = next((item for item in candidate["endorsements"] if item["author"] == author), None)
         if not existing:
@@ -606,7 +710,7 @@ def object_candidate(
             raise ValueError(f"unknown candidate '{candidate_id}'")
         if candidate["author"] == author:
             raise ValueError("candidate authors cannot object to their own candidate")
-        if candidate["status"] in _TERMINAL_CANDIDATES | {"merging"}:
+        if candidate["status"] in _TERMINAL_CANDIDATES | {"verifying", "merging"}:
             return {"status": "unchanged", "candidate": candidate}
         objection_id = "objection-" + uuid.uuid4().hex[:12]
         candidate["objections"].append({
@@ -651,7 +755,7 @@ def resolve_objection(
             return {"status": candidate["status"], "candidate": candidate}
         objection.update(status="resolved", resolution=resolution, resolved_at=time.time())
         _recompute_candidate(state, candidate)
-        if candidate["status"] in {"submitted", "acceptable"}:
+        if candidate["status"] in {"submitted", "acceptable", "merge_blocked"}:
             state["declarations"][candidate["decl"]].update(
                 status="candidate_pending", updated_at=time.time()
             )
@@ -662,20 +766,30 @@ def resolve_objection(
 
 
 def begin_merge(forum_dir: Path, candidate_id: str, author: str) -> dict:
+    """Atomically reserve a submitted candidate for mechanical review and merge."""
     with transaction(forum_dir) as state:
         candidate = state["candidates"].get(candidate_id)
         if not candidate:
             raise ValueError(f"unknown candidate '{candidate_id}'")
         if candidate["status"] == "merged":
             return {"status": "merged", "candidate": candidate, "idempotent": True}
-        if candidate["status"] == "merging":
-            return {"status": "merging", "candidate": candidate, "conflict": True}
-        if candidate["status"] != "acceptable":
-            raise ValueError(f"candidate '{candidate_id}' is not acceptable")
-        candidate.update(status="merging", merging_by=author, updated_at=time.time())
-        event = _event(state, "candidate_merge_started", candidate_id=candidate_id,
-                       decl=candidate["decl"], author=author)
-        return {"status": "merging", "candidate": candidate, "event": event}
+        if candidate["status"] in {"verifying", "merging"}:
+            return {"status": "verifying", "candidate": candidate, "conflict": True}
+        if candidate["status"] not in {"submitted", "acceptable", "merge_blocked"}:
+            raise ValueError(f"candidate '{candidate_id}' is not ready for mechanical review")
+        previous_status = candidate["status"]
+        candidate.update(
+            status="verifying",
+            merging_by=author,
+            last_merge_by=author,
+            merge_attempts=int(candidate.get("merge_attempts", 0)) + 1,
+            updated_at=time.time(),
+        )
+        candidate.pop("merge_blocker", None)
+        event = _event(state, "candidate_verification_started", candidate_id=candidate_id,
+                       decl=candidate["decl"], author=author,
+                       attempt=candidate["merge_attempts"], retry=previous_status == "merge_blocked")
+        return {"status": "verifying", "candidate": candidate, "event": event}
 
 
 def finish_merge(
@@ -683,9 +797,13 @@ def finish_merge(
     candidate_id: str,
     *,
     success: bool,
+    blocked: bool = False,
+    blocker: dict | None = None,
+    author: str = "",
     main_sha: str = "",
     error: str = "",
     build: dict | None = None,
+    verification: dict | None = None,
 ) -> dict:
     with transaction(forum_dir) as state:
         candidate = state["candidates"].get(candidate_id)
@@ -694,10 +812,49 @@ def finish_merge(
         if candidate["status"] == "merged":
             return {"status": "merged", "candidate": candidate, "idempotent": True}
         decl = candidate["decl"]
+        merge_author = author or candidate.get("merging_by", "")
         if build:
             candidate["merge_build"] = build
+        if verification:
+            candidate["verification"] = verification
+        if blocked:
+            merge_blocker = {
+                **(blocker or {}),
+                "blocked_at": time.time(),
+                "blocked_by": merge_author,
+            }
+            candidate.update(
+                status="merge_blocked",
+                merging_by=None,
+                last_merge_by=merge_author,
+                merge_blocker=merge_blocker,
+                updated_at=time.time(),
+            )
+            state["declarations"][decl].update(
+                status="candidate_pending", updated_at=time.time()
+            )
+            event = _event(
+                state,
+                "candidate_merge_blocked",
+                candidate_id=candidate_id,
+                decl=decl,
+                author=merge_author,
+                blocker=merge_blocker,
+            )
+            return {
+                "status": "merge_blocked",
+                "candidate": candidate,
+                "event": event,
+            }
         if success:
-            candidate.update(status="merged", merged_commit=main_sha, updated_at=time.time())
+            candidate.update(
+                status="merged",
+                merging_by=None,
+                last_merge_by=merge_author,
+                merged_commit=main_sha,
+                updated_at=time.time(),
+            )
+            candidate.pop("merge_blocker", None)
             declaration = state["declarations"][decl]
             declaration.update(status="solved", accepted_candidate=candidate_id,
                                merged_commit=main_sha, updated_at=time.time())
@@ -725,21 +882,32 @@ def finish_merge(
                 cancelled_strategies=cancelled,
                 build_artifact_id=(build or {}).get("artifact_id"),
                 build_returncode=(build or {}).get("returncode"),
+                verification_artifact_id=(verification or {}).get("artifact_id"),
+                verification_status=(verification or {}).get("status"),
             )
             return {"status": "merged", "candidate": candidate, "event": event,
                     "cancelled_strategies": cancelled}
-        candidate.update(status="failed", merge_error=error, updated_at=time.time())
+        candidate.update(
+            status="failed", merging_by=None, last_merge_by=merge_author,
+            merge_error=error, updated_at=time.time()
+        )
+        candidate.pop("merge_blocker", None)
         state["declarations"][decl].update(status="unresolved", updated_at=time.time())
         unpaused = _unpause_strategies(state, decl, f"candidate {candidate_id} merge failed")
+        event_kind = (
+            "candidate_verification_failed" if verification else "candidate_merge_failed"
+        )
         event = _event(
             state,
-            "candidate_merge_failed",
+            event_kind,
             candidate_id=candidate_id,
             decl=decl,
             error=error,
             unpaused_strategies=unpaused,
             build_artifact_id=(build or {}).get("artifact_id"),
             build_returncode=(build or {}).get("returncode"),
+            verification_artifact_id=(verification or {}).get("artifact_id"),
+            verification_status=(verification or {}).get("status"),
         )
         return {"status": "failed", "candidate": candidate, "event": event,
                 "unpaused_strategies": unpaused}

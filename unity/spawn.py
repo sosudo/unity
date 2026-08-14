@@ -332,7 +332,7 @@ _CODEX_MCP_NOTE = (
     "    unity mcp <server> <tool> '<json-args>'\n"
     "Examples:\n"
     "    unity mcp unity-forum forum_brief '{\"author\": \"<your agent name>\"}'\n"
-    "    unity mcp unity-forum register_strategy '{\"decl\": \"My.theorem\", \"author\": \"<you>\", \"description\": \"...\"}'\n"
+    "    unity mcp unity-forum register_strategy '{\"decl\": \"My.theorem\", \"author\": \"<you>\", \"description\": \"...\", \"strategy_family\": \"core_method\"}'\n"
     "    unity mcp unity-forum claim_strategy '{\"strategy_id\": \"strategy-...\", \"author\": \"<you>\"}'\n"
     "    unity mcp lean-lsp lean_goal '{\"file_path\": \"...\", \"line\": 12}'\n"
     "Servers: unity-forum (all forum_*/ledger_* tools), lean-lsp, axle and aristotle when "
@@ -340,9 +340,56 @@ _CODEX_MCP_NOTE = (
     "The forum contract is not optional on this backend — use it through this command.\n")
 
 
+_CODEX_INTERRUPT_REQUEST_TIMEOUT = 10.0
+_CODEX_INTERRUPT_DRAIN_TIMEOUT = 20.0
+_CODEX_CLOSE_TIMEOUT = 15.0
+
+
+async def _codex_notifications(
+    handle, codex, idle_timeout: float, stream_started: asyncio.Event
+):
+    """Yield Codex notifications without cancelling its blocking queue waiter.
+
+    AsyncTurnHandle.stream delegates each queue read through asyncio.to_thread.
+    Shielding the __anext__ task keeps outer cancellation and idle timeouts from
+    abandoning that executor thread. On either path, close the transport while
+    the stream is still registered, wait for the queue read to wake, and only then
+    close the generator (which unregisters the queue).
+    """
+    stream = handle.stream()
+    pending = None
+    try:
+        while True:
+            pending = asyncio.create_task(stream.__anext__())
+            if not stream_started.is_set():
+                # Let AsyncTurnHandle.stream synchronously register its queue before
+                # an already-set interrupt event is allowed to close the transport.
+                await asyncio.sleep(0)
+                stream_started.set()
+            try:
+                note = await asyncio.wait_for(
+                    asyncio.shield(pending), timeout=idle_timeout
+                )
+            except StopAsyncIteration:
+                pending = None
+                return
+            pending = None
+            yield note
+    finally:
+        if pending is not None and not pending.done():
+            try:
+                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+            except (asyncio.TimeoutError, Exception):
+                pass
+        if pending is not None:
+            await asyncio.gather(pending, return_exceptions=True)
+        await stream.aclose()
+
+
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                         mcp_servers: dict, *, permission: str = "bypassPermissions",
-                        idle_timeout: float = 600.0, subagents=()) -> str | None:
+                        idle_timeout: float = 600.0, subagents=(),
+                        interrupt_event: asyncio.Event | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
     system_prompt = system_prompt + _CODEX_MCP_NOTE
@@ -367,6 +414,10 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
         cfg = (CodexConfig(cwd=str(cwd), env=_agent_env(agent, home), codex_bin=codex_bin)
                if codex_bin else CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
         codex = AsyncCodex(config=cfg)
+        final = None
+        interrupt_task = None
+        turn_finished = asyncio.Event()
+        stream_started = asyncio.Event()
         try:
             # login_api_key is OpenAI-official auth only; custom providers (base_url set)
             # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
@@ -380,18 +431,58 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 cwd=str(cwd),
             )
             handle = await thread.turn(prompt)
+
+            async def interrupt_turn() -> None:
+                """Stop a Codex turn without cancelling its thread-backed queue wait.
+
+                openai-codex implements next_turn_notification with asyncio.to_thread
+                around a blocking Queue.get(). Cancelling that await abandons the worker
+                thread. Ask the app server to interrupt instead, then leave the stream
+                registered until it completes or transport shutdown wakes the waiter.
+                """
+                assert interrupt_event is not None
+                await interrupt_event.wait()
+                await stream_started.wait()
+                try:
+                    await asyncio.wait_for(
+                        handle.interrupt(), timeout=_CODEX_INTERRUPT_REQUEST_TIMEOUT
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+                    return
+
+                try:
+                    await asyncio.wait_for(
+                        turn_finished.wait(), timeout=_CODEX_INTERRUPT_DRAIN_TIMEOUT
+                    )
+                except asyncio.TimeoutError:
+                    # Interrupt was acknowledged but no terminal event arrived. Close
+                    # while the stream queue is still registered so fail_all() wakes its
+                    # blocking notification waiter before the generator unregisters it.
+                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+
+            if interrupt_event is not None:
+                interrupt_task = asyncio.create_task(
+                    interrupt_turn(), name=f"codex-interrupt:{agent.name}"
+                )
+
             # handle.run() and handle.stream() are competing consumers of one notification
             # queue — using both (in any order) starves one and hangs. Consume ONLY the
             # stream and assemble the final response from agentMessage items ourselves.
-            final = None
             usage = None
-            async for note in _idle_guard(handle.stream(), idle_timeout):
+            async for note in _codex_notifications(
+                handle, codex, idle_timeout, stream_started
+            ):
                 _log(agent.name, note, cwd)
                 if _stop_requested(cwd):
                     _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
                     break
                 method = getattr(note, "method", "") or ""
                 payload = getattr(note, "payload", None)
+                if method == "turn/completed":
+                    turn_finished.set()
                 if method == "item/completed":
                     root = getattr(getattr(payload, "item", None), "root", None)
                     if getattr(root, "type", "") == "agentMessage":
@@ -404,16 +495,24 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                                   "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
             _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
             return final
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
+            if interrupt_event is not None and interrupt_event.is_set():
+                return final
             if _give_up(e, attempt):
                 raise
             wait = _retry_sleep(e)
             _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
             await asyncio.sleep(wait)
         finally:
+            turn_finished.set()
+            if interrupt_task is not None:
+                interrupt_task.cancel()
+                await asyncio.gather(interrupt_task, return_exceptions=True)
             # close() can hang after an aborted turn; don't let cleanup wedge the agent.
             try:
-                await asyncio.wait_for(codex.close(), timeout=15)
+                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
             except (asyncio.TimeoutError, Exception):
                 pass
 
@@ -531,13 +630,20 @@ def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
 
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
-                idle_timeout: float = 600.0, subagents=()) -> str | None:
+                idle_timeout: float = 600.0, subagents=(),
+                interrupt_event: asyncio.Event | None = None) -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
     t0 = time.monotonic()
     try:
-        return await backend(agent, system_prompt, prompt, cwd, mcp_servers,
-                             permission=permission, idle_timeout=idle_timeout, subagents=subagents)
+        kwargs = {
+            "permission": permission,
+            "idle_timeout": idle_timeout,
+            "subagents": subagents,
+        }
+        if agent.backend == "codex":
+            kwargs["interrupt_event"] = interrupt_event
+        return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
     finally:
         _write_run_log(agent, cwd, time.monotonic() - t0)

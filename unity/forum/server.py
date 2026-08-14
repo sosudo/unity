@@ -1305,19 +1305,27 @@ def artifact_snapshot_file(
     }
 
 @mcp.tool()
-def register_strategy(author: str, description: str, decl: str = "") -> dict:
+def register_strategy(
+    author: str,
+    description: str,
+    decl: str = "",
+    strategy_family: str = "",
+) -> dict:
     """Register an agent-proposed proof strategy, optionally for one declaration.
 
-    Registration does not claim the strategy. Exact normalized duplicates for the same
-    declaration return the existing strategy instead of creating redundant work.
+    Registration does not claim the strategy. Exact normalized descriptions and matching
+    agent-chosen strategy families for the same declaration return the existing strategy.
     """
-    result = prove_store.register_strategy(FORUM_DIR, author, description, decl)
+    result = prove_store.register_strategy(
+        FORUM_DIR, author, description, decl, strategy_family
+    )
     if result["status"] == "registered":
         strategy = result["strategy"]
         thread = _chunk_thread(decl) if decl else "global"
         _typed_post(thread, decl or "Global Discussion", author, "strategy", strategy,
                     f"STRATEGY {strategy['strategy_id']}"
                     + (f" [{decl}]" if decl else " [general]")
+                    + (f" family={strategy_family}" if strategy_family else "")
                     + f": {description}")
     return result
 
@@ -1346,6 +1354,35 @@ def claim_strategy(strategy_id: str, author: str) -> dict:
         _typed_post(thread, strategy.get("decl") or "Global Discussion", author,
                     "strategy_claim", {"strategy_id": strategy_id, "status": "claimed"},
                     f"CLAIM STRATEGY {strategy_id}: {strategy['description']}")
+    return result
+
+
+@mcp.tool()
+def assist_strategy(strategy_id: str, author: str, contribution: str = "") -> dict:
+    """Join an owned strategy for a distinct supporting contribution.
+
+    The owner's exclusive claim remains intact. Assistance is appropriate for library/API
+    search, a helper lemma, debugging, or an explicitly coordinated alternative implementation.
+    """
+    result = prove_store.assist_strategy(
+        FORUM_DIR, strategy_id, author, contribution
+    )
+    if result["status"] == "assisting":
+        strategy = result["strategy"]
+        thread = _chunk_thread(strategy.get("decl", "")) if strategy.get("decl") else "global"
+        suffix = f": {contribution}" if contribution else ""
+        _typed_post(
+            thread,
+            strategy.get("decl") or "Global Discussion",
+            author,
+            "strategy_assist",
+            {
+                "strategy_id": strategy_id,
+                "owner": strategy.get("owner"),
+                "contribution": contribution,
+            },
+            f"ASSIST STRATEGY {strategy_id} owned by {strategy.get('owner')}{suffix}",
+        )
     return result
 
 
@@ -1565,35 +1602,69 @@ def resolve_candidate_objection(
 
 @mcp.tool()
 def sync_to_main(candidate_id: str, author: str) -> dict:
-    """Merge an acceptable exact candidate into main under a global lock and build it.
+    """Mechanically review and merge an exact candidate under the global merge lock.
 
-    The operation is idempotent. Submission alone is insufficient: at least one
-    independent endorsement and zero open objections are required.
+    The operation is idempotent. No model endorsement is required: Unity applies the
+    immutable commit to main, builds it, and checks the exact declaration before commit.
     """
     started = prove_store.begin_merge(FORUM_DIR, candidate_id, author)
     if started.get("idempotent") or started.get("conflict"):
         return started
     candidate = started["candidate"]
+    declaration = prove_store.load_state(FORUM_DIR)["declarations"][candidate["decl"]]
     try:
-        merged = worktree.sync_candidate_to_main(_require_project_root(), candidate)
+        merged = worktree.sync_candidate_to_main(
+            _require_project_root(), candidate, declaration
+        )
     except Exception as exc:
         merged = {"ok": False, "error": f"candidate merge raised: {exc}"}
     finished = prove_store.finish_merge(
         FORUM_DIR,
         candidate_id,
         success=bool(merged.get("ok")),
+        blocked=bool(merged.get("blocked")),
+        blocker=(
+            {
+                "kind": merged.get("blocker_kind", "integration_blocked"),
+                "message": merged.get("error", ""),
+                "main_sha": merged.get("main_sha", ""),
+                "git_status": merged.get("git_status", []),
+            }
+            if merged.get("blocked") else None
+        ),
+        author=author,
         main_sha=merged.get("main_sha", ""),
         error=merged.get("error", ""),
         build=merged.get("build"),
+        verification=merged.get("verification"),
+    )
+    event_kind = (
+        "candidate_merged" if merged.get("ok")
+        else "candidate_merge_blocked" if merged.get("blocked")
+        else "candidate_verification_failed" if merged.get("verification")
+        else "candidate_merge_failed"
+    )
+    message = (
+        f"MECHANICALLY VERIFIED AND MERGED CANDIDATE {candidate_id} as {merged['main_sha']}"
+        if merged.get("ok") else
+        f"CANDIDATE MERGE BLOCKED {candidate_id}: {merged.get('error', '')[:500]}"
+        if merged.get("blocked") else
+        f"CANDIDATE VERIFICATION FAILED {candidate_id}: {merged.get('error', '')[:500]}"
+        if merged.get("verification") else
+        f"CANDIDATE MERGE FAILED {candidate_id}: {merged.get('error', '')[:500]}"
     )
     _typed_post(
         _chunk_thread(candidate["decl"]), candidate["decl"], author,
-        "candidate_merged" if merged.get("ok") else "candidate_merge_failed",
+        event_kind,
         {"candidate_id": candidate_id, **merged},
-        (f"MERGED CANDIDATE {candidate_id} as {merged['main_sha']}"
-         if merged.get("ok") else f"CANDIDATE MERGE FAILED {candidate_id}: {merged.get('error', '')[:500]}"),
+        message,
     )
-    return {**finished, "sync": merged}
+    retry = (
+        "Resolve the recorded main-checkout blocker, preserving legitimate changes, then call "
+        f"sync_to_main again for the same candidate {candidate_id}."
+        if merged.get("blocked") else None
+    )
+    return {**finished, "sync": merged, **({"retry": retry} if retry else {})}
 
 
 @mcp.tool()
@@ -1867,8 +1938,9 @@ def build_brief(author: str, chunk: str = "") -> str:
         candidates = sorted(
             prove.get("candidates", {}).values(),
             key=lambda item: (
-                {"acceptable": 0, "submitted": 1, "blocked": 2, "merging": 3,
-                 "merged": 4, "failed": 5, "superseded": 6, "rejected": 7}.get(
+                {"merge_blocked": 0, "verifying": 1, "submitted": 2, "acceptable": 3,
+                 "blocked": 4, "merging": 5, "merged": 6, "failed": 7,
+                 "superseded": 8, "rejected": 9}.get(
                      item.get("status"), 9
                  ),
                 -item.get("updated_at", 0),
@@ -1877,16 +1949,29 @@ def build_brief(author: str, chunk: str = "") -> str:
         relevant_candidates = [item for item in candidates
                                if not chunk or item.get("decl") == chunk]
         if relevant_candidates:
-            lines.append("Current candidates (review exact commit):")
+            lines.append("Current candidates (Unity reviews exact commit mechanically):")
             for candidate in relevant_candidates[:5]:
                 open_objections = [item for item in candidate.get("objections", [])
                                    if item.get("status") == "open"]
                 lines.append(
                     f"  - {candidate['candidate_id']} {candidate['decl']} "
                     f"{candidate['status']} commit={candidate['commit_sha'][:12]} "
-                    f"by {candidate['author']}; endorsements={len(candidate.get('endorsements', []))}, "
+                    f"by {candidate['author']}; mechanical_review="
+                    f"{(candidate.get('verification') or {}).get('status', 'pending')}, "
                     f"open objections={len(open_objections)}"
                 )
+                merge_blocker = candidate.get("merge_blocker")
+                if merge_blocker:
+                    lines.append(
+                        f"    MERGE BLOCKER {merge_blocker.get('kind', 'integration_blocked')} "
+                        f"owner={candidate.get('last_merge_by') or 'unassigned'}: "
+                        f"{merge_blocker.get('message', '')[:200]}"
+                    )
+                    for status_line in merge_blocker.get("git_status", [])[:8]:
+                        lines.append(f"      {status_line[:240]}")
+                    lines.append(
+                        f"    next: resolve main state and retry sync_to_main({candidate['candidate_id']})"
+                    )
                 for objection in open_objections[:2]:
                     lines.append(
                         f"    BLOCKER {objection['objection_id']} by {objection['author']}: "
@@ -1900,25 +1985,33 @@ def build_brief(author: str, chunk: str = "") -> str:
                 build_artifact = (candidate.get("merge_build") or {}).get("artifact_id")
                 if build_artifact:
                     lines.append(f"    merge build output: {build_artifact}")
+                verification_artifact = (candidate.get("verification") or {}).get("artifact_id")
+                if verification_artifact:
+                    lines.append(f"    mechanical review: {verification_artifact}")
         me = _canonical_author(author)
         strategies = list(prove.get("strategies", {}).values())
-        mine = [item for item in strategies if _canonical_author(item.get("owner") or "") == me]
-        if mine:
-            lines.append("Your strategies:")
-            lines += [
-                f"  - {item['strategy_id']} [{item.get('decl') or 'general'}] "
-                f"{item['status']}: {item['description'][:140]}" for item in mine[:5]
-            ]
         active = [item for item in strategies
                   if item.get("status") in {"registered", "claimed", "paused"}
-                  and item not in mine and (not chunk or item.get("decl") in ("", chunk))]
+                  and (not chunk or item.get("decl") in ("", chunk))]
+        active.sort(key=lambda item: (
+            item.get("decl", ""), item.get("strategy_family") or "~",
+            item.get("created_at", 0),
+        ))
         if active:
-            lines.append("Other active strategies:")
-            lines += [
-                f"  - {item['strategy_id']} [{item.get('decl') or 'general'}] "
-                f"{item['status']} owner={item.get('owner') or 'none'}: {item['description'][:120]}"
-                for item in active[:8]
-            ]
+            lines.append("Active strategy families — check before choosing a direction:")
+            for item in active[:10]:
+                owner = item.get("owner") or "unclaimed"
+                assistants = ",".join(sorted(item.get("assistants", {}))) or "none"
+                family = item.get("strategy_family") or "unkeyed"
+                yours = (
+                    " yours" if _canonical_author(owner) == me
+                    or _canonical_author(item.get("creator", "")) == me else ""
+                )
+                lines.append(
+                    f"  - [{item.get('decl') or 'general'}] family={family} "
+                    f"status={item['status']} owner={owner}{yours} assistants={assistants}; "
+                    f"id={item['strategy_id']}: {item['description'][:120]}"
+                )
         unresolved_set = set(unresolved)
         findings = [
             item for item in prove.get("findings", {}).values()

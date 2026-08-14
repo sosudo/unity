@@ -498,6 +498,11 @@ def _agent_statuses(chunks: dict) -> list:
                 "chunk": strategy.get("decl", ""),
                 "strategy": strategy.get("description", ""),
             }
+            for assistant in strategy.get("assistants", {}):
+                claims[assistant] = {
+                    "chunk": strategy.get("decl", ""),
+                    "strategy": "assisting: " + strategy.get("description", ""),
+                }
     out = []
     primary_seen = any(g.get("primary") for g in groups)
     for gi, g in enumerate(groups):
@@ -2310,7 +2315,7 @@ async function loadOverview() {
         (x.merged_commit ? '<div class="who mono">main ' + esc(x.merged_commit.slice(0, 12)) + '</div>' : '') + '</div>').join('') + '</section>';
       h += '<section><h2>strategies</h2>' + (strategies.length ? strategies.slice(-10).reverse().map(x =>
         '<div class="item"><b class="mono">' + esc(x.strategy_id) + '</b><span class="badge pending">' + esc(x.status) + '</span>' +
-        '<div>' + esc(x.description).slice(0, 150) + '</div><div class="who">' + esc(x.decl || 'general') + ' · owner ' + esc(x.owner || 'none') + '</div>' +
+        '<div>' + esc(x.description).slice(0, 150) + '</div><div class="who"><b>family ' + esc(x.strategy_family || 'unkeyed') + '</b> · ' + esc(x.decl || 'general') + ' · owner ' + esc(x.owner || 'none') + ' · assistants ' + esc(Object.keys(x.assistants || {}).join(', ') || 'none') + '</div>' +
         artifactButton(x.evidence_artifact_id) + '</div>').join('') : '<div class="empty">none registered</div>') + '</section>';
       h += '<section><h2>live findings</h2>' + (findings.length ? findings.slice(0, 10).map(x =>
         '<div class="item"><b>' + esc(x.title) + '</b><span class="badge pending">' + esc(x.confidence) + '/100</span>' +
@@ -2318,10 +2323,11 @@ async function loadOverview() {
         artifactButton(x.evidence_artifact_id) + '</div>').join('') : '<div class="empty">none active</div>') + '</section>';
       h += '<section><h2>candidates</h2>' + (candidates.length ? candidates.slice(-8).reverse().map(x => {
         const objections = (x.objections || []).filter(o => o.status === 'open');
+        const verification = x.verification || {};
         return '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'merged' ? 'ok' : ['blocked','failed','rejected'].includes(x.status) ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
           '<div class="who mono">' + esc(x.commit_sha.slice(0, 12)) + ' · ' + esc(x.author) + '</div>' +
-          '<div class="who">' + (x.endorsements || []).length + ' endorsements · ' + objections.length + ' objections</div>' +
-          artifactButton((x.merge_build || {}).artifact_id) + (x.objections || []).map(o => artifactButton(o.evidence_artifact_id)).join('') + '</div>';
+          '<div class="who">mechanical review: ' + esc(verification.status || 'pending') + ' · ' + objections.length + ' objections</div>' +
+          artifactButton(verification.artifact_id) + artifactButton((x.merge_build || {}).artifact_id) + (x.objections || []).map(o => artifactButton(o.evidence_artifact_id)).join('') + '</div>';
       }).join('') : '<div class="empty">none submitted</div>') + '</section></div>';
     }
     // agents

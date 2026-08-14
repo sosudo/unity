@@ -2,7 +2,8 @@
    project to depend on LeanArchitect or annotate declarations).
 
    Loads the project's compiled modules and dumps every project-owned declaration with its
-   kind, direct sorry usage, and used-constant dependencies, as one JSON array on stdout.
+   kind, exact kernel-type representation, direct sorry usage, and used-constant
+   dependencies, as one JSON array on stdout.
 
    Run from the project root (needs `lake build` to have produced the .oleans):
        lake env lean --run <this file> Module.One Module.Two ...
@@ -44,12 +45,15 @@ def main (args : List String) : IO UInt32 := do
     unless isTarget n && !isNoise n do continue
     let used := ci.type.getUsedConstants ++
       (((ci.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[])
+    let typeDeps := ci.type.getUsedConstants.filter fun d => d != n && !isNoise d
     let sorried := used.contains ``sorryAx
     let deps := (used.filter fun d => isTarget d && d != n && !isNoise d).toList.eraseDups
     out := out.push <| Json.mkObj [
       ("name", Json.str n.toString),
       ("kind", Json.str (kindOf ci)),
       ("module", Json.str (((moduleOf n).getD .anonymous).toString)),
+      ("type_repr", Json.str (toString ci.type)),
+      ("type_deps", Json.arr (typeDeps.toList.eraseDups.toArray.map fun d => Json.str d.toString)),
       ("sorried", Json.bool sorried),
       ("deps", Json.arr (deps.toArray.map fun d => Json.str d.toString))]
   IO.println (Json.arr out).compress

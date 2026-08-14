@@ -11,6 +11,11 @@ from ..roster import load_roster
 from ..orchestrator import dispatch, build_mcp, load_prompt, toposort, mark_phase, stop_requested, resume_point, mark_done
 
 
+def _retrospective_enabled() -> bool:
+    """Retrospective is on by default and may be disabled for evaluation runs."""
+    return os.getenv("RETROSPECTIVE", "true").strip().lower() != "false"
+
+
 @click.command(name="prove")
 @click.option("--targets", default="All", help="Unresolved declaration names or Lean files to prove.")
 @click.option("--continue", "continue_", is_flag=True, default=False, help="Run a reprompt cycle first.")
@@ -117,9 +122,10 @@ async def prove(targets, continue_):
             i += 1
             run_provers = not approved
 
-    await dispatch([roster.primary], roster, load_prompt("prove/RETROSPECTIVE"),
-                   "Distill lessons from this run into the library.",
-                   root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False)
+    if _retrospective_enabled():
+        await dispatch([roster.primary], roster, load_prompt("prove/RETROSPECTIVE"),
+                       "Distill lessons from this run into the library.",
+                       root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False)
     mark_done(paths, "prove")
 
 

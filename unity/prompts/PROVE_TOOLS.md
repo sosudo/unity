@@ -14,9 +14,20 @@ state is needed.
 
 ### Strategies
 
-- `register_strategy(author, description, decl?)` — register a proposed proof strategy.
-  Registration does not claim it. Exact normalized duplicates are rejected.
+- `register_strategy(author, description, decl?, strategy_family?)` — register a proof or research
+  direction once it is coherent enough for another agent to distinguish. It may be provisional; a
+  complete proof plan is not required. Registration does not claim it.
+  Exact normalized descriptions are rejected; matching nonempty normalized `strategy_family` values
+  for the same declaration are also rejected. Use a stable family for the core method, theorem,
+  tactic, or reduction, even when descriptions differ.
+  Systematic project/Mathlib search is a valid strategy when it is aimed at materially closing the
+  exact target. Use a recognizable family such as `library_search` or a more specific normalized
+  search family, and assist an existing equivalent search rather than duplicating it.
 - `claim_strategy(strategy_id, author)` — atomically claim a registered strategy.
+- `assist_strategy(strategy_id, author, contribution?)` — join a claimed strategy without taking
+  its owner's reservation. State the distinct supporting contribution: library/API search, a helper
+  lemma, debugging, or an explicitly coordinated alternative implementation. An assistant who
+  completes the exact proof may submit the candidate for that strategy.
 - `unclaim_strategy(strategy_id, author, reason?)` — release an unsuccessful but potentially
   viable strategy.
 - `mark_strategy_incorrect(strategy_id, author, reason, evidence?)` — permanently record why a
@@ -25,15 +36,16 @@ state is needed.
 ### Candidates
 
 - `emit_candidate(strategy_id, author, commit_sha, decl?, notes?, supersedes?)` — submit the exact
-  committed source revision produced by an owned strategy.
-- `endorse_candidate(candidate_id, author, review?)` — independently approve the exact candidate
-  commit.
-- `object_candidate(candidate_id, author, reason, evidence?)` — block the exact candidate with a
-  concrete defect.
+  committed source revision produced by an owned or explicitly assisted strategy. Submission automatically triggers
+  Unity's main-checkout build and mechanical declaration review; a passing candidate merges without
+  model endorsement.
+- `endorse_candidate(candidate_id, author, review?)` and
+  `object_candidate(candidate_id, author, reason, evidence?)` — compatibility/manual-review tools;
+  they are not part of the normal automatic acceptance path.
 - `resolve_candidate_objection(candidate_id, objection_id, author, resolution)` — resolve an
   objection after checking the concern.
-- `sync_to_main(candidate_id, author)` — merge an acceptable candidate under Unity's merge lock
-  and run `lake build`.
+- `sync_to_main(candidate_id, author)` — retry mechanical review for a `merge_blocked` candidate.
+  Ordinary submitted candidates are processed automatically by the runtime.
 - `sync_from_main(author, reason?)` — discard the caller's current attempt and synchronize its
   worktree to accepted main.
 - `prove_status(decl?)` — read authoritative declaration, strategy, finding, candidate, objection,
@@ -48,10 +60,13 @@ state is needed.
 - `artifact_snapshot_file(path, known_sha256?, offset?, limit?)` — read a bounded project file
   snapshot. Pass a previously seen hash to learn that an unchanged file need not be reinserted.
 - `publish_finding(author, kind, title, content, confidence, decl?, strategy_id?, evidence?)` —
-  publish concise live proof-search knowledge. Choose a short descriptive `kind`; kinds are not
+  publish concise live proof-search knowledge as soon as it is actionable. Choose a short
+  descriptive `kind`; kinds are not
   restricted to a predefined list and Unity normalizes them for exact duplicate detection.
   `confidence` is an integer from 0 through 100. Use 100 only for a directly checked fact and
   include concrete evidence or an artifact reference.
+  Publish a plausible existing declaration before lengthy integration work, including its fully
+  qualified name, checked type, module/source, relevance, and remaining conversion gap.
 - `supersede_finding(finding_id, author, reason, replacement_id?)` — retire a finding that is
   wrong, stale, or replaced. The original remains in history but disappears from the active brief.
 - `forum_post(thread_id, author, content, reply_to?)` — free-form strategy discussion or live

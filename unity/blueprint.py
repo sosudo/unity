@@ -210,6 +210,8 @@ def _kernel_targets(base: Path, kernel: dict) -> list[dict]:
             "name": name,
             "display_name": name,
             "kind": row.get("kind", source.get("kind", "theorem")),
+            "type_repr": row.get("type_repr", ""),
+            "type_dependencies": list(row.get("type_deps", [])),
             "file": path or source.get("file", ""),
             "line": source.get("line"),
             "end_line": source.get("end_line"),
@@ -243,6 +245,8 @@ def _regex_targets(base: Path) -> list[dict]:
         "line": row["line"],
         "end_line": row["end_line"],
         "statement": row["statement"],
+        "type_repr": row.get("type_repr", ""),
+        "type_dependencies": [],
         "deps": [unique_ids[dependency] for dependency in row["deps"] if dependency in unique_ids],
     } for row in unresolved]
 
@@ -299,6 +303,8 @@ def build_prove_dag(project_root: Path, unity_dir: Path, targets: str = "All") -
             "dependencies": sorted(set(row["deps"]) & selected_ids),
             "status": "pending",
             "statement": row["statement"],
+            "kernel_type_repr": row.get("type_repr", ""),
+            "type_dependencies": sorted(set(row.get("type_dependencies", [])))[:48],
             "type": row["kind"],
             "declarations": [row["name"]],
             "lean_decl": row["name"],
