@@ -1,156 +1,112 @@
-# prepare (if continue), explore the problem, solve into .unity/source/FINAL.tex, chunk the material (likely no need to semiformalize since
-# the proof is ai-generated, formalize-critic loop [both phases can elect to change the source as well], retrospective
+"""`unity solve`: informal mathematical solving followed by faithful Lean formalization."""
 
+import fcntl
 import os
-import json
+from contextlib import contextmanager
+from pathlib import Path
+
 import asyncclick as click
 
+from ..Architect import architect
+from .. import solve_state
 from ..config import load_paths
+from ..orchestrator import mark_done, mark_phase
 from ..roster import load_roster
-from ..orchestrator import dispatch, build_mcp, load_prompt, run_worktree_phase, toposort, read_approved, read_finalized, mark_phase, stop_requested, resume_point, mark_done
+from ..solve_runtime import run_solve_retrospective, run_solve_runtime
+
+
+def _retrospective_enabled() -> bool:
+    """Retrospective is on by default and can be disabled for evaluation runs."""
+    return os.getenv("RETROSPECTIVE", "true").strip().lower() != "false"
+
+
+@contextmanager
+def _controller_lock(unity_dir: Path):
+    """Ensure one controller owns a solve run, including fresh-state reset."""
+    unity_dir.mkdir(parents=True, exist_ok=True)
+    handle = (unity_dir / "solve-controller.lock").open("a+")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise click.ClickException(
+                "another unity solve controller is already running for this project"
+            ) from exc
+        yield
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 @click.command(name="solve")
-@click.option("--continue", "continue_", is_flag=True, default=False, help="Run a reprompt cycle first.")
+@click.option("--continue", "continue_", is_flag=True, default=False,
+              help="Resume the authoritative solve state where it stopped.")
 async def solve(continue_):
-    """Solve a problem in natural language and verify the solution in Lean."""
+    """Solve a problem informally, then formalize that exact solution in Lean."""
     paths = load_paths()
-    (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
     roster = load_roster(paths.agents_yaml)
-    mcp = build_mcp(paths)
-    resume = resume_point(paths, "solve", continue_)
-    _order = ["preparation", "architect", "exploration", "drafting", "solving", "adjudication", "chunking", "resolving", "rechunking", "formalizing", "critic", "retrospective"]
-    def _do(phase: str) -> bool:
-        return resume is None or _order.index(phase) >= _order.index(resume)
-    if resume is not None:
-        click.echo(f"resuming from phase: {resume}")
-    root = paths.project_root
-    max_attempts = float(os.getenv("MAX_ATTEMPTS") or "inf")  # blank/unset = indefinite
 
-    if resume is None:
-        if continue_:
-            await dispatch([roster.primary], roster, load_prompt("solve/PREPARATION"),
-                           "Analyze the current project state and latest logs; update .unity/UNITY.md with context for continuing.",
-                           root, mcp)
+    with _controller_lock(paths.unity):
+        await _solve_locked(paths, roster, continue_)
+
+
+async def _solve_locked(paths, roster, continue_: bool) -> None:
+    """Execute solve while the stable command-lifetime controller lock is held."""
+    (paths.unity / "stop-requested").unlink(missing_ok=True)
+
+    try:
+        current = solve_state.load_state(paths.unity)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc)) from exc
+    has_run = bool(current.get("run_id"))
+    reset = not continue_
+    if continue_ and has_run:
+        if current.get("outcome") in {"stopped", "exhausted", "failed"}:
+            resumed = solve_state.resume_run(paths.unity)
+            current = solve_state.load_state(paths.unity)
+            click.echo(
+                f"resuming solve run {current['run_id']} after "
+                f"{resumed['previous_outcome']} from authoritative stage: "
+                f"{resumed['stage']}"
+            )
         else:
-            # Fresh run: bootstrap LeanArchitect (version-guarded; skips cleanly when no
-            # toolchain-matching release exists or the dependency breaks the build).
-            mark_phase("solve", "architect")
-            await dispatch([roster.primary], roster, load_prompt("ARCHITECT"),
-                           "Fresh-run bootstrap: add LeanArchitect as a project dependency pinned to the "
-                           "ref matching lean-toolchain, verify with lake build (revert + skip on any "
-                           "breakage), so later phases can annotate declarations with @[blueprint].",
-                           root, mcp)
+            click.echo(
+                f"resuming solve run {current['run_id']} from authoritative stage: "
+                f"{current.get('stage', 'solving')}"
+            )
+    elif continue_:
+        click.echo("no prior solve state found; starting a new solve run")
+        reset = True
 
-    if _do("exploration"):
-        await dispatch(roster.agents, roster, load_prompt("solve/EXPLORATION"),
-                       "Map the mathematical frontier of the problem in .unity/UNITY.md: known partial results and "
-                       "their techniques, equivalent formulations, analogous solved problems, and published "
-                       "data/computations. Research only — no solving, no Lean, no descoping decisions.",
-                       root, mcp)
+    if reset:
+        mark_phase("solve", "architect")
+        architect(paths.project_root)
 
-    # Adjudicated solving loop: the primary referees each round; a stalled round is
-    # re-attacked with the verdict's directives instead of sliding into formalization.
-    # Panel of judges: the primary + the strongest non-primary agent (when one exists) —
-    # a round only counts as solved if every judge independently agrees.
-    judges = [roster.primary]
-    others = sorted((a for a in roster.agents if not a.is_primary), key=lambda a: -a.strength)
-    if others:
-        judges.append(others[0])
-    # Solving gates on a FULL solution: rounds repeat until the panel is unanimous on
-    # "solved" (or a safe stop is requested). Formalization never starts on partial
-    # progress — "advanced" banks progress but does not pass the gate.
-    if resume is None or _order.index(resume) <= _order.index("adjudication"):
-        verdict = "stalled"
-        s = 0
-        solving = True
-        while solving:
-            if s == 0 and _do("drafting"):
-                # Independent drafts before the shared document: prevents anchoring on the
-                # first idea posted.
-                await dispatch(roster.agents, roster, load_prompt("solve/DRAFTING"),
-                               "Independently (no forum reading first) write your own attack plan and strongest "
-                               "initial results to .unity/source/drafts/<your name>.md. Do not edit PROOF.tex.",
-                               root, mcp)
-            reboot = "" if s == 0 else (
-                " A previous round did not fully solve the problem — read .unity/VERDICT.md, perform a research "
-                "reboot (reread the problem, list every established fact, generate at least five "
-                "fundamentally different attack plans before choosing one), and attack again.")
-            drafts = " Start from the independent drafts in .unity/source/drafts/ — mine every one of them for lines of attack." if s == 0 else ""
-            await dispatch(roster.agents, roster, load_prompt("solve/SOLVING"),
-                           "Collaboratively solve the problem in .unity/UNITY.md and write the full solution and proof "
-                           "as a paper to .unity/source/PROOF.tex." + drafts + reboot,
-                           root, mcp)
-            vdir = paths.unity / "verdicts"
-            import shutil
-            shutil.rmtree(vdir, ignore_errors=True)
-            vdir.mkdir()
-            await dispatch(judges, roster, load_prompt("solve/ADJUDICATION"),
-                           "Independently adjudicate this solving round: judge .unity/source/PROOF.tex against the "
-                           "original problem and write .unity/verdicts/<your name>.json and .md.",
-                           root, mcp)
-            # Merge: most conservative verdict wins; every judge's report goes into VERDICT.md.
-            rank = {"stalled": 0, "advanced": 1, "solved": 2}
-            got = []
-            for jf in sorted(vdir.glob("*.json")):
-                try:
-                    got.append(json.loads(jf.read_text()).get("verdict", "stalled"))
-                except (OSError, json.JSONDecodeError):
-                    got.append("stalled")
-            verdict = min(got, key=lambda v: rank.get(v, 0)) if got else "stalled"
-            reports = "\n\n---\n\n".join(f"# Judge: {m.stem}\n\n{m.read_text()}" for m in sorted(vdir.glob("*.md")))
-            (paths.unity / "VERDICT.md").write_text(f"Merged verdict: {verdict}\n\n{reports}\n")
-            # Archive the round: later rounds rewrite PROOF.tex, and a stalled round's
-            # partial results must never be lost (VERDICT.md points back into these).
-            proof = paths.unity / "source" / "PROOF.tex"
-            if proof.exists():
-                rounds = paths.unity / "rounds"
-                rounds.mkdir(exist_ok=True)
-                (rounds / f"round-{s + 1}-{verdict}.tex").write_text(proof.read_text())
-            s += 1
-            if verdict == "solved":
-                break
-            if stop_requested(root):
-                break
-            if s >= max_attempts:
-                break
+    state = await run_solve_runtime(roster, paths, reset_state=reset)
+    outcome = state.get("outcome") or state.get("stage")
 
-    if _do("chunking"):
-        await dispatch(roster.agents, roster, load_prompt("solve/CHUNKING"),
-                       "Separate .unity/source/PROOF.tex into chunks — each theorem/lemma/proposition/definition a "
-                       "node with its dependencies; write .unity/dag.json.",
-                       root, mcp)
-        toposort(paths)
+    if _retrospective_enabled() and outcome in {"complete", "exhausted", "failed"}:
+        try:
+            await run_solve_retrospective(roster, paths)
+        except Exception as exc:
+            # Retrospective is optional post-run learning. It must not falsify the
+            # already-computed solve outcome when its model/backend is unavailable.
+            click.echo(f"warning: solve retrospective failed: {exc}", err=True)
 
-    if resume != "retrospective":
-        i = 0
-        approved = False   # formalization accepted [critic.json]
-        finalized = True   # solution accepted as-is [finalized.json]
-        while (not approved) and (i < max_attempts) and not stop_requested(root):
-            if not finalized:
-                await dispatch(roster.agents, roster, load_prompt("solve/RESOLVING"),
-                               "Revise the solution in .unity/source/PROOF.tex to address the issues raised during formalization.",
-                               root, mcp)
-                await dispatch(roster.agents, roster, load_prompt("solve/RECHUNKING"),
-                               "Re-chunk the revised .unity/source/PROOF.tex into .unity/dag.json, keeping dependencies correct.",
-                               root, mcp)
-                toposort(paths)
-            (paths.unity / "finalized.json").write_text(json.dumps({"finalized": True}))
-            await run_worktree_phase(roster, paths, mcp, load_prompt("solve/FORMALIZING"), "Formalize")
-            (paths.unity / "critic.json").write_text(json.dumps({"approved": False}))
-            await dispatch([roster.primary], roster, load_prompt("solve/CRITIC"),
-                           "Review the project. Spot-fix trivial issues; write .unity/CRITIC.md with the remaining "
-                           "issues; set .unity/critic.json to {\"approved\": true} only if every target is fully "
-                           "proven (no sorry/axiom in scope, builds clean, no cheating), otherwise false.",
-                           root, mcp)
-            approved = read_approved(paths)
-            finalized = read_finalized(paths)
-            i += 1
+    if outcome == "complete":
+        mark_done(paths, "solve")
+        click.echo("solve complete: informal and formalization gates accepted")
+        return
 
-    await dispatch([roster.primary], roster, load_prompt("solve/RETROSPECTIVE"),
-                   "Distill lessons from this run into the library.",
-                   root, mcp)
-    mark_done(paths, "solve")
+    mark_phase("solve", str(outcome or "failed"))
+    if outcome == "stopped":
+        click.echo("solve stopped safely; rerun with --continue to resume")
+        return
+    raise click.ClickException(
+        f"solve ended with outcome={outcome or 'failed'}; rerun with --continue after addressing the recorded blockers"
+    )
 
 
 command = solve

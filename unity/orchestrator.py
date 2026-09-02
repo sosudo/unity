@@ -104,6 +104,41 @@ def build_mcp(paths, *, forum_icrl: bool = True) -> dict:
     return servers
 
 
+def build_solve_mcp(
+    paths, profile: str = "solving", *, agent_name: str = "",
+) -> dict:
+    """MCP servers for one role inside the ``unity solve`` runtime.
+
+    Solve deliberately uses a separate model-visible Forum interface.  Starting from
+    ``build_mcp`` keeps the external Lean/search services identical without changing
+    the existing Forum specification used by prove and the other commands.
+    """
+    if profile not in {
+        "solving", "solution_review", "chunking", "formalizing", "critic",
+        "retrospective",
+    }:
+        raise ValueError(f"unknown solve Forum profile: {profile}")
+    servers = build_mcp(paths, forum_icrl=False)
+    servers.pop("unity-forum", None)
+    solve_forum = {
+        "command": sys.executable,
+        "args": [
+            "-m", "unity.forum.solve_server",
+            "--run-dir", str(paths.unity / "solve"),
+            "--project-root", str(paths.project_root),
+            "--profile", profile,
+        ],
+    }
+    # The profile is also copied into the worker process environment by spawn.py.
+    # Shell-backed agents therefore retain their assigned role after global solve
+    # state advances, instead of silently receiving the next stage's tool schema.
+    solve_forum["env"] = {"UNITY_SOLVE_PROFILE": profile}
+    if agent_name:
+        solve_forum["env"]["UNITY_AGENT_NAME"] = agent_name
+    servers["unity-solve-forum"] = solve_forum
+    return servers
+
+
 def _effective_ranking(roster, forum_dir) -> dict:
     """Dynamic capability ranking: static strength + a bounded boost from forum ICRL
     credit (earned by posts and upvotes on an agent's contributions). Re-computed at

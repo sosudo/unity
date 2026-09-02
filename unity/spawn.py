@@ -20,7 +20,25 @@ _console = Console()
 
 # ── env (per-agent, never global) ──────────────────────────────────────────────
 
-def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
+_SOLVE_PROFILES = {
+    "solving", "solution_review", "chunking", "formalizing", "critic",
+    "retrospective",
+}
+
+
+def _assigned_solve_profile(mcp_servers: dict | None) -> str:
+    """Read the immutable solve role attached to this one model turn."""
+    spec = (mcp_servers or {}).get("unity-solve-forum") or {}
+    profile = str((spec.get("env") or {}).get("UNITY_SOLVE_PROFILE") or "")
+    return profile if profile in _SOLVE_PROFILES else ""
+
+
+def _agent_env(
+    agent: Agent,
+    codex_home: Path | None = None,
+    mcp_servers: dict | None = None,
+) -> dict[str, str]:
+    solve_profile = _assigned_solve_profile(mcp_servers)
     if agent.backend == "claude_code":
         # Override keys only; the SDK merges these into the CLI child it spawns.
         # All three model slots are pinned to agent.model so routing can't cross agents.
@@ -32,6 +50,7 @@ def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
             "ANTHROPIC_DEFAULT_SONNET_MODEL": agent.model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": agent.model,
             "UNITY_AGENT_NAME": agent.name,
+            "UNITY_SOLVE_PROFILE": solve_profile,
         }.items() if v}
 
     # codex: the child env is replaced wholesale, so start from os.environ and
@@ -42,6 +61,11 @@ def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
     if codex_home is not None:
         env["CODEX_HOME"] = str(codex_home)
     env["UNITY_AGENT_NAME"] = agent.name
+    if solve_profile:
+        env["UNITY_SOLVE_PROFILE"] = solve_profile
+    else:
+        # Do not leak a parent's solve role into unrelated child turns.
+        env.pop("UNITY_SOLVE_PROFILE", None)
     return env
 
 
@@ -220,7 +244,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         permission_mode=permission,
         model=agent.model,
         max_budget_usd=agent.budget,
-        env=_agent_env(agent),
+        env=_agent_env(agent, mcp_servers=mcp_servers),
     )
     attempt = 0
     while True:
@@ -340,6 +364,31 @@ _CODEX_MCP_NOTE = (
     "The forum contract is not optional on this backend — use it through this command.\n")
 
 
+def _codex_mcp_note(mcp_servers: dict) -> str:
+    """Return the shell-bridge note for the Forum interface actually attached.
+
+    The prove/legacy wording above is intentionally preserved byte-for-byte for every
+    existing pipeline.  Solve has a separate MCP schema and must not be told to call
+    declaration-oriented prove tools that are not present there.
+    """
+    if "unity-solve-forum" not in (mcp_servers or {}):
+        return _CODEX_MCP_NOTE
+    return (
+        "\n\nIMPORTANT — MCP tools on this backend: your model does NOT receive MCP "
+        "tools natively. Every MCP tool in this prompt is instead called through the shell:\n"
+        "    unity mcp <server> <tool> '<json-args>'\n"
+        "Examples:\n"
+        "    unity mcp unity-solve-forum solve_brief "
+        "'{\"author\": \"<your agent name>\"}'\n"
+        "    unity mcp unity-solve-forum solve_status '{}'\n"
+        "    unity mcp lean-lsp lean_goal "
+        "'{\"file_path\": \"...\", \"line\": 12}'\n"
+        "Servers: unity-solve-forum, lean-lsp, and axle/aristotle when configured. "
+        "Read every solve Forum/tool instruction in this prompt as 'run it via unity mcp'. "
+        "Use unity-solve-forum, not unity-forum, for this run.\n"
+    )
+
+
 _CODEX_INTERRUPT_REQUEST_TIMEOUT = 10.0
 _CODEX_INTERRUPT_DRAIN_TIMEOUT = 20.0
 _CODEX_CLOSE_TIMEOUT = 15.0
@@ -392,7 +441,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         interrupt_event: asyncio.Event | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
-    system_prompt = system_prompt + _CODEX_MCP_NOTE
+    system_prompt = system_prompt + _codex_mcp_note(mcp_servers)
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
     # from a worktree cwd, the agent still needs write access to the main project (.unity/)
@@ -411,8 +460,11 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     attempt = 0
     while True:
         attempt += 1
-        cfg = (CodexConfig(cwd=str(cwd), env=_agent_env(agent, home), codex_bin=codex_bin)
-               if codex_bin else CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
+        cfg = (CodexConfig(
+                   cwd=str(cwd), env=_agent_env(agent, home, mcp_servers), codex_bin=codex_bin,
+               ) if codex_bin else CodexConfig(
+                   cwd=str(cwd), env=_agent_env(agent, home, mcp_servers),
+               ))
         codex = AsyncCodex(config=cfg)
         final = None
         interrupt_task = None
@@ -531,7 +583,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                            "(https://antigravity.google)")
     from .config import find_unity_dir
     unity_dir = find_unity_dir(Path(cwd))
-    full = system_prompt + _CODEX_MCP_NOTE + "\n\n---\n\nTASK:\n" + prompt
+    full = system_prompt + _codex_mcp_note(mcp_servers) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
     if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
@@ -543,7 +595,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
-            env=_agent_env(agent))
+            env=_agent_env(agent, mcp_servers=mcp_servers))
 
         async def _lines():
             while True:

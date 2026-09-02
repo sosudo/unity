@@ -38,6 +38,58 @@ _GRAPH_PALETTE = [
     "#edc948", "#b07aa1", "#ff9da7", "#9c755f", "#bab0ac",
 ]
 
+
+def _load_solve_state(unity_dir: Path) -> dict:
+    """Load solve state without letting stale corruption break the shared web UI.
+
+    The authoritative runtime continues to fail closed in :mod:`solve_state`; only
+    this view-only projection substitutes an explicit unavailable record. This is
+    important because every overview can coexist with stale state from a previous
+    command, including prove.
+    """
+    from .. import solve_state
+
+    try:
+        return solve_state.load_state(unity_dir)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {
+            "schema_version": None,
+            "revision": 0,
+            "stage": "unavailable",
+            "outcome": None,
+            "problem": {},
+            "gates": {
+                "solution": {"revision": 0, "status": "unavailable"},
+                "formalization": {"revision": 0, "status": "unavailable"},
+            },
+            "subgoals": {},
+            "strategies": {},
+            "findings": {},
+            "solution_candidates": {},
+            "formal_tasks": {},
+            "formal_candidates": {},
+            "objections": {},
+            "obstacles": {},
+            "source_fixes": {},
+            "web_error": str(exc),
+        }
+
+
+def _discussion_forum_dir() -> Path:
+    """Return the discussion store for the pipeline currently shown by the app.
+
+    Solve deliberately keeps its discussion substrate under ``.unity/solve`` while
+    prove and the legacy pipelines continue using ``.unity/forum``.  Selecting the
+    directory at read time lets one long-running ``unity serve`` process follow the
+    active command without changing either pipeline's storage contract.
+    """
+    try:
+        command = json.loads((ROOT_DIR / "state.json").read_text()).get("command")
+    except (OSError, json.JSONDecodeError):
+        command = None
+    solve_forum = ROOT_DIR / "solve" / "forum"
+    return solve_forum if command == "solve" and solve_forum.exists() else FORUM_DIR
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _hot(post: dict) -> float:
@@ -57,7 +109,7 @@ def _sorted_posts(posts: list[dict], sort: str) -> list[dict]:
 
 
 def _load_thread(thread_id: str) -> dict | None:
-    path = FORUM_DIR / f"{thread_id}.json"
+    path = _discussion_forum_dir() / f"{thread_id}.json"
     if not path.exists():
         return None
     try:
@@ -74,7 +126,7 @@ _LEGACY_DIMENSIONS = ["correctness", "faithfulness", "style_alignment",
 
 
 def _load_config() -> dict:
-    path = FORUM_DIR / "config.json"
+    path = _discussion_forum_dir() / "config.json"
     if not path.exists():
         return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
     try:
@@ -89,9 +141,11 @@ def _load_config() -> dict:
 
 
 def _icrl_visible() -> bool:
-    """ICRL is not part of the prove workspace, including after a prove run ends."""
+    """ICRL is not part of authoritative prove/solve workspaces."""
     try:
-        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") != "prove"
+        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") not in {
+            "prove", "solve",
+        }
     except (OSError, json.JSONDecodeError):
         return True
 
@@ -157,7 +211,7 @@ def _chunk_status(chunk: dict, merged: set | None = None) -> str:
         return "yellow"
     # 3) typed forum acts on the chunk's thread
     for tid in dict.fromkeys([cid, f"chunk-{cid}"]):
-        thread_path = FORUM_DIR / f"{tid}.json"
+        thread_path = _discussion_forum_dir() / f"{tid}.json"
         if not thread_path.exists():
             continue
         try:
@@ -184,7 +238,8 @@ def _chunk_status(chunk: dict, merged: set | None = None) -> str:
 def list_threads():
     """Returns threads, active dimensions, pending proposals, tags, and leaderboard."""
     threads = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    forum_dir = _discussion_forum_dir()
+    for path in sorted(forum_dir.glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -203,7 +258,7 @@ def list_threads():
     # Pinned first, then by last_activity
     threads.sort(key=lambda t: (not t["pinned"], -t["last_activity"]))
     config = _load_config()
-    balances_path = FORUM_DIR / "balances.json"
+    balances_path = forum_dir / "balances.json"
     leaderboard = []
     if _icrl_visible() and balances_path.exists():
         try:
@@ -259,7 +314,7 @@ def get_graph():
     thread_colors: dict[str, str] = {}
     nodes = []
     edges = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_discussion_forum_dir().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -303,7 +358,7 @@ def get_tag(name: str):
     tag = tags[name]
     post_ids = set(tag["post_ids"])
     posts = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_discussion_forum_dir().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -344,12 +399,15 @@ async def events():
             await asyncio.sleep(1)
             try:
                 mtime = max(
-                    (p.stat().st_mtime for p in FORUM_DIR.glob("*.json")),
+                    (p.stat().st_mtime for p in _discussion_forum_dir().glob("*.json")),
                     default=0.0,
                 )
                 dag_file = ROOT_DIR / "dag.json"
                 if dag_file.exists():
                     mtime = max(mtime, dag_file.stat().st_mtime)
+                solve_state_file = ROOT_DIR / "solve" / "state.json"
+                if solve_state_file.exists():
+                    mtime = max(mtime, solve_state_file.stat().st_mtime)
                 if mtime > last_mtime:
                     last_mtime = mtime
                     yield "data: update\n\n"
@@ -375,7 +433,7 @@ def get_workspace():
     questions: list = []
     ledger: list = []
     by_act: dict = {}
-    for tp in sorted(FORUM_DIR.glob("*.json")):
+    for tp in sorted(_discussion_forum_dir().glob("*.json")):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
         try:
@@ -427,6 +485,12 @@ def get_prove_state():
     return _load_prove_state(FORUM_DIR)
 
 
+@app.get("/api/solve-state")
+def get_solve_state():
+    """Authoritative solve state spanning informal work and formalization."""
+    return _load_solve_state(ROOT_DIR)
+
+
 @app.get("/api/artifacts")
 def api_artifacts(limit: int = 200):
     """Recent immutable run artifacts and aggregate stored-byte telemetry."""
@@ -474,8 +538,11 @@ def _agent_statuses(chunks: dict) -> list:
         return []
     running = _current_run()["running"]
     phase = None
+    command = None
     try:
-        phase = json.loads((ROOT_DIR / "state.json").read_text()).get("phase")
+        run_state = json.loads((ROOT_DIR / "state.json").read_text())
+        phase = run_state.get("phase")
+        command = run_state.get("command")
     except Exception:
         pass
     last_tool: dict = {}
@@ -503,6 +570,27 @@ def _agent_statuses(chunks: dict) -> list:
                     "chunk": strategy.get("decl", ""),
                     "strategy": "assisting: " + strategy.get("description", ""),
                 }
+    if command == "solve":
+        solve = _load_solve_state(ROOT_DIR)
+        for strategy in solve.get("strategies", {}).values():
+            owner = strategy.get("owner")
+            if owner and strategy.get("status") in ("claimed", "paused"):
+                claims[owner] = {
+                    "chunk": strategy.get("subgoal_id", "") or strategy.get("scope", ""),
+                    "strategy": strategy.get("description", ""),
+                }
+            for assistant in strategy.get("assistants", {}) or {}:
+                claims[assistant] = {
+                    "chunk": strategy.get("subgoal_id", "") or strategy.get("scope", ""),
+                    "strategy": "assisting: " + strategy.get("description", ""),
+                }
+        for task in solve.get("formal_tasks", {}).values():
+            owner = task.get("owner")
+            if owner and task.get("status") == "claimed":
+                claims[owner] = {
+                    "chunk": task.get("task_id", "") or task.get("chunk_id", ""),
+                    "strategy": task.get("description", "") or task.get("title", "formalization"),
+                }
     out = []
     primary_seen = any(g.get("primary") for g in groups)
     for gi, g in enumerate(groups):
@@ -516,7 +604,11 @@ def _agent_statuses(chunks: dict) -> list:
                 except ValueError:
                     pass
             is_primary = (g.get("primary") and ni == 0) or (not primary_seen and gi == 0 and ni == 0)
-            status = ("reviewing" if recent and is_primary and phase == "critic"
+            reviewing = (
+                (phase == "critic" and is_primary)
+                or (command == "solve" and phase == "solution_review")
+            )
+            status = ("reviewing" if recent and reviewing
                       else "working" if recent else "idle")
             cl = claims.get(nm)
             out.append({"name": nm, "model": g.get("model", ""), "primary": bool(is_primary),
@@ -1395,7 +1487,7 @@ def _safe_unity_path(rel: str) -> Path:
 
 
 def _forum_nonempty() -> bool:
-    for tp in FORUM_DIR.glob("*.json"):
+    for tp in _discussion_forum_dir().glob("*.json"):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
         try:
@@ -2286,7 +2378,7 @@ $('env-save').onclick = async () => {
 // ── overview ──────────────────────────────────────────────────────────────────
 async function loadOverview() {
   try {
-    const [w, r, p, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/artifacts')]);
+    const [w, r, p, s, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/solve-state'), J('/api/artifacts')]);
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
     let h = pagehead('Overview', '');
     // top row: run status + obstacles
@@ -2295,13 +2387,79 @@ async function loadOverview() {
       : (r.command ? 'last: unity ' + esc(r.command) + (r.exit_code === null ? '' : ' (exit ' + r.exit_code + ')') : 'press run to start');
     h += '<div class="ov-top"><div class="card"><h2>run status</h2>' +
       '<div class="stat-big">' + big + '</div><div class="stat-sub">' + sub + '</div></div>';
+    const solveAttn = r.command === 'solve'
+      ? Object.values(s.obstacles || {}).filter(o => o.status === 'open').map(o => ({
+          content: o.description || o.reason || o.goal_state || 'open solve obstacle',
+          chunk: o.subgoal_id || o.task_id || '', color: '#e53935'
+        })).concat(Object.values(s.objections || {}).filter(o => o.status === 'open').map(o => ({
+          content: o.reason || o.rationale || 'open solve objection',
+          chunk: o.target_id || '', color: '#e53935'
+        })))
+      : [];
     const attn = w.chunks.flatMap(c => c.obstacles.map(o => ({...o, chunk: c.chunk, color: '#e53935'})))
-      .concat(w.questions.map(q => ({...q, chunk: q.chunk || '', color: '#f4b400'})));
+      .concat(w.questions.map(q => ({...q, chunk: q.chunk || '', color: '#f4b400'})), solveAttn);
     h += '<div class="card"><h2>open obstacles & questions</h2>' + (attn.length ? attn.slice(0, 6).map(o =>
       '<div class="item"><span class="dotc" style="background:' + o.color + '"></span>' + (o.chunk ? '<b class="mono">' + esc(o.chunk) + '</b>' : '') +
       '<div class="who" style="margin-top:2px">' + esc(o.content).slice(0, 160) + '</div></div>').join('')
       : '<div class="empty">none open</div>') + '</div></div>';
-    // authoritative prove search state
+    // authoritative solve state is shown only for solve runs. Its accepted solution
+    // gate binds the informal proof revision used by every formalization task.
+    if (r.command === 'solve') {
+      const subgoals = Object.values(s.subgoals || {}),
+        solveStrategies = Object.values(s.strategies || {}).sort((x,y) => (x.created_at || 0) - (y.created_at || 0)),
+        solveFindings = Object.values(s.findings || {}).filter(x => x.status === 'active')
+          .sort((x,y) => (y.confidence || 0) - (x.confidence || 0) || (y.updated_at || 0) - (x.updated_at || 0)),
+        solutionCandidates = Object.values(s.solution_candidates || {}).sort((x,y) => (x.created_at || 0) - (y.created_at || 0)),
+        solveObstacles = Object.values(s.obstacles || {}).filter(x => x.status === 'open'),
+        solveObjections = Object.values(s.objections || {}).filter(x => x.status === 'open'),
+        formalTasks = Object.values(s.formal_tasks || {}).sort((x,y) => (x.created_at || 0) - (y.created_at || 0)),
+        formalCandidates = Object.values(s.formal_candidates || {}).sort((x,y) => (x.created_at || 0) - (y.created_at || 0)),
+        solutionGate = (s.gates || {}).solution || {},
+        formalGate = (s.gates || {}).formalization || {};
+      const gateRevision = solutionGate.gate_revision || solutionGate.revision || s.gate_revision || 0,
+        gateCandidate = solutionGate.accepted_candidate_id || solutionGate.candidate_id || solutionGate.solution_candidate_id || '',
+        gateHash = solutionGate.source_sha256 || solutionGate.proof_sha256 || solutionGate.sha256 || '';
+      const badge = status => ['accepted','complete','completed','merged','passed','solved'].includes(status) ? 'ok'
+        : ['blocked','failed','rejected','invalidated','cancelled'].includes(status) ? 'blocked' : 'amber';
+      h += '<div class="sechead">solve workspace<span class="r">revision ' + esc(String(s.revision || 0)) + ' · ' + a.count + ' artifacts · ' + a.stored_bytes + ' bytes</span></div>';
+      h += '<div class="grid"><section><h2>stage</h2><div class="item"><b>' + esc(s.stage || 'uninitialized') + '</b>' +
+        '<span class="badge ' + badge(s.outcome || 'active') + '">' + esc(s.outcome || 'active') + '</span>' +
+        (s.problem && s.problem.statement ? '<div>' + esc(s.problem.statement).slice(0, 240) + '</div>' : '') + '</div>' +
+        (gateRevision || gateCandidate ? '<div class="item"><b>solution gate · revision ' + esc(String(gateRevision)) + '</b>' +
+          '<span class="badge ' + badge(solutionGate.status || 'accepted') + '">' + esc(solutionGate.status || 'accepted') + '</span>' +
+          (gateCandidate ? '<div class="who mono">candidate ' + esc(gateCandidate) + '</div>' : '') +
+          (gateHash ? '<div class="who mono">proof ' + esc(gateHash.slice(0, 16)) + '</div>' : '') + '</div>' : '<div class="empty">solution gate not open</div>') +
+        (Object.keys(formalGate).length ? '<div class="item"><b>formalization gate</b><span class="badge ' + badge(formalGate.status || 'active') + '">' + esc(formalGate.status || 'active') + '</span>' +
+          '<div class="who">bound to solution revision ' + esc(String(formalGate.solution_gate_revision || formalGate.gate_revision || gateRevision || '?')) + '</div></div>' : '') + '</section>';
+      h += '<section><h2>informal subgoals</h2>' + (subgoals.length ? subgoals.slice(-10).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.subgoal_id || x.goal_id || x.id || 'subgoal') + '</b><span class="badge ' + badge(x.status || 'open') + '">' + esc(x.status || 'open') + '</span>' +
+        '<div>' + esc(x.description || x.title || x.statement || '').slice(0, 180) + '</div></div>').join('') : '<div class="empty">none registered</div>') + '</section>';
+      h += '<section><h2>informal strategies</h2>' + (solveStrategies.length ? solveStrategies.slice(-10).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.strategy_id || '') + '</b><span class="badge ' + badge(x.status || 'registered') + '">' + esc(x.status || 'registered') + '</span>' +
+        '<div>' + esc(x.description || '').slice(0, 170) + '</div><div class="who">owner ' + esc(x.owner || 'none') + ' · ' + esc(x.subgoal_id || x.scope || 'global') + '</div></div>').join('') : '<div class="empty">none registered</div>') + '</section>';
+      h += '<section><h2>live findings</h2>' + (solveFindings.length ? solveFindings.slice(0, 10).map(x =>
+        '<div class="item"><b>' + esc(x.title || '') + '</b><span class="badge pending">' + esc(String(x.confidence || 0)) + '/100</span>' +
+        '<div>' + esc(x.content || '').slice(0, 180) + '</div><div class="who">' + esc(x.kind || 'finding') + ' · ' + esc(x.author || '') + '</div>' + artifactButton(x.evidence_artifact_id) + '</div>').join('') : '<div class="empty">none active</div>') + '</section>';
+      h += '<section><h2>solution candidates</h2>' + (solutionCandidates.length ? solutionCandidates.slice(-8).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.candidate_id || '') + '</b><span class="badge ' + badge(x.status || 'submitted') + '">' + esc(x.status || 'submitted') + '</span>' +
+        '<div class="who">' + esc(x.author || '') + (x.sha256 || x.source_sha256 || x.proof_sha256 ? ' · ' + esc((x.sha256 || x.source_sha256 || x.proof_sha256).slice(0, 12)) : '') + '</div>' +
+        artifactButton(x.artifact_id || x.source_artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>obstacles & objections</h2>' + (solveObstacles.length || solveObjections.length ?
+        solveObstacles.slice(0, 5).map(x => '<div class="item"><b class="mono">' + esc(x.obstacle_id || x.subgoal_id || 'obstacle') + '</b><span class="badge blocked">open</span><div>' + esc(x.description || x.reason || x.goal_state || '').slice(0, 180) + '</div></div>').join('') +
+        solveObjections.slice(0, 5).map(x => '<div class="item"><b class="mono">' + esc(x.objection_id || 'objection') + '</b><span class="badge blocked">open</span><div>' + esc(x.reason || x.rationale || '').slice(0, 180) + '</div><div class="who">target ' + esc(x.target_id || '') + '</div></div>').join('')
+        : '<div class="empty">none open</div>') + '</section>';
+      h += '<section><h2>formalization tasks</h2>' + (formalTasks.length ? formalTasks.slice(-10).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.task_id || x.chunk_id || '') + '</b><span class="badge ' + badge(x.status || 'pending') + '">' + esc(x.status || 'pending') + '</span>' +
+        '<div>' + esc(x.description || x.title || '').slice(0, 170) + '</div><div class="who">owner ' + esc(x.owner || 'none') + ' · gate ' + esc(String(x.gate_revision || x.solution_gate_revision || '?')) + '</div></div>').join('') : '<div class="empty">none yet</div>') + '</section>';
+      h += '<section><h2>formalization candidates</h2>' + (formalCandidates.length ? formalCandidates.slice(-8).reverse().map(x => {
+        const verification = x.verification || {};
+        return '<div class="item"><b class="mono">' + esc(x.candidate_id || '') + '</b><span class="badge ' + badge(x.status || 'submitted') + '">' + esc(x.status || 'submitted') + '</span>' +
+          '<div class="who mono">' + esc((x.commit_sha || '').slice(0, 12)) + ' · gate ' + esc(String(x.gate_revision || x.solution_gate_revision || '?')) + '</div>' +
+          '<div class="who">verification: ' + esc(verification.status || 'pending') + '</div>' + artifactButton(verification.artifact_id) + artifactButton((x.build || {}).artifact_id) + '</div>';
+      }).join('') : '<div class="empty">none submitted</div>') + '</section></div>';
+    }
+    // authoritative prove search state (unchanged and hidden only while solve is active)
+    if (r.command !== 'solve') {
     const goals = Object.values(p.declarations || {}),
       strategies = Object.values(p.strategies || {}).sort((a,b) => (a.created_at || 0) - (b.created_at || 0)),
       findings = Object.values(p.findings || {}).filter(x => x.status === 'active')
@@ -2329,6 +2487,7 @@ async function loadOverview() {
           '<div class="who">mechanical review: ' + esc(verification.status || 'pending') + ' · ' + objections.length + ' objections</div>' +
           artifactButton(verification.artifact_id) + artifactButton((x.merge_build || {}).artifact_id) + (x.objections || []).map(o => artifactButton(o.evidence_artifact_id)).join('') + '</div>';
       }).join('') : '<div class="empty">none submitted</div>') + '</section></div>';
+    }
     }
     // agents
     const ags = w.agents || [];

@@ -267,9 +267,12 @@ Mixed rosters are the point: mark your strongest model as the primary and fill t
 
 ## Configuration
 
-- `.unity/.env` — run flags: `MAX_ATTEMPTS` (cap on solving/critic loop rounds; blank/unset = indefinite), `UNITY_FORUM_BRIEF=off`
-  (disable workspace-brief injection), and optional service keys (`AXLE_API_KEY`,
-  `ARISTOTLE_API_KEY`) that unlock extra agent tools.
+- `.unity/.env` — run flags: `MAX_ATTEMPTS` (agent retry cap and legacy-pipeline loop cap;
+  blank/unset = indefinite), `RETROSPECTIVE=false` (skip the post-run retrospective),
+  `UNITY_SOLVE_REVIEW_QUORUM` (independent informal-solution approvals; default `1`),
+  `UNITY_FORUM_BRIEF=off` (disable workspace-brief injection), and optional service keys
+  (`AXLE_API_KEY`, `ARISTOTLE_API_KEY`) that unlock extra agent tools. The event-driven
+  `solve` runtime is controlled by its live gates and tasks rather than a fixed round count.
 - `.unity/agents.yaml` — the roster (see [Roster Configuration](#roster-configuration)). Per-agent
   credentials (`api_key` / `auth_token` / `base_url`) live here, not in `.env`; `${VAR}` references
   are resolved from the environment. Only `openai` agents with a custom `base_url` require an
