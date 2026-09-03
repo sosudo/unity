@@ -3,6 +3,7 @@ name = "unity"
 version = "0.5.0"
 description = "Multi-agent proving, solving, autoformalization, and optimization harness for Lean 4"
 readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.13"
 dependencies = [
     "asyncclick>=8.3.0.7",

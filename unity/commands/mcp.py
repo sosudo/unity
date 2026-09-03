@@ -19,7 +19,7 @@ import asyncclick as click
 async def mcp(server, tool, args):
     """Call TOOL on MCP SERVER with JSON ARGS (e.g. unity mcp unity-forum forum_stats '{}')."""
     from ..config import load_paths
-    from ..orchestrator import build_mcp
+    from ..orchestrator import build_mcp, build_solve_mcp
     from fastmcp import Client
 
     try:
@@ -34,7 +34,17 @@ async def mcp(server, tool, args):
         run_state = json.loads((paths.unity / "state.json").read_text())
     except (OSError, json.JSONDecodeError):
         run_state = {}
-    if server in ("unity-forum", "forum"):
+    active_solve = run_state.get("command") == "solve" and run_state.get("phase") != "done"
+    solve_profile = run_state.get("phase", "solving")
+    if solve_profile not in {
+        "solving", "solution_review", "chunking", "formalizing", "critic", "retrospective",
+    }:
+        solve_profile = "solving"
+    if server in ("unity-forum", "forum") and active_solve:
+        from ..forum import solve_server
+        solve_server.configure(paths.forum, paths.project_root, solve_profile)
+        client = Client(solve_server.build_server(solve_profile))
+    elif server in ("unity-forum", "forum"):
         from ..forum import server as fsrv
         fsrv.FORUM_DIR = paths.forum
         fsrv.PROJECT_ROOT = paths.unity.resolve().parent
@@ -43,7 +53,7 @@ async def mcp(server, tool, args):
         )
         client = Client(fsrv.mcp)  # in-process: no subprocess, same flock-safe storage
     else:
-        specs = build_mcp(paths)
+        specs = build_solve_mcp(paths, solve_profile) if active_solve else build_mcp(paths)
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
         client = Client({"mcpServers": {server: specs[server]}})
@@ -59,7 +69,7 @@ async def mcp(server, tool, args):
     bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
         "artifact_read", "artifact_snapshot_file",
     }
-    if active_prove and output and not bounded_artifact_read:
+    if (active_prove or active_solve) and output and not bounded_artifact_read:
         from .. import artifacts
         compacted = artifacts.compact_text(
             paths.artifacts,

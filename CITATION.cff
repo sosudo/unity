@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: >-
+  Use of Unity, including derivative works and outputs materially produced with
+  Unity, requires citation under the Unity Citation License 1.0. Please cite it
+  using the metadata below.
+title: "Unity: Multi-agent proving, solving, autoformalization, and optimization harness for Lean 4"
+type: software
+authors:
+  - family-names: Gour
+    given-names: Shivansh
+version: 0.5.0
+date-released: 2026-09-03
+repository-code: "https://github.com/sosudo/unity"
+url: "https://github.com/sosudo/unity"
+license: "LicenseRef-Unity-Citation-1.0"

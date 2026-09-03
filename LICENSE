@@ -1,0 +1,79 @@
+Unity Citation License 1.0
+
+Copyright (c) 2026 Shivansh Gour
+
+1. Definitions
+
+"Software" means Unity and its source code, object code, documentation,
+prompts, configuration, and other materials distributed with this license.
+
+"Derivative Work" means any work based upon, adapted from, incorporating, or
+modifying any copyrightable portion of the Software.
+
+"Covered Use" means using the Software, in whole or in part, to develop,
+generate, prove, formalize, evaluate, benchmark, operate, or provide any
+software, service, research, publication, presentation, dataset, model,
+artifact, or other work or result.
+
+"Citation Notice" means the following notice, or an equivalent citation that
+identifies the author, project, and canonical repository:
+
+  Shivansh Gour. "Unity: Multi-agent proving, solving, autoformalization,
+  and optimization harness for Lean 4." 2026.
+  https://github.com/sosudo/unity
+
+2. License Grant
+
+Subject to the conditions below, permission is granted, free of charge, to any
+person obtaining a copy of the Software to use, reproduce, modify, create
+Derivative Works of, distribute, publicly perform, publicly display,
+sublicense, and make the Software available as a hosted or network service.
+
+3. Citation and Attribution Requirement
+
+Every Covered Use must provide the Citation Notice in a reasonable and
+prominent location appropriate to the medium. Examples include the references
+or acknowledgments of a publication; the documentation or README of software,
+data, proofs, or other artifacts; the about, credits, or legal page of a
+product or hosted service; and the methodology and results of a benchmark.
+
+Where a Covered Use produces no public-facing material, the Citation Notice
+must be retained in the internal documentation accompanying that use.
+
+The Citation Notice must not imply endorsement by the copyright holder.
+
+4. Derivative Works and Redistribution
+
+Every copy or substantial portion of the Software, and every Derivative Work,
+must include this license and the Citation Notice. A Derivative Work must also
+carry a prominent notice stating that it has been modified. You may apply
+additional terms to your own contributions, but those terms may not remove,
+restrict, or obscure the obligations in Sections 3 and 4.
+
+Anyone to whom you distribute or make available the Software or a Derivative
+Work must receive the rights granted by Section 2 subject to the same citation
+and attribution obligations.
+
+5. Trademarks
+
+This license does not grant permission to use trade names, trademarks, service
+marks, or product names except as reasonably necessary to provide the required
+Citation Notice or describe the origin of the Software.
+
+6. Termination and Cure
+
+The rights granted by this license terminate automatically upon violation of
+its terms. They are reinstated provisionally when the violation ceases and
+permanently if the copyright holder does not notify you of the violation within
+60 days after it ceases. Receiving notice does not prevent reinstatement if you
+cure the violation within 30 days after receiving notice and it is your first
+notified violation of this license.
+
+7. Disclaimer of Warranty and Limitation of Liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE, TITLE, AND NON-INFRINGEMENT. IN NO EVENT
+SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY CLAIM, DAMAGES,
+OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
+ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR ITS USE.

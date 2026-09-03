@@ -606,7 +606,12 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
 
-def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
+def _write_run_log(
+    agent: Agent,
+    cwd: Path,
+    seconds: float,
+    log_context: dict | None = None,
+) -> None:
     """Append per-agent run accounting to .unity/logs/run.jsonl (best-effort)."""
     from .config import find_unity_dir
     import json, time
@@ -622,6 +627,8 @@ def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
             "seconds": round(seconds, 1),
             **_last_run_stats.pop(agent.name, {}),
         }
+        if log_context:
+            entry["context"] = dict(log_context)
         with (logs / "run.jsonl").open("a") as f:
             f.write(json.dumps(entry) + "\n")
     except OSError:
@@ -631,7 +638,8 @@ def _write_run_log(agent: Agent, cwd: Path, seconds: float) -> None:
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=(),
-                interrupt_event: asyncio.Event | None = None) -> str | None:
+                interrupt_event: asyncio.Event | None = None,
+                log_context: dict | None = None) -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
@@ -646,4 +654,4 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             kwargs["interrupt_event"] = interrupt_event
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
     finally:
-        _write_run_log(agent, cwd, time.monotonic() - t0)
+        _write_run_log(agent, cwd, time.monotonic() - t0, log_context)

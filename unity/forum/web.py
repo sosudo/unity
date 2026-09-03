@@ -28,6 +28,7 @@ from ..blueprint import (
     source_stamp as _source_stamp_shared,
 )
 from ..prove_state import load_state as _load_prove_state
+from ..solve_state import load_state as _load_solve_state
 
 app = FastAPI(title="unity-forum")
 FORUM_DIR: Path = Path("forum")
@@ -89,11 +90,23 @@ def _load_config() -> dict:
 
 
 def _icrl_visible() -> bool:
-    """ICRL is not part of the prove workspace, including after a prove run ends."""
+    """ICRL is not part of the prove or solve coordination workspaces."""
     try:
-        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") != "prove"
+        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") not in {"prove", "solve"}
     except (OSError, json.JSONDecodeError):
         return True
+
+
+def _active_structured_command() -> str:
+    """Return prove/solve only while that command owns the live workspace."""
+    try:
+        state = json.loads((ROOT_DIR / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return ""
+    command = state.get("command")
+    if command in {"prove", "solve"} and state.get("phase") != "done":
+        return command
+    return ""
 
 
 _SORRY_RE = re.compile(r'\bsorry\b')
@@ -323,6 +336,34 @@ def get_tag(name: str):
 
 @app.get("/api/dag")
 def get_dag():
+    if _active_structured_command() == "solve":
+        state = _load_solve_state(FORUM_DIR)
+        if state.get("phase") in {"solving", "solution_review"}:
+            claimed = {
+                strategy.get("target") for strategy in state.get("strategies", {}).values()
+                if strategy.get("phase") == "solving"
+                and strategy.get("status") in {"claimed", "paused"}
+            }
+            colors = {
+                "resolved": "green", "result_available": "blue",
+                "blocked": "red", "superseded": "grey", "cancelled": "grey",
+            }
+            chunks = []
+            revision = state.get("solution", {}).get("revision")
+            for task in state.get("informal_tasks", {}).values():
+                if task.get("solution_revision") != revision:
+                    continue
+                status = colors.get(task.get("status"), "yellow" if task.get("task_id") in claimed else "grey")
+                chunks.append({
+                    "id": task["task_id"],
+                    "title": task.get("title", ""),
+                    "type": task.get("kind", "informal task"),
+                    "summary": task.get("description", ""),
+                    "dependencies": task.get("dependencies", []),
+                    "status": status,
+                    "declarations": [],
+                })
+            return JSONResponse({"graph_kind": "informal_tasks", "chunks": chunks})
     dag_file = ROOT_DIR / "dag.json"
     if not dag_file.exists():
         return JSONResponse({"error": "dag.json not found"}, status_code=404)
@@ -332,7 +373,7 @@ def get_dag():
         return JSONResponse({"error": "failed to parse dag.json"}, status_code=500)
     merged = _merged_chunk_ids()
     chunks = [{**c, "status": _chunk_status(c, merged)} for c in dag.get("chunks", [])]
-    return JSONResponse({"chunks": chunks})
+    return JSONResponse({"graph_kind": "formalization", "chunks": chunks})
 
 
 @app.get("/api/events")
@@ -427,6 +468,29 @@ def get_prove_state():
     return _load_prove_state(FORUM_DIR)
 
 
+@app.get("/api/solve-state")
+def get_solve_state():
+    """Authoritative informal-solution and formalization state for solve."""
+    return _load_solve_state(FORUM_DIR)
+
+
+@app.get("/api/solve-metrics")
+def get_solve_metrics():
+    """Compact solve telemetry; never activates solve state during another command."""
+    try:
+        run_state = json.loads((ROOT_DIR / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if run_state.get("command") != "solve":
+        return {}
+    from . import solve_server
+    profile = run_state.get("phase", "solving")
+    if profile not in solve_server.PROFILES:
+        profile = "solving"
+    solve_server.configure(FORUM_DIR, ROOT_DIR.parent, profile)
+    return solve_server.solve_metrics()
+
+
 @app.get("/api/artifacts")
 def api_artifacts(limit: int = 200):
     """Recent immutable run artifacts and aggregate stored-byte telemetry."""
@@ -491,18 +555,33 @@ def _agent_statuses(chunks: dict) -> list:
     for c in chunks.values():
         for cl in c.get("claims", []):
             claims[cl["author"]] = {"chunk": c["chunk"], "strategy": cl.get("strategy", "")}
-    prove = _load_prove_state(FORUM_DIR)
-    for strategy in prove.get("strategies", {}).values():
-        if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
-            claims[strategy["owner"]] = {
-                "chunk": strategy.get("decl", ""),
-                "strategy": strategy.get("description", ""),
-            }
-            for assistant in strategy.get("assistants", {}):
-                claims[assistant] = {
+    active_command = _active_structured_command()
+    if active_command == "prove":
+        prove = _load_prove_state(FORUM_DIR)
+        for strategy in prove.get("strategies", {}).values():
+            if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+                claims[strategy["owner"]] = {
                     "chunk": strategy.get("decl", ""),
-                    "strategy": "assisting: " + strategy.get("description", ""),
+                    "strategy": strategy.get("description", ""),
                 }
+                for assistant in strategy.get("assistants", {}):
+                    claims[assistant] = {
+                        "chunk": strategy.get("decl", ""),
+                        "strategy": "assisting: " + strategy.get("description", ""),
+                    }
+    elif active_command == "solve":
+        solve = _load_solve_state(FORUM_DIR)
+        for strategy in solve.get("strategies", {}).values():
+            if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+                claims[strategy["owner"]] = {
+                    "chunk": strategy.get("target", ""),
+                    "strategy": strategy.get("description", ""),
+                }
+                for assistant in strategy.get("assistants", []):
+                    claims[assistant] = {
+                        "chunk": strategy.get("target", ""),
+                        "strategy": "assisting: " + strategy.get("description", ""),
+                    }
     out = []
     primary_seen = any(g.get("primary") for g in groups)
     for gi, g in enumerate(groups):
@@ -1058,7 +1137,7 @@ main { display: flex; flex: 1; overflow: hidden; position: relative; }
   </div>
 </header>
 <div style="display:flex;align-items:baseline;gap:14px;padding:18px 26px 4px">
-  <span style="font-size:24px;font-weight:700">Chunks</span>
+  <span id="dag-title" style="font-size:24px;font-weight:700">Chunks</span>
   <span id="hlegend" style="display:flex;gap:16px;font-size:12.5px;color:#6e6c75;align-items:center"></span>
 </div>
 <main style="padding:0 26px 20px">
@@ -1094,11 +1173,14 @@ function updateHeaderLegend(data) {
   const counts = {green:0, yellow:0, grey:0, red:0};
   (data.chunks||[]).forEach(c => { const k = c.status === 'blue' ? 'yellow' : c.status; if (k in counts) counts[k]++; });
   const el = document.getElementById('hlegend');
-  if (el) el.innerHTML = LEGEND.map(([k, label, col]) =>
+  const legend = data.graph_kind === 'informal_tasks'
+    ? [['green','Resolved','#2e7d32'], ['yellow','Claimed','#7c5cbf'], ['grey','Open','#d97706'], ['red','Blocked','#c62828']]
+    : LEGEND;
+  if (el) el.innerHTML = legend.map(([k, label, col]) =>
     '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+col+';margin-right:6px"></span>'+label+' '+counts[k]+'</span>').join('');
 }
 
-let cy = null, chunks = {};
+let cy = null, chunks = {}, graphKind = 'formalization';
 let nodePositions = {};  // id -> {x,y}, persisted across rebuilds
 let lastSig = '';        // sorted chunk-ids, skip rebuild when unchanged
 
@@ -1110,6 +1192,7 @@ function buildGraph(data) {
     cy.destroy();
   }
   chunks = {};
+  graphKind = data.graph_kind || 'formalization';
   data.chunks.forEach(c => { chunks[c.id] = c; });
   const elements = [];
   const nodeIds = new Set(data.chunks.map(c => c.id));
@@ -1176,7 +1259,10 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
-  const statusLabel = { grey:'not started', yellow:'in progress', green:'fully formalized', blue:'partially formalized', red:'by sorry' }[c.status] || c.status;
+  const labels = graphKind === 'informal_tasks'
+    ? { grey:'open', yellow:'claimed', green:'resolved', blue:'result under review', red:'blocked' }
+    : { grey:'not started', yellow:'in progress', green:'fully formalized', blue:'partially formalized', red:'by sorry' };
+  const statusLabel = labels[c.status] || c.status;
   document.getElementById('info-content').innerHTML =
     '<div class="info-field"><div class="info-label">chunk</div><div class="info-value">'+esc(c.id)+'</div></div>'
     +'<div class="info-field"><div class="info-label">title</div><div class="info-value">'+esc(c.title||'—')+'</div></div>'
@@ -1202,7 +1288,8 @@ async function loadDag(forceRebuild) {
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  const sig = (data.chunks||[]).map(c=>c.id).sort().join(',');
+  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : 'Formalization chunks';
+  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>c.id).sort().join(',');
   if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
   updateHeaderLegend(data);
@@ -2286,7 +2373,7 @@ $('env-save').onclick = async () => {
 // ── overview ──────────────────────────────────────────────────────────────────
 async function loadOverview() {
   try {
-    const [w, r, p, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/artifacts')]);
+    const [w, r, p, s, sm, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/solve-state'), J('/api/solve-metrics'), J('/api/artifacts')]);
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
     let h = pagehead('Overview', '');
     // top row: run status + obstacles
@@ -2307,7 +2394,7 @@ async function loadOverview() {
       findings = Object.values(p.findings || {}).filter(x => x.status === 'active')
         .sort((a,b) => (b.confidence || 0) - (a.confidence || 0) || (b.updated_at || 0) - (a.updated_at || 0)),
       candidates = Object.values(p.candidates || {}).sort((a,b) => (a.created_at || 0) - (b.created_at || 0));
-    if (goals.length) {
+    if (goals.length && r.command === 'prove') {
       const solved = goals.filter(x => x.status === 'solved').length;
       h += '<div class="sechead">proof search<span class="r">revision ' + (p.revision || 0) + ' · ' + a.count + ' artifacts · ' + a.stored_bytes + ' bytes</span></div>';
       h += '<div class="grid"><section><h2>goals · ' + solved + '/' + goals.length + ' solved</h2>' + goals.map(x =>
@@ -2329,6 +2416,48 @@ async function loadOverview() {
           '<div class="who">mechanical review: ' + esc(verification.status || 'pending') + ' · ' + objections.length + ' objections</div>' +
           artifactButton(verification.artifact_id) + artifactButton((x.merge_build || {}).artifact_id) + (x.objections || []).map(o => artifactButton(o.evidence_artifact_id)).join('') + '</div>';
       }).join('') : '<div class="empty">none submitted</div>') + '</section></div>';
+    }
+    if (s.run_id && r.command === 'solve') {
+      const sol = s.solution || {}, formal = s.formalization || {},
+        itasks = Object.values(s.informal_tasks || {}),
+        iresults = Object.values(s.informal_results || {}),
+        issues = Object.values(s.review_issues || {}).filter(x => x.status === 'open'),
+        stasks = Object.values(s.formal_tasks || {}),
+        sstrategies = Object.values(s.strategies || {}).filter(x => ['registered','claimed','paused'].includes(x.status)),
+        sfindings = Object.values(s.findings || {}).filter(x => x.status === 'active'),
+        scandidates = Object.values(s.solution_candidates || {}),
+        fcandidates = Object.values(s.formal_candidates || {});
+      h += '<div class="sechead">solve workspace<span class="r">phase ' + esc(s.phase || 'solving') + ' · revision ' + (s.revision || 0) + '</span></div>';
+      h += '<div class="grid"><section><h2>gates</h2>' +
+        '<div class="item"><b>informal solution</b><span class="badge ' + (sol.status === 'accepted' ? 'ok' : sol.status === 'review' ? 'amber' : 'pending') + '">' + esc(sol.status || 'open') + '</span>' +
+        '<div class="who">revision ' + (sol.revision || 0) + (sol.accepted_candidate ? ' · ' + esc(sol.accepted_candidate) : '') + '</div></div>' +
+        '<div class="item"><b>Lean formalization</b><span class="badge ' + (formal.status === 'accepted' ? 'ok' : formal.status === 'review' ? 'amber' : 'pending') + '">' + esc(formal.status || 'waiting') + '</span>' +
+        '<div class="who">revision ' + (formal.revision || 0) + (formal.main_sha ? ' · main ' + esc(formal.main_sha.slice(0,12)) : '') + '</div></div></section>';
+      h += '<section><h2>paper candidates</h2>' + (scandidates.length ? scandidates.slice(-6).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'accepted' ? 'ok' : x.status === 'rejected' ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
+        '<div class="who">' + esc(x.author) + ' · ' + esc((x.sha256 || '').slice(0,12)) + ' · ' + (x.components || []).length + ' components</div>' +
+        ((x.components || []).length ? '<div class="who">' + (x.components || []).map(c => esc(c.result_id)).join(' → ') + '</div>' : '') + artifactButton(x.artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>informal task graph</h2>' + (itasks.length ? itasks.slice(-16).map(x =>
+        '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge ' + (x.status === 'resolved' ? 'ok' : x.status === 'blocked' ? 'blocked' : 'pending') + '">' + esc(x.status) + '</span>' +
+        '<div>' + esc(x.title || '') + '</div><div class="who">' + esc(x.kind || 'task') + (x.dependencies && x.dependencies.length ? ' · depends on ' + x.dependencies.map(esc).join(', ') : '') + '</div></div>').join('') : '<div class="empty">no decomposition yet</div>') + '</section>';
+      h += '<section><h2>argument & paper components</h2>' + (iresults.length ? iresults.slice(-12).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.result_id) + '</b><span class="badge ' + (['supported','incorporated'].includes(x.status) ? 'ok' : x.status === 'objected' ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
+        '<div>' + esc(x.summary || '').slice(0,180) + '</div><div class="who">' + esc(x.kind || 'component') + ' · task ' + esc(x.task_id) + ' · ' + esc(x.author) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>actionable paper issues</h2>' + (issues.length ? issues.slice(-10).reverse().map(x =>
+        '<div class="item"><b>' + esc(x.kind) + '</b><span class="badge blocked">open</span><div>' + esc(x.description || '').slice(0,220) + '</div><div class="who">repair task ' + esc(x.repair_task || '') + '</div></div>').join('') : '<div class="empty">none open</div>') + '</section>';
+      h += '<section><h2>formal tasks</h2>' + (stasks.length ? stasks.map(x =>
+        '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge ' + (x.status === 'complete' ? 'ok' : 'pending') + '">' + esc(x.status) + '</span><div class="who">' + esc(x.lean_decl || '') + '</div>' +
+        ((x.source_components || []).length ? '<div class="who">source: ' + x.source_components.map(esc).join(', ') + '</div>' : '') + '</div>').join('') : '<div class="empty">not chunked yet</div>') + '</section>';
+      h += '<section><h2>formal candidates</h2>' + (fcandidates.length ? fcandidates.slice(-6).reverse().map(x => {
+        const build = x.build || {}, verification = x.verification || {};
+        return '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'merged' ? 'ok' : x.status === 'failed' ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
+          '<div class="who">' + esc(x.task_id) + ' · ' + esc(x.author) + ' · ' + esc((x.commit_sha || '').slice(0,12)) + '</div>' +
+          (x.error ? '<div class="sub">' + esc(x.error) + '</div>' : '') + artifactButton(build.artifact_id) + artifactButton(verification.artifact_id) + '</div>';
+      }).join('') : '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>live coordination & telemetry</h2><div class="item"><b>' + sstrategies.length + '</b> active strategies</div><div class="item"><b>' + sfindings.length + '</b> active findings</div>' +
+        sstrategies.slice(-8).reverse().map(x => '<div class="item"><b class="mono">' + esc(x.strategy_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div>' + esc(x.description || '').slice(0,140) + '</div><div class="who">task ' + esc(x.target || 'global') + ' · owner ' + esc(x.owner || 'none') + '</div></div>').join('') +
+        '<div class="item"><b>' + (sm.worker_turns || 0) + '</b> worker turns · ' + (sm.worker_seconds || 0) + ' agent-seconds</div>' +
+        '<div class="item"><b>$' + Number(sm.cost_usd || 0).toFixed(4) + '</b> recorded cost' + (sm.time_to_first_candidate_seconds == null ? '' : ' · first candidate ' + sm.time_to_first_candidate_seconds + 's') + '</div></section></div>';
     }
     // agents
     const ags = w.agents || [];

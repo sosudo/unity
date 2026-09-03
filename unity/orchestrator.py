@@ -104,6 +104,41 @@ def build_mcp(paths, *, forum_icrl: bool = True) -> dict:
     return servers
 
 
+def build_solve_mcp(paths, profile: str) -> dict:
+    """MCP servers for one ``unity solve`` phase.
+
+    The server key intentionally remains ``unity-forum`` so backend shell bridges
+    keep working, while the implementation and advertised tools are solve-only.
+    """
+    servers = {
+        "lean-lsp": {"command": "uvx", "args": ["lean-lsp-mcp"]},
+        "unity-forum": {
+            "command": sys.executable,
+            "args": [
+                "-m", "unity.forum.solve_server",
+                "--forum-dir", str(paths.forum),
+                "--project-root", str(paths.project_root),
+                "--profile", profile,
+            ],
+        },
+    }
+    axle_key = os.getenv("AXLE_API_KEY")
+    if axle_key:
+        servers["axle"] = {
+            "command": "uvx",
+            "args": ["--from", "axiom-axle-mcp", "axle-mcp-server"],
+            "env": {"AXLE_API_KEY": axle_key},
+        }
+    aristotle_key = os.getenv("ARISTOTLE_API_KEY")
+    if aristotle_key:
+        servers["aristotle"] = {
+            "command": sys.executable,
+            "args": ["-m", "unity.aristotle"],
+            "env": {"ARISTOTLE_API_KEY": aristotle_key},
+        }
+    return servers
+
+
 def _effective_ranking(roster, forum_dir) -> dict:
     """Dynamic capability ranking: static strength + a bounded boost from forum ICRL
     credit (earned by posts and upvotes on an agent's contributions). Re-computed at
@@ -174,6 +209,8 @@ async def dispatch(
     *,
     tools_prompt="TOOLS",
     icrl_enabled: bool = True,
+    brief_provider=None,
+    log_context: dict | None = None,
 ):
     """Spawn `agents` concurrently with per-agent prompts; await all, log failures.
 
@@ -207,18 +244,31 @@ async def dispatch(
         if unity_dir is None or os.getenv("UNITY_FORUM_BRIEF", "on").lower() == "off":
             return ""  # UNITY_FORUM_BRIEF=off -> H3 substrate ablation
         try:
-            from .forum import server as forum_server
-            forum_server.FORUM_DIR = unity_dir / "forum"
-            text = forum_server.build_brief(a.name)
+            if brief_provider is not None:
+                text = brief_provider(a.name)
+            else:
+                from .forum import server as forum_server
+                forum_server.FORUM_DIR = unity_dir / "forum"
+                text = forum_server.build_brief(a.name)
             return f"\nWorkspace brief (live state — refresh anytime with forum_brief):\n{text}\n" if text else ""
         except Exception:
             return ""
 
+    async def _spawn_one(a):
+        kwargs = {"subagents": subagents}
+        if log_context is not None:
+            kwargs["log_context"] = log_context
+        return await spawn(
+            a,
+            _preamble(a, roster, ranking, icrl_enabled=icrl_enabled) + _brief(a) + full,
+            task,
+            _cwd(a),
+            mcp,
+            **kwargs,
+        )
+
     results = await asyncio.gather(
-        *[spawn(a, _preamble(a, roster, ranking, icrl_enabled=icrl_enabled)
-                + _brief(a) + full, task, _cwd(a), mcp,
-                subagents=subagents)
-          for a in agents],
+        *[_spawn_one(a) for a in agents],
         return_exceptions=True,
     )
     for a, r in zip(agents, results):

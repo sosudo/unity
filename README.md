@@ -6,6 +6,13 @@ Unity uses a roster of heterogeneous agents (different models) to work on Lean p
 
 If you have any issues/concerns or contributions, please make a GitHub issue or reach out to me at [shivansg@andrew.cmu.edu](mailto:shivansg@andrew.cmu.edu). A technical writeup detailing exactly how Unity works will be put out soon!
 
+## License and citation
+
+Unity is distributed under the [Unity Citation License 1.0](LICENSE). Any use of
+Unity, including derivative works and outputs materially produced with Unity,
+must cite the project. Ready-to-use citation metadata is provided in
+[`CITATION.cff`](CITATION.cff).
+
 ## Prerequisites
 
 - Python 3.13+ and [uv](https://docs.astral.sh/uv/)
@@ -101,7 +108,13 @@ Again, make sure to save your agents before continuing!
 
 Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the solving and formalization loops are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with formalization.
 
-When you're ready, hover over the `run` button, press `solve`, and press the `start` button.
+When you're ready, hover over the `run` button, press `solve`, and press the `start` button. During
+informal solving the whole roster coordinates through a solve-specific Forum and submits immutable
+argument and paper components. Dependency-aware informal tasks let agents divide lemmas, checks,
+sections, and synthesis while preserving direct full-solution attempts. Paper candidates record the
+exact component revisions they incorporate and receive independent review. The accepted paper is then
+chunked into a component-traceable formalization DAG; agents implement ready Lean tasks in worktrees,
+and a final critic can reopen either individual Lean tasks or the informal solution itself.
 
 ### Create
 
@@ -267,8 +280,11 @@ Mixed rosters are the point: mark your strongest model as the primary and fill t
 
 ## Configuration
 
-- `.unity/.env` — run flags: `MAX_ATTEMPTS` (cap on solving/critic loop rounds; blank/unset = indefinite), `UNITY_FORUM_BRIEF=off`
-  (disable workspace-brief injection), and optional service keys (`AXLE_API_KEY`,
+- `.unity/.env` — run flags: `MAX_ATTEMPTS` (cap on solving, formalization, and critic loop retries;
+  blank/unset = indefinite),
+  `RETROSPECTIVE=false` (skip prove/solve retrospectives), `UNITY_SOLVE_REVIEW_QUORUM` (independent
+  approvals required for an informal solution), `UNITY_FORUM_BRIEF=off` (disable workspace-brief
+  injection), and optional service keys (`AXLE_API_KEY`,
   `ARISTOTLE_API_KEY`) that unlock extra agent tools.
 - `.unity/agents.yaml` — the roster (see [Roster Configuration](#roster-configuration)). Per-agent
   credentials (`api_key` / `auth_token` / `base_url`) live here, not in `.env`; `${VAR}` references

@@ -11,10 +11,12 @@ from ..worktree import ensure_git_excludes
 _DEFAULT_METRICS = Path(__file__).parent.parent / "defaults" / "metrics"
 
 _ENV_DEFAULT = (
-    "# Cap on solving/critic loop rounds (blank = indefinite)\n"
+    "# Cap on solving, formalization, and critic loop retries (blank = indefinite)\n"
     "MAX_ATTEMPTS=\n"
-    "# Set to false to skip the prove retrospective phase\n"
+    "# Set to false to skip prove/solve retrospective phases\n"
     "RETROSPECTIVE=true\n"
+    "# Independent semantic approvals required for a solve paper candidate\n"
+    "UNITY_SOLVE_REVIEW_QUORUM=1\n"
     "# Set to off to disable workspace-brief injection (ablation)\n"
     "UNITY_FORUM_BRIEF=on\n"
     "# Large tool/command output is retained as shared artifacts\n"
