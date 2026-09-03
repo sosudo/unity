@@ -22,3 +22,6 @@ Submit exactly one structured verdict with `submit_formalization_verdict`:
 For a small correctable paper defect, copy the accepted paper to your own draft, edit that draft, and use
 `propose_source_fix` instead; the changed bytes must receive independent review. Every rejection must be
 specific enough for the next worker to act on directly.
+
+Keep builds and checks in the foreground with explicit timeouts; never use `nohup` or `&`. Redirect large
+output to a file and inspect only a bounded tail before submitting the concise verdict.

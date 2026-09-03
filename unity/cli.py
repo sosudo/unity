@@ -25,4 +25,7 @@ for _mod in _COMMANDS:
 
 
 def main():
-    cli(_anyio_backend="asyncio")
+    try:
+        cli(_anyio_backend="asyncio")
+    except KeyboardInterrupt:
+        raise SystemExit(130) from None

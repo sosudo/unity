@@ -28,3 +28,8 @@ If Lean exposes a local defect in the paper that you can correct without changin
 write corrected paper bytes and call `propose_source_fix`; the corrected artifact returns to independent
 review. If the accepted argument is substantively false, incomplete, or proves the wrong statement, call
 `reopen_solving` with exact evidence. Never silently formalize a different theorem.
+
+Keep builds and solvers in the foreground with explicit timeouts; never use `nohup` or `&`. Redirect
+large output to a file and inspect only a bounded tail. Do not install into the host Python interpreter;
+put any genuinely necessary temporary Python dependency in a disposable virtual environment under
+`$TMPDIR`.

@@ -381,6 +381,23 @@ def claim_strategy(forum_dir: Path, strategy_id: str, author: str) -> dict:
             return {"status": "conflict", "strategy": strategy, "owner": strategy["owner"]}
         if strategy["status"] != "registered":
             raise ValueError(f"strategy is {strategy['status']}, not claimable")
+        target_task = state["informal_tasks"].get(strategy.get("target", ""), {})
+        if strategy["phase"] == "solving" and target_task.get("kind") == "synthesis":
+            active_synthesis = next((
+                item for item in state["strategies"].values()
+                if item.get("strategy_id") != strategy_id
+                and item.get("phase") == "solving"
+                and item.get("target") == strategy.get("target")
+                and item.get("status") == "claimed"
+            ), None)
+            if active_synthesis is not None:
+                return {
+                    "status": "task_conflict",
+                    "strategy": strategy,
+                    "task": target_task,
+                    "active_strategy": active_synthesis,
+                    "owner": active_synthesis.get("owner"),
+                }
         strategy["status"] = "claimed"
         strategy["owner"] = _text(author, "author", 100)
         strategy["updated_at"] = time.time()
@@ -572,6 +589,31 @@ def review_informal_result(
                 if obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
                     obstacle["status"] = "resolved"
                     obstacle["resolved_by"] = result_id
+            if task.get("kind") == "counterexample_check" and task.get("parent_id"):
+                parent = state["informal_tasks"].get(task["parent_id"])
+                if parent and parent.get("status") not in {"resolved", "superseded", "cancelled"}:
+                    parent["status"] = "superseded"
+                    parent["superseded_by"] = result_id
+                    parent["supersession_reason"] = (
+                        f"supported counterexample check {task['task_id']}"
+                    )
+                    parent["updated_at"] = time.time()
+                    for strategy in state["strategies"].values():
+                        if (
+                            strategy.get("phase") == "solving"
+                            and strategy.get("target") == parent["task_id"]
+                            and strategy.get("status") in _ACTIVE_STRATEGIES
+                        ):
+                            strategy["status"] = "cancelled"
+                            strategy["cancellation_reason"] = parent["supersession_reason"]
+                            strategy["updated_at"] = time.time()
+                    _event(
+                        state,
+                        "informal_task_superseded",
+                        task_id=parent["task_id"],
+                        superseded_by=result_id,
+                        reason=parent["supersession_reason"],
+                    )
             _event(state, "informal_task_resolved", task_id=task["task_id"],
                    result_id=result_id, author=author)
         else:
@@ -605,12 +647,20 @@ def publish_finding(
     target: str = "",
     strategy_id: str = "",
     evidence: str = "",
+    supersedes: str = "",
 ) -> dict:
     if not isinstance(confidence, int) or not 0 <= confidence <= 100:
         raise ValueError("confidence must be an integer from 0 through 100")
     with transaction(forum_dir) as state:
         if strategy_id and strategy_id not in state["strategies"]:
             raise ValueError(f"unknown strategy '{strategy_id}'")
+        old_finding = None
+        if supersedes:
+            old_finding = state["findings"].get(supersedes)
+            if old_finding is None:
+                raise ValueError(f"unknown superseded finding '{supersedes}'")
+            if old_finding.get("status") != "active":
+                raise ValueError("only an active finding can be superseded")
         finding_id = _id("finding")
         finding = {
             "finding_id": finding_id,
@@ -623,12 +673,17 @@ def publish_finding(
             "content": _text(content, "content"),
             "confidence": confidence,
             "evidence": _text(evidence, "evidence", 4000, required=False),
+            "supersedes": supersedes or None,
             "status": "active",
             "created_at": time.time(),
         }
+        if old_finding is not None:
+            old_finding["status"] = "superseded"
+            old_finding["superseded_by"] = finding_id
+            old_finding["updated_at"] = time.time()
         state["findings"][finding_id] = finding
         _event(state, "finding_published", finding_id=finding_id, author=author,
-               phase=state["phase"], target=target)
+               phase=state["phase"], target=target, supersedes=supersedes or None)
     return finding
 
 

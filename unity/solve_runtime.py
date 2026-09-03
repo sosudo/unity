@@ -77,12 +77,32 @@ def _draft_path(paths, agent_name: str) -> Path:
     return path
 
 
+def _agent_runtime_env(paths, state: dict, agent_name: str) -> dict[str, str]:
+    """Give solve workers isolated, disposable temp space without affecting prove."""
+    run_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(state.get("run_id") or "unknown-run"))
+    safe_agent = re.sub(r"[^a-zA-Z0-9_-]", "_", agent_name)
+    scratch = paths.unity / "tmp" / run_id / safe_agent
+    scratch.mkdir(parents=True, exist_ok=True)
+    value = str(scratch.resolve())
+    return {
+        "TMPDIR": value,
+        "TMP": value,
+        "TEMP": value,
+        "PIP_REQUIRE_VIRTUALENV": "true",
+        "PIP_DISABLE_PIP_VERSION_CHECK": "true",
+    }
+
+
 def reset_solve_workspace(paths) -> None:
     """Clear only solve-owned transient documents on a fresh solve run."""
     drafts = paths.unity / "source" / "drafts"
     if drafts.exists():
         import shutil
         shutil.rmtree(drafts)
+    scratch = paths.unity / "tmp"
+    if scratch.exists():
+        import shutil
+        shutil.rmtree(scratch)
     (paths.unity / "source").mkdir(parents=True, exist_ok=True)
     (paths.unity / "source" / "PROOF.tex").unlink(missing_ok=True)
     (paths.unity / "dag.json").unlink(missing_ok=True)
@@ -116,6 +136,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
     reviewer_results: dict[str, str] = {}
+    submission_nudges: set[str] = set()
     state = solve_state.load_state(paths.forum)
     seen = {event["event_id"] for event in state.get("events", [])}
     pending_reviews = {
@@ -146,7 +167,16 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
             )
         if review_result:
             reviewer_results[name] = review_result
-        task_prompt = followup or (task_context +
+        draft_context = ""
+        if draft.is_file() and draft.stat().st_size:
+            payload = draft.read_bytes()
+            draft_context = (
+                f"You already have a nonempty draft at `{draft.relative_to(paths.project_root)}` "
+                f"({len(payload)} bytes, SHA-256 {hashlib.sha256(payload).hexdigest()}). Read those "
+                "exact bytes before doing new research. If they already form a complete rigorous "
+                "solution, emit_solution_candidate immediately. "
+            )
+        task_prompt = draft_context + (followup or (task_context +
             "Collaboratively solve the original problem in natural language. Coordinate through "
             "the solve Forum, but develop your own exact candidate paper at "
             f"`{draft.relative_to(paths.project_root)}`. You may investigate privately before a "
@@ -154,7 +184,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
             "publish useful findings early, and ask for help on concrete blockers. Submit the exact "
             "draft immediately once it is a complete rigorous solution. Continue useful work until "
             "the candidate interrupt or genuine quiescence."
-        )
+        ))
         event = asyncio.Event()
         interrupts[name] = event
         tasks[name] = asyncio.create_task(
@@ -172,6 +202,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                     "role": "component_reviewer" if review_result else "solver",
                     "result_id": review_result or None,
                 },
+                env_overrides=_agent_runtime_env(paths, current, name),
+                own_process_group=True,
             ),
             name=f"solve:solving:{name}",
         )
@@ -197,7 +229,9 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 f"`{result.get('task_id')}` at immutable artifact `{result.get('artifact_id')}` "
                 f"with SHA-256 `{result.get('sha256')}`. Call review_informal_result with `support` "
                 "only if the exact argument is correct and reusable; otherwise call `object` with "
-                "the concrete defect. Then refresh solve_brief and continue useful work.",
+                "the concrete defect. Submit the review as soon as you have decisive support or one "
+                "concrete blocking defect, then end the turn. Do not search for a stronger objection "
+                "or an alternate proof after recording the verdict.",
                 target_task=result.get("task_id", ""),
                 review_result=result_id,
             )
@@ -211,14 +245,15 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
             strategy.get("target") for strategy in current.get("strategies", {}).values()
             if strategy.get("phase") == "solving" and strategy.get("status") == "claimed"
         }
-        preferred = [task for task in ready if task["task_id"] not in claimed_targets] or ready
-        for index, name in enumerate(idle):
-            launch(name, target_task=preferred[index % len(preferred)]["task_id"])
+        preferred = [task for task in ready if task["task_id"] not in claimed_targets]
+        for name, task in zip(idle, preferred):
+            launch(name, target_task=task["task_id"])
 
     launch_idle_work()
-    for agent in roster.agents:
-        if agent.name not in tasks:
-            launch(agent.name)
+    if not state.get("informal_tasks"):
+        for agent in roster.agents:
+            if agent.name not in tasks:
+                launch(agent.name)
 
     try:
         while not stop_requested(paths.project_root):
@@ -242,8 +277,32 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 except Exception as exc:
                     _console.print(f"[red]informal solver {name} failed: {exc!r}[/red]")
                 tasks.pop(name, None)
-                workers_finished = True
                 interrupts.pop(name, None)
+                target = worker_targets.get(name, "")
+                current = solve_state.load_state(paths.forum)
+                informal = current.get("informal_tasks", {}).get(target, {})
+                draft = _draft_path(paths, name)
+                can_nudge = (
+                    informal.get("kind") == "synthesis"
+                    and not current.get("solution", {}).get("current_candidate")
+                    and draft.is_file()
+                    and draft.stat().st_size > 0
+                    and name not in submission_nudges
+                    and name not in reviewer_results
+                )
+                if can_nudge:
+                    submission_nudges.add(name)
+                    launch(
+                        name,
+                        "Submission check only: read your existing draft before any new research. "
+                        "Your first substantive action must be either emit_solution_candidate if "
+                        "the draft is a complete rigorous solution, or publishing one precise "
+                        "blocker explaining why it cannot yet be submitted. Do not begin another "
+                        "research trajectory in this turn.",
+                        target_task=target,
+                    )
+                    continue
+                workers_finished = True
                 worker_targets.pop(name, None)
                 reviewer_results.pop(name, None)
                 solve_state.release_author_claims(
@@ -296,6 +355,25 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                         tasks.pop(name, None)
                         interrupts.pop(name, None)
                         worker_targets.pop(name, None)
+                    launch_idle_work()
+                elif kind == "informal_task_superseded":
+                    target = event.get("task_id", "")
+                    affected = [
+                        name for name, running in tasks.items()
+                        if not running.done() and worker_targets.get(name) == target
+                    ]
+                    await asyncio.gather(*(
+                        _cancel(
+                            agents[name], tasks[name], interrupts[name],
+                            f"informal task {target} superseded",
+                        )
+                        for name in affected
+                    ))
+                    for name in affected:
+                        tasks.pop(name, None)
+                        interrupts.pop(name, None)
+                        worker_targets.pop(name, None)
+                        reviewer_results.pop(name, None)
                     launch_idle_work()
                 elif kind == "informal_result_objected":
                     pending_reviews.discard(event["result_id"])
@@ -675,6 +753,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     "command": "solve", "run_id": current.get("run_id"), "phase": "formalizing",
                     "task_id": task_id, "role": "formalizer",
                 },
+                env_overrides=_agent_runtime_env(paths, current, name),
+                own_process_group=True,
             ),
             name=f"solve:formalizing:{name}:{task_id}",
         )

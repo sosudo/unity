@@ -8,6 +8,8 @@ concurrently under asyncio.gather. Callers use spawn(); the per-backend helpers
 
 import asyncio
 import os
+import signal
+import sys
 import tempfile
 from pathlib import Path
 
@@ -20,11 +22,15 @@ _console = Console()
 
 # ── env (per-agent, never global) ──────────────────────────────────────────────
 
-def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
+def _agent_env(
+    agent: Agent,
+    codex_home: Path | None = None,
+    env_overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
     if agent.backend == "claude_code":
         # Override keys only; the SDK merges these into the CLI child it spawns.
         # All three model slots are pinned to agent.model so routing can't cross agents.
-        return {k: v for k, v in {
+        env = {k: v for k, v in {
             "ANTHROPIC_BASE_URL": agent.base_url,
             "ANTHROPIC_API_KEY": agent.api_key,
             "ANTHROPIC_AUTH_TOKEN": agent.auth_token,
@@ -33,6 +39,8 @@ def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": agent.model,
             "UNITY_AGENT_NAME": agent.name,
         }.items() if v}
+        env.update(env_overrides or {})
+        return env
 
     # codex: the child env is replaced wholesale, so start from os.environ and
     # isolate creds + config under a per-agent CODEX_HOME.
@@ -42,7 +50,42 @@ def _agent_env(agent: Agent, codex_home: Path | None = None) -> dict[str, str]:
     if codex_home is not None:
         env["CODEX_HOME"] = str(codex_home)
     env["UNITY_AGENT_NAME"] = agent.name
+    env.update(env_overrides or {})
     return env
+
+
+def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tuple[Path, Path]:
+    """Wrap a CLI so its entire process tree has a solve-owned process group."""
+    wrapper = directory / f"{label}-group-wrapper"
+    pid_file = directory / f"{label}-group.pid"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, sys\n"
+        "os.setsid()\n"
+        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        f"os.execv({str(executable)!r}, [{str(executable)!r}, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o700)
+    return wrapper, pid_file
+
+
+async def _terminate_process_group(pid_file: Path | None) -> None:
+    if pid_file is None or os.name != "posix":
+        return
+    try:
+        pgid = int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return
+    for sig, delay in ((signal.SIGTERM, 0.25), (signal.SIGKILL, 0.0)):
+        try:
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            break
+        except PermissionError:
+            break
+        if delay:
+            await asyncio.sleep(delay)
+    pid_file.unlink(missing_ok=True)
 
 
 # ── stream helpers ──────────────────────────────────────────────────────────────
@@ -205,8 +248,21 @@ def _log(name: str, msg, cwd=None) -> None:
 
 async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                          mcp_servers: dict, *, permission: str = "bypassPermissions",
-                         idle_timeout: float = 600.0, subagents=()) -> str | None:
+                         idle_timeout: float = 600.0, subagents=(),
+                         env_overrides: dict[str, str] | None = None,
+                         own_process_group: bool = False) -> str | None:
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
+    import shutil
+
+    cli_path = None
+    pid_file = None
+    if own_process_group and os.name == "posix":
+        from claude_agent_sdk._internal.transport import subprocess_cli
+        bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
+        real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
+        if real_cli.is_file():
+            group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
+            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
 
     agents_def = {
         s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
@@ -220,7 +276,8 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         permission_mode=permission,
         model=agent.model,
         max_budget_usd=agent.budget,
-        env=_agent_env(agent),
+        env=_agent_env(agent, env_overrides=env_overrides),
+        cli_path=cli_path,
     )
     attempt = 0
     while True:
@@ -252,7 +309,10 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                 raise
             wait = _retry_sleep(e)
             _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await _terminate_process_group(pid_file)
             await asyncio.sleep(wait)
+        finally:
+            await _terminate_process_group(pid_file)
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
@@ -389,7 +449,9 @@ async def _codex_notifications(
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                         mcp_servers: dict, *, permission: str = "bypassPermissions",
                         idle_timeout: float = 600.0, subagents=(),
-                        interrupt_event: asyncio.Event | None = None) -> str | None:
+                        interrupt_event: asyncio.Event | None = None,
+                        env_overrides: dict[str, str] | None = None,
+                        own_process_group: bool = False) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
     system_prompt = system_prompt + _CODEX_MCP_NOTE
@@ -408,11 +470,23 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     # SDK's pinned bundled binary — newest models often require a newer runtime.
     import shutil as _sh
     codex_bin = _sh.which("codex")
+    pid_file = None
+    if own_process_group and os.name == "posix":
+        if codex_bin is None:
+            try:
+                from codex_cli_bin import bundled_codex_path
+                codex_bin = str(bundled_codex_path())
+            except ImportError:
+                pass
+        if codex_bin:
+            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), home, "codex")
+            codex_bin = str(wrapped)
     attempt = 0
     while True:
         attempt += 1
-        cfg = (CodexConfig(cwd=str(cwd), env=_agent_env(agent, home), codex_bin=codex_bin)
-               if codex_bin else CodexConfig(cwd=str(cwd), env=_agent_env(agent, home)))
+        agent_env = _agent_env(agent, home, env_overrides)
+        cfg = (CodexConfig(cwd=str(cwd), env=agent_env, codex_bin=codex_bin)
+               if codex_bin else CodexConfig(cwd=str(cwd), env=agent_env))
         codex = AsyncCodex(config=cfg)
         final = None
         interrupt_task = None
@@ -515,11 +589,14 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
             except (asyncio.TimeoutError, Exception):
                 pass
+            await _terminate_process_group(pid_file)
 
 
 async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                               mcp_servers: dict, *, permission: str = "bypassPermissions",
-                              idle_timeout: float = 600.0, subagents=()) -> str | None:
+                              idle_timeout: float = 600.0, subagents=(),
+                              env_overrides: dict[str, str] | None = None,
+                              own_process_group: bool = False) -> str | None:
     """Google Antigravity backend: drives the user's installed `agy` CLI in print mode
     (subscription auth; serves both the Gemini pool and the Claude/GPT pool). MCP tools
     reach the model through the `unity mcp` shell bridge, like codex."""
@@ -543,7 +620,8 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
-            env=_agent_env(agent))
+            env=_agent_env(agent, env_overrides=env_overrides),
+            start_new_session=own_process_group and os.name == "posix")
 
         async def _lines():
             while True:
@@ -580,7 +658,10 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                         _console.print(f"[red]{_ts()} \\[{agent.name}] ✗ agy result: {failed}[/red]")
                 if _stop_requested(cwd):
                     _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                    proc.terminate()
+                    if own_process_group and os.name == "posix":
+                        os.killpg(proc.pid, signal.SIGTERM)
+                    else:
+                        proc.terminate()
                     break
             rc = await proc.wait()
             if failed:
@@ -601,7 +682,14 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
             await asyncio.sleep(wait)
         finally:
             if proc.returncode is None:
-                proc.kill()
+                if own_process_group and os.name == "posix":
+                    try:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    proc.kill()
+                await proc.wait()
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -639,7 +727,9 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=(),
                 interrupt_event: asyncio.Event | None = None,
-                log_context: dict | None = None) -> str | None:
+                log_context: dict | None = None,
+                env_overrides: dict[str, str] | None = None,
+                own_process_group: bool = False) -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
@@ -649,6 +739,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             "permission": permission,
             "idle_timeout": idle_timeout,
             "subagents": subagents,
+            "env_overrides": env_overrides,
+            "own_process_group": own_process_group,
         }
         if agent.backend == "codex":
             kwargs["interrupt_event"] = interrupt_event

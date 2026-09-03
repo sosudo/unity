@@ -37,3 +37,6 @@ the graph must be acyclic. Include every declaration necessary for the complete 
 not invent redundant administrative nodes. Ensure the recorded solution hash exactly matches the brief.
 Every chunk must cite at least one valid source component, and every source reference in the plan must be
 covered by at least one chunk.
+
+Keep helper commands in the foreground with explicit timeouts; never use `nohup` or `&`. Redirect large
+output to a file and inspect only a bounded tail.

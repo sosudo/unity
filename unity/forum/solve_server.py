@@ -181,6 +181,18 @@ def solve_brief(author: str) -> str:
         f"Solution gate: {solution.get('status')} (revision {solution.get('revision')})",
         f"Formalization gate: {formal.get('status')} (revision {formal.get('revision')})",
     ]
+    safe_author = re.sub(r"[^a-zA-Z0-9_-]", "_", author)
+    draft = _root() / ".unity" / "source" / "drafts" / safe_author / "PROOF.tex"
+    if draft.is_file() and draft.stat().st_size:
+        payload = draft.read_bytes()
+        lines.extend([
+            "",
+            "YOUR EXISTING DRAFT",
+            f"- {draft.relative_to(_root())}",
+            f"- {len(payload)} bytes; SHA-256 {hashlib.sha256(payload).hexdigest()}",
+            "- Read these exact bytes before starting new research. If they already form a "
+            "complete rigorous solution, emit the candidate immediately.",
+        ])
     accepted_id = solution.get("accepted_candidate")
     current_id = solution.get("current_candidate")
     previous_id = solution.get("previous_candidate")
@@ -517,8 +529,9 @@ def publish_finding(
     target: str = "",
     strategy_id: str = "",
     evidence: str = "",
+    supersedes: str = "",
 ) -> dict:
-    """Publish concise live knowledge with an agent-chosen kind and 0–100 confidence."""
+    """Publish or correct concise live knowledge with agent-chosen kind/confidence."""
     author = _author(author)
     if len(evidence) > 4000:
         record = artifacts.store_text(
@@ -528,7 +541,7 @@ def publish_finding(
         evidence = f"artifact {record['artifact_id']} SHA-256 {record['sha256']}"
     result = solve_state.publish_finding(
         FORUM_DIR, author, kind, title, content, confidence,
-        target=target, strategy_id=strategy_id, evidence=evidence,
+        target=target, strategy_id=strategy_id, evidence=evidence, supersedes=supersedes,
     )
     _mirror(author, f"FINDING {result['finding_id']}: {title}", content, target)
     return result

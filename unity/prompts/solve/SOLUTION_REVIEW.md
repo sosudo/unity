@@ -17,3 +17,6 @@ rigorous solution. Use `object` for a concrete defect and provide structured `is
 issue has an agent-chosen `kind`, precise `description`, and optional `component_ids`; Unity turns it into
 an actionable repair task. If issues are omitted, the review text becomes a general repair task. Changed
 bytes require a new candidate and a new review.
+
+Keep any checks in the foreground with explicit timeouts; never use `nohup` or `&`. Redirect large output
+to a file and inspect only the bounded portion needed for the verdict.
