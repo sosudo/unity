@@ -16,9 +16,14 @@ For your assigned task:
 - read the task's `source_components` and implement precisely the corresponding accepted argument or
   paper section; do not silently omit an incorporated component;
 - do not use `sorry`, `admit`, new axioms, `native_decide`, or equivalent proof bypasses;
-- run `lake build`, commit the complete change, and immediately call `emit_formalization_candidate` with
-  the exact commit; and
+- use Lean LSP or a targeted file/module check while iterating;
+- after the final edit, run one full `lake build`, commit the complete change, and immediately call
+  `emit_formalization_candidate` with the exact commit; and
 - after a merge, synchronize from main before beginning new work.
+
+A successful build with warnings is successful. Do not investigate or repair style, header, documentation,
+or unrelated linter warnings unless they indicate a correctness problem in your candidate. Once the final
+build exits successfully, submit immediately. Do not rerun an unchanged successful build.
 
 Candidate submission is an interrupt for that task. Unity applies the exact commit to main, builds it,
 and mechanically checks the expected declaration before accepting it. A local build claim is not

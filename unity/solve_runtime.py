@@ -93,6 +93,30 @@ def _agent_runtime_env(paths, state: dict, agent_name: str) -> dict[str, str]:
     }
 
 
+def _formal_task_assignments(
+    ready: list[dict],
+    idle_workers: list[str],
+    active_targets: list[str],
+) -> list[tuple[str, str]]:
+    """Cover independent ready tasks before assigning redundant formalizers."""
+    if not ready:
+        return []
+    load = {formal_task["task_id"]: 0 for formal_task in ready}
+    for target in active_targets:
+        if target in load:
+            load[target] += 1
+    order = {
+        formal_task["task_id"]: index
+        for index, formal_task in enumerate(ready)
+    }
+    assignments = []
+    for name in idle_workers:
+        task_id = min(load, key=lambda target: (load[target], order[target]))
+        assignments.append((name, task_id))
+        load[task_id] += 1
+    return assignments
+
+
 def reset_solve_workspace(paths) -> None:
     """Clear only solve-owned transient documents on a fresh solve run."""
     drafts = paths.unity / "source" / "drafts"
@@ -738,8 +762,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             f"`{formal_task.get('lean_decl')}`. Its accepted-paper source references are "
             f"{formal_task.get('source_components', [])}. Dependencies have already been integrated. "
             "Refresh solve_brief, register and claim a distinct implementation strategy for this "
-            "task, edit in your worktree, run lake build, commit the complete change, and submit "
-            "the exact commit with emit_formalization_candidate. Publish useful Lean/API findings "
+            "task, and edit in your worktree using targeted Lean checks while iterating. After the "
+            "final edit, run one full lake build, commit the complete change, and submit the exact "
+            "commit with emit_formalization_candidate. Publish useful Lean/API findings "
             "as you work. If the accepted paper is wrong, propose corrected paper bytes or explicitly "
             "reopen solving rather than silently formalizing a different result."
         )
@@ -765,8 +790,13 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         if not ready:
             return
         idle = [name for name in agents if name not in tasks]
-        for index, name in enumerate(idle):
-            launch(name, ready[index % len(ready)]["task_id"])
+        active_targets = [
+            worker_targets.get(name, "")
+            for name, running in tasks.items()
+            if not running.done()
+        ]
+        for name, task_id in _formal_task_assignments(ready, idle, active_targets):
+            launch(name, task_id)
 
     launch_idle()
     try:

@@ -161,7 +161,9 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
                 f"Read the exact accepted paper at `{proof.relative_to(paths.project_root)}` and the "
                 f"mechanical coverage scaffold at `{plan.relative_to(paths.project_root)}`. Its SHA-256 is "
                 f"`{candidate['sha256']}`. Produce `.unity/dag.json` bound to that candidate and hash, with "
-                "one concrete Lean declaration per chunk, source-component coverage, and an acyclic graph."
+                "one concrete Lean declaration per chunk, source-component coverage, and an acyclic graph. "
+                "Prefer one final-theorem chunk for a short single-result proof; introduce helpers only when "
+                "Lean implementation or useful parallelism actually requires them."
                 + prior_context,
                 paths.project_root,
                 build_solve_mcp(paths, "chunking"),
@@ -237,8 +239,9 @@ async def _run_critic(roster, paths) -> None:
         [roster.primary],
         roster,
         load_prompt("solve/CRITIC"),
-        "Audit the complete Lean project against the exact accepted PROOF.tex. Check the build, "
-        "every intended declaration, prohibited shortcuts, and mathematical fidelity. Submit one "
+        "Audit the complete Lean project against the exact accepted PROOF.tex. Use the exact recorded "
+        "machine verification for build and kernel status, then independently check theorem statements, "
+        "dependencies, prohibited shortcuts, and mathematical fidelity. Submit one "
         "structured verdict with submit_formalization_verdict. Reopen only the exact Lean tasks that "
         "need repair, or reopen informal solving if the accepted mathematics is substantively wrong.",
         paths.project_root,

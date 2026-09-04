@@ -8,8 +8,15 @@ subprocess); other servers get a one-shot stdio client.
 
 import json
 import os
+from pathlib import Path
 
 import asyncclick as click
+
+
+def _solve_shared_paths(paths) -> tuple[Path, Path]:
+    """Return solve's shared forum and main root, resolving worktree links."""
+    shared_unity = paths.unity.resolve()
+    return shared_unity / "forum", shared_unity.parent
 
 
 @click.command(name="mcp")
@@ -42,7 +49,11 @@ async def mcp(server, tool, args):
         solve_profile = "solving"
     if server in ("unity-forum", "forum") and active_solve:
         from ..forum import solve_server
-        solve_server.configure(paths.forum, paths.project_root, solve_profile)
+        # Worktrees expose the run-scoped .unity directory through a symlink.
+        # Resolve it before deriving the source root so candidate verification and
+        # synchronization operate against main rather than the caller's HEAD.
+        shared_forum, shared_root = _solve_shared_paths(paths)
+        solve_server.configure(shared_forum, shared_root, solve_profile)
         client = Client(solve_server.build_server(solve_profile))
     elif server in ("unity-forum", "forum"):
         from ..forum import server as fsrv

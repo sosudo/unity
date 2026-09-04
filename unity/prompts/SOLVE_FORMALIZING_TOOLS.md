@@ -9,7 +9,9 @@ ready tasks, current strategies, findings, and candidate events.
 - `publish_finding`, `report_obstacle`, `ask_question`, and `answer_question` share checked APIs, tactic
   patterns, failures, and blockers.
 - `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?)` submits an
-  exact worktree commit. Run `lake build` first; Unity independently rebuilds and verifies it in main.
+  exact worktree commit. Use targeted checks while iterating, then run one full `lake build` after the final
+  edit; Unity independently rebuilds and verifies it in main. A zero exit status is success even when the
+  build emits unrelated style or documentation warnings.
 - `sync_from_main(author, reason?)` discards obsolete local work and synchronizes to accepted main.
 - `propose_source_fix(author, path, reason, supersedes?)` snapshots corrected paper bytes and returns them
   to independent review.

@@ -12,6 +12,16 @@ and other declarations whose dependency order reflects the paper. Each chunk mus
 concrete expected Lean declaration and contain enough information for a formalizer to implement it
 faithfully without rereading the entire transcript.
 
+Default to one chunk containing the final theorem when the accepted solution can be formalized directly
+as one Lean declaration. Create helper chunks only when they are independently useful, required by the
+formalization, or enable genuinely parallel work. Steps in the English proof do not automatically require
+separate Lean declarations.
+
+Copy source-component IDs exactly from `.unity/formalization-plan.json`. Never add suffixes, section names,
+equation labels, or inferred component IDs. Inspect the project's lakefile and existing source tree before
+selecting `lean_file`. New declarations must go under the current project's Lean library, not under a
+dependency namespace such as `Mathlib/`, unless that path already belongs to the project.
+
 Write this schema:
 
 ```json
