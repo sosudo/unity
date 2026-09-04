@@ -19,7 +19,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from . import artifacts, blueprint, library, solve_state, worktree
+from . import artifacts, blueprint, library, solve_jobs, solve_state, worktree
 from .forum import solve_server
 from .orchestrator import _preamble, load_prompt, stop_requested
 from .spawn import spawn
@@ -55,19 +55,42 @@ def _shared_prompt(paths, roster, agent, profile: str, base_prompt: str, tools_p
     return prompt
 
 
-async def _cancel(agent, task: asyncio.Task, interrupt: asyncio.Event, reason: str) -> None:
+_CANCEL_GRACE_SECONDS = 20.0
+_CANCEL_HARD_SECONDS = 10.0
+
+
+async def _cancel(
+    agent,
+    task: asyncio.Task,
+    interrupt: asyncio.Event,
+    reason: str,
+    project_root: Path | None = None,
+) -> None:
     if task.done():
         return
     _console.print(f"[yellow]interrupting {agent.name}: {reason}[/yellow]")
-    if agent.backend == "codex":
-        interrupt.set()
+    try:
+        if agent.backend == "codex":
+            interrupt.set()
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(task), timeout=_CANCEL_GRACE_SECONDS,
+                )
+                return
+            except asyncio.TimeoutError:
+                pass
+        task.cancel()
         try:
-            await asyncio.wait_for(asyncio.shield(task), timeout=50)
-            return
-        except asyncio.TimeoutError:
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=_CANCEL_HARD_SECONDS,
+            )
+        except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
-    task.cancel()
-    await asyncio.gather(task, return_exceptions=True)
+    finally:
+        if project_root is not None:
+            await asyncio.to_thread(
+                solve_jobs.terminate, project_root, owner=agent.name,
+            )
 
 
 def _draft_path(paths, agent_name: str) -> Path:
@@ -228,6 +251,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 },
                 env_overrides=_agent_runtime_env(paths, current, name),
                 own_process_group=True,
+                mcp_profile="solve",
             ),
             name=f"solve:solving:{name}",
         )
@@ -285,7 +309,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
             state = solve_state.load_state(paths.forum)
             if state.get("phase") != "solving":
                 await asyncio.gather(*(
-                    _cancel(agents[name], task, interrupts[name], "solution candidate submitted")
+                    _cancel(agents[name], task, interrupts[name], "solution candidate submitted",
+                            paths.project_root)
                     for name, task in list(tasks.items())
                 ))
                 return state
@@ -352,7 +377,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                     ]
                     await asyncio.gather(*(
                         _cancel(agents[name], tasks[name], interrupts[name],
-                                f"informal component {event['result_id']} submitted for review")
+                                f"informal component {event['result_id']} submitted for review",
+                                paths.project_root)
                         for name in affected
                     ))
                     for name in affected:
@@ -372,7 +398,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                     ]
                     await asyncio.gather(*(
                         _cancel(agents[name], tasks[name], interrupts[name],
-                                f"informal task {target} resolved")
+                                f"informal task {target} resolved", paths.project_root)
                         for name in affected
                     ))
                     for name in affected:
@@ -390,6 +416,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                         _cancel(
                             agents[name], tasks[name], interrupts[name],
                             f"informal task {target} superseded",
+                            paths.project_root,
                         )
                         for name in affected
                     ))
@@ -406,7 +433,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                     if author in agents:
                         if author in tasks:
                             await _cancel(agents[author], tasks[author], interrupts[author],
-                                          f"informal result {event['result_id']} objected")
+                                          f"informal result {event['result_id']} objected",
+                                          paths.project_root)
                             tasks.pop(author, None)
                             interrupts.pop(author, None)
                         launch(
@@ -442,7 +470,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 if event.get("kind") == "solution_candidate_submitted":
                     await asyncio.gather(*(
                         _cancel(agents[name], task, interrupts[name],
-                                f"solution candidate {event['candidate_id']} submitted")
+                                f"solution candidate {event['candidate_id']} submitted",
+                                paths.project_root)
                         for name, task in list(tasks.items())
                     ))
                     return solve_state.load_state(paths.forum)
@@ -452,7 +481,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
         return solve_state.load_state(paths.forum)
     finally:
         await asyncio.gather(*(
-            _cancel(agents[name], task, interrupts[name], "informal solving runtime ending")
+            _cancel(agents[name], task, interrupts[name], "informal solving runtime ending",
+                    paths.project_root)
             for name, task in list(tasks.items())
         ))
 
@@ -657,8 +687,13 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
             _git(root, "reset", "--hard", before)
             return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
         try:
-            build = subprocess.run(
-                ["lake", "build"], cwd=root, capture_output=True, text=True, check=False,
+            build = solve_jobs.run(
+                root,
+                ["lake", "build"],
+                cwd=root,
+                owner="Unity",
+                task_id=task["task_id"],
+                serialize_build=True,
             )
         except OSError as exc:
             _git(root, "reset", "--hard", before)
@@ -723,6 +758,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     tasks: dict[str, asyncio.Task] = {}
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
+    submission_nudges: set[tuple[str, str, str]] = set()
     state = solve_state.load_state(paths.forum)
     seen = {
         event["event_id"] for event in state.get("events", [])
@@ -740,6 +776,22 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         worktree.link_runtime_state(tree, paths.project_root)
         worktrees[agent.name] = tree
 
+    def owned_strategy(current: dict, name: str, task_id: str = "") -> dict | None:
+        return next((
+            strategy for strategy in current.get("strategies", {}).values()
+            if strategy.get("phase") == "formalizing"
+            and strategy.get("status") == "claimed"
+            and strategy.get("owner") == name
+            and (not task_id or strategy.get("target") == task_id)
+        ), None)
+
+    def worktree_changes(name: str) -> tuple[str, str]:
+        status = _git(
+            worktrees[name], "status", "--porcelain", "--untracked-files=all"
+        ).stdout.strip()
+        diff = _git(worktrees[name], "diff", "HEAD", "--binary").stdout
+        return status, hashlib.sha256((status + "\n" + diff).encode()).hexdigest()
+
     def launch(name: str, task_id: str, followup: str = "") -> None:
         if name in tasks and not tasks[name].done():
             return
@@ -756,18 +808,38 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         system += base_prompt + "\n\n" + tools_prompt
         if context:
             system += "\n\n" + context
-        task_prompt = followup or (
+        strategy = owned_strategy(current, name, task_id)
+        dirty, _ = worktree_changes(name)
+        resume = ""
+        if strategy:
+            resume += (
+                f"Resume your currently claimed strategy `{strategy['strategy_id']}`. Do not "
+                "register or claim a replacement unless you explicitly abandon this strategy. "
+            )
+        if dirty:
+            resume += (
+                "Your worktree already has source changes. Inspect the current diff before any new "
+                "search or edit. If the target is complete, call `finalize_formalization` immediately. "
+            )
+        strategy_instruction = (
+            "Continue the claimed strategy for this task. "
+            if strategy else
+            "Claim a suitable existing unclaimed strategy, or register one only when your approach "
+            "is materially different. You may investigate or edit before registering, but claim a "
+            "strategy before finalizing. "
+        )
+        task_prompt = resume + (followup or (
             f"Your current formalization target is task `{task_id}`: "
             f"{formal_task.get('description', '')}. The required Lean declaration is "
             f"`{formal_task.get('lean_decl')}`. Its accepted-paper source references are "
             f"{formal_task.get('source_components', [])}. Dependencies have already been integrated. "
-            "Refresh solve_brief, register and claim a distinct implementation strategy for this "
-            "task, and edit in your worktree using targeted Lean checks while iterating. After the "
-            "final edit, run one full lake build, commit the complete change, and submit the exact "
-            "commit with emit_formalization_candidate. Publish useful Lean/API findings "
+            "Refresh solve_brief. " + strategy_instruction +
+            "Edit in your worktree using Lean diagnostics and targeted checks while iterating. "
+            "When the implementation is ready, call `finalize_formalization`; Unity will commit the "
+            "exact source and perform the sole authoritative full build in main. Publish useful Lean/API findings "
             "as you work. If the accepted paper is wrong, propose corrected paper bytes or explicitly "
             "reopen solving rather than silently formalizing a different result."
-        )
+        ))
         event = asyncio.Event()
         interrupts[name] = event
         tasks[name] = asyncio.create_task(
@@ -780,6 +852,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 },
                 env_overrides=_agent_runtime_env(paths, current, name),
                 own_process_group=True,
+                mcp_profile="solve",
             ),
             name=f"solve:formalizing:{name}:{task_id}",
         )
@@ -790,12 +863,20 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         if not ready:
             return
         idle = [name for name in agents if name not in tasks]
+        ready_ids = {formal_task["task_id"] for formal_task in ready}
+        unassigned = []
+        for name in idle:
+            strategy = owned_strategy(current, name)
+            if strategy and strategy.get("target") in ready_ids:
+                launch(name, strategy["target"])
+            else:
+                unassigned.append(name)
         active_targets = [
             worker_targets.get(name, "")
             for name, running in tasks.items()
             if not running.done()
         ]
-        for name, task_id in _formal_task_assignments(ready, idle, active_targets):
+        for name, task_id in _formal_task_assignments(ready, unassigned, active_targets):
             launch(name, task_id)
 
     launch_idle()
@@ -805,7 +886,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             state = solve_state.load_state(paths.forum)
             if state.get("phase") != "formalizing":
                 await asyncio.gather(*(
-                    _cancel(agents[name], task, interrupts[name], "formalization phase changed")
+                    _cancel(agents[name], task, interrupts[name], "formalization phase changed",
+                            paths.project_root)
                     for name, task in list(tasks.items())
                 ))
                 return state
@@ -821,9 +903,28 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     _console.print(f"[red]formalizer {name} failed: {exc!r}[/red]")
                 tasks.pop(name, None)
                 interrupts.pop(name, None)
-                solve_state.release_author_claims(
-                    paths.forum, name, "formalizer turn ended without an accepted candidate"
-                )
+                current = solve_state.load_state(paths.forum)
+                task_id = worker_targets.get(name, "")
+                formal_task = current.get("formal_tasks", {}).get(task_id, {})
+                dirty, digest = worktree_changes(name)
+                strategy = owned_strategy(current, name, task_id)
+                nudge_key = (name, task_id, digest)
+                if (
+                    formal_task.get("status") == "pending"
+                    and dirty
+                    and strategy
+                    and nudge_key not in submission_nudges
+                ):
+                    submission_nudges.add(nudge_key)
+                    launch(
+                        name,
+                        task_id,
+                        "Submission check only: inspect the existing worktree diff before doing "
+                        "new research. Your first substantive action must be either calling "
+                        "`finalize_formalization` if it completes the target, or publishing one "
+                        "precise blocker and continuing the currently claimed strategy. Do not "
+                        "register a new strategy or repeat unchanged searches in this turn.",
+                    )
 
             state = solve_state.load_state(paths.forum)
             events = solve_state.events_after(state, seen)
@@ -847,7 +948,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 ]
                 await asyncio.gather(*(
                     _cancel(agents[name], tasks[name], interrupts[name],
-                            f"formal candidate {candidate_id} submitted for {task_id}")
+                            f"formal candidate {candidate_id} submitted for {task_id}",
+                            paths.project_root)
                     for name in affected
                 ))
                 for name in affected:
@@ -874,7 +976,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 if result.get("ok"):
                     for name, running in list(tasks.items()):
                         await _cancel(agents[name], running, interrupts[name],
-                                      f"task {task_id} merged; synchronizing main")
+                                      f"task {task_id} merged; synchronizing main",
+                                      paths.project_root)
                     tasks.clear()
                     interrupts.clear()
                     worker_targets.clear()
@@ -895,9 +998,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         return solve_state.load_state(paths.forum)
     finally:
         await asyncio.gather(*(
-            _cancel(agents[name], task, interrupts[name], "formalization runtime ending")
+            _cancel(agents[name], task, interrupts[name], "formalization runtime ending",
+                    paths.project_root)
             for name, task in list(tasks.items())
         ))
+        await asyncio.to_thread(solve_jobs.terminate, paths.project_root)
         for agent in roster.agents:
             solve_state.release_author_claims(
                 paths.forum, agent.name, "formalization runtime ended"

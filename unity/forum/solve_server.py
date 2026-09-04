@@ -8,11 +8,13 @@ uses the same ``solve-state.json`` and discussion directory.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable
 
@@ -97,6 +99,55 @@ def _source_path(author: str, path: str, *, default: str) -> Path:
     if not candidate.is_file():
         raise ValueError(f"source file does not exist: {candidate}")
     return candidate
+
+
+def _git(cwd: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["git", *args], cwd=cwd, capture_output=True, text=True, check=False,
+    )
+    if check and result.returncode:
+        raise ValueError(
+            result.stderr.strip() or result.stdout.strip()
+            or f"git {' '.join(args)} failed with exit code {result.returncode}"
+        )
+    return result
+
+
+@contextmanager
+def _finalization_lock(author: str):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", author)
+    path = FORUM_DIR / f"solve-finalize-{safe}.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _submit_formal_commit(
+    strategy_id: str,
+    author: str,
+    task_id: str,
+    commit_sha: str,
+    *,
+    notes: str = "",
+    supersedes: str = "",
+) -> dict:
+    resolved = worktree.verify_candidate_commit(_root(), author, commit_sha)
+    parent = _git(_root(), "rev-parse", f"{resolved}^").stdout.strip()
+    diff = _git(_root(), "show", "--format=", "--binary", resolved).stdout
+    diff_sha = hashlib.sha256(diff.encode()).hexdigest()
+    result = solve_state.submit_formal_candidate(
+        FORUM_DIR, strategy_id, author, task_id, resolved, parent, diff_sha,
+        notes=notes, supersedes=supersedes,
+    )
+    if result["status"] == "submitted":
+        candidate = result["candidate"]
+        _mirror(author, f"FORMAL CANDIDATE {candidate['candidate_id']}",
+                f"task {task_id}, commit {resolved}, diff SHA-256 {diff_sha}", task_id)
+    return result
 
 
 def solve_status() -> dict:
@@ -675,27 +726,131 @@ def emit_formalization_candidate(
     notes: str = "",
     supersedes: str = "",
 ) -> dict:
-    """Submit an exact committed Lean implementation for one formalization task."""
+    """Compatibility API for submitting an already-committed implementation."""
     author = _author(author)
-    resolved = worktree.verify_candidate_commit(_root(), author, commit_sha)
-    parent = subprocess.run(
-        ["git", "rev-parse", f"{resolved}^"], cwd=_root(), capture_output=True,
-        text=True, check=True,
-    ).stdout.strip()
-    diff = subprocess.run(
-        ["git", "show", "--format=", "--binary", resolved], cwd=_root(),
-        capture_output=True, text=True, check=True,
-    ).stdout
-    diff_sha = hashlib.sha256(diff.encode()).hexdigest()
-    result = solve_state.submit_formal_candidate(
-        FORUM_DIR, strategy_id, author, task_id, resolved, parent, diff_sha,
+    return _submit_formal_commit(
+        strategy_id, author, task_id, commit_sha,
         notes=notes, supersedes=supersedes,
     )
-    if result["status"] == "submitted":
-        candidate = result["candidate"]
-        _mirror(author, f"FORMAL CANDIDATE {candidate['candidate_id']}",
-                f"task {task_id}, commit {resolved}, diff SHA-256 {diff_sha}", task_id)
-    return result
+
+
+def finalize_formalization(
+    strategy_id: str,
+    author: str,
+    task_id: str,
+    changed_paths: list[str] | None = None,
+    notes: str = "",
+    supersedes: str = "",
+) -> dict:
+    """Commit current worktree bytes and submit one immutable formal candidate.
+
+    This is deliberately not a build assertion.  The solve controller applies
+    the exact resulting commit to main and performs the sole authoritative full
+    build and declaration review there.
+    """
+    author = _author(author)
+    with _finalization_lock(author):
+        state = solve_state.load_state(FORUM_DIR)
+        task = state.get("formal_tasks", {}).get(task_id)
+        if state.get("phase") != "formalizing" or not task:
+            raise ValueError("formalization task is unavailable")
+        if task.get("status") != "pending":
+            raise ValueError(f"formalization task is {task.get('status')}, not finalizable")
+        strategy = state.get("strategies", {}).get(strategy_id)
+        if (
+            not strategy
+            or strategy.get("phase") != "formalizing"
+            or strategy.get("target") != task_id
+            or author not in {strategy.get("owner"), *strategy.get("assistants", [])}
+        ):
+            raise ValueError("author must own or assist a strategy for this formal task")
+
+        tree = worktree.agent_worktree(_root(), author).resolve()
+        if not tree.is_dir():
+            raise ValueError(f"no active worktree for agent '{author}'")
+
+        selected: list[str] = []
+        for raw in changed_paths or []:
+            relative = Path(str(raw))
+            if relative.is_absolute():
+                try:
+                    relative = relative.resolve().relative_to(tree)
+                except ValueError as exc:
+                    raise ValueError("changed paths must be inside the agent worktree") from exc
+            resolved = (tree / relative).resolve()
+            try:
+                normalized = resolved.relative_to(tree).as_posix()
+            except ValueError as exc:
+                raise ValueError("changed paths must be inside the agent worktree") from exc
+            if not normalized or normalized.split("/", 1)[0] in {
+                ".git", ".unity", ".lake", ".worktrees",
+            }:
+                raise ValueError(f"runtime/build path cannot be finalized: {normalized}")
+            selected.append(normalized)
+
+        if selected:
+            _git(tree, "add", "--", *selected)
+        else:
+            _git(tree, "add", "--all")
+
+        staged = [
+            item for item in _git(
+                tree, "diff", "--cached", "--name-only", "-z"
+            ).stdout.split("\0") if item
+        ]
+        blocked = [
+            path for path in staged
+            if path.split("/", 1)[0] in {".git", ".unity", ".lake", ".worktrees"}
+        ]
+        if blocked:
+            _git(tree, "reset", check=False)
+            raise ValueError("candidate includes runtime/build paths: " + ", ".join(blocked))
+
+        committed = False
+        if staged:
+            expected_file = str(task.get("lean_file") or "").strip().lstrip("./")
+            if expected_file and expected_file not in staged:
+                _git(tree, "reset", check=False)
+                raise ValueError(
+                    f"candidate does not change the target file '{expected_file}'"
+                )
+            staged_diff = _git(tree, "diff", "--cached", "--no-ext-diff").stdout
+            forbidden = sorted({
+                match.group(1)
+                for line in staged_diff.splitlines()
+                if line.startswith("+") and not line.startswith("+++")
+                for match in re.finditer(
+                    r"\b(sorry|admit|axiom|native_decide)\b",
+                    line[1:].split("--", 1)[0],
+                )
+            })
+            if forbidden:
+                _git(tree, "reset", check=False)
+                raise ValueError(
+                    "candidate adds forbidden construct(s): " + ", ".join(forbidden)
+                )
+            commit = _git(
+                tree,
+                "-c", f"user.name=Unity ({author})",
+                "-c", "user.email=unity@localhost",
+                "commit", "-m", f"UNITY: solve candidate for {task_id}",
+                check=False,
+            )
+            if commit.returncode:
+                raise ValueError(commit.stderr.strip() or "could not commit formalization")
+            committed = True
+
+        head = _git(tree, "rev-parse", "HEAD").stdout.strip()
+        result = _submit_formal_commit(
+            strategy_id, author, task_id, head,
+            notes=notes, supersedes=supersedes,
+        )
+        return {
+            **result,
+            "committed": committed,
+            "changed_paths": staged,
+            "commit_sha": head,
+        }
 
 
 def sync_from_main(author: str, reason: str = "") -> dict:
@@ -769,7 +924,8 @@ PROFILE_TOOLS: dict[str, tuple[Callable, ...]] = {
                                   review_solution_candidate),
     "chunking": COMMON,
     "formalizing": COMMON + COORDINATION + (
-        emit_formalization_candidate, sync_from_main, propose_source_fix, reopen_solving,
+        finalize_formalization, emit_formalization_candidate,
+        sync_from_main, propose_source_fix, reopen_solving,
     ),
     "critic": COMMON + (propose_source_fix, reopen_solving, submit_formalization_verdict),
     "retrospective": COMMON,

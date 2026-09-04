@@ -211,6 +211,7 @@ async def dispatch(
     icrl_enabled: bool = True,
     brief_provider=None,
     log_context: dict | None = None,
+    mcp_profile: str = "prove",
 ):
     """Spawn `agents` concurrently with per-agent prompts; await all, log failures.
 
@@ -258,6 +259,7 @@ async def dispatch(
         kwargs = {"subagents": subagents}
         if log_context is not None:
             kwargs["log_context"] = log_context
+        kwargs["mcp_profile"] = mcp_profile
         return await spawn(
             a,
             _preamble(a, roster, ranking, icrl_enabled=icrl_enabled) + _brief(a) + full,

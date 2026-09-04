@@ -399,6 +399,27 @@ _CODEX_MCP_NOTE = (
     "configured. Read every forum/tool instruction in this prompt as 'run it via unity mcp'. "
     "The forum contract is not optional on this backend — use it through this command.\n")
 
+_SOLVE_CODEX_MCP_NOTE = (
+    "\n\nIMPORTANT — solve MCP tools on this backend: your model does NOT receive MCP tools "
+    "natively. Every solve Forum, Lean, Axle, and Aristotle tool in this prompt is called "
+    "through the shell:\n"
+    "    unity mcp <server> <tool> '<json-args>'\n"
+    "Examples:\n"
+    "    unity mcp unity-forum solve_brief '{\"author\": \"<your agent name>\"}'\n"
+    "    unity mcp unity-forum register_strategy '{\"target\": \"formal-task-id\", \"author\": \"<you>\", \"description\": \"...\", \"strategy_family\": \"core_method\"}'\n"
+    "    unity mcp unity-forum claim_strategy '{\"strategy_id\": \"strategy-...\", \"author\": \"<you>\"}'\n"
+    "    unity mcp unity-forum finalize_formalization '{\"strategy_id\": \"strategy-...\", \"task_id\": \"formal-task-id\", \"author\": \"<you>\"}'\n"
+    "    unity mcp lean-lsp lean_goal '{\"file_path\": \"...\", \"line\": 12}'\n"
+    "Servers: unity-forum (solve tools), lean-lsp, axle and aristotle when configured. Read "
+    "every tool instruction in this prompt as 'run it via unity mcp'. The solve Forum contract "
+    "is not optional on this backend. Use `target`, never prove's `decl` argument, when "
+    "registering a solve strategy.\n"
+)
+
+
+def _codex_mcp_note(profile: str) -> str:
+    return _SOLVE_CODEX_MCP_NOTE if profile == "solve" else _CODEX_MCP_NOTE
+
 
 _CODEX_INTERRUPT_REQUEST_TIMEOUT = 10.0
 _CODEX_INTERRUPT_DRAIN_TIMEOUT = 20.0
@@ -451,10 +472,11 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         idle_timeout: float = 600.0, subagents=(),
                         interrupt_event: asyncio.Event | None = None,
                         env_overrides: dict[str, str] | None = None,
-                        own_process_group: bool = False) -> str | None:
+                        own_process_group: bool = False,
+                        mcp_profile: str = "prove") -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
-    system_prompt = system_prompt + _CODEX_MCP_NOTE
+    system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
     # from a worktree cwd, the agent still needs write access to the main project (.unity/)
@@ -596,7 +618,8 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                               mcp_servers: dict, *, permission: str = "bypassPermissions",
                               idle_timeout: float = 600.0, subagents=(),
                               env_overrides: dict[str, str] | None = None,
-                              own_process_group: bool = False) -> str | None:
+                              own_process_group: bool = False,
+                              mcp_profile: str = "prove") -> str | None:
     """Google Antigravity backend: drives the user's installed `agy` CLI in print mode
     (subscription auth; serves both the Gemini pool and the Claude/GPT pool). MCP tools
     reach the model through the `unity mcp` shell bridge, like codex."""
@@ -608,7 +631,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                            "(https://antigravity.google)")
     from .config import find_unity_dir
     unity_dir = find_unity_dir(Path(cwd))
-    full = system_prompt + _CODEX_MCP_NOTE + "\n\n---\n\nTASK:\n" + prompt
+    full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
     if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
@@ -729,7 +752,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 interrupt_event: asyncio.Event | None = None,
                 log_context: dict | None = None,
                 env_overrides: dict[str, str] | None = None,
-                own_process_group: bool = False) -> str | None:
+                own_process_group: bool = False,
+                mcp_profile: str = "prove") -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
@@ -744,6 +768,9 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
         }
         if agent.backend == "codex":
             kwargs["interrupt_event"] = interrupt_event
+            kwargs["mcp_profile"] = mcp_profile
+        elif agent.backend == "antigravity":
+            kwargs["mcp_profile"] = mcp_profile
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
     finally:
         _write_run_log(agent, cwd, time.monotonic() - t0, log_context)

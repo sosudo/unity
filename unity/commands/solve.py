@@ -98,6 +98,7 @@ async def _review_current_solution(roster, paths) -> bool:
             tools_prompt="SOLVE_REVIEW_TOOLS",
             icrl_enabled=False,
             brief_provider=_brief_provider(paths, "solution_review"),
+            mcp_profile="solve",
             log_context={"command": "solve", "run_id": state.get("run_id"),
                          "phase": "solution_review", "role": "reviewer"},
         )
@@ -170,6 +171,7 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
                 tools_prompt="SOLVE_CHUNKING_TOOLS",
                 icrl_enabled=False,
                 brief_provider=_brief_provider(paths, "chunking"),
+                mcp_profile="solve",
                 log_context={
                     "command": "solve",
                     "run_id": state.get("run_id"),
@@ -249,6 +251,7 @@ async def _run_critic(roster, paths) -> None:
         tools_prompt="SOLVE_CRITIC_TOOLS",
         icrl_enabled=False,
         brief_provider=_brief_provider(paths, "critic"),
+        mcp_profile="solve",
         log_context={"command": "solve", "run_id": state.get("run_id"),
                      "phase": "critic", "role": "critic"},
     )
@@ -359,6 +362,7 @@ async def solve(continue_):
             tools_prompt="SOLVE_RETROSPECTIVE_TOOLS",
             icrl_enabled=False,
             brief_provider=_brief_provider(paths, "retrospective"),
+            mcp_profile="solve",
             log_context={"command": "solve", "run_id": solve_state.load_state(paths.forum).get("run_id"),
                          "phase": "retrospective", "role": "retrospective"},
         )

@@ -9,21 +9,22 @@ findings so the team does not repeat work.
 
 For your assigned task:
 
-- refresh `solve_brief`, then register and claim a genuinely distinct implementation strategy targeting
-  the task ID;
+- refresh `solve_brief`; claim a suitable existing unclaimed strategy when one exists, and register a new
+  strategy only when your approach is materially different. You may investigate or edit before registering,
+  but claim a strategy before requesting candidate finalization;
 - work only in your assigned Git worktree;
 - preserve the accepted paper's mathematical meaning and the chunk's expected `lean_decl`;
 - read the task's `source_components` and implement precisely the corresponding accepted argument or
   paper section; do not silently omit an incorporated component;
 - do not use `sorry`, `admit`, new axioms, `native_decide`, or equivalent proof bypasses;
-- use Lean LSP or a targeted file/module check while iterating;
-- after the final edit, run one full `lake build`, commit the complete change, and immediately call
-  `emit_formalization_candidate` with the exact commit; and
+- use Lean LSP or bounded targeted diagnostics while iterating;
+- after the final edit, immediately call `finalize_formalization`; Unity commits the exact change and runs
+  the sole authoritative full `lake build` in main; and
 - after a merge, synchronize from main before beginning new work.
 
-A successful build with warnings is successful. Do not investigate or repair style, header, documentation,
-or unrelated linter warnings unless they indicate a correctness problem in your candidate. Once the final
-build exits successfully, submit immediately. Do not rerun an unchanged successful build.
+Do not run a project-wide `lake build` in your worktree; it duplicates Unity's authoritative main build and
+delays candidate discovery. Do not investigate or repair style, header, documentation, or unrelated linter
+warnings unless they indicate a correctness problem in your candidate.
 
 Candidate submission is an interrupt for that task. Unity applies the exact commit to main, builds it,
 and mechanically checks the expected declaration before accepting it. A local build claim is not
@@ -34,7 +35,8 @@ write corrected paper bytes and call `propose_source_fix`; the corrected artifac
 review. If the accepted argument is substantively false, incomplete, or proves the wrong statement, call
 `reopen_solving` with exact evidence. Never silently formalize a different theorem.
 
-Keep builds and solvers in the foreground with explicit timeouts; never use `nohup` or `&`. Redirect
-large output to a file and inspect only a bounded tail. Do not install into the host Python interpreter;
-put any genuinely necessary temporary Python dependency in a disposable virtual environment under
-`$TMPDIR`.
+Keep targeted diagnostics and solvers in the foreground with explicit timeouts; never use `nohup` or `&`.
+Do not repeat an unchanged search command. After the same search fails twice, publish the negative finding
+or change methods. Redirect large output to a file and inspect only a bounded tail. Do not install into the
+host Python interpreter; put any genuinely necessary temporary Python dependency in a disposable virtual
+environment under `$TMPDIR`.
