@@ -13,7 +13,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -100,20 +102,45 @@ def _draft_path(paths, agent_name: str) -> Path:
     return path
 
 
-def _agent_runtime_env(paths, state: dict, agent_name: str) -> dict[str, str]:
+def _agent_runtime_env(
+    paths, state: dict, agent_name: str, *, task_id: str = "",
+) -> dict[str, str]:
     """Give solve workers isolated, disposable temp space without affecting prove."""
     run_id = re.sub(r"[^a-zA-Z0-9_-]", "_", str(state.get("run_id") or "unknown-run"))
     safe_agent = re.sub(r"[^a-zA-Z0-9_-]", "_", agent_name)
     scratch = paths.unity / "tmp" / run_id / safe_agent
     scratch.mkdir(parents=True, exist_ok=True)
     value = str(scratch.resolve())
-    return {
+    result = {
         "TMPDIR": value,
         "TMP": value,
         "TEMP": value,
         "PIP_REQUIRE_VIRTUALENV": "true",
         "PIP_DISABLE_PIP_VERSION_CHECK": "true",
     }
+    if state.get("phase") == "formalizing":
+        real_lake = shutil.which("lake")
+        if real_lake:
+            bin_dir = paths.unity / "bin" / "solve"
+            bin_dir.mkdir(parents=True, exist_ok=True)
+            wrapper = bin_dir / "lake"
+            wrapper_source = (
+                f"#!{sys.executable}\n"
+                "from unity.solve_lake_guard import main\n"
+                "raise SystemExit(main())\n"
+            )
+            if not wrapper.exists() or wrapper.read_text() != wrapper_source:
+                temporary = wrapper.with_name(f".{wrapper.name}.{os.getpid()}.tmp")
+                temporary.write_text(wrapper_source)
+                temporary.chmod(0o700)
+                os.replace(temporary, wrapper)
+            result.update({
+                "PATH": str(bin_dir.resolve()) + os.pathsep + os.environ.get("PATH", ""),
+                "UNITY_REAL_LAKE": str(Path(real_lake).resolve()),
+                "UNITY_SOLVE_PROJECT_ROOT": str(paths.project_root.resolve()),
+                "UNITY_SOLVE_TASK_ID": task_id,
+            })
+    return result
 
 
 def _formal_task_assignments(
@@ -850,7 +877,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     "command": "solve", "run_id": current.get("run_id"), "phase": "formalizing",
                     "task_id": task_id, "role": "formalizer",
                 },
-                env_overrides=_agent_runtime_env(paths, current, name),
+                env_overrides=_agent_runtime_env(paths, current, name, task_id=task_id),
                 own_process_group=True,
                 mcp_profile="solve",
             ),

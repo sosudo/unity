@@ -24,3 +24,7 @@ ready tasks, current strategies, findings, and candidate events.
   bounded detail.
 
 For backends without native MCP, run `unity mcp unity-forum <tool> '<json-args>'`.
+
+The shared `.lake/packages` cache is controller-owned. Worker commands `lake clean`, `lake update`,
+`lake upgrade`, `lake exe cache`, and bare `lake build` are rejected. Use Lean LSP, `lake env lean <file>`, or a
+targeted `lake build <target>`; permitted diagnostics are registered and serialized automatically.

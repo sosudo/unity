@@ -26,6 +26,11 @@ Do not run a project-wide `lake build` in your worktree; it duplicates Unity's a
 delays candidate discovery. Do not investigate or repair style, header, documentation, or unrelated linter
 warnings unless they indicate a correctness problem in your candidate.
 
+`.lake/packages` is a controller-owned dependency cache shared by every solve worktree. Never run any of
+`lake clean`, `lake update`, `lake upgrade`, or `lake exe cache`; those commands would invalidate every
+agent's Lean environment. Use Lean LSP, `lake env lean <file>`, or a targeted `lake build <target>` for local
+diagnostics. Unity serializes these diagnostics and cancels them when their owning work is interrupted.
+
 Candidate submission is an interrupt for that task. Unity applies the exact commit to main, builds it,
 and mechanically checks the expected declaration before accepting it. A local build claim is not
 authoritative.

@@ -6,7 +6,7 @@ import os
 import asyncclick as click
 
 from ..Architect import architect
-from .. import solve_state, worktree
+from .. import lake, solve_jobs, solve_state, worktree
 from ..config import load_paths
 from ..orchestrator import (
     build_solve_mcp,
@@ -57,6 +57,19 @@ def _attempt_limit() -> int | float:
 
 def _brief_provider(paths, profile: str):
     return lambda author: forum_brief(paths, profile, author)
+
+
+def _prepare_solve_environment(root, *, run_architect: bool) -> None:
+    """Refresh deterministic Lean state before any solve worker is launched."""
+    # Reap registered work left by an interrupted solve before touching the
+    # controller-owned shared package cache.
+    solve_jobs.terminate(root)
+    if run_architect:
+        architect(root)
+    click.echo("Refreshing Mathlib build cache...")
+    lake.cache_get(root)
+    click.echo("Validating Lean project...")
+    lake.build(root)
 
 
 async def _review_current_solution(roster, paths) -> bool:
@@ -274,9 +287,10 @@ async def solve(continue_):
     root = paths.project_root
     max_attempts = _attempt_limit()
 
-    if resume is None and not continue_:
+    fresh = resume is None and not continue_
+    if fresh:
         mark_phase("solve", "architect")
-        architect(root)
+    _prepare_solve_environment(root, run_architect=fresh)
 
     problem = paths.unity_md.read_bytes() if paths.unity_md.exists() else b""
     problem_sha = hashlib.sha256(problem).hexdigest()
