@@ -352,17 +352,24 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
     )
 
 
-async def _run_critic(roster, paths) -> None:
-    """Run the final fidelity/correctness gate in a fresh primary-agent turn."""
+async def _run_critic(roster, paths, *, attempt: int = 1) -> None:
+    """Run one critic attempt; the solve loop owns the retry budget."""
     state = solve_state.load_state(paths.forum)
     if state["phase"] != "critic":
         solve_state.begin_critic(paths.forum)
     before = len(solve_state.load_state(paths.forum).get("critic_verdicts", []))
+    retry_context = (
+        f"This is critic attempt {attempt}. The gate is still open. Reading files or ending a turn "
+        "without submitting a verdict does not complete the review. Refresh the current brief, "
+        "check any remaining concerns, and submit the structured verdict before finishing. "
+        if attempt > 1 else ""
+    )
     await dispatch(
         [roster.primary],
         roster,
         load_prompt("solve/CRITIC"),
-        "Audit the complete Lean project against the exact accepted PROOF.tex. Use the exact recorded "
+        retry_context
+        + "Audit the complete Lean project against the exact accepted PROOF.tex. Use the exact recorded "
         "machine verification for build and kernel status, then independently check theorem statements, "
         "dependencies, prohibited shortcuts, and mathematical fidelity. Submit one "
         "structured verdict with submit_formalization_verdict. Reopen only the exact Lean tasks that "
@@ -374,11 +381,16 @@ async def _run_critic(roster, paths) -> None:
         brief_provider=_brief_provider(paths, "critic"),
         mcp_profile="solve",
         log_context={"command": "solve", "run_id": state.get("run_id"),
-                     "phase": "critic", "role": "critic"},
+                     "phase": "critic", "role": "critic", "attempt": attempt},
     )
     after_state = solve_state.load_state(paths.forum)
     if len(after_state.get("critic_verdicts", [])) == before and after_state["phase"] == "critic":
-        raise click.ClickException("critic ended without submitting a structured verdict")
+        # Leave the gate open. Returning lets the existing outer loop count this
+        # attempt, honor stop requests, and retry only while its budget remains.
+        click.echo(
+            f"critic attempt {attempt} ended without submitting a structured verdict; "
+            "review remains incomplete"
+        )
 
 
 @click.command(name="solve")
@@ -461,7 +473,7 @@ async def solve(continue_):
             continue
 
         if phase == "critic":
-            await _run_critic(roster, paths)
+            await _run_critic(roster, paths, attempt=attempts["critic"] + 1)
             attempts["critic"] += 1
             continue
 
