@@ -7,6 +7,7 @@ concurrently under asyncio.gather. Callers use spawn(); the per-backend helpers
 """
 
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -507,8 +508,18 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     while True:
         attempt += 1
         agent_env = _agent_env(agent, home, env_overrides)
-        cfg = (CodexConfig(cwd=str(cwd), env=agent_env, codex_bin=codex_bin)
-               if codex_bin else CodexConfig(cwd=str(cwd), env=agent_env))
+        config_kwargs = {}
+        if mcp_profile == "solve" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
+            # Login startup and cached shell state can move elan ahead of solve's
+            # Lake shim even when the app-server process receives the right PATH.
+            config_kwargs["config_overrides"] = (
+                "allow_login_shell=false",
+                "features.shell_snapshot=false",
+                "shell_environment_policy.set.PATH=" + json.dumps(agent_env["PATH"]),
+            )
+        cfg = CodexConfig(
+            cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,
+        )
         codex = AsyncCodex(config=cfg)
         final = None
         interrupt_task = None

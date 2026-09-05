@@ -557,6 +557,12 @@ def review_informal_result(
         result = state["informal_results"].get(result_id)
         if not result or result.get("status") not in {"submitted", "supported"}:
             raise ValueError("informal result is not reviewable")
+        task = state["informal_tasks"][result["task_id"]]
+        if (
+            task.get("solution_revision") != state["solution"]["revision"]
+            or task.get("status") in {"superseded", "cancelled"}
+        ):
+            raise ValueError("informal result targets a stale or closed task")
         if result.get("author") == author:
             raise ValueError("authors cannot review their own informal result")
         if any(item.get("author") == author for item in result.get("reviews", [])):
@@ -569,7 +575,6 @@ def review_informal_result(
             "timestamp": time.time(),
         }
         result["reviews"].append(item)
-        task = state["informal_tasks"][result["task_id"]]
         if verdict == "support":
             result["status"] = "supported"
             task["status"] = "resolved"
@@ -996,6 +1001,20 @@ def accept_solution_candidate(forum_dir: Path, candidate_id: str, author: str) -
                 if repair and repair.get("status") not in {"superseded", "cancelled"}:
                     repair["status"] = "resolved"
                     repair["updated_at"] = time.time()
+        for task in state["informal_tasks"].values():
+            if (
+                task.get("solution_revision") == state["solution"]["revision"]
+                and task.get("status") in {"open", "result_available", "blocked"}
+            ):
+                task.update(
+                    status="superseded",
+                    superseded_by=candidate_id,
+                    cancellation_reason="accepted complete informal solution",
+                    updated_at=time.time(),
+                )
+                _event(state, "informal_task_superseded",
+                       task_id=task["task_id"], superseded_by=candidate_id,
+                       reason=task["cancellation_reason"])
         for strategy in state["strategies"].values():
             if strategy.get("phase") == "solving" and strategy.get("status") in _ACTIVE_STRATEGIES:
                 strategy["status"] = "succeeded" if strategy.get("strategy_id") == candidate.get("strategy_id") else "cancelled"

@@ -1,12 +1,15 @@
 """``unity solve``: solve a problem in English, then formalize that solution."""
 
 import hashlib
+import json
 import os
+from pathlib import Path
+import tempfile
 
 import asyncclick as click
 
 from ..Architect import architect
-from .. import lake, solve_jobs, solve_state, worktree
+from .. import lake, library, solve_jobs, solve_state, worktree
 from ..config import load_paths
 from ..orchestrator import (
     build_solve_mcp,
@@ -33,6 +36,111 @@ from ..solve_runtime import (
 
 def _retrospective_enabled() -> bool:
     return os.getenv("RETROSPECTIVE", "true").strip().lower() != "false"
+
+
+def _validate_retrospective_result(report_path: Path, run_id: str, library_root: Path) -> dict:
+    """Check the saved outcome, not a model's claim that it wrote useful lessons."""
+    report = json.loads(report_path.read_text())
+    if not isinstance(report, dict) or report.get("run_id") != run_id:
+        raise ValueError("retrospective report has a missing or stale run_id")
+    status = report.get("status")
+    if status == "no_changes":
+        reason = report.get("reason")
+        if not isinstance(reason, str) or not reason.strip():
+            raise ValueError("no_changes requires a concrete reason")
+        return {"run_id": run_id, "status": status, "reason": reason.strip()}
+    if status != "written" or not isinstance(report.get("entries"), list) or not report["entries"]:
+        raise ValueError("retrospective must report written entries or no_changes with a reason")
+
+    root = library_root.resolve(strict=True)
+    entries = []
+    for entry in report["entries"]:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise ValueError("each retrospective entry requires a library Markdown path")
+        path = Path(entry["path"]).expanduser()
+        path = (path if path.is_absolute() else root / path).resolve(strict=True)
+        if not path.is_relative_to(root) or path.suffix.lower() != ".md" or not path.is_file():
+            raise ValueError("retrospective entries must be Markdown files inside the library")
+        content = path.read_bytes()
+        if not content.decode("utf-8").strip():
+            raise ValueError("retrospective library entries must not be empty")
+        evidence = entry.get("evidence")
+        if (not isinstance(evidence, list) or not evidence
+                or any(not isinstance(item, str) or not item.strip() for item in evidence)):
+            raise ValueError("each retrospective entry requires nonempty evidence references")
+        entries.append({
+            "path": str(path),
+            "evidence": [item.strip() for item in evidence],
+            "sha256": hashlib.sha256(content).hexdigest(),
+        })
+    return {"run_id": run_id, "status": status, "entries": entries}
+
+
+def _save_retrospective_result(path: Path, result: dict) -> None:
+    """Replace the run report atomically, including when an agent left a symlink."""
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile("w", dir=path.parent, delete=False, encoding="utf-8") as file:
+            temporary = Path(file.name)
+            json.dump(result, file, indent=2)
+            file.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+async def _run_retrospective(roster, paths) -> dict:
+    """Run one retrospective and report its outcome independently of proof acceptance."""
+    run_id = solve_state.load_state(paths.forum)["run_id"]
+    report_path = paths.unity / "retrospective.json"
+    result = {"run_id": run_id, "status": "incomplete", "reason": "no new retrospective result saved"}
+    try:
+        # Reset even on --continue: an earlier result from this run is not evidence
+        # that the newly dispatched retrospective produced anything.
+        _save_retrospective_result(report_path, result)
+        library_root = library.ensure_library().resolve()
+        configure_forum(paths, "retrospective")
+        schemas = (
+            {"run_id": run_id, "status": "written", "entries": [
+                {"path": "tactics/example.md", "evidence": ["artifact-id or checked source reference"]}
+            ]},
+            {"run_id": run_id, "status": "no_changes", "reason": "why no reusable lesson is justified"},
+        )
+        results = await dispatch(
+            [roster.primary], roster, load_prompt("solve/RETROSPECTIVE"),
+            f"Distill reusable lessons from this completed solve run. Run ID: {run_id}. "
+            f"Write library Markdown under {library_root}, using the existing tactics, lemmas, "
+            "references, subagents, or skills directories. Preserve existing useful content. "
+            f"Then write {report_path.resolve()} with exactly one of these JSON shapes:\n"
+            + "\n".join(json.dumps(schema) for schema in schemas)
+            + "\nEntry paths may be absolute or relative to the library root. Evidence must cite "
+            "the actual checked run artifacts or source locations supporting each lesson. "
+            "Do not compute file hashes; Unity records them after reading the saved files. "
+            "Do not inspect Unity installation internals. Save the report and end the turn.",
+            paths.project_root, build_solve_mcp(paths, "retrospective"),
+            tools_prompt="SOLVE_RETROSPECTIVE_TOOLS", icrl_enabled=False,
+            brief_provider=_brief_provider(paths, "retrospective"), mcp_profile="solve",
+            log_context={"command": "solve", "run_id": run_id,
+                         "phase": "retrospective", "role": "retrospective"},
+        )
+        failures = [type(item).__name__ for item in results if isinstance(item, BaseException)]
+        if failures:
+            raise ValueError("retrospective agent failed: " + ", ".join(failures))
+        result = _validate_retrospective_result(report_path, run_id, library_root)
+    except Exception as exc:
+        result = {"run_id": run_id, "status": "incomplete",
+                  "reason": f"{type(exc).__name__}: {exc}"}
+    try:
+        _save_retrospective_result(report_path, result)
+    except OSError as exc:
+        result = {"run_id": run_id, "status": "incomplete",
+                  "reason": f"could not save retrospective outcome: {exc}"}
+    if result["status"] == "incomplete":
+        click.echo("Warning: proof accepted, but retrospective is incomplete: " + result["reason"])
+    else:
+        click.echo(f"retrospective {result['status']}: {report_path}")
+    return result
 
 
 def _review_quorum() -> int:
@@ -364,22 +472,7 @@ async def solve(continue_):
         return
 
     if _retrospective_enabled():
-        configure_forum(paths, "retrospective")
-        await dispatch(
-            [roster.primary],
-            roster,
-            load_prompt("solve/RETROSPECTIVE"),
-            "Distill lessons from the complete informal-solving and Lean-formalization run into "
-            "the reusable Unity library.",
-            root,
-            build_solve_mcp(paths, "retrospective"),
-            tools_prompt="SOLVE_RETROSPECTIVE_TOOLS",
-            icrl_enabled=False,
-            brief_provider=_brief_provider(paths, "retrospective"),
-            mcp_profile="solve",
-            log_context={"command": "solve", "run_id": solve_state.load_state(paths.forum).get("run_id"),
-                         "phase": "retrospective", "role": "retrospective"},
-        )
+        await _run_retrospective(roster, paths)
     mark_done(paths, "solve")
     click.echo("solve complete: informal solution and Lean formalization accepted")
 

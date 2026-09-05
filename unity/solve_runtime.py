@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -664,15 +665,10 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str) -> dict:
     expected = task.get("lean_decl", "")
     target = _kernel_target(kernel, expected) if kernel else None
     if kernel is None:
-        matches = []
-        for file, rows, _ in blueprint.scan_blueprint(project_root):
-            for row in rows:
-                if row["name"] == expected.rsplit(".", 1)[-1]:
-                    matches.append((file, row))
-        if len(matches) != 1:
-            issues.append(f"expected declaration {expected} was not found uniquely")
-        elif matches[0][1].get("status") in {"sorry", "axiom"}:
-            issues.append(f"expected declaration {expected} remains unresolved")
+        # A successful build alone does not establish that this exact target was
+        # checked. Textual discovery is useful elsewhere, but cannot accept a
+        # solve candidate when its kernel verification is unavailable.
+        issues.append("kernel verification unavailable: could not inspect the built declarations")
     elif target is None:
         issues.append(f"expected declaration {expected} was not found in the built kernel")
     else:
@@ -688,7 +684,7 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str) -> dict:
         "status": "passed" if not issues else "failed",
         "expected_decl": expected,
         "source_components": list(task.get("source_components", [])),
-        "mode": "kernel" if kernel is not None else "source_fallback",
+        "mode": "kernel" if kernel is not None else "unavailable",
         "forbidden_constructs": forbidden,
         "issues": issues,
     }
@@ -713,6 +709,7 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
         if applied.returncode:
             _git(root, "reset", "--hard", before)
             return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
+        build_started = time.monotonic()
         try:
             build = solve_jobs.run(
                 root,
@@ -723,10 +720,15 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
                 serialize_build=True,
             )
         except OSError as exc:
+            build_seconds = time.monotonic() - build_started
             _git(root, "reset", "--hard", before)
-            return {"ok": False, "error": f"could not run lake build: {exc}"}
+            return {
+                "ok": False, "error": f"could not run lake build: {exc}",
+                "build": {"returncode": None, "seconds": build_seconds},
+            }
+        build_seconds = time.monotonic() - build_started
         output = "\n".join(part.rstrip() for part in (build.stdout, build.stderr) if part)
-        build_record = {"returncode": build.returncode}
+        build_record = {"returncode": build.returncode, "seconds": build_seconds}
         if output:
             record = artifacts.store_text(
                 paths.artifacts, output, kind="solve_formal_build",
@@ -745,7 +747,9 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
             _git(root, "reset", "--hard", before)
             return {"ok": False, "error": "lake build changed tracked files", "build": build_record}
         staged = _git(root, "diff", "--cached", "--no-ext-diff", before).stdout
+        verification_started = time.monotonic()
         verification = _review_new_declaration(root, task, staged)
+        verification["seconds"] = time.monotonic() - verification_started
         record = artifacts.store_text(
             paths.artifacts, json.dumps(verification, indent=2, sort_keys=True) + "\n",
             kind="solve_formal_verification", producer="Unity",
