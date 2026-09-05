@@ -627,10 +627,7 @@ def _merge_lock(project_root: Path):
 def _kernel_target(kernel: dict, expected: str) -> tuple[str, dict] | None:
     if expected in kernel:
         return expected, kernel[expected]
-    tail = expected.rsplit(".", 1)[-1]
-    matches = [(name, row) for name, row in kernel.items()
-               if name == tail or name.endswith("." + tail)]
-    return matches[0] if len(matches) == 1 else None
+    return None
 
 
 def _unsafe_dependencies(kernel: dict, target: str) -> list[str]:

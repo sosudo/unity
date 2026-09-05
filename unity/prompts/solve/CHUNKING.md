@@ -22,6 +22,10 @@ equation labels, or inferred component IDs. Inspect the project's lakefile and e
 selecting `lean_file`. New declarations must go under the current project's Lean library, not under a
 dependency namespace such as `Mathlib/`, unless that path already belongs to the project.
 
+`lean_decl` is the exact fully qualified Lean declaration name the formalizer must define. `lean_file`
+is its source path. File/module names do not automatically create namespaces; do not infer the
+declaration namespace from the file path.
+
 Write this schema:
 
 ```json

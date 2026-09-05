@@ -13,7 +13,9 @@ For your assigned task:
   strategy only when your approach is materially different. You may investigate or edit before registering,
   but claim a strategy before requesting candidate finalization;
 - work only in your assigned Git worktree;
-- preserve the accepted paper's mathematical meaning and the chunk's expected `lean_decl`;
+- preserve the accepted paper's mathematical meaning and define the exact `lean_decl` recorded in the
+  task, including its namespace. A declaration with the same final name in a different namespace will
+  fail verification;
 - read the task's `source_components` and implement precisely the corresponding accepted argument or
   paper section; do not silently omit an incorporated component;
 - do not use `sorry`, `admit`, new axioms, `native_decide`, or equivalent proof bypasses;
