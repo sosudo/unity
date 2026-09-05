@@ -9,7 +9,7 @@ import tempfile
 import asyncclick as click
 
 from ..Architect import architect
-from .. import lake, library, solve_jobs, solve_state, worktree
+from .. import lake, library, solve_contract, solve_jobs, solve_state, worktree
 from ..config import load_paths
 from ..orchestrator import (
     build_solve_mcp,
@@ -31,6 +31,7 @@ from ..solve_runtime import (
     run_solving_runtime,
     validate_formalization_dag,
     write_formalization_plan,
+    _merge_lock,
 )
 
 
@@ -283,7 +284,9 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
                 f"Read the exact accepted paper at `{proof.relative_to(paths.project_root)}` and the "
                 f"mechanical coverage scaffold at `{plan.relative_to(paths.project_root)}`. Its SHA-256 is "
                 f"`{candidate['sha256']}`. Produce `.unity/dag.json` bound to that candidate and hash, with "
-                "one concrete Lean declaration per chunk, source-component coverage, and an acyclic graph. "
+                "explicit mathematical requirements, source-component coverage, and an acyclic graph. "
+                "Create an elaboratable Lean scaffold for each chunk's exact declaration and complete "
+                "meaning-bearing definitions. Only theorem proofs may remain as scaffold sorry holes. "
                 "Prefer one final-theorem chunk for a short single-result proof; introduce helpers only when "
                 "Lean implementation or useful parallelism actually requires them."
                 + prior_context,
@@ -308,13 +311,21 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
             try:
                 dag = validate_formalization_dag(paths, candidate["sha256"])
                 toposort(paths)
-                solve_state.initialize_formal_tasks(
-                    paths.forum,
-                    dag["chunks"],
-                    solution_candidate=candidate_id,
-                    solution_sha256=candidate["sha256"],
-                    main_sha=worktree.main_commit(paths.project_root),
-                )
+                with _merge_lock(paths.project_root):
+                    current = solve_state.load_state(paths.forum)
+                    if (current["phase"] != "chunking"
+                            or current["solution"].get("accepted_candidate") != candidate_id):
+                        return
+                    contract = solve_contract.freeze_formal_contract(paths, dag)
+                    solve_state.initialize_formal_tasks(
+                        paths.forum,
+                        dag["chunks"],
+                        solution_candidate=candidate_id,
+                        solution_sha256=candidate["sha256"],
+                        main_sha=worktree.main_commit(paths.project_root),
+                        requirements=dag["requirements"],
+                        contract=contract,
+                    )
             except (OSError, ValueError) as exc:
                 reason = str(exc)
                 if dispatch_failure is not None:
@@ -352,11 +363,70 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
     )
 
 
-async def _run_critic(roster, paths, *, attempt: int = 1) -> None:
-    """Run one critic attempt; the solve loop owns the retry budget."""
+def _prepare_critic_snapshot(paths) -> bool:
+    """Controller-only mechanical gate, cached for unchanged critic retries."""
+    with _merge_lock(paths.project_root):
+        state = solve_state.load_state(paths.forum)
+        if not state["formalization"].get("contract"):
+            raise click.ClickException(
+                "this solve run has no protected formal specification; request_rechunk before resuming review"
+            )
+        snapshot = state["formalization"].get("review_snapshot") or {}
+        if not snapshot.get("passed") or not solve_contract.snapshot_is_current(paths, state, snapshot):
+            try:
+                report = solve_contract.verify_final_project(paths, state)
+            except (OSError, ValueError) as exc:
+                raise click.ClickException(f"mechanical critic gate could not verify this revision: {exc}") from exc
+            if report["main_sha"] != state["formalization"]["main_sha"]:
+                raise click.ClickException(
+                    "main changed outside candidate integration; request_rechunk to establish a new reviewed specification"
+                )
+            solve_state.record_review_snapshot(paths.forum, report)
+            if not report["passed"]:
+                solve_state.reopen_after_machine_failure(paths.forum, report)
+                click.echo("mechanical critic gate reopened formalization: " + "; ".join(report["issues"]))
+                return False
+        if state["phase"] != "critic":
+            solve_state.begin_critic(paths.forum)
+    return True
+
+
+def _accept_current_critic(paths) -> bool:
+    """An LLM verdict is not authority to accept stale or edited sources."""
+    if stop_requested(paths.project_root):
+        return False
+    with _merge_lock(paths.project_root):
+        state = solve_state.load_state(paths.forum)
+        formal = state["formalization"]
+        if formal.get("status") != "approval_pending":
+            return False
+        snapshot = formal.get("review_snapshot") or {}
+        if not solve_contract.snapshot_is_current(paths, state, snapshot):
+            # Recompute and require a new semantic review even when the new bytes
+            # still pass machine checks. Never stamp old evidence with a new SHA.
+            report = solve_contract.verify_final_project(paths, state)
+            if report["main_sha"] != formal["main_sha"]:
+                raise click.ClickException(
+                    "main changed during critic review; request_rechunk before acceptance"
+                )
+            solve_state.record_review_snapshot(paths.forum, report)
+            if not report["passed"]:
+                solve_state.reopen_after_machine_failure(paths.forum, report)
+            click.echo("critic approval became stale; the changed revision needs a new review")
+            return False
+        solve_state.complete_critic_review(
+            paths.forum, snapshot["snapshot_id"], formal["pending_verdict_id"],
+        )
+        return True
+
+
+async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
+    """Run one attempt with the selected critic."""
+    if not _prepare_critic_snapshot(paths):
+        return
+    if _accept_current_critic(paths):
+        return
     state = solve_state.load_state(paths.forum)
-    if state["phase"] != "critic":
-        solve_state.begin_critic(paths.forum)
     before = len(solve_state.load_state(paths.forum).get("critic_verdicts", []))
     retry_context = (
         f"This is critic attempt {attempt}. The gate is still open. Reading files or ending a turn "
@@ -365,14 +435,15 @@ async def _run_critic(roster, paths, *, attempt: int = 1) -> None:
         if attempt > 1 else ""
     )
     await dispatch(
-        [roster.primary],
+        [critic],
         roster,
         load_prompt("solve/CRITIC"),
         retry_context
         + "Audit the complete Lean project against the exact accepted PROOF.tex. Use the exact recorded "
-        "machine verification for build and kernel status, then independently check theorem statements, "
-        "dependencies, prohibited shortcuts, and mathematical fidelity. Submit one "
-        "structured verdict with submit_formalization_verdict. Reopen only the exact Lean tasks that "
+        "machine snapshot for build, contract, and axiom status. Independently check requirement "
+        "completeness and the mathematical meaning of statements and definitions against the source. "
+        "Submit one structured verdict with submit_formalization_verdict and mandatory snapshot-bound "
+        "per-requirement review evidence. Reopen only the exact Lean tasks that "
         "need repair, or reopen informal solving if the accepted mathematics is substantively wrong.",
         paths.project_root,
         build_solve_mcp(paths, "critic"),
@@ -384,6 +455,8 @@ async def _run_critic(roster, paths, *, attempt: int = 1) -> None:
                      "phase": "critic", "role": "critic", "attempt": attempt},
     )
     after_state = solve_state.load_state(paths.forum)
+    if after_state["formalization"].get("status") == "approval_pending":
+        _accept_current_critic(paths)
     if len(after_state.get("critic_verdicts", [])) == before and after_state["phase"] == "critic":
         # Leave the gate open. Returning lets the existing outer loop count this
         # attempt, honor stop requests, and retry only while its budget remains.
@@ -391,6 +464,35 @@ async def _run_critic(roster, paths, *, attempt: int = 1) -> None:
             f"critic attempt {attempt} ended without submitting a structured verdict; "
             "review remains incomplete"
         )
+
+
+async def _run_critics(roster, paths, max_attempts: int | float) -> None:
+    """Rotate critics, each with its own attempt budget for the current gate."""
+    critics = [roster.primary] + [
+        agent for agent in roster.agents
+        if agent.name != roster.primary.name
+    ]
+
+    for critic in critics:
+        attempt = 0
+        while attempt < max_attempts:
+            if stop_requested(paths.project_root):
+                return
+
+            attempt += 1
+            await _run_critic(
+                roster, paths, critic=critic, attempt=attempt,
+            )
+
+            if stop_requested(paths.project_root):
+                return
+            if solve_state.load_state(paths.forum)["phase"] != "critic":
+                return
+
+    raise click.ClickException(
+        "every configured agent exhausted its critic attempts "
+        "without completing the review"
+    )
 
 
 @click.command(name="solve")
@@ -427,10 +529,10 @@ async def solve(continue_):
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    # MAX_ATTEMPTS limits retries of each substantive worker loop. Mechanical
-    # transitions (review and chunking) do not consume an attempt, so
-    # MAX_ATTEMPTS=1 still permits one complete happy-path solve run.
-    attempts = {"solving": 0, "formalizing": 0, "critic": 0}
+    # Count solving/formalizing outer loops here. Chunking and critic helpers
+    # enforce their own per-agent retry budgets, so MAX_ATTEMPTS=1 still permits
+    # one complete happy-path solve run.
+    attempts = {"solving": 0, "formalizing": 0}
     while not stop_requested(root):
         state = solve_state.load_state(paths.forum)
         phase = state.get("phase", "solving")
@@ -468,13 +570,12 @@ async def solve(continue_):
                 load_prompt("solve/FORMALIZING"),
             )
             if state.get("phase") == "formalizing" and solve_state.all_formal_tasks_complete(state):
-                solve_state.begin_critic(paths.forum)
+                _prepare_critic_snapshot(paths)
             attempts["formalizing"] += 1
             continue
 
         if phase == "critic":
-            await _run_critic(roster, paths, attempt=attempts["critic"] + 1)
-            attempts["critic"] += 1
+            await _run_critics(roster, paths, max_attempts)
             continue
 
         raise click.ClickException(f"unknown solve phase '{phase}'")

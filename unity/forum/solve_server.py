@@ -21,6 +21,7 @@ from typing import Callable
 from fastmcp import FastMCP
 
 from .. import artifacts, solve_state, worktree
+from ..solve_review import SemanticReview
 from . import server as discussion
 
 
@@ -126,6 +127,19 @@ def _finalization_lock(author: str):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+@contextmanager
+def _merge_lock():
+    """Serialize contract/source reopen with controller integration and final acceptance."""
+    path = _root() / ".unity" / "forum" / "merge.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def _submit_formal_commit(
     strategy_id: str,
     author: str,
@@ -201,7 +215,7 @@ def solve_metrics() -> dict:
     accepted = first_by_kind.get("solution_candidate_accepted", 0)
     completed = max((
         float(event.get("timestamp") or 0) for event in events
-        if event.get("kind") == "critic_verdict" and event.get("verdict") == "approved"
+        if event.get("kind") == "critic_review_completed"
     ), default=0)
     return {
         "run_id": state.get("run_id"),
@@ -232,6 +246,25 @@ def solve_brief(author: str) -> str:
         f"Solution gate: {solution.get('status')} (revision {solution.get('revision')})",
         f"Formalization gate: {formal.get('status')} (revision {formal.get('revision')})",
     ]
+    snapshot = formal.get("review_snapshot")
+    if snapshot:
+        lines.extend([
+            f"Review snapshot: {snapshot.get('snapshot_id')} (deterministic checks: "
+            f"{'passed' if snapshot.get('passed') else 'failed'})",
+            f"Reviewed main: {snapshot.get('main_sha')}; source SHA-256: {snapshot.get('source_sha256')}",
+        ])
+        if snapshot.get("artifact_id"):
+            lines.append(f"Machine review artifact: {snapshot['artifact_id']} (artifact_read)")
+    if formal.get("requirements"):
+        lines.extend(["", f"REQUIRED SEMANTIC CHECKS ({len(formal['requirements'])})",
+                      "Full immutable ledger and structured verdict evidence: solve_status() "
+                      "(formalization and critic_verdicts), also .unity/forum/solve-state.json."])
+        if (formal.get("contract") or {}).get("artifact_id"):
+            lines.append(f"Frozen specification artifact: {formal['contract']['artifact_id']} (artifact_read)")
+        for requirement in formal["requirements"]:
+            lines.append(f"- {requirement['id']} → tasks {', '.join(requirement['tasks'])}: "
+                         f"{requirement['statement'][:240]}")
+        lines.append("Approve only after checking every requirement against actual Lean statements and definitions.")
     safe_author = re.sub(r"[^a-zA-Z0-9_-]", "_", author)
     draft = _root() / ".unity" / "source" / "drafts" / safe_author / "PROOF.tex"
     if draft.is_file() and draft.stat().st_size:
@@ -309,6 +342,12 @@ def solve_brief(author: str) -> str:
             lines.append("- reopened tasks: " + ", ".join(verdict["reopen_tasks"]))
         if verdict.get("evidence"):
             lines.append(f"- evidence: {verdict['evidence'][:500]}")
+        if verdict.get("review"):
+            lines.append(f"- semantic review snapshot: {verdict['review']['snapshot_id']}")
+            for entry in verdict["review"]["requirements"]:
+                lines.append(f"- {entry['requirement_id']}: {entry['status']} "
+                             f"({', '.join(entry['declarations']) or 'no declaration checked'})")
+            lines.append("- Full structured evidence and rationale: solve_status().critic_verdicts")
 
     owned_strategy = next((
         item for item in state["strategies"].values()
@@ -875,10 +914,11 @@ def propose_source_fix(
         _artifacts_dir(), content, kind="solve_solution_candidate",
         producer=author, source=str(source), metadata={"reason": reason},
     )
-    result = solve_state.submit_solution_candidate(
-        FORUM_DIR, author, record["artifact_id"], record["sha256"], str(source),
-        notes=reason, supersedes=supersedes, replace_accepted=True,
-    )
+    with _merge_lock():
+        result = solve_state.submit_solution_candidate(
+            FORUM_DIR, author, record["artifact_id"], record["sha256"], str(source),
+            notes=reason, supersedes=supersedes, replace_accepted=True,
+        )
     _mirror(author, "SOURCE FIX PROPOSED", reason)
     return result
 
@@ -886,8 +926,22 @@ def propose_source_fix(
 def reopen_solving(author: str, reason: str) -> dict:
     """Return to informal solving because the accepted mathematics is substantively wrong."""
     author = _author(author)
-    result = solve_state.reopen_solution(FORUM_DIR, author, reason)
+    with _merge_lock():
+        result = solve_state.reopen_solution(FORUM_DIR, author, reason)
     _mirror(author, "SOLVING REOPENED", reason)
+    return result
+
+
+def request_rechunk(author: str, reason: str) -> dict:
+    """Rebuild a wrong encoding/signature contract while keeping the accepted paper.
+
+    Use this when a frozen declaration or encoding is wrong. Use reopen_solving
+    instead when the accepted mathematics is substantively wrong.
+    """
+    author = _author(author)
+    with _merge_lock():
+        result = solve_state.request_rechunk(FORUM_DIR, author, reason)
+    _mirror(author, "FORMALIZATION CONTRACT REOPENED", reason)
     return result
 
 
@@ -895,13 +949,20 @@ def submit_formalization_verdict(
     author: str,
     verdict: str,
     summary: str,
+    review: SemanticReview,
     reopen_tasks: list[str] | None = None,
     evidence: str = "",
 ) -> dict:
-    """Submit the critic verdict: approved, lean_reopen, or reopen_solving."""
+    """Submit snapshot-bound semantic evidence. Approval requires every requirement to pass.
+
+    Read solve_status() for the current snapshot_id and immutable requirements.
+    Free-text evidence is optional context, never a substitute for structured review.
+    Approval remains pending until the controller verifies that source bytes are unchanged.
+    """
     author = _author(author)
     result = solve_state.submit_critic_verdict(
         FORUM_DIR, author, verdict, summary,
+        review=SemanticReview.model_validate(review).model_dump(),
         reopen_tasks=reopen_tasks, evidence=evidence,
     )
     _mirror(author, f"FORMALIZATION VERDICT: {verdict}", summary)
@@ -925,9 +986,9 @@ PROFILE_TOOLS: dict[str, tuple[Callable, ...]] = {
     "chunking": COMMON,
     "formalizing": COMMON + COORDINATION + (
         finalize_formalization, emit_formalization_candidate,
-        sync_from_main, propose_source_fix, reopen_solving,
+        sync_from_main, propose_source_fix, reopen_solving, request_rechunk,
     ),
-    "critic": COMMON + (propose_source_fix, reopen_solving, submit_formalization_verdict),
+    "critic": COMMON + (propose_source_fix, reopen_solving, request_rechunk, submit_formalization_verdict),
     "retrospective": COMMON,
 }
 

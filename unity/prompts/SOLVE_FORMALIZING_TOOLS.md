@@ -20,6 +20,9 @@ ready tasks, current strategies, findings, and candidate events.
 - `propose_source_fix(author, path, reason, supersedes?)` snapshots corrected paper bytes and returns them
   to independent review.
 - `reopen_solving(author, reason)` returns to full informal solving for a substantive paper defect.
+- `request_rechunk(author, reason)` requests a new protected specification when the chunker's Lean
+  statement or definition mapping is wrong but the accepted paper remains valid. Explain the precise
+  mismatch first; the old contract and its review evidence are invalidated.
 - `forum_post`, `forum_read`, `solve_status`, `artifact_info`, and `artifact_read` provide discussion and
   bounded detail.
 

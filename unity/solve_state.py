@@ -9,6 +9,7 @@ remains in ``commands/solve.py`` and ``solve_runtime.py``.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -16,18 +17,21 @@ import tempfile
 import time
 import uuid
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
 from typing import Iterator
 
+from .solve_review import SemanticReview
 
-SCHEMA_VERSION = 3
+
+SCHEMA_VERSION = 4
 PHASES = {"solving", "solution_review", "chunking", "formalizing", "critic", "complete"}
 STRATEGY_PHASES = {"solving", "formalizing"}
 STRATEGY_STATUSES = {"registered", "claimed", "paused", "incorrect", "succeeded", "cancelled"}
 INFORMAL_TASK_STATUSES = {"open", "result_available", "resolved", "blocked", "superseded", "cancelled"}
 INFORMAL_RESULT_STATUSES = {"submitted", "supported", "objected", "incorporated", "superseded"}
 SOLUTION_STATUSES = {"open", "review", "accepted"}
-FORMAL_STATUSES = {"waiting", "active", "review", "accepted"}
+FORMAL_STATUSES = {"waiting", "active", "review", "approval_pending", "accepted"}
 _ACTIVE_STRATEGIES = {"registered", "claimed", "paused"}
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _ARTIFACT_SHA_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -58,6 +62,10 @@ def _default_state() -> dict:
             "solution_candidate": None,
             "solution_sha256": "",
             "main_sha": "",
+            "contract": None,
+            "requirements": [],
+            "review_snapshot": None,
+            "pending_verdict_id": None,
         },
         "informal_tasks": {},
         "informal_results": {},
@@ -71,6 +79,7 @@ def _default_state() -> dict:
         "formal_candidates": {},
         "chunking_attempts": [],
         "critic_verdicts": [],
+        "review_snapshots": {},
         "events": [],
     }
 
@@ -89,6 +98,7 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "informal_tasks", "informal_results", "review_issues",
         "strategies", "findings", "obstacles", "questions",
         "solution_candidates", "formal_tasks", "formal_candidates",
+        "review_snapshots",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
@@ -1046,6 +1056,7 @@ def chunking_attempt_count(state: dict, candidate_id: str, author: str) -> int:
     """Count attempts already allocated to an agent for one immutable paper."""
     return sum(
         item.get("candidate_id") == candidate_id
+        and not item.get("obsolete")
         and str(item.get("author", "")).casefold() == str(author).casefold()
         for item in state.get("chunking_attempts", [])
     )
@@ -1156,6 +1167,10 @@ def _reopen_solution_in_tx(state: dict, author: str, reason: str) -> None:
         "solution_candidate": None,
         "solution_sha256": "",
         "main_sha": state["formalization"].get("main_sha", ""),
+        "contract": None,
+        "requirements": [],
+        "review_snapshot": None,
+        "pending_verdict_id": None,
     }
     # A new informal-paper revision invalidates the entire old formalization,
     # including tasks that had compiled against the superseded paper.
@@ -1181,6 +1196,37 @@ def reopen_solution(forum_dir: Path, author: str, reason: str) -> dict:
     return load_state(forum_dir)
 
 
+def request_rechunk(forum_dir: Path, author: str, reason: str) -> dict:
+    """Invalidate an encoding contract without changing the accepted mathematics."""
+    author = _text(author, "author", 100)
+    reason = _text(reason, "reason")
+    with transaction(forum_dir) as state:
+        if state["phase"] not in {"formalizing", "critic"}:
+            raise ValueError("re-chunking can only be requested during formalizing or critic")
+        formal = state["formalization"]
+        if state["solution"].get("accepted_candidate") != formal.get("solution_candidate"):
+            raise ValueError("re-chunking requires the current accepted solution")
+        _invalidate_review(state)
+        formal.update({"revision": int(formal.get("revision", 0)) + 1,
+                       "status": "waiting", "contract": None, "requirements": [],
+                       "rechunk_reason": reason})
+        for task in state["formal_tasks"].values():
+            task["status"] = "superseded"
+        for candidate in state["formal_candidates"].values():
+            if candidate.get("status") in {"submitted", "merging"}:
+                candidate["status"] = "superseded"
+        for strategy in state["strategies"].values():
+            if strategy.get("phase") == "formalizing" and strategy.get("status") in _ACTIVE_STRATEGIES:
+                strategy["status"] = "cancelled"
+        for attempt in state["chunking_attempts"]:
+            if attempt.get("candidate_id") == formal.get("solution_candidate"):
+                attempt["obsolete"] = True
+        state["phase"] = "chunking"
+        _event(state, "contract_reopened", author=author, reason=reason,
+               formalization_revision=formal["revision"], solution_candidate=formal.get("solution_candidate"))
+    return load_state(forum_dir)
+
+
 def initialize_formal_tasks(
     forum_dir: Path,
     chunks: list[dict],
@@ -1188,18 +1234,29 @@ def initialize_formal_tasks(
     solution_candidate: str,
     solution_sha256: str,
     main_sha: str,
+    requirements: list[dict],
+    contract: dict,
 ) -> dict:
     with transaction(forum_dir) as state:
         if state["phase"] != "chunking":
             raise ValueError("formal tasks can only be initialized during chunking")
         if state["solution"].get("accepted_candidate") != solution_candidate:
             raise ValueError("formal task graph does not target the accepted solution candidate")
+        accepted = state["solution_candidates"].get(solution_candidate, {})
+        if accepted.get("sha256") != solution_sha256:
+            raise ValueError("formal task graph does not match the accepted solution SHA-256")
+        if not _FULL_SHA_RE.fullmatch(main_sha):
+            raise ValueError("formalization requires a full main commit")
         if not chunks:
             raise ValueError("formalization DAG contains no chunks")
         ids = [str(chunk.get("id") or "").strip() for chunk in chunks]
         if any(not item for item in ids) or len(set(ids)) != len(ids):
             raise ValueError("formalization chunks require unique nonempty ids")
         tasks = {}
+        declarations = set()
+        source_refs = {f"paper:{solution_candidate}"} | {
+            item["result_id"] for item in accepted.get("components", [])
+        }
         for chunk in chunks:
             task_id = str(chunk["id"])
             dependencies = [str(item) for item in chunk.get("dependencies", [])]
@@ -1209,6 +1266,12 @@ def initialize_formal_tasks(
             lean_decl = str(chunk.get("lean_decl") or "").strip()
             if not lean_decl:
                 raise ValueError(f"task {task_id} is missing lean_decl")
+            if lean_decl in declarations:
+                raise ValueError("formalization chunks require unique lean_decl values")
+            declarations.add(lean_decl)
+            sources = _reference_list(chunk.get("source_components"), "source_components")
+            if set(sources) - source_refs:
+                raise ValueError(f"task {task_id} has unknown source components")
             tasks[task_id] = {
                 "task_id": task_id,
                 "title": str(chunk.get("title") or task_id),
@@ -1216,12 +1279,26 @@ def initialize_formal_tasks(
                 "lean_decl": lean_decl,
                 "lean_file": str(chunk.get("lean_file") or ""),
                 "dependencies": dependencies,
-                "source_components": list(dict.fromkeys(
-                    str(item) for item in chunk.get("source_components", [])
-                )),
+                "source_components": sources,
                 "status": "pending",
                 "accepted_candidate": None,
             }
+        remaining = set(tasks)
+        while remaining:
+            ready = {task_id for task_id in remaining
+                     if not (set(tasks[task_id]["dependencies"]) & remaining)}
+            if not ready:
+                raise ValueError("formalization DAG contains a dependency cycle")
+            remaining -= ready
+        requirements = _validate_requirements(requirements, tasks, source_refs)
+        if not isinstance(contract, dict) or not _ARTIFACT_SHA_RE.fullmatch(str(contract.get("sha256") or "")):
+            raise ValueError("formalization requires a controller-built contract SHA-256")
+        if not isinstance(contract.get("targets"), dict) or set(contract["targets"]) != declarations:
+            raise ValueError("formalization contract targets must exactly match chunk declarations")
+        if not isinstance(contract.get("environment"), dict):
+            raise ValueError("formalization contract requires its build environment")
+        if "requirements" in contract and _validate_requirements(contract["requirements"], tasks, source_refs) != requirements:
+            raise ValueError("requirements ledger differs from the frozen formalization contract")
         revision = int(state["formalization"].get("revision", 0)) + 1
         state["formal_tasks"] = tasks
         state["formal_candidates"] = {}
@@ -1231,11 +1308,53 @@ def initialize_formal_tasks(
             "solution_candidate": solution_candidate,
             "solution_sha256": solution_sha256,
             "main_sha": main_sha,
+            "requirements": deepcopy(requirements),
+            "contract": deepcopy(contract),
+            "review_snapshot": None,
+            "pending_verdict_id": None,
         }
         state["phase"] = "formalizing"
         _event(state, "formalization_initialized", formalization_revision=revision,
                tasks=ids, solution_candidate=solution_candidate)
     return load_state(forum_dir)
+
+
+def _reference_list(value, field: str) -> list[str]:
+    if not isinstance(value, list) or not value or any(
+        not isinstance(item, str) or not item.strip() or item != item.strip() for item in value
+    ):
+        raise ValueError(f"{field} requires a nonempty list of nonempty references")
+    if len(value) != len(set(value)):
+        raise ValueError(f"{field} contains duplicate references")
+    return list(value)
+
+
+def _validate_requirements(requirements, tasks: dict, source_refs: set[str]) -> list[dict]:
+    if not isinstance(requirements, list) or not requirements:
+        raise ValueError("formalization requires a nonempty requirements ledger")
+    result, ids, covered_sources = [], set(), set()
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            raise ValueError("each requirement must be an object")
+        requirement_id = _text(requirement.get("id"), "requirement id", 200)
+        if requirement_id in ids:
+            raise ValueError("requirements require unique nonempty ids")
+        ids.add(requirement_id)
+        statement = _text(requirement.get("statement"), "requirement statement", 16000)
+        sources = _reference_list(requirement.get("source_components"), "requirement source_components")
+        task_ids = _reference_list(requirement.get("tasks"), "requirement tasks")
+        if set(sources) - source_refs:
+            raise ValueError(f"requirement {requirement_id} has unknown source components")
+        if set(task_ids) - tasks.keys():
+            raise ValueError(f"requirement {requirement_id} has unknown tasks")
+        if set(sources) - {source for task_id in task_ids for source in tasks[task_id]["source_components"]}:
+            raise ValueError(f"requirement {requirement_id} sources are not covered by its tasks")
+        covered_sources.update(sources)
+        result.append({"id": requirement_id, "statement": statement,
+                       "source_components": sources, "tasks": task_ids})
+    if source_refs - covered_sources:
+        raise ValueError("requirements ledger does not cover every accepted source component")
+    return result
 
 
 def ready_formal_tasks(state: dict) -> list[dict]:
@@ -1319,6 +1438,10 @@ def begin_formal_merge(forum_dir: Path, candidate_id: str) -> dict:
         candidate = state["formal_candidates"].get(candidate_id)
         if not candidate:
             raise ValueError(f"unknown formal candidate '{candidate_id}'")
+        if (state["phase"] != "formalizing"
+                or candidate.get("formalization_revision") != state["formalization"].get("revision")
+                or candidate.get("solution_candidate") != state["formalization"].get("solution_candidate")):
+            return {"candidate": candidate, "conflict": True}
         if candidate.get("status") == "merged":
             return {"candidate": candidate, "idempotent": True}
         if candidate.get("status") != "submitted":
@@ -1341,6 +1464,11 @@ def finish_formal_merge(
 ) -> dict:
     with transaction(forum_dir) as state:
         candidate = state["formal_candidates"].get(candidate_id)
+        if (state["phase"] != "formalizing" or not candidate
+                or candidate.get("formalization_revision") != state["formalization"].get("revision")
+                or candidate.get("solution_candidate") != state["formalization"].get("solution_candidate")
+                or candidate.get("solution_sha256") != state["formalization"].get("solution_sha256")):
+            return {"candidate": candidate, "stale": True}
         if not candidate or candidate.get("status") != "merging":
             raise ValueError("formal candidate is not being merged")
         task = state["formal_tasks"][candidate["task_id"]]
@@ -1350,11 +1478,16 @@ def finish_formal_merge(
         if success:
             if not _FULL_SHA_RE.fullmatch(main_sha.casefold()):
                 raise ValueError("successful merge requires a full main commit")
+            if (not verification or verification.get("status") != "passed"
+                    or verification.get("contract_sha256") != (state["formalization"].get("contract") or {}).get("sha256")
+                    or not state["formalization"].get("contract")):
+                raise ValueError("successful merge requires verification against the current formal contract")
             candidate["status"] = "merged"
             candidate["main_sha"] = main_sha.casefold()
             task["status"] = "complete"
             task["accepted_candidate"] = candidate_id
             state["formalization"]["main_sha"] = main_sha.casefold()
+            _invalidate_review(state)
             for obstacle in state["obstacles"].values():
                 if obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
                     obstacle["status"] = "resolved"
@@ -1382,10 +1515,151 @@ def all_formal_tasks_complete(state: dict) -> bool:
     return bool(tasks) and all(task.get("status") == "complete" for task in tasks.values())
 
 
+def _invalidate_review(state: dict) -> None:
+    """Keep old snapshots and verdicts as history, never as live approval evidence."""
+    formal = state["formalization"]
+    formal["review_snapshot"] = None
+    formal["pending_verdict_id"] = None
+
+
+def _report_digest(report: dict | list) -> str:
+    return hashlib.sha256(json.dumps(report, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: bool) -> None:
+    formal = state["formalization"]
+    contract = formal.get("contract")
+    if not isinstance(contract, dict) or not formal.get("requirements"):
+        raise ValueError("formalization is missing its immutable contract or requirements; re-chunk it")
+    if "requirements" in contract:
+        source_refs = {f"paper:{formal.get('solution_candidate')}"} | {
+            item["result_id"] for item in state["solution_candidates"].get(formal.get("solution_candidate"), {}).get("components", [])
+        }
+        if _validate_requirements(contract["requirements"], state["formal_tasks"], source_refs) != formal["requirements"]:
+            raise ValueError("requirements ledger differs from the frozen formalization contract")
+    if not isinstance(report, dict) or not isinstance(report.get("snapshot_id"), str) or not report["snapshot_id"].strip():
+        raise ValueError("review requires a controller-verified snapshot_id")
+    if type(report.get("passed")) is not bool:
+        raise ValueError("review snapshot requires a boolean passed result")
+    if require_passed and report["passed"] is not True:
+        raise ValueError("review snapshot did not pass the deterministic checks")
+    for field, pattern in (("main_sha", _FULL_SHA_RE), ("source_sha256", _ARTIFACT_SHA_RE),
+                           ("solution_sha256", _ARTIFACT_SHA_RE), ("contract_sha256", _ARTIFACT_SHA_RE)):
+        if not isinstance(report.get(field), str) or not pattern.fullmatch(report[field]):
+            raise ValueError(f"review snapshot requires a full {field}")
+    expected = {"main_sha": formal.get("main_sha"),
+                "solution_candidate": formal.get("solution_candidate"),
+                "solution_sha256": formal.get("solution_sha256"),
+                "formalization_revision": formal.get("revision"),
+                "contract_sha256": contract.get("sha256")}
+    if any(report.get(key) != value for key, value in expected.items()):
+        raise ValueError("review snapshot is stale for the current formalization")
+    solution_id = formal.get("solution_candidate")
+    if state["solution"].get("status") != "accepted" or state["solution"].get("accepted_candidate") != solution_id:
+        raise ValueError("review snapshot no longer targets the accepted solution")
+    if state["solution_candidates"].get(solution_id, {}).get("sha256") != formal.get("solution_sha256"):
+        raise ValueError("review snapshot has stale accepted solution bytes")
+    tasks = state["formal_tasks"]
+    accepted = {task_id: task.get("accepted_candidate") for task_id, task in tasks.items()}
+    if report.get("accepted_candidates") != accepted:
+        raise ValueError("review snapshot has stale accepted candidates")
+    expected_declarations = {task["lean_decl"]: task_id for task_id, task in tasks.items()}
+    if report.get("declarations") != expected_declarations:
+        raise ValueError("review snapshot declarations do not match the formal tasks")
+    if set(contract.get("targets", {})) != set(expected_declarations):
+        raise ValueError("formalization contract does not match the formal tasks")
+    if require_passed and not all_formal_tasks_complete(state):
+        raise ValueError("review requires all formal tasks to be complete")
+    for task_id, candidate_id in accepted.items():
+        if candidate_id is None and not require_passed:
+            continue
+        candidate = state["formal_candidates"].get(candidate_id, {})
+        if (candidate.get("status") != "merged" or candidate.get("task_id") != task_id
+                or candidate.get("solution_candidate") != solution_id
+                or candidate.get("solution_sha256") != formal.get("solution_sha256")
+                or candidate.get("formalization_revision") != formal.get("revision")):
+            raise ValueError("review snapshot requires current merged candidates for every task")
+
+
+def record_review_snapshot(forum_dir: Path, report: dict) -> dict:
+    """Record controller checks; this internal API is not exposed to workers via MCP."""
+    report = deepcopy(report)
+    with transaction(forum_dir) as state:
+        if state["phase"] not in {"formalizing", "critic"}:
+            raise ValueError("review snapshots can only be recorded for an active formalization")
+        _validate_snapshot_binding(state, report, require_passed=report.get("passed") is True)
+        existing = state["review_snapshots"].get(report["snapshot_id"])
+        if existing is not None and existing != report:
+            raise ValueError("snapshot_id already identifies a different immutable report")
+        previous = state["formalization"].get("review_snapshot")
+        if previous != report:
+            _invalidate_review(state)
+            if state["formalization"].get("status") == "approval_pending":
+                state["formalization"]["status"] = "review"
+        state["review_snapshots"][report["snapshot_id"]] = report
+        state["formalization"]["review_snapshot"] = report
+        _event(state, "review_snapshot_recorded", snapshot_id=report["snapshot_id"], passed=report["passed"])
+    return load_state(forum_dir)
+
+
+def reopen_after_machine_failure(forum_dir: Path, report: dict) -> dict:
+    """Atomically retain failed controller evidence and require all tasks to be repaired."""
+    report = deepcopy(report)
+    with transaction(forum_dir) as state:
+        if state["phase"] not in {"formalizing", "critic"}:
+            raise ValueError("machine failure can only reopen an active formalization")
+        _validate_snapshot_binding(state, report, require_passed=False)
+        if report.get("passed") is not False:
+            raise ValueError("machine failure reopening requires a failed report")
+        existing = state["review_snapshots"].get(report["snapshot_id"])
+        if existing is not None and existing != report:
+            raise ValueError("snapshot_id already identifies a different immutable report")
+        state["review_snapshots"][report["snapshot_id"]] = report
+        for task in state["formal_tasks"].values():
+            candidate_id = task.get("accepted_candidate")
+            if candidate_id in state["formal_candidates"]:
+                state["formal_candidates"][candidate_id]["status"] = "superseded"
+            task["status"] = "pending"
+            task["accepted_candidate"] = None
+        for strategy in state["strategies"].values():
+            if strategy.get("phase") == "formalizing" and strategy.get("status") in _ACTIVE_STRATEGIES:
+                strategy["status"] = "cancelled"
+        _invalidate_review(state)
+        state["formalization"]["status"] = "active"
+        state["formalization"]["machine_review_failure"] = report["snapshot_id"]
+        state["phase"] = "formalizing"
+        obstacle_id = _id("obstacle")
+        state["obstacles"][obstacle_id] = {
+            "obstacle_id": obstacle_id, "phase": "formalizing", "target": "", "author": "Unity",
+            "goal_state": "Deterministic final review failed: " + json.dumps(report.get("issues", [])),
+            "tried": "controller preflight", "hypothesis": "Repair against the frozen contract, or request_rechunk for an encoding correction.",
+            "status": "open", "created_at": time.time(), "snapshot_id": report["snapshot_id"],
+        }
+        _event(state, "machine_review_failed", snapshot_id=report["snapshot_id"],
+               issues=report.get("issues", []), reopened_tasks=list(state["formal_tasks"]))
+    return load_state(forum_dir)
+
+
+def _current_snapshot(state: dict, snapshot_id: str) -> dict:
+    report = state["formalization"].get("review_snapshot")
+    if not isinstance(report, dict) or report.get("snapshot_id") != snapshot_id:
+        raise ValueError("semantic review refers to a stale or unknown snapshot")
+    if state.get("review_snapshots", {}).get(snapshot_id) != report:
+        raise ValueError("review snapshot differs from its immutable controller report")
+    _validate_snapshot_binding(state, report, require_passed=True)
+    return report
+
+
 def begin_critic(forum_dir: Path) -> dict:
     with transaction(forum_dir) as state:
+        if state["phase"] not in {"formalizing", "critic"}:
+            raise ValueError("critic can only start for an active formalization")
         if not all_formal_tasks_complete(state):
             raise ValueError("critic cannot start before all formal tasks are complete")
+        report = state["formalization"].get("review_snapshot") or {}
+        _current_snapshot(state, report.get("snapshot_id", ""))
+        if state["formalization"].get("status") == "approval_pending":
+            raise ValueError("critic approval is awaiting controller finalization")
         state["formalization"]["status"] = "review"
         state["phase"] = "critic"
         _event(state, "critic_started", main_sha=state["formalization"].get("main_sha", ""))
@@ -1398,16 +1672,22 @@ def submit_critic_verdict(
     verdict: str,
     summary: str,
     *,
+    review: dict,
     reopen_tasks: list[str] | None = None,
     evidence: str = "",
 ) -> dict:
     verdict = verdict.strip().casefold()
     if verdict not in {"approved", "lean_reopen", "reopen_solving"}:
         raise ValueError("verdict must be approved, lean_reopen, or reopen_solving")
+    review = SemanticReview.model_validate(review).model_dump()
     with transaction(forum_dir) as state:
-        if state["phase"] != "critic":
+        if state["phase"] != "critic" or state["formalization"].get("status") != "review":
             raise ValueError("critic verdicts are only accepted during critic")
+        report = _current_snapshot(state, review["snapshot_id"])
+        _validate_semantic_review(state, review, approved=verdict == "approved")
         task_ids = list(dict.fromkeys(reopen_tasks or []))
+        if verdict == "approved" and task_ids:
+            raise ValueError("approved verdict cannot reopen formal tasks")
         if verdict == "lean_reopen":
             if not task_ids:
                 raise ValueError("lean_reopen requires at least one formal task")
@@ -1421,22 +1701,38 @@ def submit_critic_verdict(
             "summary": _text(summary, "summary"),
             "reopen_tasks": task_ids,
             "evidence": _text(evidence, "evidence", 4000, required=False),
+            "review": review,
+            "snapshot_id": report["snapshot_id"],
+            "snapshot_sha256": _report_digest(report),
+            "requirements_sha256": _report_digest(state["formalization"]["requirements"]),
             "main_sha": state["formalization"].get("main_sha", ""),
             "timestamp": time.time(),
         }
         state["critic_verdicts"].append(item)
         if verdict == "approved":
-            state["formalization"]["status"] = "accepted"
-            state["phase"] = "complete"
-            for obstacle in state["obstacles"].values():
-                if obstacle.get("status") == "open" and obstacle.get("phase") != "solving":
-                    obstacle["status"] = "resolved"
-                    obstacle["resolved_by"] = item["verdict_id"]
+            state["formalization"]["status"] = "approval_pending"
+            state["formalization"]["pending_verdict_id"] = item["verdict_id"]
         elif verdict == "lean_reopen":
-            for task_id in task_ids:
+            reopened = set(task_ids)
+            while True:
+                dependents = {task_id for task_id, task in state["formal_tasks"].items()
+                              if set(task.get("dependencies", [])) & reopened}
+                if dependents <= reopened:
+                    break
+                reopened |= dependents
+            item["reopened_tasks"] = sorted(reopened)
+            for task_id in reopened:
                 task = state["formal_tasks"][task_id]
+                accepted = task.get("accepted_candidate")
+                if accepted in state["formal_candidates"]:
+                    state["formal_candidates"][accepted]["status"] = "superseded"
                 task["status"] = "pending"
                 task["accepted_candidate"] = None
+            for strategy in state["strategies"].values():
+                if (strategy.get("phase") == "formalizing" and strategy.get("target") in reopened
+                        and strategy.get("status") in _ACTIVE_STRATEGIES):
+                    strategy["status"] = "cancelled"
+            _invalidate_review(state)
             state["formalization"]["status"] = "active"
             state["phase"] = "formalizing"
         else:
@@ -1444,6 +1740,63 @@ def submit_critic_verdict(
         _event(state, "critic_verdict", verdict_id=item["verdict_id"], author=author,
                verdict=verdict, reopen_tasks=task_ids)
     return {"verdict": item, "state": load_state(forum_dir)}
+
+
+def _validate_semantic_review(state: dict, review: dict, *, approved: bool) -> None:
+    ledger = {item["id"]: item for item in state["formalization"]["requirements"]}
+    seen = set()
+    declarations = state["formalization"]["review_snapshot"]["declarations"]
+    for entry in review["requirements"]:
+        requirement_id = entry["requirement_id"]
+        if requirement_id not in ledger:
+            raise ValueError(f"unknown reviewed requirement '{requirement_id}'")
+        if requirement_id in seen:
+            raise ValueError(f"duplicate reviewed requirement '{requirement_id}'")
+        seen.add(requirement_id)
+        if not entry["rationale"].strip():
+            raise ValueError("requirement review rationale is required")
+        refs = entry["declarations"]
+        if len(refs) != len(set(refs)):
+            raise ValueError("requirement review has duplicate declaration references")
+        for declaration in refs:
+            if declaration not in declarations:
+                raise ValueError(f"unknown reviewed declaration '{declaration}'")
+            if declarations[declaration] not in ledger[requirement_id]["tasks"]:
+                raise ValueError(f"declaration '{declaration}' is unrelated to requirement '{requirement_id}'")
+        if approved and (entry["status"] != "pass" or not refs):
+            raise ValueError("approval requires every requirement to pass with declaration references")
+    if approved and seen != set(ledger):
+        raise ValueError("approval requires exact coverage of every requirement")
+
+
+def complete_critic_review(forum_dir: Path, snapshot_id: str, verdict_id: str) -> dict:
+    """CAS approval after the controller rechecks source bytes under the merge lock."""
+    with transaction(forum_dir) as state:
+        formal = state["formalization"]
+        if (state["phase"] != "critic" or formal.get("status") != "approval_pending"
+                or formal.get("pending_verdict_id") != verdict_id):
+            raise ValueError("critic approval is no longer pending for this verdict")
+        report = _current_snapshot(state, snapshot_id)
+        verdict = next((item for item in state["critic_verdicts"] if item.get("verdict_id") == verdict_id), None)
+        if (not verdict or verdict.get("verdict") != "approved"
+                or verdict.get("snapshot_id") != snapshot_id
+                or verdict.get("snapshot_sha256") != _report_digest(report)
+                or verdict.get("requirements_sha256") != _report_digest(formal["requirements"])):
+            raise ValueError("critic approval evidence no longer matches the current snapshot")
+        review = SemanticReview.model_validate(verdict["review"]).model_dump()
+        if review["snapshot_id"] != snapshot_id or verdict.get("reopen_tasks"):
+            raise ValueError("critic approval does not target this snapshot")
+        _validate_semantic_review(state, review, approved=True)
+        formal["status"] = "accepted"
+        formal["pending_verdict_id"] = None
+        formal["accepted_verdict_id"] = verdict_id
+        state["phase"] = "complete"
+        for obstacle in state["obstacles"].values():
+            if obstacle.get("status") == "open" and obstacle.get("phase") != "solving":
+                obstacle["status"] = "resolved"
+                obstacle["resolved_by"] = verdict_id
+        _event(state, "critic_review_completed", snapshot_id=snapshot_id, verdict_id=verdict_id)
+    return load_state(forum_dir)
 
 
 def events_after(state: dict, seen: set[str]) -> list[dict]:

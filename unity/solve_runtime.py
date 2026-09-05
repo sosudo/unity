@@ -22,7 +22,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from . import artifacts, blueprint, library, solve_jobs, solve_state, worktree
+from . import artifacts, library, solve_contract, solve_jobs, solve_state, worktree
 from .forum import solve_server
 from .orchestrator import _preamble, load_prompt, stop_requested
 from .spawn import spawn
@@ -562,8 +562,8 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
         raise ValueError("formalization chunks require unique nonempty ids")
     try:
         plan = json.loads((paths.unity / "formalization-plan.json").read_text())
-    except (OSError, json.JSONDecodeError):
-        plan = None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("chunking requires a readable formalization-plan.json") from exc
     required_refs: set[str] = set()
     if plan is not None:
         if plan.get("solution_sha256") != expected_solution_sha:
@@ -574,12 +574,17 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
         if not required_refs or "None" in required_refs:
             raise ValueError("formalization plan has invalid source references")
     known = set(ids)
+    declarations = [str(item.get("lean_decl") or "").strip() for item in chunks]
+    if any(not name for name in declarations) or len(set(declarations)) != len(declarations):
+        raise ValueError("formalization declarations must be unique and nonempty")
     graph = {}
     covered_refs: set[str] = set()
     for chunk in chunks:
         task_id = str(chunk["id"])
         if not str(chunk.get("lean_decl") or "").strip():
             raise ValueError(f"chunk {task_id} must name its expected lean_decl")
+        if not isinstance(chunk.get("lean_file"), str) or not chunk["lean_file"].strip():
+            raise ValueError(f"chunk {task_id} must name its Lean scaffold file")
         deps = [str(item) for item in chunk.get("dependencies", [])]
         unknown = set(deps) - known
         if unknown:
@@ -596,6 +601,32 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
     missing_refs = required_refs - covered_refs
     if missing_refs:
         raise ValueError("formalization DAG does not cover source components: " + ", ".join(sorted(missing_refs)))
+    requirements = dag.get("requirements")
+    if not isinstance(requirements, list) or not requirements:
+        raise ValueError("formalization DAG requires explicit mathematical requirements")
+    requirement_ids = set()
+    requirement_refs = set()
+    by_id = {chunk["id"]: chunk for chunk in chunks}
+    for requirement in requirements:
+        if not isinstance(requirement, dict):
+            raise ValueError("each mathematical requirement must be an object")
+        rid = requirement.get("id")
+        if not isinstance(rid, str) or not rid.strip() or rid in requirement_ids:
+            raise ValueError("mathematical requirement IDs must be unique and nonempty")
+        requirement_ids.add(rid)
+        if not isinstance(requirement.get("statement"), str) or not requirement["statement"].strip():
+            raise ValueError(f"requirement {rid} needs a precise statement")
+        refs, tasks = requirement.get("source_components"), requirement.get("tasks")
+        if not isinstance(refs, list) or not refs or not set(refs) <= required_refs:
+            raise ValueError(f"requirement {rid} has missing/unknown source references")
+        if not isinstance(tasks, list) or not tasks or not set(tasks) <= known:
+            raise ValueError(f"requirement {rid} has missing/unknown tasks")
+        mapped_refs = {ref for task in tasks for ref in by_id[task]["source_components"]}
+        if not set(refs) <= mapped_refs:
+            raise ValueError(f"requirement {rid} references sources not covered by its tasks")
+        requirement_refs.update(refs)
+    if required_refs - requirement_refs:
+        raise ValueError("mathematical requirements do not cover all accepted source components")
     pending = dict(graph)
     while pending:
         ready = [node for node, deps in pending.items() if not (deps & pending.keys())]
@@ -624,31 +655,9 @@ def _merge_lock(project_root: Path):
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
-def _kernel_target(kernel: dict, expected: str) -> tuple[str, dict] | None:
-    if expected in kernel:
-        return expected, kernel[expected]
-    return None
-
-
-def _unsafe_dependencies(kernel: dict, target: str) -> list[str]:
-    unsafe: list[str] = []
-    seen: set[str] = set()
-    pending = list(kernel.get(target, {}).get("deps", []))
-    while pending:
-        name = pending.pop()
-        if name in seen:
-            continue
-        seen.add(name)
-        row = kernel.get(name)
-        if not row:
-            continue
-        if row.get("sorried") or row.get("kind") == "axiom":
-            unsafe.append(name)
-        pending.extend(row.get("deps", []))
-    return sorted(unsafe)
-
-
-def _review_new_declaration(project_root: Path, task: dict, diff: str) -> dict:
+def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
+                            contract: dict | None = None,
+                            formal_tasks: list[dict] | None = None) -> dict:
     forbidden = sorted({
         match.group(1)
         for line in diff.splitlines()
@@ -658,119 +667,171 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str) -> dict:
     issues = []
     if forbidden:
         issues.append("candidate adds forbidden construct(s): " + ", ".join(forbidden))
-    kernel = blueprint.kernel_extract(project_root)
     expected = task.get("lean_decl", "")
-    target = _kernel_target(kernel, expected) if kernel else None
-    if kernel is None:
-        # A successful build alone does not establish that this exact target was
-        # checked. Textual discovery is useful elsewhere, but cannot accept a
-        # solve candidate when its kernel verification is unavailable.
-        issues.append("kernel verification unavailable: could not inspect the built declarations")
-    elif target is None:
-        issues.append(f"expected declaration {expected} was not found in the built kernel")
-    else:
-        name, row = target
-        if row.get("kind") == "axiom":
-            issues.append(f"expected declaration {name} remains an axiom")
-        if row.get("sorried"):
-            issues.append(f"expected declaration {name} still uses sorryAx")
-        unsafe = _unsafe_dependencies(kernel, name)
-        if unsafe:
-            issues.append("target depends on unresolved project declarations: " + ", ".join(unsafe))
+    tasks = formal_tasks or [task]
+    completed = {item["task_id"] for item in tasks
+                 if item.get("status") == "complete" or item["task_id"] == task["task_id"]}
+    try:
+        check = solve_contract.check_formal_contract(project_root, contract or {}, tasks,
+                                                     completed=completed)
+    except (OSError, ValueError) as exc:
+        check = {"passed": False, "issues": [f"formal contract verification unavailable: {exc}"]}
+    issues.extend(check["issues"])
     return {
         "status": "passed" if not issues else "failed",
         "expected_decl": expected,
         "source_components": list(task.get("source_components", [])),
-        "mode": "kernel" if kernel is not None else "unavailable",
+        "mode": "formal_contract",
+        "contract_sha256": (contract or {}).get("sha256"),
+        "verified_tasks": sorted(completed),
         "forbidden_constructs": forbidden,
         "issues": issues,
     }
 
 
-def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
+def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
     """Apply, build, review, and commit one immutable formalization candidate."""
     root = paths.project_root
-    with _merge_lock(root):
-        try:
-            resolved = worktree.verify_candidate_commit(root, candidate["author"], candidate["commit_sha"])
-        except Exception as exc:
-            return {"ok": False, "error": f"candidate identity failed: {exc}"}
-        exact_diff = _git(root, "show", "--format=", "--binary", resolved).stdout
-        if hashlib.sha256(exact_diff.encode()).hexdigest() != candidate["diff_sha256"]:
-            return {"ok": False, "error": "candidate commit no longer matches its submitted diff hash"}
-        dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
-        if dirty.returncode or dirty.stdout.strip():
-            return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
-        before = worktree.main_commit(root)
-        applied = _git(root, "cherry-pick", "--no-commit", resolved)
-        if applied.returncode:
-            _git(root, "reset", "--hard", before)
-            return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
-        build_started = time.monotonic()
-        try:
-            build = solve_jobs.run(
-                root,
-                ["lake", "build"],
-                cwd=root,
-                owner="Unity",
-                task_id=task["task_id"],
-                serialize_build=True,
-            )
-        except OSError as exc:
-            build_seconds = time.monotonic() - build_started
-            _git(root, "reset", "--hard", before)
-            return {
-                "ok": False, "error": f"could not run lake build: {exc}",
-                "build": {"returncode": None, "seconds": build_seconds},
-            }
-        build_seconds = time.monotonic() - build_started
-        output = "\n".join(part.rstrip() for part in (build.stdout, build.stderr) if part)
-        build_record = {"returncode": build.returncode, "seconds": build_seconds}
-        if output:
-            record = artifacts.store_text(
-                paths.artifacts, output, kind="solve_formal_build",
-                source="lake build", producer="Unity",
-                metadata={"candidate_id": candidate["candidate_id"], "task_id": task["task_id"]},
-            )
-            build_record.update({"artifact_id": record["artifact_id"], "sha256": record["sha256"]})
-        if build.returncode:
-            _git(root, "reset", "--hard", before)
-            return {
-                "ok": False,
-                "error": "lake build failed: " + artifacts.preview_text(output, 3000),
-                "build": build_record,
-            }
-        if _git(root, "diff", "--quiet").returncode:
-            _git(root, "reset", "--hard", before)
-            return {"ok": False, "error": "lake build changed tracked files", "build": build_record}
-        staged = _git(root, "diff", "--cached", "--no-ext-diff", before).stdout
-        verification_started = time.monotonic()
-        verification = _review_new_declaration(root, task, staged)
-        verification["seconds"] = time.monotonic() - verification_started
-        record = artifacts.store_text(
-            paths.artifacts, json.dumps(verification, indent=2, sort_keys=True) + "\n",
-            kind="solve_formal_verification", producer="Unity",
-            source=f"formal task {task['task_id']}",
+    current = solve_state.load_state(paths.forum)
+    contract = current["formalization"].get("contract", {})
+    if not contract:
+        return {"ok": False, "error": "missing formal contract; request re-chunking before proving"}
+    if candidate.get("formalization_revision") != current["formalization"].get("revision"):
+        return {"ok": False, "error": "candidate belongs to a superseded formal contract"}
+    try:
+        resolved = worktree.verify_candidate_commit(root, candidate["author"], candidate["commit_sha"])
+    except Exception as exc:
+        return {"ok": False, "error": f"candidate identity failed: {exc}"}
+    exact_diff = _git(root, "show", "--format=", "--binary", resolved).stdout
+    if hashlib.sha256(exact_diff.encode()).hexdigest() != candidate["diff_sha256"]:
+        return {"ok": False, "error": "candidate commit no longer matches its submitted diff hash"}
+    dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode or dirty.stdout.strip():
+        return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
+    before = worktree.main_commit(root)
+    applied = _git(root, "cherry-pick", "--no-commit", resolved)
+    if applied.returncode:
+        _git(root, "reset", "--hard", before)
+        return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
+    checked_source = solve_contract.source_identity(root)
+    checked_tree = _git(root, "write-tree").stdout.strip()
+    build_started = time.monotonic()
+    try:
+        build = solve_jobs.run(
+            root,
+            ["lake", "build"],
+            cwd=root,
+            owner="Unity",
+            task_id=task["task_id"],
+            serialize_build=True,
         )
-        verification["artifact_id"] = record["artifact_id"]
-        if verification["status"] != "passed":
-            _git(root, "reset", "--hard", before)
-            return {
-                "ok": False,
-                "error": "; ".join(verification["issues"]),
-                "build": build_record,
-                "verification": verification,
-            }
-        commit = _git(root, "commit", "-m", f"UNITY: merge solve task {task['task_id']}")
-        if commit.returncode:
-            _git(root, "reset", "--hard", before)
-            return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
+    except OSError as exc:
+        build_seconds = time.monotonic() - build_started
+        _git(root, "reset", "--hard", before)
         return {
-            "ok": True,
-            "main_sha": worktree.main_commit(root),
+            "ok": False, "error": f"could not run lake build: {exc}",
+            "build": {"returncode": None, "seconds": build_seconds},
+        }
+    build_seconds = time.monotonic() - build_started
+    # Default Lake targets need not include the task's module. Explicitly
+    # build all inspected source modules before loading their .olean files.
+    if not build.returncode:
+        modules_build = solve_contract.build_sources(root)
+        if modules_build["returncode"]:
+            _git(root, "reset", "--hard", before)
+            return {"ok": False, "error": "target module build failed: " +
+                    artifacts.preview_text(modules_build["output"], 3000)}
+    output = "\n".join(part.rstrip() for part in (build.stdout, build.stderr) if part)
+    build_record = {"returncode": build.returncode, "seconds": build_seconds}
+    if output:
+        record = artifacts.store_text(
+            paths.artifacts, output, kind="solve_formal_build",
+            source="lake build", producer="Unity",
+            metadata={"candidate_id": candidate["candidate_id"], "task_id": task["task_id"]},
+        )
+        build_record.update({"artifact_id": record["artifact_id"], "sha256": record["sha256"]})
+    if build.returncode:
+        _git(root, "reset", "--hard", before)
+        return {
+            "ok": False,
+            "error": "lake build failed: " + artifacts.preview_text(output, 3000),
+            "build": build_record,
+        }
+    if _git(root, "diff", "--quiet").returncode:
+        _git(root, "reset", "--hard", before)
+        return {"ok": False, "error": "lake build changed tracked files", "build": build_record}
+    staged = _git(root, "diff", "--cached", "--no-ext-diff", before).stdout
+    verification_started = time.monotonic()
+    verification = _review_new_declaration(
+        root, task, staged, contract=contract,
+        formal_tasks=list(current["formal_tasks"].values()),
+    )
+    if (solve_contract.source_identity(root) != checked_source
+            or _git(root, "write-tree").stdout.strip() != checked_tree):
+        raise ValueError("source changed during candidate build or kernel inspection")
+    verification["seconds"] = time.monotonic() - verification_started
+    record = artifacts.store_text(
+        paths.artifacts, json.dumps(verification, indent=2, sort_keys=True) + "\n",
+        kind="solve_formal_verification", producer="Unity",
+        source=f"formal task {task['task_id']}",
+    )
+    verification["artifact_id"] = record["artifact_id"]
+    if verification["status"] != "passed":
+        _git(root, "reset", "--hard", before)
+        return {
+            "ok": False,
+            "error": "; ".join(verification["issues"]),
             "build": build_record,
             "verification": verification,
         }
+    commit = _git(root, "commit", "-m", f"UNITY: merge solve task {task['task_id']}")
+    if commit.returncode:
+        _git(root, "reset", "--hard", before)
+        return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
+    committed_source = solve_contract.source_identity(root)
+    if (committed_source != {**checked_source, "main_sha": committed_source["main_sha"]}
+            or _git(root, "rev-parse", "HEAD^{tree}").stdout.strip() != checked_tree):
+        raise ValueError("commit changed the verified candidate source")
+    verification["source_identity"] = committed_source
+    return {
+        "ok": True,
+        "main_sha": worktree.main_commit(root),
+        "build": build_record,
+        "verification": verification,
+    }
+
+
+def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
+    root = paths.project_root
+    # Nothing below may discard pre-existing tracked edits.
+    dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
+    if dirty.returncode or dirty.stdout.strip():
+        return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
+    before = worktree.main_commit(root)
+    try:
+        return _apply_formal_candidate(paths, candidate, task)
+    except (OSError, ValueError, KeyError) as exc:
+        restored = _git(root, "reset", "--hard", before)
+        suffix = "" if restored.returncode == 0 else "; main rollback also failed: " + restored.stderr
+        return {"ok": False, "error": f"candidate verification failed: {exc}{suffix}"}
+
+
+def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
+    """Apply one candidate under the merge lock (also useful for integration tests)."""
+    with _merge_lock(paths.project_root):
+        return _integrate_checked(paths, candidate, task)
+
+
+def _integrate_and_record(paths, candidate: dict, task: dict) -> dict:
+    """Serialize Git integration AND state publication under the same lock."""
+    with _merge_lock(paths.project_root):
+        result = _integrate_checked(paths, candidate, task)
+        solve_state.finish_formal_merge(
+            paths.forum, candidate["candidate_id"], success=bool(result.get("ok")),
+            main_sha=result.get("main_sha", ""), error=result.get("error", ""),
+            build=result.get("build"), verification=result.get("verification"),
+        )
+        return result
 
 
 async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) -> dict:
@@ -988,18 +1049,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     continue
                 _console.print(f"[cyan]mechanically reviewing {candidate_id} for {task_id}[/cyan]")
                 result = await asyncio.to_thread(
-                    _integrate_formal_candidate,
+                    _integrate_and_record,
                     paths,
                     started["candidate"],
                     current["formal_tasks"][task_id],
-                )
-                solve_state.finish_formal_merge(
-                    paths.forum, candidate_id,
-                    success=bool(result.get("ok")),
-                    main_sha=result.get("main_sha", ""),
-                    error=result.get("error", ""),
-                    build=result.get("build"),
-                    verification=result.get("verification"),
                 )
                 if result.get("ok"):
                     for name, running in list(tasks.items()):

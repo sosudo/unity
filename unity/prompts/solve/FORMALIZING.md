@@ -18,6 +18,13 @@ For your assigned task:
   fail verification;
 - read the task's `source_components` and implement precisely the corresponding accepted argument or
   paper section; do not silently omit an incorporated component;
+- use the task description and recorded requirements as a fidelity checklist. Before finalizing,
+  compare the actual statement and relevant definitions against that mapping and the source;
+- fill the scaffold's proof holes without changing the protected statement or meaning-bearing
+  definitions. Unity mechanically rejects contract changes, even if the changed theorem builds.
+  If the chunker's interpretation is wrong, publish concrete evidence and call `request_rechunk`
+  for a new specification revision; do not silently weaken the theorem. If the paper itself is
+  substantively wrong, use the existing `reopen_solving` path instead;
 - do not use `sorry`, `admit`, new axioms, `native_decide`, or equivalent proof bypasses;
 - use Lean LSP or targeted diagnostics while iterating;
 - after the final edit, immediately call `finalize_formalization`; Unity commits the exact change and runs
