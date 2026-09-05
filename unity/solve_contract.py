@@ -23,8 +23,12 @@ from . import artifacts, solve_jobs, solve_workspace
 
 
 AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
-_EXCLUDED = {".git", ".lake", ".unity", ".worktrees", "lake-packages", "build", "__pycache__"}
+_EXCLUDED = {".git", ".lake", ".unity", ".worktrees", "lake-packages", "__pycache__"}
 _CONFIGS = {"lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json"}
+
+
+class ContractEnvironmentError(ValueError):
+    """Dependency inspection failed; another chunking attempt cannot repair it."""
 
 
 def digest(value: object) -> str:
@@ -39,11 +43,15 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout.strip()
 
 
-def source_files(root: Path) -> list[Path]:
+def source_files(root: Path, *, build_dir: str | None = None) -> list[Path]:
     """Include untracked Lean sources too; Git HEAD alone is not a build identity."""
+    output = (root / build_dir).resolve() if build_dir else None
+    if output is not None and (output == root.resolve() or not output.is_relative_to(root.resolve())):
+        raise ValueError("project build directory must be strictly inside the project")
     result = []
     for directory, dirs, names in os.walk(root):
-        dirs[:] = sorted(d for d in dirs if d not in _EXCLUDED)
+        dirs[:] = sorted(d for d in dirs if d not in _EXCLUDED
+                         and (output is None or (Path(directory) / d).resolve() != output))
         if any((Path(directory) / d).is_symlink() for d in dirs):
             raise ValueError("project source directories must not be symlinks")
         for name in sorted(names):
@@ -57,7 +65,10 @@ def source_files(root: Path) -> list[Path]:
     return sorted(result)
 
 
-def _file_hashes(root: Path, *, build_dir: str | None = None) -> dict:
+def _file_hashes(
+    root: Path, *, build_dir: str | None = None,
+    allow_internal_file_symlinks: bool = False,
+) -> dict:
     # Lean elaboration can read non-Lean inputs (e.g. include_str). Include all
     # local non-runtime inputs, even when untracked or ignored by Git.
     result = {}
@@ -73,13 +84,25 @@ def _file_hashes(root: Path, *, build_dir: str | None = None) -> dict:
             if name in _EXCLUDED:
                 continue
             path = Path(directory) / name
-            if path.is_symlink() or not path.is_file():
+            source = path
+            link = None
+            if path.is_symlink():
+                if not allow_internal_file_symlinks:
+                    raise ValueError(f"contract input must not be a symlink: {path}")
+                link = os.readlink(path)
+                source = path.resolve(strict=True)
+                if not source.is_relative_to(root.resolve()):
+                    raise ValueError(f"dependency symlink escapes its package: {path}")
+            if not source.is_file():
                 raise ValueError(f"contract input must be a regular file: {path}")
             hashed = hashlib.sha256()
-            with path.open("rb") as file:
+            with source.open("rb") as file:
                 for block in iter(lambda: file.read(1024 * 1024), b""):
                     hashed.update(block)
-            result[str(path.relative_to(root))] = hashed.hexdigest()
+            result[str(path.relative_to(root))] = (
+                {"symlink": link, "sha256": hashed.hexdigest()}
+                if link is not None else hashed.hexdigest()
+            )
     return result
 
 
@@ -95,7 +118,7 @@ def _dependencies(root: Path) -> dict:
     try:
         manifest = json.loads(manifest_path.read_text())
     except (OSError, ValueError) as exc:
-        raise ValueError("cannot inspect Lake dependency manifest") from exc
+        raise ContractEnvironmentError("cannot inspect Lake dependency manifest") from exc
     package_dir = root / manifest.get("packagesDir", ".lake/packages")
     result = {}
     for package in manifest.get("packages", []):
@@ -104,10 +127,16 @@ def _dependencies(root: Path) -> dict:
             directory = root / package["dir"]
         else:
             directory = package_dir / name
-        directory = directory.resolve()
-        if not directory.is_dir():
-            raise ValueError(f"missing dependency source: {name}")
-        result[name] = {"path": str(directory), "sources": digest(_file_hashes(directory))}
+        try:
+            directory = directory.resolve()
+            if not directory.is_dir():
+                raise ValueError(f"missing dependency source: {name}")
+            hashes = _file_hashes(directory, allow_internal_file_symlinks=True)
+        except (OSError, ValueError, RuntimeError) as exc:
+            raise ContractEnvironmentError(
+                f"Cannot fingerprint dependency {name}: {exc}"
+            ) from exc
+        result[name] = {"path": str(directory), "sources": digest(hashes)}
     return result
 
 
@@ -132,7 +161,9 @@ def source_identity(root: Path) -> dict:
 
 
 def workspace_layout(root: Path) -> dict:
-    files = [str(path.relative_to(root)) for path in source_files(root)
+    layout = solve_workspace.discover(root, ["--layout-only"])
+    files = [str(path.relative_to(root))
+             for path in source_files(root, build_dir=layout["build_dir"])
              if path.suffix == ".lean" and path.name != "lakefile.lean"]
     data = solve_workspace.discover(root, files)
     if data.get("issues") or not isinstance(data.get("modules"), dict):
@@ -180,7 +211,8 @@ def inspect_environment(root: Path, tasks: list[dict]) -> dict:
         raise ValueError("formal contract inspector did not return valid JSON") from exc
     if data.get("issues") or set(data.get("targets", {})) != set(names):
         raise ValueError("formal contract inspection incomplete: " + str(data.get("issues", [])))
-    if not isinstance(data.get("project_axioms"), list) or not isinstance(data.get("project_sorries"), list):
+    if any(not isinstance(data.get(key), list)
+           for key in ("project_axioms", "project_sorries", "project_used_axioms")):
         raise ValueError("formal contract inspector omitted project-wide axiom/placeholder audit")
     return data
 
@@ -272,7 +304,9 @@ def freeze_formal_contract(paths, dag: dict) -> dict:
                     for name, row in targets.items()},
     }
     # Commit only source/build configuration, never run state or arbitrary files.
-    filenames = [str(path.relative_to(root)) for path in source_files(root)]
+    filenames = [str(path.relative_to(root)) for path in source_files(
+        root, build_dir=workspace_layout(root)["build_dir"],
+    )]
     unrelated_staged = set(_git(root, "diff", "--cached", "--name-only").splitlines()) - set(filenames)
     if unrelated_staged:
         raise ValueError("cannot checkpoint scaffold with unrelated staged files: " +
@@ -310,6 +344,11 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
         targets = inspection["targets"]
     except ValueError as exc:
         return {"passed": False, "issues": [*issues, str(exc)], "targets": {}}
+    native = set(inspection["project_used_axioms"]) & {
+        "Lean.ofReduceBool", "Lean.ofReduceNat", "Lean.trustCompiler",
+    }
+    if native:
+        issues.append("project uses native evaluation axioms: " + ", ".join(sorted(native)))
     if completed == {task.get("task_id", task.get("id")) for task in tasks}:
         if inspection["project_axioms"]:
             issues.append("project retains custom axioms: " + ", ".join(inspection["project_axioms"]))

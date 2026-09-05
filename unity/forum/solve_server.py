@@ -61,7 +61,7 @@ def _author(author: str) -> str:
     bound = os.getenv("UNITY_AGENT_NAME", "").strip()
     if bound and value.casefold() != bound.casefold():
         raise ValueError(f"this worker is bound to author '{bound}'")
-    return value
+    return bound or value
 
 
 def _thread_id(thread_id: str) -> str:
@@ -150,11 +150,14 @@ def _submit_formal_commit(
     supersedes: str = "",
 ) -> dict:
     resolved = worktree.verify_candidate_commit(_root(), author, commit_sha)
-    parent = _git(_root(), "rev-parse", f"{resolved}^").stdout.strip()
-    diff = _git(_root(), "show", "--format=", "--binary", resolved).stdout
+    base = _git(_root(), "merge-base", resolved, worktree.main_commit(_root())).stdout.strip()
+    diff = _git(
+        _root(), "diff", "--no-ext-diff", "--no-textconv",
+        "--binary", "--full-index", base, resolved,
+    ).stdout
     diff_sha = hashlib.sha256(diff.encode()).hexdigest()
     result = solve_state.submit_formal_candidate(
-        FORUM_DIR, strategy_id, author, task_id, resolved, parent, diff_sha,
+        FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
         notes=notes, supersedes=supersedes,
     )
     if result["status"] == "submitted":
@@ -800,7 +803,9 @@ def finalize_formalization(
             not strategy
             or strategy.get("phase") != "formalizing"
             or strategy.get("target") != task_id
-            or author not in {strategy.get("owner"), *strategy.get("assistants", [])}
+            or strategy.get("phase_revision") != state["formalization"]["revision"]
+            or strategy.get("status") != "claimed"
+            or not solve_state.participates(strategy, author)
         ):
             raise ValueError("author must own or assist a strategy for this formal task")
 
@@ -848,25 +853,16 @@ def finalize_formalization(
         committed = False
         if staged:
             expected_file = str(task.get("lean_file") or "").strip().lstrip("./")
-            if expected_file and expected_file not in staged:
+            # The proof may already be committed; the staged repair can live in
+            # another file. Check the complete candidate, not just this commit.
+            base = _git(tree, "merge-base", "HEAD", worktree.main_commit(_root())).stdout.strip()
+            candidate_paths = _git(
+                tree, "diff", "--cached", "--name-only", "-z", base,
+            ).stdout.split("\0")
+            if expected_file and expected_file not in candidate_paths:
                 _git(tree, "reset", check=False)
                 raise ValueError(
                     f"candidate does not change the target file '{expected_file}'"
-                )
-            staged_diff = _git(tree, "diff", "--cached", "--no-ext-diff").stdout
-            forbidden = sorted({
-                match.group(1)
-                for line in staged_diff.splitlines()
-                if line.startswith("+") and not line.startswith("+++")
-                for match in re.finditer(
-                    r"\b(sorry|admit|axiom|native_decide)\b",
-                    line[1:].split("--", 1)[0],
-                )
-            })
-            if forbidden:
-                _git(tree, "reset", check=False)
-                raise ValueError(
-                    "candidate adds forbidden construct(s): " + ", ".join(forbidden)
                 )
             commit = _git(
                 tree,

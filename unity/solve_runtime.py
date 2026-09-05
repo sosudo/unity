@@ -29,7 +29,6 @@ from .spawn import spawn
 
 
 _console = Console()
-_FORBIDDEN_RE = re.compile(r"\b(sorry|admit|axiom|native_decide)\b")
 
 
 def configure_forum(paths, profile: str) -> None:
@@ -207,11 +206,13 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
     tools_prompt = load_prompt("SOLVE_SOLVING_TOOLS")
     subagents = library.library_subagents()
     agents = {agent.name: agent for agent in roster.agents}
+    agent_names = {solve_state.author_key(name): name for name in agents}
     tasks: dict[str, asyncio.Task] = {}
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
     reviewer_results: dict[str, str] = {}
     submission_nudges: set[str] = set()
+    attempted_targets: set[str] = set()
     state = solve_state.load_state(paths.forum)
     seen = {event["event_id"] for event in state.get("events", [])}
     pending_reviews = {
@@ -235,6 +236,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
         if target_task:
             informal = current.get("informal_tasks", {}).get(target_task, {})
             worker_targets[name] = target_task
+            if not review_result:
+                attempted_targets.add(target_task)
             task_context = (
                 f"Your current informal task is `{target_task}` ({informal.get('kind', 'task')}): "
                 f"{informal.get('title', '')}. {informal.get('description', '')} "
@@ -295,7 +298,10 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
             if result.get("status") != "submitted":
                 pending_reviews.discard(result_id)
                 continue
-            reviewer = next((name for name in idle if name != result.get("author")), None)
+            reviewer = next((
+                name for name in idle
+                if solve_state.author_key(name) != solve_state.author_key(result.get("author"))
+            ), None)
             if reviewer is None:
                 break
             idle.remove(reviewer)
@@ -321,7 +327,15 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
             strategy.get("target") for strategy in current.get("strategies", {}).values()
             if strategy.get("phase") == "solving" and strategy.get("status") == "claimed"
         }
-        preferred = [task for task in ready if task["task_id"] not in claimed_targets]
+        active_targets = {
+            worker_targets[name] for name in tasks if name in worker_targets
+        }
+        preferred = [
+            task for task in ready
+            if task["task_id"] not in claimed_targets
+            and task["task_id"] not in active_targets
+            and task["task_id"] not in attempted_targets
+        ]
         for name, task in zip(idle, preferred):
             launch(name, target_task=task["task_id"])
 
@@ -385,15 +399,13 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 solve_state.release_author_claims(
                     paths.forum, name, "informal solver turn ended without a candidate"
                 )
-            if workers_finished and pending_reviews:
-                launch_idle_work(include_tasks=False)
-
             for event in solve_state.events_after(state, seen):
                 seen.add(event["event_id"])
                 kind = event.get("kind")
                 if kind in {"strategy_registered", "strategy_claimed", "strategy_assisted"}:
-                    if event.get("phase") == "solving" and event.get("author") in agents:
-                        worker_targets[event["author"]] = event.get("target", "")
+                    author = agent_names.get(solve_state.author_key(event.get("author")))
+                    if event.get("phase") == "solving" and author:
+                        worker_targets[author] = event.get("target", "")
                 elif kind == "informal_task_created":
                     launch_idle_work()
                 elif kind == "informal_result_submitted":
@@ -434,8 +446,9 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                         interrupts.pop(name, None)
                         worker_targets.pop(name, None)
                     launch_idle_work()
-                elif kind == "informal_task_superseded":
+                elif kind in {"informal_task_superseded", "informal_task_invalidated"}:
                     target = event.get("task_id", "")
+                    attempted_targets.discard(target)
                     affected = [
                         name for name, running in tasks.items()
                         if not running.done() and worker_targets.get(name) == target
@@ -443,7 +456,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                     await asyncio.gather(*(
                         _cancel(
                             agents[name], tasks[name], interrupts[name],
-                            f"informal task {target} superseded",
+                            event.get("reason") or f"informal task {target} superseded",
                             paths.project_root,
                         )
                         for name in affected
@@ -457,7 +470,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 elif kind == "informal_result_objected":
                     pending_reviews.discard(event["result_id"])
                     result = state.get("informal_results", {}).get(event["result_id"], {})
-                    author = result.get("author")
+                    author = agent_names.get(solve_state.author_key(result.get("author")))
                     if author in agents:
                         if author in tasks:
                             await _cancel(agents[author], tasks[author], interrupts[author],
@@ -474,7 +487,7 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                         )
                     launch_idle_work()
                 elif kind == "question_asked":
-                    recipient = event.get("to")
+                    recipient = agent_names.get(solve_state.author_key(event.get("to")))
                     if recipient in agents and recipient not in tasks:
                         launch(
                             recipient,
@@ -485,7 +498,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                 elif kind == "obstacle_reported":
                     helper = next((
                         name for name in agents
-                        if name != event.get("author") and name not in tasks
+                        if solve_state.author_key(name) != solve_state.author_key(event.get("author"))
+                        and name not in tasks
                     ), None)
                     if helper:
                         launch(
@@ -504,6 +518,8 @@ async def run_solving_runtime(roster, paths, mcp: dict, base_prompt: str) -> dic
                     ))
                     return solve_state.load_state(paths.forum)
 
+            if workers_finished:
+                launch_idle_work()
             if not tasks:
                 return state
         return solve_state.load_state(paths.forum)
@@ -658,15 +674,7 @@ def _merge_lock(project_root: Path):
 def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
                             contract: dict | None = None,
                             formal_tasks: list[dict] | None = None) -> dict:
-    forbidden = sorted({
-        match.group(1)
-        for line in diff.splitlines()
-        if line.startswith("+") and not line.startswith("+++")
-        for match in _FORBIDDEN_RE.finditer(line[1:].split("--", 1)[0])
-    })
     issues = []
-    if forbidden:
-        issues.append("candidate adds forbidden construct(s): " + ", ".join(forbidden))
     expected = task.get("lean_decl", "")
     tasks = formal_tasks or [task]
     completed = {item["task_id"] for item in tasks
@@ -684,7 +692,6 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
         "mode": "formal_contract",
         "contract_sha256": (contract or {}).get("sha256"),
         "verified_tasks": sorted(completed),
-        "forbidden_constructs": forbidden,
         "issues": issues,
     }
 
@@ -702,14 +709,23 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
         resolved = worktree.verify_candidate_commit(root, candidate["author"], candidate["commit_sha"])
     except Exception as exc:
         return {"ok": False, "error": f"candidate identity failed: {exc}"}
-    exact_diff = _git(root, "show", "--format=", "--binary", resolved).stdout
+    diff_result = _git(
+        root, "diff", "--no-ext-diff", "--no-textconv", "--binary", "--full-index",
+        candidate["base_main_sha"], resolved,
+    )
+    if diff_result.returncode:
+        return {"ok": False, "error": "could not read cumulative candidate diff"}
+    exact_diff = diff_result.stdout
     if hashlib.sha256(exact_diff.encode()).hexdigest() != candidate["diff_sha256"]:
         return {"ok": False, "error": "candidate commit no longer matches its submitted diff hash"}
     dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
     if dirty.returncode or dirty.stdout.strip():
         return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
     before = worktree.main_commit(root)
-    applied = _git(root, "cherry-pick", "--no-commit", resolved)
+    applied = subprocess.run(
+        ["git", "apply", "--3way", "--index", "-"],
+        cwd=root, input=exact_diff, capture_output=True, text=True, check=False,
+    )
     if applied.returncode:
         _git(root, "reset", "--hard", before)
         return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
@@ -834,6 +850,40 @@ def _integrate_and_record(paths, candidate: dict, task: dict) -> dict:
         return result
 
 
+def recover_interrupted_formal_merges(paths) -> None:
+    """Reopen clean interrupted merges; never discard ambiguous main changes."""
+    with _merge_lock(paths.project_root):
+        state = solve_state.load_state(paths.forum)
+        formal = state["formalization"]
+        interrupted = [
+            candidate for candidate in state["formal_candidates"].values()
+            if state["phase"] == "formalizing"
+            and candidate.get("status") == "merging"
+            and candidate.get("formalization_revision") == formal.get("revision")
+            and candidate.get("solution_candidate") == formal.get("solution_candidate")
+        ]
+        if not interrupted:
+            return
+        status = _git(
+            paths.project_root, "status", "--porcelain", "--untracked-files=no",
+        )
+        if (
+            status.returncode
+            or status.stdout.strip()
+            or worktree.main_commit(paths.project_root) != formal["main_sha"]
+        ):
+            raise ValueError(
+                "Interrupted formal merge: main is dirty or differs from "
+                f"the last accepted commit {formal['main_sha']}. "
+                "Inspect and reconcile main before resuming. No changes were discarded."
+            )
+        for candidate in interrupted:
+            solve_state.finish_formal_merge(
+                paths.forum, candidate["candidate_id"], success=False,
+                error="Merge interrupted; task reopened for resubmission.",
+            )
+
+
 async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) -> dict:
     """Swarm ready formal tasks and integrate candidates using prove-style events."""
     if stop_requested(paths.project_root):
@@ -843,6 +893,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     context = library.library_context()
     subagents = library.library_subagents()
     agents = {agent.name: agent for agent in roster.agents}
+    agent_names = {solve_state.author_key(name): name for name in agents}
     worktrees: dict[str, Path] = {}
     tasks: dict[str, asyncio.Task] = {}
     interrupts: dict[str, asyncio.Event] = {}
@@ -870,7 +921,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             strategy for strategy in current.get("strategies", {}).values()
             if strategy.get("phase") == "formalizing"
             and strategy.get("status") == "claimed"
-            and strategy.get("owner") == name
+            and solve_state.author_key(strategy.get("owner")) == solve_state.author_key(name)
             and (not task_id or strategy.get("target") == task_id)
         ), None)
 
@@ -1021,8 +1072,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 seen.add(event["event_id"])
                 kind = event.get("kind")
                 if kind in {"strategy_registered", "strategy_claimed", "strategy_assisted"}:
-                    if event.get("phase") == "formalizing" and event.get("author") in agents:
-                        worker_targets[event["author"]] = event.get("target", "")
+                    author = agent_names.get(solve_state.author_key(event.get("author")))
+                    if event.get("phase") == "formalizing" and author:
+                        worker_targets[author] = event.get("target", "")
                 if kind != "formal_candidate_submitted":
                     continue
                 candidate_id = event["candidate_id"]
@@ -1033,7 +1085,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 task_id = candidate["task_id"]
                 affected = [
                     name for name, task in tasks.items()
-                    if not task.done() and (worker_targets.get(name) == task_id or name == candidate["author"])
+                    if not task.done() and (
+                        worker_targets.get(name) == task_id
+                        or solve_state.author_key(name) == solve_state.author_key(candidate["author"])
+                    )
                 ]
                 await asyncio.gather(*(
                     _cancel(agents[name], tasks[name], interrupts[name],

@@ -179,6 +179,30 @@ def _key(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
 
 
+def author_key(value) -> str:
+    """Compare bound roster identities consistently, including legacy records."""
+    return str(value or "").strip().casefold()
+
+
+def participates(strategy: dict, author: str) -> bool:
+    identity = author_key(author)
+    return bool(identity) and identity in {
+        author_key(strategy.get("owner")),
+        *(author_key(item) for item in strategy.get("assistants", [])),
+    }
+
+
+def independent_reviewers(record: dict, verdict: str) -> set[str]:
+    producer = author_key(record.get("author"))
+    return {
+        author_key(review.get("author"))
+        for review in record.get("reviews", [])
+        if review.get("verdict") == verdict
+        and author_key(review.get("author"))
+        and author_key(review.get("author")) != producer
+    }
+
+
 def _event(state: dict, kind: str, **fields) -> dict:
     event = {"event_id": _id("event"), "kind": kind, "timestamp": time.time(), **fields}
     state.setdefault("events", []).append(event)
@@ -372,11 +396,17 @@ def claim_strategy(forum_dir: Path, strategy_id: str, author: str) -> dict:
             raise ValueError(f"unknown strategy '{strategy_id}'")
         if strategy["phase"] != state["phase"]:
             raise ValueError("strategy belongs to a different phase")
+        revision = (
+            state["solution"]["revision"] if strategy["phase"] == "solving"
+            else state["formalization"]["revision"]
+        )
+        if strategy.get("phase_revision") != revision:
+            raise ValueError("strategy belongs to an obsolete revision")
         active_owned = next((
             item for item in state["strategies"].values()
             if item.get("strategy_id") != strategy_id
             and item.get("phase") == strategy["phase"]
-            and item.get("owner") == author
+            and author_key(item.get("owner")) == author_key(author)
             and item.get("status") == "claimed"
         ), None)
         if active_owned is not None:
@@ -386,7 +416,7 @@ def claim_strategy(forum_dir: Path, strategy_id: str, author: str) -> dict:
                 "active_strategy": active_owned,
             }
         if strategy["status"] == "claimed":
-            if strategy["owner"] == author:
+            if author_key(strategy["owner"]) == author_key(author):
                 return {"status": "claimed", "strategy": strategy, "idempotent": True}
             return {"status": "conflict", "strategy": strategy, "owner": strategy["owner"]}
         if strategy["status"] != "registered":
@@ -427,7 +457,7 @@ def assist_strategy(forum_dir: Path, strategy_id: str, author: str, contribution
         strategy = state["strategies"].get(strategy_id)
         if not strategy or strategy.get("status") != "claimed":
             raise ValueError("strategy is not actively claimed")
-        if author != strategy["owner"] and author not in strategy["assistants"]:
+        if not participates(strategy, author):
             strategy["assistants"].append(_text(author, "author", 100))
         strategy["updated_at"] = time.time()
         _event(state, "strategy_assisted", strategy_id=strategy_id, author=author,
@@ -448,7 +478,7 @@ def release_strategy(
         strategy = state["strategies"].get(strategy_id)
         if not strategy:
             raise ValueError(f"unknown strategy '{strategy_id}'")
-        if strategy.get("owner") != author:
+        if author_key(strategy.get("owner")) != author_key(author):
             raise ValueError("only the strategy owner can release it")
         strategy["status"] = "incorrect" if incorrect else "registered"
         strategy["owner"] = None
@@ -463,7 +493,10 @@ def release_author_claims(forum_dir: Path, author: str, reason: str) -> list[str
     released: list[str] = []
     with transaction(forum_dir) as state:
         for strategy in state["strategies"].values():
-            if strategy.get("owner") != author or strategy.get("status") != "claimed":
+            if (
+                author_key(strategy.get("owner")) != author_key(author)
+                or strategy.get("status") != "claimed"
+            ):
                 continue
             strategy["owner"] = None
             strategy["status"] = "registered"
@@ -503,9 +536,10 @@ def submit_informal_result(
             not strategy
             or strategy.get("phase") != "solving"
             or strategy.get("target") != task_id
+            or strategy.get("phase_revision") != state["solution"]["revision"]
         ):
             raise ValueError("result strategy does not target this informal task")
-        if author != strategy.get("owner") and author not in strategy.get("assistants", []):
+        if not participates(strategy, author):
             raise ValueError("result author does not own or assist the strategy")
         if supersedes:
             old = state["informal_results"].get(supersedes)
@@ -514,10 +548,16 @@ def submit_informal_result(
         for existing in state["informal_results"].values():
             if existing.get("task_id") != task_id:
                 continue
-            if existing.get("sha256") == sha256:
+            if (
+                existing.get("sha256") == sha256
+                and existing.get("status") in {"submitted", "supported", "incorporated"}
+            ):
                 return {"status": "duplicate", "result": existing}
             if existing.get("status") in {"submitted", "supported", "incorporated"}:
                 return {"status": "conflict", "result": existing}
+        if strategy.get("status") != "claimed":
+            raise ValueError("result strategy is no longer actively claimed")
+        _require_dependencies(state, task)
         result_id = _id("result")
         result = {
             "result_id": result_id,
@@ -564,6 +604,8 @@ def review_informal_result(
     if verdict not in {"support", "object"}:
         raise ValueError("verdict must be support or object")
     with transaction(forum_dir) as state:
+        if state["phase"] != "solving":
+            raise ValueError("component review is closed; review the submitted paper instead")
         result = state["informal_results"].get(result_id)
         if not result or result.get("status") not in {"submitted", "supported"}:
             raise ValueError("informal result is not reviewable")
@@ -573,10 +615,15 @@ def review_informal_result(
             or task.get("status") in {"superseded", "cancelled"}
         ):
             raise ValueError("informal result targets a stale or closed task")
-        if result.get("author") == author:
+        if author_key(result.get("author")) == author_key(author):
             raise ValueError("authors cannot review their own informal result")
-        if any(item.get("author") == author for item in result.get("reviews", [])):
+        if any(
+            author_key(item.get("author")) == author_key(author)
+            for item in result.get("reviews", [])
+        ):
             raise ValueError("reviewer already reviewed this informal result")
+        if verdict == "support":
+            _require_dependencies(state, task)
         item = {
             "review_id": _id("result-review"),
             "author": _text(author, "author", 100),
@@ -644,11 +691,83 @@ def review_informal_result(
                     strategy["status"] = strategy.pop("paused_from", "registered")
             _event(state, "informal_task_reopened", task_id=task["task_id"],
                    result_id=result_id, author=author, reason=review[:1000])
+            _invalidate_dependents(
+                state, task["task_id"], f"dependency result {result_id} was objected to",
+            )
         task["updated_at"] = time.time()
         _event(state, f"informal_result_{'supported' if verdict == 'support' else 'objected'}",
                result_id=result_id, task_id=task["task_id"], author=author,
                review=review[:1000])
     return {"result": result, "review": item, "task": task}
+
+
+def _require_component(
+    state: dict, result_id: str, ancestors: frozenset[str] = frozenset(),
+) -> dict:
+    result = state["informal_results"].get(result_id)
+    if (
+        not result
+        or result.get("status") not in {"supported", "incorporated"}
+        or any(review.get("verdict") == "object" for review in result.get("reviews", []))
+        or not independent_reviewers(result, "support")
+    ):
+        raise ValueError(f"component '{result_id}' is unavailable")
+    if result_id in ancestors:
+        raise ValueError("component dependencies contain a cycle")
+    task = state["informal_tasks"].get(result["task_id"])
+    if not task:
+        raise ValueError(f"component '{result_id}' has no producer task")
+    # Earlier incorporated components remain usable in an accepted-paper spot fix.
+    # Their producer tasks belong to the previous revision and may be superseded.
+    for dependency in task.get("dependencies", []):
+        dependency_result = state["informal_tasks"].get(dependency, {}).get("resolved_result")
+        if not dependency_result:
+            raise ValueError(f"unresolved component dependency '{dependency}'")
+        _require_component(state, dependency_result, ancestors | {result_id})
+    return result
+
+
+def _require_dependencies(state: dict, task: dict) -> None:
+    for dependency in task.get("dependencies", []):
+        prerequisite = state["informal_tasks"].get(dependency, {})
+        if prerequisite.get("status") != "resolved":
+            raise ValueError(f"dependency '{dependency}' is not resolved")
+        _require_component(state, prerequisite.get("resolved_result", ""))
+
+
+def _invalidate_dependents(state: dict, source_task: str, reason: str) -> None:
+    tasks = state["informal_tasks"]
+    affected = {source_task}
+    while True:
+        more = {
+            task_id for task_id, task in tasks.items()
+            if task_id not in affected
+            and task.get("solution_revision") == state["solution"]["revision"]
+            and task.get("status") not in {"superseded", "cancelled"}
+            and affected.intersection(task.get("dependencies", []))
+        }
+        if not more:
+            break
+        affected |= more
+    for task_id in affected - {source_task}:
+        tasks[task_id].update(
+            status="open", resolved_result=None,
+            invalidation_reason=reason, updated_at=time.time(),
+        )
+        for result in state["informal_results"].values():
+            if (
+                result.get("task_id") == task_id
+                and result.get("status") in {"submitted", "supported", "incorporated"}
+            ):
+                result.update(status="superseded", supersession_reason=reason)
+        for strategy in state["strategies"].values():
+            if (
+                strategy.get("phase") == "solving"
+                and strategy.get("target") == task_id
+                and strategy.get("status") in _ACTIVE_STRATEGIES
+            ):
+                strategy.update(status="cancelled", cancellation_reason=reason)
+        _event(state, "informal_task_invalidated", task_id=task_id, reason=reason)
 
 
 def publish_finding(
@@ -814,14 +933,17 @@ def submit_solution_candidate(
         if current_id:
             current = state["solution_candidates"].get(current_id, {})
             if current.get("status") in {"submitted", "review"}:
-                if current.get("sha256") == sha256 and current.get("author") == author:
+                if (
+                    current.get("sha256") == sha256
+                    and author_key(current.get("author")) == author_key(author)
+                ):
                     return {"status": "submitted", "candidate": current, "idempotent": True}
                 return {"status": "conflict", "candidate": current}
         if strategy_id:
             strategy = state["strategies"].get(strategy_id)
             if not strategy or strategy.get("phase") != "solving":
                 raise ValueError("candidate strategy is not a solving strategy")
-            if author != strategy.get("owner") and author not in strategy.get("assistants", []):
+            if not participates(strategy, author):
                 raise ValueError("candidate author does not own or assist the strategy")
         if supersedes and supersedes not in state["solution_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
@@ -834,9 +956,7 @@ def submit_solution_candidate(
         component_ids = list(dict.fromkeys(component_ids))
         components = []
         for result_id in component_ids:
-            result = state["informal_results"].get(result_id)
-            if not result or result.get("status") not in {"supported", "incorporated"}:
-                raise ValueError(f"candidate component '{result_id}' is unavailable")
+            result = _require_component(state, result_id)
             components.append({
                 "result_id": result_id,
                 "task_id": result["task_id"],
@@ -891,9 +1011,12 @@ def review_solution_candidate(
         candidate = state["solution_candidates"].get(candidate_id)
         if not candidate or candidate.get("status") != "review":
             raise ValueError("candidate is not under review")
-        if candidate["author"] == author:
+        if author_key(candidate["author"]) == author_key(author):
             raise ValueError("candidate authors cannot review their own candidate")
-        if any(item["author"] == author for item in candidate["reviews"]):
+        if any(
+            author_key(item["author"]) == author_key(author)
+            for item in candidate["reviews"]
+        ):
             raise ValueError("reviewer already submitted a verdict for this candidate")
         item = {
             "review_id": _id("review"),
@@ -971,10 +1094,22 @@ def accept_solution_candidate(forum_dir: Path, candidate_id: str, author: str) -
         candidate = state["solution_candidates"].get(candidate_id)
         if not candidate or candidate.get("status") != "review":
             raise ValueError("candidate is not reviewable")
-        if not any(item.get("verdict") == "approve" for item in candidate["reviews"]):
+        if (
+            state["phase"] != "solution_review"
+            or state["solution"].get("current_candidate") != candidate_id
+        ):
+            raise ValueError("candidate is no longer the current paper under review")
+        if not independent_reviewers(candidate, "approve"):
             raise ValueError("candidate has no independent approval")
         if any(item.get("verdict") == "object" for item in candidate["reviews"]):
             raise ValueError("candidate has an unresolved objection")
+        for part in candidate.get("components", []):
+            result = _require_component(state, part["result_id"])
+            if (
+                result["sha256"] != part["sha256"]
+                or result["artifact_id"] != part["artifact_id"]
+            ):
+                raise ValueError(f"component '{part['result_id']}' changed")
         candidate["status"] = "accepted"
         candidate["accepted_at"] = time.time()
         state["solution"].update({
@@ -1393,15 +1528,34 @@ def submit_formal_candidate(
         if not task or task.get("status") == "complete":
             raise ValueError("formal task is unknown or already complete")
         strategy = state["strategies"].get(strategy_id)
-        if not strategy or strategy.get("phase") != "formalizing" or strategy.get("target") != task_id:
-            raise ValueError("candidate strategy does not target this formal task")
-        if author != strategy.get("owner") and author not in strategy.get("assistants", []):
+        if (
+            not strategy
+            or strategy.get("phase") != "formalizing"
+            or strategy.get("target") != task_id
+            or strategy.get("phase_revision") != state["formalization"]["revision"]
+        ):
+            raise ValueError("candidate strategy does not target this formal task/revision")
+        if strategy.get("status") not in {"claimed", "paused"}:
+            raise ValueError("candidate strategy is no longer active")
+        if not participates(strategy, author):
             raise ValueError("candidate author does not own or assist the strategy")
         for existing in state["formal_candidates"].values():
-            if existing.get("task_id") == task_id and existing.get("status") in {"submitted", "merging"}:
-                if existing.get("commit_sha") == commit_sha:
+            if (
+                existing.get("task_id") == task_id
+                and existing.get("formalization_revision") == state["formalization"]["revision"]
+                and existing.get("status") in {"submitted", "merging"}
+            ):
+                if (
+                    existing.get("strategy_id") == strategy_id
+                    and author_key(existing.get("author")) == author_key(author)
+                    and existing.get("commit_sha") == commit_sha
+                    and existing.get("base_main_sha") == base_main_sha.casefold()
+                    and existing.get("diff_sha256") == diff_sha256
+                ):
                     return {"status": "submitted", "candidate": existing, "idempotent": True}
                 return {"status": "conflict", "candidate": existing}
+        if strategy.get("status") != "claimed" or task.get("status") != "pending":
+            raise ValueError("formal strategy/task is not accepting a new candidate")
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
         candidate_id = _id("formal")

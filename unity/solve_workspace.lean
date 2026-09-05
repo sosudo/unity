@@ -17,7 +17,8 @@ import name), `traces` (module name to package-relative trace file), `build_dir`
 `source_roots`, `unmatched`, and `issues`. Pass the controller's
 already checked source paths; unowned scratch files are reported as unmatched.
 The caller must reject an unmatched required target, and must still check source
-containment/symlinks. With no arguments, Lake's configured library globs and
+containment/symlinks. Pass --layout-only to inspect configuration without source
+enumeration. With no arguments, Lake's configured library globs and
 executable roots are enumerated (not the transitive imports of those modules).
 
 Use Lake's actual Lean/TOML package loader and source lookup, not a TOML parser
@@ -49,7 +50,8 @@ private def loadRoot : IO Package := do
 
 private def discover (paths : List String) : IO Json := do
   let pkg ← loadRoot
-  let mut paths := paths
+  let layoutOnly := paths == ["--layout-only"]
+  let mut paths := if layoutOnly then [] else paths
   let mut roots : Array Json := #[]
   for lib in pkg.leanLibs do
     roots := roots.push <| Json.mkObj [
@@ -59,7 +61,7 @@ private def discover (paths : List String) : IO Json := do
     roots := roots.push <| Json.mkObj [
       ("kind", Json.str "executable"), ("name", Json.str exe.name.toString),
       ("path", Json.str (relPathFrom pkg.dir exe.root.rootDir).normalize.toString)]
-  if paths.isEmpty then
+  if paths.isEmpty && !layoutOnly then
     for lib in pkg.leanLibs do
       for mod in ← lib.getModuleArray do
         paths := paths ++ [mod.relLeanFile.normalize.toString]

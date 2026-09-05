@@ -8,9 +8,13 @@ After building all project modules:
 The module arguments define project ownership; callers MUST separately pin/audit
 all external dependencies and the toolchain. Output is a JSON object containing
 `targets` (keyed by exact declaration name), `issues`, and whole-project
-`project_axioms`/`project_sorries` lists. The latter list records direct sorryAx
+`project_axioms`/`project_sorries` lists, plus `project_used_axioms` containing
+the transitive axiom dependencies of every project-owned declaration.
+The project_sorries list records direct sorryAx
 uses in any project declaration's type or value, so even unused private proof
-holes are visible. These lists are final-completion checks, not frozen meanings.
+holes are visible. The direct axiom and placeholder lists are final-completion
+checks; transitive native-evaluation dependencies are checked at every merge.
+None of these proof-dependent lists is a frozen meaning.
 A target has `name`,
 `target_kind`, `module`, `level_params`, structural `type`, project-owned
 `meanings`, and full-environment `axioms`. Only `axioms` is proof-dependent.
@@ -213,8 +217,10 @@ private def extract (modules targets : List String) : IO (Json × UInt32) := do
   let projects : NameSet := modules.foldl (fun s a => s.insert a.toName) {}
   let mut projectAxioms : List String := []
   let mut projectSorries : List String := []
+  let mut projectRoots : Array Name := #[]
   for (n, ci) in env.constants.toList do
     unless (moduleOf env n).any projects.contains do continue
+    projectRoots := projectRoots.push n
     if let .axiomInfo _ := ci then projectAxioms := n.toString :: projectAxioms
     let direct := usedConstants ci.type ++
       ((ci.value? (allowOpaque := true)).map usedConstants).getD #[]
@@ -246,9 +252,13 @@ private def extract (modules targets : List String) : IO (Json × UInt32) := do
       ("type", exprJson ci.type),
       ("meanings", Json.mkObj ms.records),
       ("axioms", Json.arr (axiomNames.toArray.map Json.str))]) :: records
+  let (_, projectAudit) := (projectRoots.forM (audit env)).run { edges := edges }
+  issues := issues ++ projectAudit.issues
+  let projectUsedAxioms := projectAudit.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
   return (Json.mkObj [("targets", Json.mkObj records),
     ("project_axioms", toJson (projectAxioms.mergeSort (· ≤ ·))),
     ("project_sorries", toJson (projectSorries.mergeSort (· ≤ ·))),
+    ("project_used_axioms", toJson projectUsedAxioms),
     ("issues", Json.arr (issues.map Json.str))], if issues.isEmpty then 0 else 1)
 
 end UnitySolveContract

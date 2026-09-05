@@ -26,6 +26,7 @@ from ..solve_runtime import (
     configure_forum,
     forum_brief,
     materialize_solution,
+    recover_interrupted_formal_merges,
     reset_solve_workspace,
     run_formalizing_runtime,
     run_solving_runtime,
@@ -168,7 +169,9 @@ def _brief_provider(paths, profile: str):
     return lambda author: forum_brief(paths, profile, author)
 
 
-def _prepare_solve_environment(root, *, run_architect: bool) -> None:
+def _prepare_solve_environment(
+    root, *, run_architect: bool, validate_project: bool = True,
+) -> None:
     """Refresh deterministic Lean state before any solve worker is launched."""
     # Reap registered work left by an interrupted solve before touching the
     # controller-owned shared package cache.
@@ -177,11 +180,12 @@ def _prepare_solve_environment(root, *, run_architect: bool) -> None:
         architect(root)
     click.echo("Refreshing Mathlib build cache...")
     lake.cache_get(root)
-    click.echo("Validating Lean project...")
-    lake.build(root)
+    if validate_project:
+        click.echo("Validating Lean project...")
+        lake.build(root)
 
 
-async def _review_current_solution(roster, paths) -> bool:
+async def _review_current_solution(roster, paths, max_attempts: int | float) -> bool:
     """Run the independent semantic gate for the exact submitted paper."""
     state = solve_state.load_state(paths.forum)
     candidate_id = state["solution"].get("current_candidate")
@@ -190,53 +194,79 @@ async def _review_current_solution(roster, paths) -> bool:
         raise click.ClickException("solution-review phase has no reviewable candidate")
 
     quorum = _review_quorum()
-    existing = {review["author"] for review in candidate.get("reviews", [])}
-    approvals = sum(review.get("verdict") == "approve" for review in candidate.get("reviews", []))
+    existing = {solve_state.author_key(review["author"])
+                for review in candidate.get("reviews", [])}
+    approvals = len(solve_state.independent_reviewers(candidate, "approve"))
     reviewers = sorted(
         (
             agent for agent in roster.agents
-            if agent.name != candidate["author"] and agent.name not in existing
+            if solve_state.author_key(agent.name) != solve_state.author_key(candidate["author"])
+            and solve_state.author_key(agent.name) not in existing
         ),
         key=lambda agent: -agent.strength,
     )
     needed = max(0, quorum - approvals)
-    if needed and len(reviewers) < needed:
+    objected = any(review.get("verdict") == "object" for review in candidate.get("reviews", []))
+    if needed and not objected and len(reviewers) < needed:
         raise click.ClickException(
             f"solution candidate needs {quorum} independent review(s), but the roster has "
             f"only {len(reviewers) + approvals} available"
         )
 
-    if needed:
-        await dispatch(
-            reviewers[:needed],
-            roster,
-            load_prompt("solve/SOLUTION_REVIEW"),
-            f"Independently review solution candidate `{candidate_id}` at immutable artifact "
-            f"`{candidate['artifact_id']}` with SHA-256 `{candidate['sha256']}` against the original "
-            "problem. Submit exactly one approve or object verdict through review_solution_candidate. "
-            "Do not edit the paper.",
-            paths.project_root,
-            build_solve_mcp(paths, "solution_review"),
-            tools_prompt="SOLVE_REVIEW_TOOLS",
-            icrl_enabled=False,
-            brief_provider=_brief_provider(paths, "solution_review"),
-            mcp_profile="solve",
-            log_context={"command": "solve", "run_id": state.get("run_id"),
-                         "phase": "solution_review", "role": "reviewer"},
-        )
+    for reviewer in reviewers:
+        attempt = 0
+        while attempt < max_attempts:
+            if stop_requested(paths.project_root):
+                return False
+            state = solve_state.load_state(paths.forum)
+            if (state["phase"] != "solution_review"
+                    or state["solution"].get("current_candidate") != candidate_id):
+                return False
+            candidate = state["solution_candidates"][candidate_id]
+            reviews = candidate.get("reviews", [])
+            if (any(review.get("verdict") == "object" for review in reviews)
+                    or len(solve_state.independent_reviewers(candidate, "approve")) >= quorum
+                    or any(solve_state.author_key(review["author"])
+                           == solve_state.author_key(reviewer.name) for review in reviews)):
+                break
+            attempt += 1
+            await dispatch(
+                [reviewer],
+                roster,
+                load_prompt("solve/SOLUTION_REVIEW"),
+                f"Independently review solution candidate `{candidate_id}` at immutable artifact "
+                f"`{candidate['artifact_id']}` with SHA-256 `{candidate['sha256']}` against the original "
+                "problem. Submit exactly one approve or object verdict through review_solution_candidate. "
+                "Do not edit the paper.",
+                paths.project_root,
+                build_solve_mcp(paths, "solution_review"),
+                tools_prompt="SOLVE_REVIEW_TOOLS",
+                icrl_enabled=False,
+                brief_provider=_brief_provider(paths, "solution_review"),
+                mcp_profile="solve",
+                log_context={"command": "solve", "run_id": state.get("run_id"),
+                             "phase": "solution_review", "role": "reviewer", "attempt": attempt},
+            )
 
+    if stop_requested(paths.project_root):
+        return False
     state = solve_state.load_state(paths.forum)
+    if (state["phase"] != "solution_review"
+            or state["solution"].get("current_candidate") != candidate_id):
+        return False
     candidate = state["solution_candidates"][candidate_id]
     objections = [review for review in candidate.get("reviews", []) if review.get("verdict") == "object"]
-    approvals = [review for review in candidate.get("reviews", []) if review.get("verdict") == "approve"]
+    approvals = solve_state.independent_reviewers(candidate, "approve")
     if objections:
         reason = " | ".join(review.get("review", "") for review in objections)
         solve_state.reject_solution_candidate(paths.forum, candidate_id, "Unity", reason)
         click.echo(f"solution candidate {candidate_id} rejected: {reason[:500]}")
         return False
     if len(approvals) < quorum:
-        click.echo(f"solution candidate {candidate_id} did not receive a review; retrying review")
-        return False
+        raise click.ClickException(
+            "every eligible reviewer exhausted its solution-review attempts "
+            "before the required verdicts were submitted"
+        )
 
     accepted = solve_state.accept_solution_candidate(paths.forum, candidate_id, "Unity")
     materialize_solution(paths, accepted)
@@ -326,6 +356,14 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
                         requirements=dag["requirements"],
                         contract=contract,
                     )
+            except solve_contract.ContractEnvironmentError as exc:
+                solve_state.finish_chunking_attempt(
+                    paths.forum, attempt["attempt_id"], succeeded=False,
+                    reason=f"environment failure: {exc}",
+                )
+                raise click.ClickException(
+                    f"Contract environment check failed; not retrying chunking: {exc}"
+                ) from exc
             except (OSError, ValueError) as exc:
                 reason = str(exc)
                 if dispatch_failure is not None:
@@ -503,6 +541,9 @@ async def solve(continue_):
     paths = load_paths()
     (paths.unity / "stop-requested").unlink(missing_ok=True)
     roster = load_roster(paths.agents_yaml, use_learned_strength=False)
+    names = [solve_state.author_key(agent.name) for agent in roster.agents]
+    if len(names) != len(set(names)):
+        raise click.ClickException("solve agent names must be unique ignoring case")
     resume = resume_point(paths, "solve", continue_)
     if resume:
         click.echo(f"resuming from phase: {resume}")
@@ -510,9 +551,18 @@ async def solve(continue_):
     max_attempts = _attempt_limit()
 
     fresh = resume is None and not continue_
+    if not fresh:
+        solve_jobs.terminate(root)
+        try:
+            recover_interrupted_formal_merges(paths)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     if fresh:
         mark_phase("solve", "architect")
-    _prepare_solve_environment(root, run_architect=fresh)
+    persisted_phase = solve_state.load_state(paths.forum).get("phase") if not fresh else None
+    _prepare_solve_environment(
+        root, run_architect=fresh, validate_project=persisted_phase != "chunking",
+    )
 
     problem = paths.unity_md.read_bytes() if paths.unity_md.exists() else b""
     problem_sha = hashlib.sha256(problem).hexdigest()
@@ -555,7 +605,7 @@ async def solve(continue_):
             continue
 
         if phase == "solution_review":
-            await _review_current_solution(roster, paths)
+            await _review_current_solution(roster, paths, max_attempts)
             continue
 
         if phase == "chunking":
