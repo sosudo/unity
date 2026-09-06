@@ -317,8 +317,10 @@ async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> 
                 "explicit mathematical requirements, source-component coverage, and an acyclic graph. "
                 "Create an elaboratable Lean scaffold for each chunk's exact declaration and complete "
                 "meaning-bearing definitions. Only theorem proofs may remain as scaffold sorry holes. "
-                "Prefer one final-theorem chunk for a short single-result proof; introduce helpers only when "
-                "Lean implementation or useful parallelism actually requires them."
+                "Use meaningful proof units, keeping tightly coupled steps together and splitting "
+                "substantial independently useful work. Record genuine proof prerequisites, not "
+                "paper order or shared-definition dependencies. Minimize scaffold imports using "
+                "the installed min_imports tools."
                 + prior_context,
                 paths.project_root,
                 build_solve_mcp(paths, "chunking"),

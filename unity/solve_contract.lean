@@ -2,8 +2,9 @@
 SOLVE-only kernel contract and axiom extractor. This is deliberately independent of
 the human-readable blueprint extractor, and never applies its name/noise filters.
 
-After building all project modules:
-  lake env lean --run <this file> Module.One Module.Two -- Target.one Target.two
+After building all project modules, Unity runs the cached native inspector:
+  lake env <cache>/contract Module.One Module.Two -- Target.one Target.two
+The same helper can be interpreted with lean --run for equivalence tests.
 
 The module arguments define project ownership; callers MUST separately pin/audit
 all external dependencies and the toolchain. Output is a JSON object containing
@@ -211,9 +212,11 @@ private partial def collectMeanings (env : Environment) (projects : NameSet)
   for dep in meaningDeps env ci do collectMeanings env projects dep
 
 private def extract (modules targets : List String) : IO (Json × UInt32) := do
+  let started ← IO.monoMsNow
   initSearchPath (← findSysroot)
   let mods := modules.toArray.map fun a => ({ module := a.toName, importAll := true } : Import)
   let env ← importModules mods {} 0
+  let imported ← IO.monoMsNow
   let projects : NameSet := modules.foldl (fun s a => s.insert a.toName) {}
   let mut projectAxioms : List String := []
   let mut projectSorries : List String := []
@@ -225,6 +228,7 @@ private def extract (modules targets : List String) : IO (Json × UInt32) := do
     let direct := usedConstants ci.type ++
       ((ci.value? (allowOpaque := true)).map usedConstants).getD #[]
     if direct.contains ``sorryAx then projectSorries := n.toString :: projectSorries
+  let enumerated ← IO.monoMsNow
   let mut records : List (String × Json) := []
   let mut issues : Array String := #[]
   let mut edges : NameMap (Array Name) := {}
@@ -252,13 +256,21 @@ private def extract (modules targets : List String) : IO (Json × UInt32) := do
       ("type", exprJson ci.type),
       ("meanings", Json.mkObj ms.records),
       ("axioms", Json.arr (axiomNames.toArray.map Json.str))]) :: records
+  let targetsChecked ← IO.monoMsNow
   let (_, projectAudit) := (projectRoots.forM (audit env)).run { edges := edges }
   issues := issues ++ projectAudit.issues
   let projectUsedAxioms := projectAudit.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
+  let audited ← IO.monoMsNow
   return (Json.mkObj [("targets", Json.mkObj records),
     ("project_axioms", toJson (projectAxioms.mergeSort (· ≤ ·))),
     ("project_sorries", toJson (projectSorries.mergeSort (· ≤ ·))),
     ("project_used_axioms", toJson projectUsedAxioms),
+    -- Telemetry is deliberately outside the per-target semantic records.
+    ("timings_ms", Json.mkObj [
+      ("imports", toJson (imported - started)),
+      ("enumeration", toJson (enumerated - imported)),
+      ("targets", toJson (targetsChecked - enumerated)),
+      ("project_audit", toJson (audited - targetsChecked))]),
     ("issues", Json.arr (issues.map Json.str))], if issues.isEmpty then 0 else 1)
 
 end UnitySolveContract
@@ -269,7 +281,7 @@ def main (args : List String) : IO UInt32 := do
   let targets := rest.drop 1
   if modules.isEmpty || targets.isEmpty then
     IO.println (Json.mkObj [("targets", Json.mkObj []), ("issues", toJson [
-      "usage: lake env lean --run solve_contract.lean Module... -- Target..."])]).compress
+      "usage: lake env <contract-executable> Module... -- Target..."])]).compress
     return 1
   try
     let (result, code) ← UnitySolveContract.extract modules targets

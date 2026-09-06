@@ -14,7 +14,7 @@ import signal
 import subprocess
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
 
@@ -45,6 +45,7 @@ def run(
     owner: str = "Unity",
     task_id: str = "",
     serialize_build: bool = False,
+    timings: dict | None = None,
 ) -> subprocess.CompletedProcess:
     """Run and register one deterministic solve job in its own process group."""
     project_root = Path(project_root).resolve()
@@ -54,11 +55,22 @@ def run(
 
     @contextmanager
     def maybe_locked():
-        if serialize_build:
-            with _build_lock(project_root):
+        queued = time.monotonic() if timings is not None else 0.0
+        acquired = None
+        try:
+            with _build_lock(project_root) if serialize_build else nullcontext():
+                if timings is not None:
+                    acquired = time.monotonic()
+                    timings["lock_wait_seconds"] = acquired - queued
                 yield
-        else:
-            yield
+        finally:
+            if timings is not None:
+                finished = time.monotonic()
+                if acquired is None:
+                    timings["lock_wait_seconds"] = finished - queued
+                    timings["process_seconds"] = 0.0
+                else:
+                    timings["process_seconds"] = finished - acquired
 
     with maybe_locked():
         proc = subprocess.Popen(

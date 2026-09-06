@@ -673,7 +673,9 @@ def _merge_lock(project_root: Path):
 
 def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
                             contract: dict | None = None,
-                            formal_tasks: list[dict] | None = None) -> dict:
+                            formal_tasks: list[dict] | None = None,
+                            layout: dict | None = None, environment: dict | None = None,
+                            timings: dict | None = None) -> dict:
     issues = []
     expected = task.get("lean_decl", "")
     tasks = formal_tasks or [task]
@@ -681,7 +683,8 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
                  if item.get("status") == "complete" or item["task_id"] == task["task_id"]}
     try:
         check = solve_contract.check_formal_contract(project_root, contract or {}, tasks,
-                                                     completed=completed)
+                                                     completed=completed, layout=layout,
+                                                     environment=environment, timings=timings)
     except (OSError, ValueError) as exc:
         check = {"passed": False, "issues": [f"formal contract verification unavailable: {exc}"]}
     issues.extend(check["issues"])
@@ -696,7 +699,7 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
     }
 
 
-def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
+def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict | None = None) -> dict:
     """Apply, build, review, and commit one immutable formalization candidate."""
     root = paths.project_root
     current = solve_state.load_state(paths.forum)
@@ -729,17 +732,15 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
     if applied.returncode:
         _git(root, "reset", "--hard", before)
         return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
-    checked_source = solve_contract.source_identity(root)
+    with solve_contract.measure(timings, "workspace_seconds"):
+        layout = solve_contract.workspace_layout(root)
+    with solve_contract.measure(timings, "initial_identity_seconds"):
+        checked_source = solve_contract.source_identity(root, layout=layout)
     checked_tree = _git(root, "write-tree").stdout.strip()
     build_started = time.monotonic()
     try:
-        build = solve_jobs.run(
-            root,
-            ["lake", "build"],
-            cwd=root,
-            owner="Unity",
-            task_id=task["task_id"],
-            serialize_build=True,
+        build = solve_contract.build_sources(
+            root, full=True, layout=layout, task_id=task["task_id"], timings=timings,
         )
     except OSError as exc:
         build_seconds = time.monotonic() - build_started
@@ -749,24 +750,18 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
             "build": {"returncode": None, "seconds": build_seconds},
         }
     build_seconds = time.monotonic() - build_started
-    # Default Lake targets need not include the task's module. Explicitly
-    # build all inspected source modules before loading their .olean files.
-    if not build.returncode:
-        modules_build = solve_contract.build_sources(root)
-        if modules_build["returncode"]:
-            _git(root, "reset", "--hard", before)
-            return {"ok": False, "error": "target module build failed: " +
-                    artifacts.preview_text(modules_build["output"], 3000)}
-    output = "\n".join(part.rstrip() for part in (build.stdout, build.stderr) if part)
-    build_record = {"returncode": build.returncode, "seconds": build_seconds}
+    # Invalidation precedes BOTH build passes, whose complete duration/output is
+    # recorded. Default targets alone need not include every inspected module.
+    output = build["output"]
+    build_record = {"returncode": build["returncode"], "seconds": build_seconds}
     if output:
         record = artifacts.store_text(
             paths.artifacts, output, kind="solve_formal_build",
-            source="lake build", producer="Unity",
+            source="lake build + explicit source modules", producer="Unity",
             metadata={"candidate_id": candidate["candidate_id"], "task_id": task["task_id"]},
         )
         build_record.update({"artifact_id": record["artifact_id"], "sha256": record["sha256"]})
-    if build.returncode:
+    if build["returncode"]:
         _git(root, "reset", "--hard", before)
         return {
             "ok": False,
@@ -781,8 +776,11 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
     verification = _review_new_declaration(
         root, task, staged, contract=contract,
         formal_tasks=list(current["formal_tasks"].values()),
+        layout=layout, environment=checked_source["environment"], timings=timings,
     )
-    if (solve_contract.source_identity(root) != checked_source
+    with solve_contract.measure(timings, "postcheck_identity_seconds"):
+        reviewed_source = solve_contract.source_identity(root)
+    if (reviewed_source != checked_source
             or _git(root, "write-tree").stdout.strip() != checked_tree):
         raise ValueError("source changed during candidate build or kernel inspection")
     verification["seconds"] = time.monotonic() - verification_started
@@ -804,7 +802,8 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict) -> dict:
     if commit.returncode:
         _git(root, "reset", "--hard", before)
         return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
-    committed_source = solve_contract.source_identity(root)
+    with solve_contract.measure(timings, "postcommit_identity_seconds"):
+        committed_source = solve_contract.source_identity(root)
     if (committed_source != {**checked_source, "main_sha": committed_source["main_sha"]}
             or _git(root, "rev-parse", "HEAD^{tree}").stdout.strip() != checked_tree):
         raise ValueError("commit changed the verified candidate source")
@@ -824,12 +823,31 @@ def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     if dirty.returncode or dirty.stdout.strip():
         return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
     before = worktree.main_commit(root)
+    timings = {}
+    started = time.monotonic()
+    result = {}
     try:
-        return _apply_formal_candidate(paths, candidate, task)
+        result = _apply_formal_candidate(paths, candidate, task, timings=timings)
     except (OSError, ValueError, KeyError) as exc:
         restored = _git(root, "reset", "--hard", before)
         suffix = "" if restored.returncode == 0 else "; main rollback also failed: " + restored.stderr
-        return {"ok": False, "error": f"candidate verification failed: {exc}{suffix}"}
+        result = {"ok": False, "error": f"candidate verification failed: {exc}{suffix}"}
+    finally:
+        timings["total_seconds"] = time.monotonic() - started
+        # Detailed profiling is telemetry, never prompt memory or acceptance
+        # evidence. Failure to write it must not undo a verified commit.
+        try:
+            artifact = artifacts.store_text(
+                paths.artifacts, json.dumps(timings, sort_keys=True) + "\n",
+                kind="solve_formal_timings", producer="Unity",
+                metadata={"candidate_id": candidate["candidate_id"], "task_id": task["task_id"]},
+            )
+            record = result.get("verification", result.get("build"))
+            if isinstance(record, dict):
+                record["timing_artifact_id"] = artifact["artifact_id"]
+        except (OSError, ValueError):
+            pass
+    return result
 
 
 def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:

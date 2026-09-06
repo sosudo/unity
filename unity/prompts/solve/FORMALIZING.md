@@ -28,8 +28,8 @@ For your assigned task:
 - do not use `sorry`, `admit`, new axioms, `native_decide`, or equivalent proof bypasses;
 - prefer enabled, compatible Axle tools over equivalent Lean LSP tools;
   use Lean LSP or targeted local diagnostics where appropriate;
-- after the final edit, immediately call `finalize_formalization`; Unity commits the exact change and runs
-  the sole authoritative full `lake build` in main; and
+- after the proof and import edits pass a targeted check, immediately call `finalize_formalization` unless
+  a concrete error remains; Unity commits the exact change and runs the sole authoritative full `lake build` in main; and
 - after a merge, synchronize from main before beginning new work.
 
 Do not run a project-wide `lake build` in your worktree; it duplicates Unity's authoritative main build and
@@ -41,13 +41,30 @@ Use specific Mathlib modules from the start. Do not introduce `import Mathlib` o
 If you encounter broad imports in a file you are editing, narrow them while preserving all declarations
 in that file.
 
-When useful and available in the project's installed version, temporarily import
-`ImportGraph.Tools.MinImports` and put `#min_imports` at the end of the file. Use its suggestions to narrow
-imports, retain required tactic/notation imports, then remove the diagnostic command and its import and
-check the edited file again. The command can miss tactics and syntax; a suggestion is not proof that the
-new imports suffice. `Mathlib.Tactic.MinImports` also provides `#min_imports in` for an individual named
-declaration. Do not update dependencies just to obtain these tools, and do not repeat import minimization
-when the relevant source is unchanged.
+For each newly created or relevantly changed file, use the installed min_imports tools before handing it
+off. Temporarily import `ImportGraph.Tools.MinImports` and put `#min_imports` at the end of the file.
+Apply its suggestions while retaining required tactic and notation imports. Remove the diagnostic
+command/import and check the edited file again.
+
+Do not repeat minimization for unchanged source. If the tool is unavailable in the installed dependencies,
+select narrow imports manually; do not update dependencies just to obtain it. Use targeted diagnostics,
+not a project-wide build.
+
+For tactic/notation-aware suggestions, temporarily import `Mathlib.Tactic.MinImports` and prefix the
+existing complete named declaration, including its proof, with `#min_imports in`. Do not duplicate the
+declaration or substitute an anonymous example. Inspecting only an existing declaration name cannot
+recover its original tactic syntax. For example, temporarily wrap the existing declaration:
+
+```lean
+import Mathlib.Tactic.MinImports
+
+#min_imports in
+theorem target ... := by
+  ...
+```
+
+Suggestions can still miss dependencies, including attributes. The final targeted check after removing
+the wrapper and diagnostic command/import is required.
 
 `.lake/packages` is a controller-owned dependency cache shared by every solve worktree. Never run any of
 `lake clean`, `lake update`, `lake upgrade`, or `lake exe cache`; those commands would invalidate every

@@ -15,11 +15,14 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import subprocess
+import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
-from . import artifacts, solve_jobs, solve_workspace
+from . import artifacts, solve_jobs, solve_native, solve_workspace
 
 
 AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
@@ -27,8 +30,28 @@ _EXCLUDED = {".git", ".lake", ".unity", ".worktrees", "lake-packages", "__pycach
 _CONFIGS = {"lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json"}
 
 
+def _native_axioms(axioms: list[str]) -> set[str]:
+    # Older Lean uses shared reduction axioms. Newer Lean's nativeEqTrue
+    # (native_decide, bv_decide, and callers) emits <owner>._native.<tactic>.ax_N.
+    # Inspect the actual axiom closure, never tactic words in source/comments.
+    legacy = {"Lean.ofReduceBool", "Lean.ofReduceNat", "Lean.trustCompiler"}
+    return {name for name in axioms if name in legacy or
+            re.search(r"(?:^|\.)_native(?:\.[^.]+)*\.ax(?:_[0-9]+)+$", name)}
+
+
 class ContractEnvironmentError(ValueError):
     """Dependency inspection failed; another chunking attempt cannot repair it."""
+
+
+@contextmanager
+def measure(timings: dict | None, stage: str):
+    """Artifact-only elapsed time, including failed checks; never contract input."""
+    started = time.monotonic() if timings is not None else 0.0
+    try:
+        yield
+    finally:
+        if timings is not None:
+            timings[stage] = time.monotonic() - started
 
 
 def digest(value: object) -> str:
@@ -153,19 +176,26 @@ def environment_identity(root: Path) -> dict:
     }
 
 
-def source_identity(root: Path) -> dict:
-    layout = workspace_layout(root)
+def source_identity(root: Path, *, layout: dict | None = None) -> dict:
+    """Bind source bytes AND Lake ownership; only reuse layout within a candidate.
+
+    Fresh boundary calls rediscover the layout and fingerprint dependencies. The
+    versioned hash also invalidates pre-layout-bound verification receipts.
+    """
+    layout = workspace_layout(root) if layout is None else layout
     return {"main_sha": _git(root, "rev-parse", "HEAD"),
-            "source_sha256": digest(_file_hashes(root, build_dir=layout["build_dir"])),
+            "source_sha256": digest({"version": 2, "workspace": layout,
+                                     "files": _file_hashes(root, build_dir=layout["build_dir"])}),
             "environment": environment_identity(root)}
 
 
 def workspace_layout(root: Path) -> dict:
-    layout = solve_workspace.discover(root, ["--layout-only"])
+    executable = solve_workspace._executable(root)
+    layout = solve_workspace.discover(root, ["--layout-only"], executable=executable)
     files = [str(path.relative_to(root))
              for path in source_files(root, build_dir=layout["build_dir"])
              if path.suffix == ".lean" and path.name != "lakefile.lean"]
-    data = solve_workspace.discover(root, files)
+    data = solve_workspace.discover(root, files, executable=executable)
     if data.get("issues") or not isinstance(data.get("modules"), dict):
         raise ValueError("Lake module inspection returned errors")
     return data
@@ -190,18 +220,28 @@ def module_for_file(root: Path, filename: str, modules: dict | None = None) -> s
     return modules[filename]
 
 
-def inspect_environment(root: Path, tasks: list[dict]) -> dict:
+def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = None,
+                        timings: dict | None = None) -> dict:
     # Import every project module: generated/private dependencies are inspected by
     # the Lean helper, not filtered through the web blueprint presentation model.
-    modules = sorted(set(workspace_modules(root).values()))
+    modules = sorted(set((workspace_modules(root) if layout is None else layout["modules"]).values()))
     names = [task["lean_decl"] for task in tasks]
     if not names or not modules:
         raise ValueError("formal contract has no declarations/modules")
-    result = solve_jobs.run(
-        root, ["lake", "env", "lean", "--run", str(Path(__file__).with_suffix(".lean")),
-               *modules, "--", *names], cwd=root, owner="Unity", task_id="contract",
-        serialize_build=True,
+    native_timings = {} if timings is not None else None
+    job_timings = {} if timings is not None else None
+    if timings is not None:
+        timings["native_helper"] = native_timings
+        timings["inspector_job"] = job_timings
+    executable = solve_native.executable(
+        root, Path(__file__).with_suffix(".lean"), name="contract", timings=native_timings,
     )
+    with measure(timings, "inspector_seconds"):
+        result = solve_jobs.run(
+            root, ["lake", "env", str(executable), *modules, "--", *names],
+            cwd=root, owner="Unity", task_id="contract", serialize_build=True,
+            timings=job_timings,
+        )
     if result.returncode:
         raise ValueError("formal contract inspection failed: " +
                          artifacts.preview_text(result.stderr or result.stdout, 2000))
@@ -214,6 +254,8 @@ def inspect_environment(root: Path, tasks: list[dict]) -> dict:
     if any(not isinstance(data.get(key), list)
            for key in ("project_axioms", "project_sorries", "project_used_axioms")):
         raise ValueError("formal contract inspector omitted project-wide axiom/placeholder audit")
+    if timings is not None:
+        timings["kernel_ms"] = data.get("timings_ms", {})
     return data
 
 
@@ -225,8 +267,9 @@ def _semantic_record(record: dict) -> dict:
     return {key: value for key, value in record.items() if key != "axioms"}
 
 
-def build_sources(root: Path, *, full: bool = False) -> dict:
-    layout = workspace_layout(root)
+def build_sources(root: Path, *, full: bool = False, layout: dict | None = None,
+                  task_id: str = "contract", timings: dict | None = None) -> dict:
+    layout = workspace_layout(root) if layout is None else layout
     modules = sorted(set(layout["modules"].values()))
     auxiliary = digest({name: value for name, value in _file_hashes(root, build_dir=layout["build_dir"]).items()
                         if Path(name).suffix != ".lean"})
@@ -254,8 +297,12 @@ def build_sources(root: Path, *, full: bool = False) -> dict:
         [["lake", "--rehash", "build", *[f"+{module}" for module in modules]]] if modules else [])
     outputs = []
     for command in commands:
-        result = solve_jobs.run(root, command, cwd=root, owner="Unity", task_id="contract",
-                                serialize_build=True)
+        job_timings = {} if timings is not None else None
+        stage = "default_build" if command == ["lake", "build"] else "module_build"
+        if timings is not None:
+            timings[stage] = job_timings
+        result = solve_jobs.run(root, command, cwd=root, owner="Unity", task_id=task_id,
+                                serialize_build=True, timings=job_timings)
         outputs.append(" ".join(command) + "\n" + result.stdout + "\n" + result.stderr)
         if result.returncode:
             return {"returncode": result.returncode, "output": "\n".join(outputs)}
@@ -331,22 +378,22 @@ def freeze_formal_contract(paths, dag: dict) -> dict:
 
 
 def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
-                          *, completed: set[str]) -> dict:
+                          *, completed: set[str], layout: dict | None = None,
+                          environment: dict | None = None, timings: dict | None = None) -> dict:
     """Identity is conservative: harmless signature refactors require re-chunking."""
     body = {key: value for key, value in contract.items() if key not in {"sha256", "artifact_id"}}
     if not contract or digest(body) != contract.get("sha256"):
         return {"passed": False, "issues": ["formal contract is missing or corrupt"], "targets": {}}
     issues = []
-    if environment_identity(root) != contract["environment"]:
+    environment = environment_identity(root) if environment is None else environment
+    if environment != contract["environment"]:
         issues.append("toolchain or dependency environment changed from the formal contract")
     try:
-        inspection = inspect_environment(root, tasks)
+        inspection = inspect_environment(root, tasks, layout=layout, timings=timings)
         targets = inspection["targets"]
     except ValueError as exc:
         return {"passed": False, "issues": [*issues, str(exc)], "targets": {}}
-    native = set(inspection["project_used_axioms"]) & {
-        "Lean.ofReduceBool", "Lean.ofReduceNat", "Lean.trustCompiler",
-    }
+    native = _native_axioms(inspection["project_used_axioms"])
     if native:
         issues.append("project uses native evaluation axioms: " + ", ".join(sorted(native)))
     if completed == {task.get("task_id", task.get("id")) for task in tasks}:
