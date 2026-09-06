@@ -757,6 +757,27 @@ def _write_run_log(
         pass
 
 
+def _solve_external_tools_prompt(mcp_servers: dict) -> str:
+    """Describe only configured services, without exposing their credentials."""
+    prompt_dir = Path(__file__).parent / "prompts"
+    enabled = [
+        name for name in ("axle", "aristotle")
+        if name in mcp_servers
+    ]
+    sections = [
+        "External services enabled for this run: "
+        + (", ".join(enabled) or "none")
+        + ".",
+        "Tool availability does not change your phase's permissions "
+        "or Unity's verification requirements.",
+    ]
+    for name in enabled:
+        sections.append(
+            (prompt_dir / f"SOLVE_{name.upper()}_TOOLS.md").read_text()
+        )
+    return "\n\n".join(sections)
+
+
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=(),
@@ -770,6 +791,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
     import time
     t0 = time.monotonic()
     try:
+        if mcp_profile == "solve":
+            system_prompt += "\n\n" + _solve_external_tools_prompt(mcp_servers)
         kwargs = {
             "permission": permission,
             "idle_timeout": idle_timeout,

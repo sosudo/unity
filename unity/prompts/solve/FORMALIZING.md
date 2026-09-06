@@ -26,7 +26,8 @@ For your assigned task:
   for a new specification revision; do not silently weaken the theorem. If the paper itself is
   substantively wrong, use the existing `reopen_solving` path instead;
 - do not use `sorry`, `admit`, new axioms, `native_decide`, or equivalent proof bypasses;
-- use Lean LSP or targeted diagnostics while iterating;
+- prefer enabled, compatible Axle tools over equivalent Lean LSP tools;
+  use Lean LSP or targeted local diagnostics where appropriate;
 - after the final edit, immediately call `finalize_formalization`; Unity commits the exact change and runs
   the sole authoritative full `lake build` in main; and
 - after a merge, synchronize from main before beginning new work.
@@ -50,8 +51,9 @@ when the relevant source is unchanged.
 
 `.lake/packages` is a controller-owned dependency cache shared by every solve worktree. Never run any of
 `lake clean`, `lake update`, `lake upgrade`, or `lake exe cache`; those commands would invalidate every
-agent's Lean environment. Use Lean LSP, `lake env lean <file>`, or a targeted `lake build <target>` for local
-diagnostics. Unity serializes these diagnostics and cancels them when their owning work is interrupted.
+agent's Lean environment. Prefer enabled, compatible Axle tools over equivalent Lean LSP tools.
+Use Lean LSP, `lake env lean <file>`, or a targeted `lake build <target>` for local diagnostics where
+appropriate. Unity serializes these local diagnostics and cancels them when their owning work is interrupted.
 
 Candidate submission is an interrupt for that task. Unity applies the exact commit to main, builds it,
 and mechanically checks the expected declaration before accepting it. A local build claim is not
