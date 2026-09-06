@@ -14,10 +14,17 @@ proof as one chunk. Keep tightly coupled steps together; helper lemmas do not au
 own chunks. Split off a substantial helper when it is independently useful or enables genuinely independent
 proof work. Do not create a separate chunk for every paragraph, definition, or routine final assembly step.
 
-Each chunk still has one exact target declaration and enough information for a formalizer to implement
-it faithfully without rereading the entire transcript. Multiple mathematical requirements may share that
-declaration, provided its statement covers them completely. Complete meaning-bearing definitions during
-chunking rather than creating tasks merely to reimplement them.
+A chunk is a proof deliverable, not a declaration inventory. Its one exact target declaration identifies
+the result to verify; it does not limit the implementation to one declaration. The formalizer may introduce
+and prove auxiliary lemmas inside the target's proof or module without separate DAG nodes. Describe useful
+helper steps in the chunk's summary instead of scaffolding routine helper proof holes. Leave their creation
+and proofs to that formalizer; only split off substantial independently useful proof work.
+
+Give each chunk enough information for faithful implementation without rereading the entire transcript.
+Multiple mathematical requirements may share its target declaration, provided the statement covers them
+completely. Complete meaning-bearing definitions during chunking rather than creating tasks merely to
+reimplement them. On a retry, existing helper declarations or scaffold holes do not by themselves justify
+new chunks; revise the draft scaffold and grouping as needed while preserving all requirements.
 
 Record only genuine direct proof prerequisites in `dependencies`. An edge means the other chunk's
 completed result is needed, not merely that its definition is available, its file is imported, or it appears

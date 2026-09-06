@@ -992,7 +992,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             f"`{formal_task.get('lean_decl')}`. Its accepted-paper source references are "
             f"{formal_task.get('source_components', [])}. Dependencies have already been integrated. "
             "Refresh solve_brief. " + strategy_instruction +
-            "Edit in your worktree using Lean diagnostics and targeted checks while iterating. "
+            "Edit in your worktree using MCP tools while iterating: prefer compatible Axle tools "
+            "when enabled over equivalent Lean LSP tools, and Lean LSP for local goals and diagnostics. "
+            "Use direct shell checks only as a fallback or when compiled artifacts are needed. "
             "When the implementation is ready, call `finalize_formalization`; Unity will commit the "
             "exact source and perform the sole authoritative full build in main. Publish useful Lean/API findings "
             "as you work. If the accepted paper is wrong, propose corrected paper bytes or explicitly "

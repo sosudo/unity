@@ -29,13 +29,16 @@ ready tasks, current strategies, findings, and candidate events.
 For backends without native MCP, run `unity mcp unity-forum <tool> '<json-args>'`.
 
 The shared `.lake/packages` cache is controller-owned. Worker commands `lake clean`, `lake update`,
-`lake upgrade`, `lake exe cache`, and bare `lake build` are rejected. Prefer enabled, compatible Axle tools
-over equivalent Lean LSP tools. Use Lean LSP, `lake env lean <file>`, or a targeted `lake build <target>` for
-local diagnostics where appropriate; permitted local diagnostics are registered and serialized automatically.
+`lake upgrade`, `lake exe cache`, and bare `lake build` are rejected. Do not bypass these restrictions
+with `lean_build`. Use MCP tools for normal proof development: prefer enabled, compatible Axle tools
+over equivalent Lean LSP tools; use Lean LSP for local goal state and project-specific diagnostics.
+The injected Lean and external-tool catalogs describe available tools and their uses.
 
 Use the supplied non-login shell environment (`login=false` where available). Do not start nested login
-shells or bypass the guarded `lake` command. Run private checks from your worktree root through
-`unity capture -- lake env lean Project/File.lean` (or a targeted `lake build` when compiled artifacts are
-needed). Do not pipe away the check's exit status. Poll a running check's same tool session until it exits;
-never start a duplicate check merely because output is empty. Finalize after a successful targeted check
-unless a concrete error remains; do not repeat a check against unchanged source.
+shells or bypass the guarded `lake` command. Direct shell checks are a fallback when MCP cannot provide
+the needed diagnostic, or when a targeted build is needed for compiled artifacts. In that case, use
+`unity capture -- lake env lean Project/File.lean` (or the targeted `lake build`) from your worktree root;
+these shell checks are registered and serialized automatically. Do not pipe away the check's exit status.
+Poll a running check's same tool session until it exits; never start a duplicate check merely because
+output is empty. Finalize after a successful targeted local check unless a concrete error remains;
+do not repeat a check against unchanged source.

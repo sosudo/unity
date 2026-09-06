@@ -758,7 +758,7 @@ def _write_run_log(
 
 
 def _solve_external_tools_prompt(mcp_servers: dict) -> str:
-    """Describe only configured services, without exposing their credentials."""
+    """Describe configured formalizing tools without exposing credentials."""
     prompt_dir = Path(__file__).parent / "prompts"
     enabled = [
         name for name in ("axle", "aristotle")
@@ -771,6 +771,8 @@ def _solve_external_tools_prompt(mcp_servers: dict) -> str:
         "Tool availability does not change your phase's permissions "
         "or Unity's verification requirements.",
     ]
+    if "lean-lsp" in mcp_servers:
+        sections.append((prompt_dir / "SOLVE_LEAN_TOOLS.md").read_text())
     for name in enabled:
         sections.append(
             (prompt_dir / f"SOLVE_{name.upper()}_TOOLS.md").read_text()
@@ -791,7 +793,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
     import time
     t0 = time.monotonic()
     try:
-        if mcp_profile == "solve":
+        # Other solve phases keep their own prompts, without proof-development catalogs.
+        if mcp_profile == "solve" and (log_context or {}).get("phase") == "formalizing":
             system_prompt += "\n\n" + _solve_external_tools_prompt(mcp_servers)
         kwargs = {
             "permission": permission,
