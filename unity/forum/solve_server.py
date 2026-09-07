@@ -263,7 +263,10 @@ def solve_brief(author: str) -> str:
                       "Full immutable ledger and structured verdict evidence: solve_status() "
                       "(formalization and critic_verdicts), also .unity/forum/solve-state.json."])
         if (formal.get("contract") or {}).get("artifact_id"):
-            lines.append(f"Frozen specification artifact: {formal['contract']['artifact_id']} (artifact_read)")
+            lines.append(
+                f"Frozen pre-proof specification artifact: {formal['contract']['artifact_id']} (artifact_read). "
+                "Its scaffold proof-axiom lists are historical, not current verification."
+            )
         for requirement in formal["requirements"]:
             lines.append(f"- {requirement['id']} → tasks {', '.join(requirement['tasks'])}: "
                          f"{requirement['statement'][:240]}")
