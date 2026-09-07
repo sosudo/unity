@@ -4,9 +4,6 @@ this independent review.
 
 Use the controller's machine-review snapshot and its artifact for the exact final source revision.
 Unity has checked builds, exact declaration identities, protected types/definitions, and axiom usage.
-The frozen specification records the pre-proof scaffold; its proof-axiom lists may contain `sorryAx`
-from unfinished proofs. Those historical entries alone do not justify repeating checks or reopening.
-Use the current machine-review snapshot for final proof integrity.
 Do not rerun
 `lake build` or individually query every already-verified declaration unless a verification record is
 missing, stale, inconsistent with main, or reveals a concrete concern. Inspect the accepted paper, theorem
