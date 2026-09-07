@@ -18,6 +18,13 @@ from .orchestrator import load_prompt, mark_done, mark_phase, resume_point, stop
 _console = Console()
 
 
+def load_role_prompt(name: str) -> str:
+    """Optional work roles are not phase transitions (nor shell-MCP profile changes)."""
+    if name != "SOURCE_REPAIR":
+        raise ValueError(f"unknown autoformalize work role {name!r}")
+    return (Path(__file__).with_name("prompts") / "autoformalize" / f"{name}.md").read_text()
+
+
 def build_autoformalize_mcp(paths, profile: str) -> dict:
     """MCP servers for one ``unity autoformalize`` phase.
 

@@ -23,6 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import artifacts, autoformalize_jobs, autoformalize_native, autoformalize_workspace
+from .autoformalize_spec import library_declarations, normalize_requirements, normalize_spec, task_spec_hash
 
 
 AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
@@ -221,11 +222,17 @@ def module_for_file(root: Path, filename: str, modules: dict | None = None) -> s
 
 
 def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = None,
-                        timings: dict | None = None) -> dict:
+                        timings: dict | None = None,
+                        external_declarations: list[str] | None = None) -> dict:
     # Import every project module: generated/private dependencies are inspected by
     # the Lean helper, not filtered through the web blueprint presentation model.
     modules = sorted(set((workspace_modules(root) if layout is None else layout["modules"]).values()))
     names = [task["lean_decl"] for task in tasks]
+    requested_externals = external_declarations or []
+    if (not isinstance(requested_externals, list)
+            or any(not isinstance(name, str) or not name.strip() or name.startswith("-") for name in requested_externals)):
+        raise ValueError("external declarations require exact nonempty names")
+    externals = sorted(set(requested_externals))
     if not names or not modules:
         raise ValueError("formal contract has no declarations/modules")
     native_timings = {} if timings is not None else None
@@ -238,7 +245,8 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
     )
     with measure(timings, "inspector_seconds"):
         result = autoformalize_jobs.run(
-            root, ["lake", "env", str(executable), *modules, "--", *names],
+            root, ["lake", "env", str(executable), *modules, "--", *names,
+                   *(["--external", *externals] if externals else [])],
             cwd=root, owner="Unity", task_id="contract", serialize_build=True,
             timings=job_timings,
         )
@@ -249,8 +257,23 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
         data = json.loads(result.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError) as exc:
         raise ValueError("formal contract inspector did not return valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("formal contract inspector did not return a JSON object")
     if data.get("issues") or set(data.get("targets", {})) != set(names):
         raise ValueError("formal contract inspection incomplete: " + str(data.get("issues", [])))
+    external_records = data.get("external_declarations", {})
+    if not isinstance(external_records, dict) or set(external_records) != set(externals):
+        raise ValueError("formal contract inspection omitted requested external declarations")
+    for name, row in external_records.items():
+        if (not isinstance(row, dict) or row.get("name") != name
+                or not isinstance(row.get("module"), str) or not row["module"]
+                or row["module"] in modules or not isinstance(row.get("type"), list)
+                or row.get("target_kind") not in {"theorem", "def", "opaque", "inductive", "constructor", "recursor", "quot", "axiom"}
+                or not isinstance(row.get("level_params"), list)
+                or not isinstance(row.get("signature"), str) or not row["signature"].strip()
+                or not isinstance(row.get("axioms"), list)):
+            raise ValueError(f"incomplete kernel evidence for external declaration {name}")
+    data["external_declarations"] = external_records
     if any(not isinstance(data.get(key), list)
            for key in ("project_axioms", "project_sorries", "project_used_axioms")):
         raise ValueError("formal contract inspector omitted project-wide axiom/placeholder audit")
@@ -264,7 +287,17 @@ def inspect_declarations(root: Path, tasks: list[dict]) -> dict:
 
 
 def _semantic_record(record: dict) -> dict:
-    return {key: value for key, value in record.items() if key != "axioms"}
+    return {key: value for key, value in record.items() if key not in {"axioms", "signature"}}
+
+
+def _external_records(records: dict) -> dict:
+    """Freeze kernel identities; human-readable signatures are display evidence only."""
+    result = {}
+    for name, row in records.items():
+        if row.get("target_kind") == "axiom" or set(row["axioms"]) - AXIOMS:
+            raise ValueError(f"external prerequisite {name} depends on forbidden axioms")
+        result[name] = {**row, "fingerprint": digest(_semantic_record(row))}
+    return result
 
 
 def build_sources(root: Path, *, full: bool = False, layout: dict | None = None,
@@ -317,6 +350,14 @@ def freeze_formal_contract(paths, dag: dict) -> dict:
     """Build the chunker's scaffold and freeze its meaning before proof search."""
     root = paths.project_root
     chunks = dag["chunks"]
+    from . import autoformalize_state
+    source = autoformalize_state.formal_source(autoformalize_state.load_state(paths.forum))
+    if (not source or dag.get("solution_candidate") != source["candidate_id"]
+            or dag.get("solution_sha256") != source["sha256"]):
+        raise ValueError("scaffold must target the current supplied-source snapshot")
+    requirements = normalize_requirements(dag["requirements"], chunks,
+                                         {row["ref_id"] for row in source["source_refs"]})
+    spec = normalize_spec(dag.get("spec"), source=source, requirements=requirements, tasks=chunks)
     modules = workspace_modules(root)
     for chunk in chunks:
         module_for_file(root, chunk.get("lean_file", ""), modules)
@@ -325,7 +366,9 @@ def freeze_formal_contract(paths, dag: dict) -> dict:
     if build["returncode"]:
         raise ValueError("Lean specification scaffold failed to build: " +
                          artifacts.preview_text(build["output"], 3000))
-    targets = inspect_declarations(root, chunks)
+    inspection = inspect_environment(root, chunks, external_declarations=library_declarations(spec))
+    targets = inspection["targets"]
+    externals = _external_records(inspection["external_declarations"])
     if source_identity(root) != before:
         raise ValueError("source or dependencies changed while freezing the formal contract")
     for chunk in chunks:
@@ -340,10 +383,13 @@ def freeze_formal_contract(paths, dag: dict) -> dict:
         if set(row["axioms"]) - AXIOMS - {"sorryAx"}:
             raise ValueError("specification uses an unexpected axiom")
     body = {
-        "version": 1,
+        "version": 2,
         "solution_candidate": dag["solution_candidate"],
         "solution_sha256": dag["solution_sha256"],
-        "requirements": dag["requirements"],
+        "requirements": requirements,
+        "spec": spec,
+        "spec_sha256": digest(spec),
+        "external_declarations": externals,
         "environment": before["environment"],
         "scaffold_source_sha256": before["source_sha256"],
         "targets": {name: {"target_kind": row["target_kind"], "module": row["module"],
@@ -384,18 +430,32 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
     body = {key: value for key, value in contract.items() if key not in {"sha256", "artifact_id"}}
     if not contract or digest(body) != contract.get("sha256"):
         return {"passed": False, "issues": ["formal contract is missing or corrupt"], "targets": {}}
+    if contract.get("version") != 2 or not isinstance(contract.get("spec"), dict):
+        return {"passed": False, "issues": ["formal contract lacks source-evidence metadata; re-chunk it"], "targets": {}}
+    if digest(contract["spec"]) != contract.get("spec_sha256"):
+        return {"passed": False, "issues": ["formal contract spec digest is inconsistent"], "targets": {}}
     issues = []
     environment = environment_identity(root) if environment is None else environment
     if environment != contract["environment"]:
         issues.append("toolchain or dependency environment changed from the formal contract")
     try:
-        inspection = inspect_environment(root, tasks, layout=layout, timings=timings)
+        expected_externals = library_declarations(contract["spec"])
+        if set(contract.get("external_declarations", {})) != set(expected_externals):
+            raise ValueError("formal contract has inconsistent external prerequisite evidence")
+        inspection = inspect_environment(root, tasks, layout=layout, timings=timings,
+                                         external_declarations=expected_externals)
         targets = inspection["targets"]
+        external_records = _external_records(inspection["external_declarations"])
+    except autoformalize_jobs.JobCancelled:
+        raise
     except ValueError as exc:
         return {"passed": False, "issues": [*issues, str(exc)], "targets": {}}
     native = _native_axioms(inspection["project_used_axioms"])
     if native:
         issues.append("project uses native evaluation axioms: " + ", ".join(sorted(native)))
+    for name, row in external_records.items():
+        if row["fingerprint"] != contract["external_declarations"][name].get("fingerprint"):
+            issues.append(f"external prerequisite signature changed: {name}")
     if completed == {task.get("task_id", task.get("id")) for task in tasks}:
         if inspection["project_axioms"]:
             issues.append("project retains custom axioms: " + ", ".join(inspection["project_axioms"]))
@@ -410,7 +470,8 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
             unexpected = set(row["axioms"]) - AXIOMS
             if unexpected:
                 issues.append(f"{name} depends on forbidden axioms: {', '.join(sorted(unexpected))}")
-    return {"passed": not issues, "issues": issues, "targets": targets}
+    return {"passed": not issues, "issues": issues, "targets": targets,
+            "external_declarations": external_records}
 
 
 def _problem_matches(paths, state: dict) -> bool:
@@ -420,8 +481,52 @@ def _problem_matches(paths, state: dict) -> bool:
         return False
 
 
+def carry_forward_revalidation(paths, new_contract: dict, old_state: dict,
+                               new_chunks: list[dict], new_requirements: list[dict]) -> dict:
+    """Fresh kernel evidence for unchanged completed tasks in a replanned contract.
+
+    A failed check preserves nothing; it does not prevent a valid new plan from
+    proceeding. Historical candidates and their old verification are never edited.
+    """
+    try:
+        old_formal = old_state["formalization"]
+        old_contract = old_formal.get("contract") or {}
+        if old_contract.get("version") != 2 or not old_formal.get("spec"):
+            return {}
+        new_tasks = {row.get("task_id", row.get("id")): row for row in new_chunks}
+        reusable = []
+        for task_id, old_task in old_state["formal_tasks"].items():
+            if old_task.get("status") != "complete" or task_id not in new_tasks:
+                continue
+            if task_spec_hash(old_task, old_formal["requirements"], old_formal["spec"], old_contract) == task_spec_hash(
+                    new_tasks[task_id], new_requirements, new_contract["spec"], new_contract):
+                reusable.append(task_id)
+        if not reusable:
+            return {}
+        before = source_identity(paths.project_root)
+        if before["main_sha"] != new_contract.get("scaffold_main_sha"):
+            return {}
+        check = check_formal_contract(paths.project_root, new_contract, new_chunks, completed=set(reusable))
+        if not check["passed"] or source_identity(paths.project_root) != before:
+            return {}
+        return {"status": "passed", "contract_sha256": new_contract["sha256"],
+                "spec_sha256": new_contract["spec_sha256"], "task_ids": sorted(reusable),
+                "main_sha": before["main_sha"], "source_sha256": before["source_sha256"]}
+    except autoformalize_jobs.JobCancelled:
+        raise
+    except (KeyError, OSError, ValueError):
+        return {}
+
+
+def _external_evidence(contract: dict) -> dict:
+    """Compact critic-facing signatures; full structural records remain in artifacts."""
+    return {name: {key: row[key] for key in ("fingerprint", "module", "signature", "axioms")}
+            for name, row in contract.get("external_declarations", {}).items()}
+
+
 def snapshot_is_current(paths, state: dict, snapshot: dict) -> bool:
     from .autoformalize_input import source_matches
+    from .autoformalize_state import repair_digest
 
     if not snapshot:
         return False
@@ -434,6 +539,11 @@ def snapshot_is_current(paths, state: dict, snapshot: dict) -> bool:
         and current["source_sha256"] == snapshot.get("source_sha256")
         and current["environment"] == snapshot.get("environment")
         and contract.get("sha256") == snapshot.get("contract_sha256")
+        and contract.get("version") == 2
+        and contract.get("spec_sha256") == snapshot.get("spec_sha256")
+        == digest(formal.get("spec")) == digest(contract.get("spec"))
+        and snapshot.get("repairs_sha256") == repair_digest(state)
+        and snapshot.get("external_declarations") == _external_evidence(contract)
         and formal.get("revision") == snapshot.get("formalization_revision")
         and formal.get("solution_candidate") == snapshot.get("solution_candidate")
         == contract.get("solution_candidate") == source.get("candidate_id")
@@ -448,9 +558,11 @@ def snapshot_is_current(paths, state: dict, snapshot: dict) -> bool:
 
 def verify_final_project(paths, state: dict) -> dict:
     from .autoformalize_input import source_matches
+    from .autoformalize_state import repair_digest
 
     root = paths.project_root
     formal = state["formalization"]
+    contract = formal.get("contract") or {}
     before = source_identity(root)
     tasks = list(state["formal_tasks"].values())
     last = next((candidate for candidate in reversed(list(state["formal_candidates"].values()))
@@ -472,6 +584,10 @@ def verify_final_project(paths, state: dict) -> dict:
                  if not build["returncode"] else
                  {"passed": False, "issues": ["final project build failed"], "targets": {}})
     issues = list(check["issues"])
+    if (contract.get("version") != 2 or not isinstance(formal.get("spec"), dict)
+            or digest(formal.get("spec")) != contract.get("spec_sha256")
+            or digest(contract.get("spec")) != contract.get("spec_sha256")):
+        issues.append("source-evidence spec is missing or inconsistent; re-chunk it")
     if any(task.get("status") != "complete" for task in tasks) or not tasks:
         issues.append("formal tasks are incomplete")
     if source_identity(root) != before:
@@ -490,6 +606,9 @@ def verify_final_project(paths, state: dict) -> dict:
         "solution_sha256": formal["solution_sha256"],
         "formalization_revision": formal["revision"],
         "contract_sha256": formal.get("contract", {}).get("sha256"),
+        "spec_sha256": digest(formal.get("spec")),
+        "repairs_sha256": repair_digest(state),
+        "external_declarations": _external_evidence(contract),
         "accepted_candidates": {task["task_id"]: task.get("accepted_candidate") for task in tasks},
         "declarations": {task["lean_decl"]: task["task_id"] for task in tasks},
         "build": build,

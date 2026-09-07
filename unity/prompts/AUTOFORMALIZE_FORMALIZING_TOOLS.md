@@ -18,12 +18,17 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `sync_from_main(author, reason?)` merges accepted main without discarding local work. Dirty trees and
   pending candidates block sync; conflicts remain for resolution and claims are retained. Do not sync
   just because an unrelated task merged.
-- `request_rechunk(author, reason)` requests a corrected protected specification when the Lean encoding
+- `request_rechunk(author, reason, task_ids?)` queues a corrected protected specification when the Lean encoding
   misrepresents the supplied source. Give precise source locations/evidence; the source is unchanged.
 - `forum_post`, `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
+- `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
+  for a task. The normal brief prioritizes your task, its candidates and blockers.
+- `report_source_issue(author, anchor_ids, description, task_ids?)` records a source defect.
+  `submit_source_repair(author, issue_id, explanation, evidence, replacement?)` proposes an explicit
+  evidence-backed spot repair. Unity routes it through chunking and independent review.
 
-Source-rewrite and informal-solving tools are not part of this pipeline. Report original-source defects
-with evidence instead of modifying the input or silently formalizing a different statement.
+Original source bytes must not change. Explore source defects and propose explicit corrections instead
+of modifying the input or silently formalizing a different statement.
 
 For a backend without native MCP, use `unity mcp unity-forum <tool> '<json-args>'`. For multiline Lean or
 quoted content, serialize the JSON argument object and pass a file/stdin rather than hand-quoting Lean:

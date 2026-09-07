@@ -18,13 +18,15 @@ For your assigned task:
 - work only in your assigned Git worktree and preserve separately claimed work;
 - read the task's `source_components` and source locations. Preserve the source statement's domains,
   hypotheses, quantifiers, definitions and conclusion, and follow its mathematical proof argument;
+- use `autoformalize_task(task_id)` for its exact anchors, argument mapping, prerequisites and adopted
+  repairs. The brief is task-focused; retrieve other task details only when relevant;
 - use the recorded requirements as a fidelity checklist, comparing them with the actual supplied source
   and Lean statements. Do not omit requirements or silently generalize away a difficult hypothesis;
 - fill scaffold proof holes without changing protected types or meaning-bearing definitions. Routine
   helpers belong inside this task's proof/module, not automatically in separate DAG nodes. Finish those
   helpers before submitting: Unity rejects targets depending on unfinished work;
 - if the chunker's encoding is wrong, publish exact evidence and call `request_rechunk` for a corrected
-  specification. Do not silently weaken the theorem or alter the supplied source;
+  specification, supplying affected `task_ids`. Do not silently weaken the theorem or alter the supplied source;
 - reuse matching Mathlib results for cited prerequisites. If a needed prerequisite is missing, prove the
   needed API. No `sorry`, `admit`, new axioms, `native_decide`, or equivalent bypasses in final work;
 - use MCP for normal proof development: prefer enabled, compatible Axle tools over equivalent Lean LSP
@@ -39,10 +41,12 @@ For your assigned task:
 
 Candidate submission interrupts work for that task. A model's local build claim is not authoritative.
 Do not manually merge into main or submit passive endorsements in place of candidate finalization.
-If the supplied source itself is false, incomplete, or unreadable, publish a precise obstacle/finding
-with its location and evidence and ask the Forum for clarification. Do not invent a repaired paper,
-use `propose_source_fix` or `reopen_solving`, or claim a different theorem solves this task. Preserve
-the original source and report the blocker rather than pretending formalization succeeded.
+If the supplied source is false, incomplete or ambiguous, call `report_source_issue` with exact anchors,
+affected task IDs and evidence. Explore a local repair or ask teammates for help. Use
+`submit_source_repair` to record a justified correction with evidence and explicit replacement text
+when needed. Original source bytes remain unchanged. Proposed repairs return through chunking and
+independent review; a changed theorem never silently counts as the original. Unity schedules optional
+repair work when useful. Do not use solve-pipeline tools or invent a replacement paper.
 
 Use specific Mathlib modules; avoid `import Mathlib` and `import Mathlib.Tactic`. Narrow broad imports
 in a file you edit while preserving every declaration. For new or relevantly changed files, temporarily

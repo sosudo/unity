@@ -13,6 +13,18 @@ class RequirementReview(BaseModel):
     requirement_id: str = Field(min_length=1)
     status: Literal["pass", "fail", "not_checked"]
     declarations: list[str]
+    checked_anchor_ids: list[str]
+    rationale: str = Field(min_length=1)
+    argument_rationale: str = Field(min_length=1)
+
+
+class RepairReview(BaseModel):
+    """Independent evidence about one explicitly recorded source repair."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    repair_id: str = Field(min_length=1)
+    status: Literal["pass", "fail", "not_checked"]
     rationale: str = Field(min_length=1)
 
 
@@ -22,4 +34,6 @@ class SemanticReview(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     snapshot_id: str = Field(min_length=1)
+    scope_rationale: str = Field(min_length=1)
     requirements: list[RequirementReview]
+    repair_reviews: list[RepairReview] = Field(default_factory=list)

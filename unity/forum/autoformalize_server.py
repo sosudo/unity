@@ -26,7 +26,7 @@ from . import server as discussion
 FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
 PROFILE = "chunking"
-PROFILES = {"chunking", "formalizing", "critic", "retrospective"}
+PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair"}
 
 
 def configure(forum_dir: Path, project_root: Path, profile: str = "chunking") -> None:
@@ -217,129 +217,311 @@ def autoformalize_metrics() -> dict:
     return read_metrics(FORUM_DIR, _root())
 
 
-def autoformalize_brief(author: str) -> str:
-    """Return bounded source, task, candidate, and review state for this run."""
+def _task_focus(state: dict, author: str, task_id: str = "") -> tuple[set[str], set[str]]:
+    """Keep direct assignments distinct from their supporting prerequisites."""
+    tasks = state.get("formal_tasks", {})
+    assigned = task_id or os.getenv("UNITY_AUTOFORMALIZE_TASK_ID", "")
+    if assigned and assigned not in tasks:
+        raise ValueError(f"unknown task '{assigned}'")
+    focus = {assigned} if assigned else {
+        item["target"] for item in state.get("strategies", {}).values()
+        if item.get("target") in tasks and item.get("status") in {"claimed", "paused"}
+        and autoformalize_state.participates(item, author)
+        and autoformalize_state.strategy_is_current(state, item)
+    }
+    related = set(focus)
+    while True:
+        dependencies = {
+            dependency for target in related
+            for dependency in tasks[target].get("dependencies", [])
+            if dependency in tasks
+        }
+        if dependencies <= related:
+            return focus, related
+        related |= dependencies
+
+
+def _spec(state: dict) -> dict:
+    formal = state.get("formalization", {})
+    return formal.get("spec") or (formal.get("contract") or {}).get("spec") or {}
+
+
+def _detail(payload: dict, source: str) -> str:
+    compacted = artifacts.compact_text(
+        _artifacts_dir(), json.dumps(payload, sort_keys=True),
+        kind="autoformalize_detail", producer="Unity", source=source,
+    )
+    return artifacts.format_compacted(compacted)
+
+
+def _requirement_spec(state: dict, requirements: list[dict]) -> dict:
+    """Resolve only the immutable citations/prerequisites needed by these rows."""
+    spec = _spec(state)
+    requirement_ids = {item["id"] for item in requirements}
+    task_ids = {target for item in requirements for target in item.get("tasks", [])}
+    arguments = [item for item in spec.get("arguments", [])
+                 if item.get("requirement_id") in requirement_ids]
+    prerequisite_ids = {key for item in arguments for key in item.get("prerequisites", [])}
+    prerequisites = [item for item in spec.get("prerequisites", [])
+                     if item.get("id") in prerequisite_ids
+                     or task_ids.intersection(item.get("needed_by", []))]
+    anchor_ids = {key for item in requirements + arguments + prerequisites
+                  for key in item.get("anchor_ids", [])}
+    repair_ids = {key for item in arguments for key in item.get("repair_ids", [])}
+    return {
+        "anchors": [item for item in spec.get("anchors", []) if item["id"] in anchor_ids],
+        "arguments": arguments, "prerequisites": prerequisites,
+        "source_repairs": [item for key, item in state.get("source_repairs", {}).items()
+                           if key in repair_ids],
+    }
+
+
+def autoformalize_requirements(offset: int = 0, limit: int = 20) -> str:
+    """Read the complete global coverage ledger in stable-ID-sorted pages.
+
+    Continue with next_offset until null. Task-filtered views never establish
+    full source coverage. Large pages are stored as exact readable artifacts.
+    """
+    if type(offset) is not int or offset < 0:
+        raise ValueError("offset must be a nonnegative integer")
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("limit must be from 1 through 100")
+    state = autoformalize_state.load_state(FORUM_DIR)
+    formal = state["formalization"]
+    rows = sorted(formal.get("requirements", []), key=lambda item: item["id"])
+    end = min(len(rows), offset + limit)
+    spec = _spec(state)
+    scope = spec.get("scope", {})
+    scope_ids = set(scope.get("targets", [])) | set(scope.get("references", []))
+    scope_ids.update(key for item in scope.get("excluded", []) for key in item.get("anchor_ids", []))
+    return _detail({
+        "run_id": state.get("run_id"), "revision": state.get("revision"),
+        "formalization_revision": formal.get("revision"),
+        "contract_sha256": (formal.get("contract") or {}).get("sha256"),
+        "scope": scope if offset == 0 else None,
+        "scope_anchors": [item for item in spec.get("anchors", []) if item["id"] in scope_ids]
+                         if offset == 0 else [],
+        "scope_details_at_offset": 0,
+        "total": len(rows), "offset": offset,
+        "next_offset": end if end < len(rows) else None,
+        "requirements": rows[offset:end],
+        **_requirement_spec(state, rows[offset:end]),
+    }, "requirements")
+
+
+def autoformalize_task(task_id: str) -> str:
+    """Read one task's exact requirements, source citations and current evidence."""
+    state = autoformalize_state.load_state(FORUM_DIR)
+    tasks = state.get("formal_tasks", {})
+    task = tasks.get(task_id)
+    if task is None:
+        raise ValueError(f"unknown task '{task_id}'")
+    requirements = [
+        item for item in state["formalization"].get("requirements", [])
+        if task_id in item["tasks"]
+    ]
+    source_ids = {
+        ref for item in requirements for ref in item.get("source_components", [])
+    } | set(task.get("source_components", []))
+    spec = _requirement_spec(state, requirements)
+    source_ids.update(item["source_ref"] for item in spec["anchors"])
+    return _detail({
+        "run_id": state.get("run_id"), "revision": state.get("revision"),
+        "contract_sha256": (state["formalization"].get("contract") or {}).get("sha256"),
+        "task": task, "requirements": requirements,
+        "source_refs": [
+            ref for ref in (state.get("input_source") or {}).get("source_refs", [])
+            if ref["ref_id"] in source_ids
+        ],
+        **spec,
+        "dependencies": [tasks[dep] for dep in task.get("dependencies", [])],
+        "candidates": [
+            item for item in state.get("formal_candidates", {}).values()
+            if item.get("task_id") == task_id
+            and autoformalize_state.candidate_is_current(state, item)
+        ],
+        "source_issues": [
+            item for item in state.get("source_issues", {}).values()
+            if not item.get("task_ids") or task_id in item["task_ids"]
+        ],
+        "findings": [
+            item for item in state.get("findings", {}).values()
+            if item.get("status") == "active" and item.get("target") in {"", task_id}
+        ],
+    }, task_id)
+
+
+def autoformalize_brief(author: str, task_id: str = "") -> str:
+    """Return bounded task-focused state; global review uses the paged ledger."""
     author = _author(author)
     state = autoformalize_state.load_state(FORUM_DIR)
     formal = state["formalization"]
     source = state.get("input_source") or {}
-    refs = source.get("source_refs") or []
+    focus, related = _task_focus(state, author, task_id)
+    review_phase = PROFILE == "critic" or state.get("phase") == "critic"
+    if review_phase:
+        focus, related = set(), set()  # Critic coverage is never task-filtered.
+    tasks = state.get("formal_tasks", {})
+    issues = [item for item in state.get("source_issues", {}).values()
+              if item.get("status") != "resolved"]
+    requests = list(state.get("replan_requests", {}).values())
+    queued = [item for item in requests if item.get("status") == "queued"]
     lines = [
         f"AUTOFORMALIZE RUN {state.get('run_id') or 'uninitialized'}",
-        f"Phase: {state.get('phase', 'chunking')}",
+        f"Phase: {state.get('phase', 'chunking')}; state revision: {state.get('revision', 0)}",
         f"Problem SHA-256: {state.get('problem_sha256') or 'unavailable'}",
-        "Source: user-supplied, immutable; no informal solving gate",
-        f"Source snapshot: {source.get('candidate_id')}; SHA-256: {source.get('sha256')}",
+        f"Supplied source snapshot: {source.get('candidate_id')}; SHA-256: {source.get('sha256')}",
         f"Formalization gate: {formal.get('status')} (revision {formal.get('revision')})",
-        "SUPPLIED SOURCE REFERENCES (full manifest: autoformalize_status().input_source)",
+        f"Global source issues not resolved: {len(issues)}; "
+        f"pending replan requests: {len(queued)}",
     ]
-    for ref in refs[:8]:
-        lines.append(f"- {ref.get('ref_id')}: {str(ref.get('path', ''))[:160]} "
-                     f"artifact {ref.get('artifact_id')} SHA-256 {ref.get('sha256')}")
-    if len(refs) > 8:
-        lines.append(f"- {len(refs) - 8} more source references in the manifest")
-    lines.append("Preserve supplied source bytes. Report source defects as obstacles; "
-                 "request_rechunk for a wrong Lean encoding, never rewrite the supplied argument.")
+    if focus:
+        lines.extend(["", "YOUR ASSIGNED/CLAIMED TASKS"])
+        for target in sorted(focus):
+            task = tasks[target]
+            lines.append(f"- {target} [{task.get('status')}]: {task.get('lean_decl')} "
+                         f"{task.get('description', '')[:220]}")
+        lines.append("Exact requirements, source citations and evidence: autoformalize_task(task_id).")
+    candidates = [
+        item for item in state.get("formal_candidates", {}).values()
+        if autoformalize_state.candidate_is_current(state, item)
+        and (not related or item.get("task_id") in related)
+    ]
+    candidates.sort(key=lambda item: (
+        item.get("status") not in {"submitted", "merging"},
+        item.get("status") != "failed", -(item.get("created_at") or 0),
+    ))
+    if candidates:
+        lines.extend(["", "CURRENT FORMALIZATION CANDIDATES"])
+        for item in candidates[:6]:
+            lines.append(f"- {item['candidate_id']} [{item['status']}] task={item['task_id']} "
+                         f"by {item['author']} at {item['commit_sha'][:12]}")
+            if item.get("error"):
+                lines.append(f"  failure: {item['error'][:240]}")
+            for record in (item.get("build") or {}, item.get("verification") or {}):
+                if record.get("artifact_id"):
+                    lines.append(f"  artifact {record['artifact_id']}")
+    if issues:
+        lines.extend(["", "SOURCE ISSUES — RESOLVE WITH EVIDENCE, NEVER SILENTLY REWRITE"])
+        relevant = sorted(issues, key=lambda item: bool(
+            related and item.get("task_ids") and not related.intersection(item["task_ids"])
+        ))
+        for item in relevant[:5]:
+            lines.append(f"- {item['issue_id']} [{item['status']}]: {item.get('description', '')[:220]}")
+            for repair_id in item.get("repair_ids", [])[-2:]:
+                repair = state.get("source_repairs", {}).get(repair_id, {})
+                lines.append(f"  proposal {repair_id} by {repair.get('author')}: "
+                             f"{repair.get('explanation', '')[:180]}; artifact {repair.get('artifact_id')}")
+        lines.append("Explore gaps and submit a source repair proposal; original documents stay unchanged.")
+    for item in queued[:3]:
+        lines.append(f"Queued replan: {item.get('reason', '')[:200]}")
+    obstacles = [
+        item for item in state.get("obstacles", {}).values()
+        if item.get("status") == "open" and (not related or item.get("target") in related | {"", None})
+    ]
+    if obstacles:
+        lines.extend(["", "OPEN OBSTACLES"])
+        for item in obstacles[-5:]:
+            lines.append(f"- {item['obstacle_id']} task={item.get('target') or 'global'}: "
+                         f"{item.get('goal_state', '')[:250]}")
     snapshot = formal.get("review_snapshot")
     if snapshot:
         lines.extend([
-            f"Review snapshot: {snapshot.get('snapshot_id')} (deterministic checks: "
-            f"{'passed' if snapshot.get('passed') else 'failed'})",
-            f"Reviewed main: {snapshot.get('main_sha')}; source SHA-256: {snapshot.get('source_sha256')}",
+            f"Machine snapshot: {snapshot.get('snapshot_id')} "
+            f"({'passed' if snapshot.get('passed') else 'failed'}); main {snapshot.get('main_sha')}",
+            f"Machine evidence artifact: {snapshot.get('artifact_id')}; "
+            "scaffold axiom lists are historical, not current verification.",
         ])
-        if snapshot.get("artifact_id"):
-            lines.append(f"Machine review artifact: {snapshot['artifact_id']} (artifact_read)")
-    if formal.get("requirements"):
-        lines.extend(["", f"REQUIRED SEMANTIC CHECKS ({len(formal['requirements'])})",
-                      "Full immutable ledger and verdict evidence: autoformalize_status() "
-                      "(formalization and critic_verdicts), also "
-                      ".unity/forum/autoformalize/autoformalize-state.json."])
-        if (formal.get("contract") or {}).get("artifact_id"):
-            lines.append(f"Frozen pre-proof specification artifact: {formal['contract']['artifact_id']} "
-                         "(artifact_read). Its scaffold proof-axiom lists are historical, not current verification.")
-        for requirement in formal["requirements"]:
-            lines.append(f"- {requirement['id']} → tasks {', '.join(requirement['tasks'])}: "
-                         f"{requirement['statement'][:240]}")
-        lines.append("Approve only after checking every requirement against actual Lean statements and definitions.")
+    requirements = formal.get("requirements", [])
+    lines.extend([
+        "", f"GLOBAL COVERAGE LEDGER: {len(requirements)} requirements",
+        "Read autoformalize_requirements(offset=0) and follow next_offset to null for ALL requirements. "
+        "A focused task view or this bounded brief is not complete coverage.",
+    ])
+    selected_requirements = [
+        item for item in requirements if not related or related.intersection(item["tasks"])
+    ]
+    if selected_requirements:
+        lines.append("RELEVANT REQUIREMENT SUMMARIES" if related else "REQUIREMENT PREVIEW")
+        for item in selected_requirements[:8]:
+            lines.append(f"- {item['id']} → tasks {', '.join(item['tasks'])}: "
+                         f"{item['statement'][:180]}")
+        if len(selected_requirements) > 8:
+            lines.append(f"- {len(selected_requirements) - 8} additional entries available through detail tools.")
+    refs = source.get("source_refs") or []
+    relevant_source_ids = {
+        ref for item in selected_requirements for ref in item.get("source_components", [])
+    }
+    relevant_refs = [ref for ref in refs if not related or ref["ref_id"] in relevant_source_ids]
+    lines.extend(["", "SUPPLIED SOURCE REFERENCES"])
+    for ref in relevant_refs[:6]:
+        lines.append(f"- {ref.get('ref_id')}: {str(ref.get('path', ''))[:140]} "
+                     f"artifact {ref.get('artifact_id')} SHA-256 {ref.get('sha256')}")
+    if len(relevant_refs) > 6:
+        lines.append(f"- {len(relevant_refs) - 6} more references in the detail tools.")
+    owned = [
+        item for item in state.get("strategies", {}).values()
+        if item.get("status") in {"claimed", "paused"}
+        and autoformalize_state.strategy_is_current(state, item)
+        and autoformalize_state.participates(item, author)
+    ]
+    if owned:
+        lines.extend(["", "YOUR CLAIMED/ASSISTED STRATEGIES"])
+        for item in owned[:6]:
+            lines.append(f"- {item['strategy_id']} [{item['status']}] task={item.get('target')}: "
+                         f"{item.get('description', '')[:200]}")
+    visible_tasks = [tasks[target] for target in sorted(related)] if related else list(tasks.values())
+    if visible_tasks:
+        lines.extend(["", "RELEVANT TASK STATUS" if related else "TASK PREVIEW"])
+        for task in visible_tasks[:10]:
+            lines.append(f"- {task['task_id']} [{task['status']}]: {task.get('lean_decl')}; "
+                         f"dependencies={','.join(task.get('dependencies', []))}")
+    findings = [
+        item for item in state.get("findings", {}).values()
+        if item.get("status") == "active" and (not related or item.get("target") in related | {"", None})
+    ]
+    findings.sort(key=lambda item: (item.get("confidence", 0), item.get("created_at", 0)), reverse=True)
+    if findings:
+        lines.extend(["", "LIVE FINDINGS"])
+        for item in findings[:6]:
+            lines.append(f"- {item['finding_id']} ({item.get('confidence')}/100) "
+                         f"{item.get('title')}: {item.get('content', '')[:300]}")
+            if item.get("evidence"):
+                lines.append(f"  evidence: {item['evidence'][:180]}")
+    questions = [
+        item for item in state.get("questions", {}).values()
+        if item.get("status") == "open" and (
+            not item.get("to") or autoformalize_state.author_key(item.get("to"))
+            == autoformalize_state.author_key(author)
+        ) and (not related or item.get("target") in related | {"", None})
+    ]
+    if questions:
+        lines.extend(["", "OPEN QUESTIONS"])
+        for item in questions[-5:]:
+            lines.append(f"- {item['question_id']}: {item.get('body', '')[:250]}")
     attempts = [item for item in state.get("chunking_attempts", [])
                 if item.get("candidate_id") == source.get("candidate_id")]
-    if attempts:
-        lines.extend(["", "CHUNKING ATTEMPTS"])
-        for item in attempts[-8:]:
+    if attempts and not related:
+        lines.extend(["", "RECENT CHUNKING ATTEMPTS"])
+        for item in attempts[-3:]:
             lines.append(f"- {item.get('author')} attempt {item.get('attempt')} "
-                         f"[{item.get('status')}]: {item.get('reason', '')[:500]}")
+                         f"[{item.get('status')}]: {item.get('reason', '')[:250]}")
     verdicts = state.get("critic_verdicts", [])
     if verdicts:
         verdict = verdicts[-1]
         lines.extend(["", "LATEST FORMALIZATION VERDICT",
                       f"- {verdict.get('verdict')} by {verdict.get('author')}: "
-                      f"{verdict.get('summary', '')[:1000]}"])
-        if verdict.get("reopen_tasks"):
-            lines.append("- reopened tasks: " + ", ".join(verdict["reopen_tasks"]))
-        if verdict.get("review"):
-            lines.append("- Full structured evidence and rationale: autoformalize_status().critic_verdicts")
-    owned = [item for item in state.get("strategies", {}).values()
-             if item.get("status") in {"claimed", "paused"}
-             and autoformalize_state.participates(item, author)]
-    if owned:
-        lines.extend(["", "YOUR CLAIMED/ASSISTED STRATEGIES"])
-        for item in owned[:8]:
-            lines.append(f"- {item['strategy_id']} [{item['status']}] task={item.get('target')}: "
-                         f"{item.get('description', '')[:500]}")
-    tasks = list(state.get("formal_tasks", {}).values())
-    if tasks:
-        lines.extend(["", "FORMALIZATION TASKS"])
-        for task in tasks[:40]:
-            lines.append(f"- {task['task_id']} [{task['status']}]: {task.get('lean_decl')}"
-                         + (f"; deps={','.join(task['dependencies'])}" if task.get("dependencies") else ""))
-    candidates = list(state.get("formal_candidates", {}).values())
-    if candidates:
-        lines.extend(["", "RECENT FORMALIZATION CANDIDATES"])
-        for item in candidates[-12:]:
-            lines.append(f"- {item['candidate_id']} [{item['status']}] task={item['task_id']} "
-                         f"by {item['author']} at {item['commit_sha'][:12]}")
-            if item.get("error"):
-                lines.append(f"  failure: {item['error'][:800]}")
-            for record in (item.get("build") or {}, item.get("verification") or {}):
-                if record.get("artifact_id"):
-                    lines.append(f"  artifact {record['artifact_id']}")
-    strategies = [item for item in state.get("strategies", {}).values()
-                  if item.get("status") in {"registered", "claimed", "paused"}]
-    if strategies:
-        lines.extend(["", "ACTIVE STRATEGIES"])
-        for item in strategies[-16:]:
-            lines.append(f"- {item['strategy_id']} [{item['status']}] task={item.get('target')} "
-                         f"owner={item.get('owner') or 'none'}: {item.get('description', '')[:300]}")
-    findings = [item for item in state.get("findings", {}).values() if item.get("status") == "active"]
-    findings.sort(key=lambda item: (item.get("confidence", 0), item.get("created_at", 0)), reverse=True)
-    if findings:
-        lines.extend(["", "LIVE FINDINGS"])
-        for item in findings[:10]:
-            lines.append(f"- {item['finding_id']} ({item.get('confidence')}/100) "
-                         f"{item.get('title')}: {item.get('content', '')[:600]}")
-            if item.get("evidence"):
-                lines.append(f"  evidence: {item['evidence'][:300]}")
-    obstacles = [item for item in state.get("obstacles", {}).values() if item.get("status") == "open"]
-    if obstacles:
-        lines.extend(["", "OPEN OBSTACLES"])
-        for item in obstacles[-10:]:
-            lines.append(f"- {item['obstacle_id']} task={item.get('target') or 'global'}: "
-                         f"{item.get('goal_state', '')[:500]}")
-    questions = [item for item in state.get("questions", {}).values()
-                 if item.get("status") == "open" and (
-                     not item.get("to") or autoformalize_state.author_key(item.get("to"))
-                     == autoformalize_state.author_key(author))]
-    if questions:
-        lines.extend(["", "OPEN QUESTIONS"])
-        for item in questions[-8:]:
-            lines.append(f"- {item['question_id']}: {item.get('body', '')[:500]}")
+                      f"{verdict.get('summary', '')[:350]}"])
+    if state.get("final_report"):
+        lines.append(f"Run report: artifact {state['final_report'].get('artifact_id')}")
     text = "\n".join(lines)
     try:
         limit = max(2_000, min(32_000, int(os.getenv("UNITY_AUTOFORMALIZE_BRIEF_CHARS", "12000"))))
     except ValueError:
         limit = 12_000
-    suffix = "\n...[brief truncated]"
+    suffix = "\n...[brief truncated] Use autoformalize_task or autoformalize_requirements."
     return text if len(text) <= limit else text[:limit - len(suffix)].rstrip() + suffix
+
 
 
 def forum_post(thread_id: str, author: str, content: str, reply_to: list[str] | None = None) -> dict:
@@ -503,7 +685,7 @@ def finalize_formalization(
             not strategy
             or strategy.get("phase") != "formalizing"
             or strategy.get("target") != task_id
-            or strategy.get("phase_revision") != state["formalization"]["revision"]
+            or not autoformalize_state.strategy_is_current(state, strategy)
             or strategy.get("status") != "claimed"
             or not autoformalize_state.participates(strategy, author)
         ):
@@ -589,12 +771,7 @@ def finalize_formalization(
 
 
 def _current_formal_candidate(state: dict, candidate: dict) -> bool:
-    formal = state.get("formalization", {})
-    return (
-        candidate.get("formalization_revision") == formal.get("revision")
-        and candidate.get("solution_candidate") == formal.get("solution_candidate")
-        and candidate.get("solution_sha256") == formal.get("solution_sha256")
-    )
+    return autoformalize_state.candidate_is_current(state, candidate)
 
 
 def has_pending_formal_candidate(state: dict, author: str = "") -> bool:
@@ -610,12 +787,11 @@ def has_pending_formal_candidate(state: dict, author: str = "") -> bool:
 
 def unresolved_formal_tasks(state: dict, author: str) -> list[str]:
     """Current claimed/assisted work and queued candidate targets for an author."""
-    revision = state.get("formalization", {}).get("revision")
     targets = {
         strategy.get("target", "")
         for strategy in state.get("strategies", {}).values()
         if strategy.get("phase") == "formalizing"
-        and strategy.get("phase_revision") == revision
+        and autoformalize_state.strategy_is_current(state, strategy)
         and strategy.get("status") in {"claimed", "paused"}
         and autoformalize_state.participates(strategy, author)
     }
@@ -733,16 +909,63 @@ def sync_from_main(author: str, reason: str = "") -> dict:
         return {"ok": True, "main_sha": main_sha, "worktree": str(tree)}
 
 
-def request_rechunk(author: str, reason: str) -> dict:
-    """Rebuild an incorrect encoding/signature contract without changing supplied sources.
+def report_source_issue(
+    author: str, anchor_ids: list[str], description: str,
+    task_ids: list[str] | None = None,
+) -> dict:
+    """Report an exact source gap for investigation, without editing supplied bytes.
 
-    Report defects in the supplied mathematics as obstacles with evidence. This
-    pipeline cannot rewrite the source or switch to an informal solving phase.
+    Cite frozen anchor IDs, or original source-reference IDs before chunking has
+    registered anchors; in that case put the precise location in description.
     """
     author = _author(author)
-    with _merge_lock():
-        result = autoformalize_state.request_rechunk(FORUM_DIR, author, reason)
-    _mirror(author, "FORMALIZATION CONTRACT REOPENED", reason)
+    issue = autoformalize_state.report_source_issue(
+        FORUM_DIR, author, anchor_ids, description, task_ids=task_ids,
+    )
+    _mirror(author, f"SOURCE ISSUE {issue['issue_id']}", description)
+    return issue
+
+
+def submit_source_repair(
+    author: str, issue_id: str, explanation: str, evidence: str, replacement: str = "",
+) -> dict:
+    """Propose an evidence-backed local repair; this is not an approval or source rewrite.
+
+    Original files remain immutable. Unity binds the proposal to the source issue
+    and requires explicit argument/critic review before accepting the repaired proof.
+    """
+    author = _author(author)
+    state = autoformalize_state.load_state(FORUM_DIR)
+    if issue_id not in state.get("source_issues", {}):
+        raise ValueError(f"unknown source issue '{issue_id}'")
+    explanation = autoformalize_state._text(explanation, "explanation", 16000)
+    evidence = autoformalize_state._text(evidence, "evidence", 16000)
+    replacement = autoformalize_state._text(replacement, "replacement", 16000, required=False)
+    payload = {"author": author, "issue_id": issue_id, "explanation": explanation,
+               "evidence": evidence, "replacement": replacement,
+               "source_candidate": (state.get("input_source") or {}).get("candidate_id"),
+               "source_sha256": (state.get("input_source") or {}).get("sha256")}
+    record = artifacts.store_text(
+        _artifacts_dir(), json.dumps(payload, sort_keys=True),
+        kind="autoformalize_source_repair", producer=author, source=issue_id,
+    )
+    repair = autoformalize_state.submit_source_repair(
+        FORUM_DIR, author, issue_id, explanation, evidence, replacement,
+        artifact_id=record["artifact_id"],
+    )
+    _mirror(author, f"SOURCE REPAIR PROPOSAL {repair['repair_id']}", explanation)
+    return repair
+
+
+def request_rechunk(author: str, reason: str, task_ids: list[str] | None = None) -> dict:
+    """Queue a contract repair, naming affected tasks when known.
+
+    This does not acquire the merge lock or interrupt verification in progress.
+    Unity applies the request safely, preserving unaffected accepted work.
+    """
+    author = _author(author)
+    result = autoformalize_state.request_rechunk(FORUM_DIR, author, reason, task_ids=task_ids)
+    _mirror(author, "FORMALIZATION REPLAN REQUESTED", reason)
     return result
 
 
@@ -772,6 +995,7 @@ def submit_formalization_verdict(
 
 COMMON = (
     autoformalize_status, autoformalize_metrics, autoformalize_brief,
+    autoformalize_task, autoformalize_requirements,
     forum_post, forum_read, artifact_info, artifact_read,
 )
 COORDINATION = (
@@ -779,14 +1003,17 @@ COORDINATION = (
     mark_strategy_incorrect, publish_finding, report_obstacle,
     ask_question, answer_question,
 )
-SOURCE_FEEDBACK = (publish_finding, report_obstacle, ask_question, answer_question)
+SOURCE_FEEDBACK = (publish_finding, report_obstacle, ask_question, answer_question,
+                   report_source_issue, submit_source_repair)
 PROFILE_TOOLS = {
     "chunking": COMMON + SOURCE_FEEDBACK,
     "formalizing": COMMON + COORDINATION + (
         finalize_formalization, emit_formalization_candidate, sync_from_main, request_rechunk,
+        report_source_issue, submit_source_repair,
     ),
     "critic": COMMON + SOURCE_FEEDBACK + (request_rechunk, submit_formalization_verdict),
     "retrospective": COMMON,
+    "source_repair": COMMON + SOURCE_FEEDBACK,
 }
 
 

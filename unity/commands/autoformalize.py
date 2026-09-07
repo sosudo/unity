@@ -20,7 +20,10 @@ from ..roster import load_roster
 from ..autoformalize_runtime import (
     configure_forum, forum_brief, recover_interrupted_formal_merges,
     run_formalizing_runtime, validate_formalization_dag, write_formalization_plan, _merge_lock,
+    refresh_replanned_worktrees,
 )
+from ..autoformalize_repairs import run_source_repairs
+from ..autoformalize_report import persist_report
 
 PIPELINE = "autoformalize"
 
@@ -178,7 +181,6 @@ async def _chunk_source(
     candidate_id = candidate["candidate_id"]
     require_source_matches(paths, state)
     source_instruction = "Read UNITY.md for scope and the exact supplied documents listed in "
-    plan = write_formalization_plan(paths, candidate)
     chunkers = [roster.primary] + [
         agent for agent in roster.agents if agent.name != roster.primary.name
     ]
@@ -196,6 +198,7 @@ async def _chunk_source(
                 paths.forum, candidate_id, chunker.name,
             )
             attempt_number = int(attempt["attempt"])
+            plan = write_formalization_plan(paths, candidate)
             (paths.unity / "dag.json").unlink(missing_ok=True)
             prior = failures[-3:]
             prior_context = (
@@ -210,13 +213,15 @@ async def _chunk_source(
                 + source_instruction
                 + f"the mechanical coverage scaffold at `{plan.relative_to(paths.project_root)}`. Its input SHA-256 is "
                 f"`{candidate['sha256']}`. Produce `.unity/dag.json` bound to that candidate and hash, with "
-                "explicit mathematical requirements, source-component coverage, and an acyclic graph. "
+                "explicit mathematical requirements, anchored scope/argument/prerequisite spec, and an acyclic graph. "
                 "Create an elaboratable Lean scaffold for each chunk's exact declaration and complete "
                 "meaning-bearing definitions. Only theorem proofs may remain as scaffold sorry holes. "
                 "Use meaningful proof units, keeping tightly coupled steps together and splitting "
                 "substantial independently useful work. Record genuine proof prerequisites, not "
                 "paper order or shared-definition dependencies. Minimize scaffold imports using "
-                "the installed min_imports tools."
+                "the installed min_imports tools. Read any repair proposals and replan context in the plan; "
+                "preserve unchanged task IDs, signatures and completed proofs. Report source gaps with "
+                "report_source_issue; propose justified local repairs without editing original source files."
                 + prior_context,
                 paths.project_root,
                 build_autoformalize_mcp(paths, "chunking"),
@@ -239,6 +244,15 @@ async def _chunk_source(
             if stop_requested(paths.project_root):
                 return
             require_source_matches(paths, autoformalize_state.load_state(paths.forum))
+            repaired = await run_source_repairs(roster, paths, max_attempts)
+            if stop_requested(paths.project_root):
+                return
+            if any(issue.get("status") == "unresolved" for issue in autoformalize_state.open_source_issues(repaired)):
+                autoformalize_state.finish_chunking_attempt(
+                    paths.forum, attempt["attempt_id"], succeeded=False,
+                    reason="source-repair attempts exhausted; original input and evidence preserved",
+                )
+                raise click.ClickException("Source-repair attempts exhausted; see source issues and repair evidence")
             try:
                 dag = validate_formalization_dag(paths, candidate["sha256"])
                 toposort(paths)
@@ -249,7 +263,10 @@ async def _chunk_source(
                         return
                     contract = autoformalize_contract.freeze_formal_contract(paths, dag)
                     require_source_matches(paths, current)
-                    autoformalize_state.initialize_formal_tasks(
+                    revalidation = autoformalize_contract.carry_forward_revalidation(
+                        paths, contract, current, dag["chunks"], dag["requirements"],
+                    )
+                    initialized = autoformalize_state.initialize_formal_tasks(
                         paths.forum,
                         dag["chunks"],
                         solution_candidate=candidate_id,
@@ -257,6 +274,7 @@ async def _chunk_source(
                         main_sha=worktree.main_commit(paths.project_root),
                         requirements=dag["requirements"],
                         contract=contract,
+                        revalidation=revalidation,
                     )
             except autoformalize_contract.ContractEnvironmentError as exc:
                 autoformalize_state.finish_chunking_attempt(
@@ -282,6 +300,9 @@ async def _chunk_source(
                 )
                 continue
 
+            assignments = (current.get("replan") or {}).get("assignments", {})
+            if assignments:
+                refresh_replanned_worktrees(paths, assignments, initialized)
             autoformalize_state.finish_chunking_attempt(
                 paths.forum,
                 attempt["attempt_id"],
@@ -338,7 +359,8 @@ def _accept_current_critic(paths) -> bool:
     with _merge_lock(paths.project_root):
         state = autoformalize_state.load_state(paths.forum)
         formal = state["formalization"]
-        if formal.get("status") != "approval_pending":
+        if (formal.get("status") != "approval_pending" or autoformalize_state.pending_replan(state)
+                or autoformalize_state.open_source_issues(state)):
             return False
         snapshot = formal.get("review_snapshot") or {}
         if not autoformalize_contract.snapshot_is_current(paths, state, snapshot):
@@ -398,6 +420,8 @@ async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
                      "phase": "critic", "role": "critic", "attempt": attempt},
     )
     after_state = autoformalize_state.load_state(paths.forum)
+    if autoformalize_state.pending_replan(after_state) or autoformalize_state.open_source_issues(after_state):
+        return
     if after_state["formalization"].get("status") == "approval_pending":
         _accept_current_critic(paths)
     if len(after_state.get("critic_verdicts", [])) == before and after_state["phase"] == "critic":
@@ -415,11 +439,22 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
         agent for agent in roster.agents
         if agent.name != roster.primary.name
     ]
+    state = autoformalize_state.load_state(paths.forum)
+    adopted = {key for row in (state["formalization"].get("spec") or {}).get("arguments", [])
+               for key in row["repair_ids"]}
+    repair_authors = {autoformalize_state.author_key(state["source_repairs"][key]["author"])
+                      for key in adopted}
+    critics = [critic for critic in critics if autoformalize_state.author_key(critic.name) not in repair_authors]
+    if not critics:
+        raise click.ClickException("No independent critic remains to review the adopted source repairs")
 
     for critic in critics:
         attempt = 0
         while attempt < max_attempts:
             if stop_requested(paths.project_root):
+                return
+            current = autoformalize_state.load_state(paths.forum)
+            if autoformalize_state.pending_replan(current) or autoformalize_state.open_source_issues(current):
                 return
 
             attempt += 1
@@ -429,7 +464,9 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
 
             if stop_requested(paths.project_root):
                 return
-            if autoformalize_state.load_state(paths.forum)["phase"] != "critic":
+            after = autoformalize_state.load_state(paths.forum)
+            if (after["phase"] != "critic" or autoformalize_state.pending_replan(after)
+                    or autoformalize_state.open_source_issues(after)):
                 return
 
     raise click.ClickException(
@@ -455,6 +492,12 @@ async def autoformalize(continue_):
             "Supplied source documents will be preserved."
         )
     fresh = not continue_ or not previous.get("run_id")
+    if (not fresh and previous.get("phase") != "chunking"
+            and (previous.get("formalization", {}).get("contract") or {}).get("version") != 2):
+        raise click.ClickException(
+            "This autoformalize run predates the source-evidence contract; rerun without --continue. "
+            "Original sources and historical artifacts are preserved."
+        )
     if not paths.unity_md.is_file():
         raise click.ClickException("Missing .unity/UNITY.md; initialize the project or restore its scope/instructions file")
     try:
@@ -474,6 +517,7 @@ async def autoformalize(continue_):
         autoformalize_jobs.terminate(root)
         try:
             recover_interrupted_formal_merges(paths)
+            autoformalize_state.recover_source_repairs(paths.forum)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
     if fresh:
@@ -504,6 +548,18 @@ async def autoformalize(continue_):
             phase = state["phase"]
             if phase == "complete":
                 break
+            # Critic tools only queue changes. No integration workers remain here,
+            # so the command can safely dispatch repairs or enter replanning.
+            if phase == "critic":
+                if autoformalize_state.ready_source_issues(state):
+                    state = await run_source_repairs(roster, paths, max_attempts)
+                request = autoformalize_state.pending_replan(state)
+                if request:
+                    with _merge_lock(root):
+                        autoformalize_state.begin_replan(paths.forum, request["request_id"])
+                    continue
+                if autoformalize_state.open_source_issues(state):
+                    raise click.ClickException("Source issues remain unresolved after repair attempts; review is incomplete")
             if phase == "chunking":
                 await _chunk_source(roster, paths, max_attempts)
             elif phase == "formalizing":
@@ -516,20 +572,37 @@ async def autoformalize(continue_):
                     load_prompt("autoformalize/FORMALIZING"),
                 )
                 attempts += 1
-                if state.get("phase") == "formalizing" and autoformalize_state.all_formal_tasks_complete(state):
+                if (state.get("phase") == "formalizing" and autoformalize_state.all_formal_tasks_complete(state)
+                        and not autoformalize_state.open_source_issues(state)):
                     _prepare_critic_snapshot(paths)
             elif phase == "critic":
                 await _run_critics(roster, paths, max_attempts)
             else:
                 raise click.ClickException(f"unknown autoformalize phase '{phase}'")
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, click.ClickException) as exc:
+        _save_incomplete_report(paths)
+        if isinstance(exc, click.ClickException):
+            raise
         raise click.ClickException(str(exc)) from exc
 
     if stop_requested(root):
+        _save_incomplete_report(paths)
         click.echo("autoformalize stopped safely; rerun with --continue to resume")
         return
+    try:
+        persist_report(paths, accepted=True)
+    except (OSError, ValueError) as exc:
+        _save_incomplete_report(paths)
+        raise click.ClickException(f"Could not publish the accepted snapshot report: {exc}") from exc
     if _retrospective_enabled():
         await _run_retrospective(roster, paths)
     mark_done(paths, "autoformalize")
     click.echo("autoformalize complete: supplied-source Lean formalization accepted")
 command = autoformalize
+
+
+def _save_incomplete_report(paths) -> None:
+    try:
+        persist_report(paths, accepted=False)
+    except (OSError, ValueError) as exc:
+        click.echo(f"Warning: could not persist incomplete autoformalization report: {exc}")

@@ -21,9 +21,10 @@ from pathlib import Path
 from typing import Iterator
 
 from .autoformalize_review import SemanticReview
+from .autoformalize_spec import digest, normalize_requirements, normalize_spec, task_spec_hash
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 PHASES = {"chunking", "formalizing", "critic", "complete"}
 STRATEGY_PHASES = {"formalizing"}
 STRATEGY_STATUSES = {"registered", "claimed", "paused", "incorrect", "succeeded", "cancelled"}
@@ -72,6 +73,10 @@ def _default_state() -> dict:
         "solution_candidates": {},
         "formal_tasks": {},
         "formal_candidates": {},
+        "source_issues": {},
+        "source_repairs": {},
+        "replan_requests": {},
+        "replan": None,
         "chunking_attempts": [],
         "critic_verdicts": [],
         "review_snapshots": {},
@@ -93,6 +98,7 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "strategies", "findings", "obstacles", "questions",
         "solution_candidates", "formal_tasks", "formal_candidates",
         "review_snapshots",
+        "source_issues", "source_repairs", "replan_requests",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
@@ -200,6 +206,197 @@ def source_reference_ids(state: dict) -> set[str]:
     return source_refs(state)
 
 
+def candidate_is_current(state: dict, candidate: dict) -> bool:
+    task = state.get("formal_tasks", {}).get(candidate.get("task_id"), {})
+    source = formal_source(state)
+    return bool(task and type(task.get("revision")) is int and task["revision"] > 0
+                and candidate.get("task_revision") == task["revision"]
+                and candidate.get("solution_candidate") == source.get("candidate_id")
+                and candidate.get("solution_sha256") == source.get("sha256"))
+
+
+def strategy_is_current(state: dict, strategy: dict) -> bool:
+    source = formal_source(state)
+    if (strategy.get("solution_candidate") != source.get("candidate_id")
+            or strategy.get("solution_sha256") != source.get("sha256")):
+        return False
+    target = strategy.get("target")
+    if not target:
+        return strategy.get("phase_revision") == state["formalization"].get("revision")
+    task = state.get("formal_tasks", {}).get(target, {})
+    return bool(task and type(task.get("revision")) is int and task["revision"] > 0
+                and strategy.get("task_revision") == task["revision"])
+
+
+def _dependent_closure(tasks: dict, seeds) -> set[str]:
+    result = set(seeds)
+    while True:
+        expanded = {key for key, task in tasks.items()
+                    if set(task.get("dependencies", [])) & result}
+        if expanded <= result:
+            return result
+        result |= expanded
+
+
+def _known_anchors(state: dict) -> set[str]:
+    return source_refs(state) | {item["id"] for item in
+        (state["formalization"].get("spec") or {}).get("anchors", [])}
+
+
+def report_source_issue(forum_dir: Path, author: str, anchor_ids: list[str],
+                        description: str, task_ids: list[str] | None = None) -> dict:
+    anchors = _reference_list(anchor_ids, "anchor_ids")
+    description = _text(description, "description")
+    with transaction(forum_dir) as state:
+        if state["phase"] not in {"chunking", "formalizing", "critic"}:
+            raise ValueError("source issues require an active autoformalization")
+        if set(anchors) - _known_anchors(state):
+            raise ValueError("unknown source anchors; before freezing use supplied source reference IDs")
+        targets = list(dict.fromkeys(task_ids or []))
+        if set(targets) - state["formal_tasks"].keys():
+            raise ValueError("source issue has unknown formal tasks")
+        for issue in state["source_issues"].values():
+            if (set(issue["anchor_ids"]) == set(anchors)
+                    and issue["description"].casefold() == description.casefold()):
+                return deepcopy(issue)
+        source = formal_source(state)
+        identifier = _id("source-issue")
+        issue = {"issue_id": identifier, "author": _text(author, "author", 100),
+                 "anchor_ids": anchors, "task_ids": targets, "description": description,
+                 "source_candidate": source["candidate_id"], "source_sha256": source["sha256"],
+                 "status": "open", "owner": None, "attempts": [], "repair_ids": [],
+                 "created_at": time.time()}
+        state["source_issues"][identifier] = issue
+        _invalidate_review(state)
+        _event(state, "source_issue_reported", issue_id=identifier, author=author, task_ids=targets)
+    return deepcopy(issue)
+
+
+def open_source_issues(state: dict) -> list[dict]:
+    return [item for item in state.get("source_issues", {}).values()
+            if item.get("status") != "resolved"]
+
+
+def ready_source_issues(state: dict) -> list[dict]:
+    return [item for item in open_source_issues(state) if item.get("status") == "open"]
+
+
+def _live_repair_ids(issue: dict) -> set[str]:
+    return set(issue["repair_ids"]) - set(issue.get("rejected_repair_ids", []))
+
+
+def source_issues_blocking_task(state: dict, task_id: str) -> list[dict]:
+    return [issue for issue in open_source_issues(state)
+            if not issue.get("task_ids") or task_id in _dependent_closure(
+                state.get("formal_tasks", {}), issue["task_ids"])]
+
+
+def claim_source_issue(forum_dir: Path, issue_id: str, author: str,
+                       max_attempts: int | float) -> dict:
+    with transaction(forum_dir) as state:
+        issue = state["source_issues"].get(issue_id)
+        if not issue:
+            raise ValueError("unknown source issue")
+        used = sum(author_key(row["author"]) == author_key(author) for row in issue["attempts"])
+        if issue["status"] != "open":
+            return {"status": "conflict", "issue": deepcopy(issue)}
+        if used >= max_attempts:
+            return {"status": "exhausted", "issue": deepcopy(issue)}
+        attempt = {"attempt_id": _id("repair-attempt"), "author": _text(author, "author", 100),
+                   "status": "active", "started_at": time.time()}
+        issue["attempts"].append(attempt)
+        issue.update(status="repairing", owner=author)
+        _event(state, "source_repair_started", issue_id=issue_id, **attempt)
+    return {"status": "claimed", "issue": deepcopy(issue), "attempt_id": attempt["attempt_id"]}
+
+
+def finish_source_repair_attempt(forum_dir: Path, issue_id: str, author: str,
+                                 attempt_id: str, *, error: str = "") -> dict:
+    with transaction(forum_dir) as state:
+        issue = state["source_issues"].get(issue_id)
+        if not issue:
+            raise ValueError("unknown source issue")
+        attempt = next((row for row in issue["attempts"] if row["attempt_id"] == attempt_id), None)
+        if not attempt or author_key(attempt["author"]) != author_key(author):
+            raise ValueError("unknown source repair attempt/owner")
+        if attempt["status"] != "active":
+            return deepcopy(issue)
+        attempt.update(status="proposed" if _live_repair_ids(issue) else "failed",
+                       error=_text(error, "error", required=False), finished_at=time.time())
+        if author_key(issue.get("owner")) == author_key(author):
+            issue.update(status="proposed" if _live_repair_ids(issue) else "open", owner=None)
+        _event(state, "source_repair_attempt_finished", issue_id=issue_id, attempt_id=attempt_id,
+               status=attempt["status"])
+    return deepcopy(issue)
+
+
+def mark_source_issue_unresolved(forum_dir: Path, issue_id: str, reason: str) -> dict:
+    with transaction(forum_dir) as state:
+        issue = state["source_issues"].get(issue_id)
+        if not issue:
+            raise ValueError("unknown source issue")
+        if issue["status"] == "open":
+            issue.update(status="unresolved", reason=_text(reason, "reason"), owner=None)
+            _event(state, "source_issue_unresolved", issue_id=issue_id, reason=reason)
+    return deepcopy(issue)
+
+
+def recover_source_repairs(forum_dir: Path) -> None:
+    """Controller startup recovery after terminating the previous run's workers."""
+    with transaction(forum_dir) as state:
+        for issue in state["source_issues"].values():
+            active = [row for row in issue["attempts"] if row.get("status") == "active"]
+            if not active:
+                continue
+            for row in active:
+                row.update(status="interrupted", error="controller resumed after interruption",
+                           finished_at=time.time())
+            issue.update(owner=None, status="proposed" if _live_repair_ids(issue) else "open")
+            _event(state, "source_repair_recovered", issue_id=issue["issue_id"])
+
+
+def submit_source_repair(forum_dir: Path, author: str, issue_id: str,
+                         explanation: str, evidence: str, replacement: str = "",
+                         artifact_id: str = "") -> dict:
+    with transaction(forum_dir) as state:
+        issue = state["source_issues"].get(issue_id)
+        if not issue or issue["status"] == "resolved":
+            raise ValueError("source issue is unknown or already resolved")
+        if issue.get("owner") and author_key(issue["owner"]) != author_key(author):
+            raise ValueError(f"source issue is owned by {issue['owner']}")
+        source = formal_source(state)
+        body = {"issue_id": issue_id, "author": _text(author, "author", 100),
+                "explanation": _text(explanation, "explanation", 16000),
+                "evidence": _text(evidence, "evidence", 16000),
+                "replacement": _text(replacement, "replacement", 16000, required=False),
+                "source_candidate": source["candidate_id"], "source_sha256": source["sha256"]}
+        sha = digest(body)
+        existing = next((item for item in state["source_repairs"].values() if item["sha256"] == sha), None)
+        if existing:
+            if existing["repair_id"] in issue.get("rejected_repair_ids", []):
+                raise ValueError("critic rejected this repair; submit revised evidence or a corrected proposal")
+            return deepcopy(existing)
+        repair = {**body, "repair_id": _id("source-repair"), "sha256": sha,
+                  "artifact_id": artifact_id, "created_at": time.time()}
+        state["source_repairs"][repair["repair_id"]] = repair
+        issue["repair_ids"].append(repair["repair_id"])
+        issue["status"] = "proposed"
+        _invalidate_review(state)
+        _event(state, "source_repair_proposed", issue_id=issue_id, repair_id=repair["repair_id"], author=author)
+        if state["phase"] in {"formalizing", "critic"}:
+            _queue_replan(state, author, "Adopt/review source repair " + repair["repair_id"], issue["task_ids"])
+    return deepcopy(repair)
+
+
+def repair_digest(state: dict) -> str:
+    # Ownership/retry chatter is telemetry, not semantic evidence.
+    return digest({"repairs": state.get("source_repairs", {}), "issues": {
+        key: {**{field: row.get(field) for field in ("anchor_ids", "task_ids", "description",
+              "source_candidate", "source_sha256", "repair_ids", "rejected_repair_ids", "review_feedback")},
+              "status": "open" if row.get("status") == "repairing" else row.get("status")}
+        for key, row in state.get("source_issues", {}).items()}})
+
+
 def initialize_source(forum_dir: Path, problem_sha256: str, main_sha: str,
                       source: dict, *, reset: bool = False) -> dict:
     """Bind supplied documents and start at chunking, without an English review gate."""
@@ -290,7 +487,7 @@ def register_strategy(
         for existing in state["strategies"].values():
             if (
                 existing.get("phase") == phase
-                and existing.get("phase_revision") == revision
+                and strategy_is_current(state, existing)
                 and existing.get("target", "") == target
                 and existing.get("status") in _ACTIVE_STRATEGIES
                 and (
@@ -305,6 +502,9 @@ def register_strategy(
             "strategy_id": strategy_id,
             "phase": phase,
             "phase_revision": revision,
+            "task_revision": state["formal_tasks"].get(target, {}).get("revision"),
+            "solution_candidate": formal_source(state).get("candidate_id"),
+            "solution_sha256": formal_source(state).get("sha256"),
             "target": target,
             "description": description,
             "description_key": description_key,
@@ -332,8 +532,7 @@ def claim_strategy(forum_dir: Path, strategy_id: str, author: str) -> dict:
             raise ValueError(f"unknown strategy '{strategy_id}'")
         if strategy["phase"] != state["phase"]:
             raise ValueError("strategy belongs to a different phase")
-        revision = state["formalization"]["revision"]
-        if strategy.get("phase_revision") != revision:
+        if not strategy_is_current(state, strategy):
             raise ValueError("strategy belongs to an obsolete revision")
         active_owned = next((
             item for item in state["strategies"].values()
@@ -365,7 +564,8 @@ def claim_strategy(forum_dir: Path, strategy_id: str, author: str) -> dict:
 def assist_strategy(forum_dir: Path, strategy_id: str, author: str, contribution: str = "") -> dict:
     with transaction(forum_dir) as state:
         strategy = state["strategies"].get(strategy_id)
-        if not strategy or strategy.get("status") != "claimed":
+        if (not strategy or strategy.get("status") != "claimed"
+                or state["phase"] != "formalizing" or not strategy_is_current(state, strategy)):
             raise ValueError("strategy is not actively claimed")
         if not participates(strategy, author):
             strategy["assistants"].append(_text(author, "author", 100))
@@ -635,34 +835,66 @@ def finish_chunking_attempt(
     return dict(attempt)
 
 
-def request_rechunk(forum_dir: Path, author: str, reason: str) -> dict:
-    """Invalidate an encoding contract without changing the supplied source binding."""
-    author = _text(author, "author", 100)
-    reason = _text(reason, "reason")
+def pending_replan(state: dict) -> dict | None:
+    return next((row for row in state.get("replan_requests", {}).values()
+                 if row.get("status") == "queued"), None)
+
+
+def _queue_replan(state: dict, author: str, reason: str, task_ids=None) -> dict:
+    targets = list(dict.fromkeys(task_ids or []))
+    if set(targets) - state["formal_tasks"].keys():
+        raise ValueError("re-chunk request has unknown tasks")
+    existing = pending_replan(state)
+    if existing:
+        # Empty scope means global. Multiple requests conservatively union scope.
+        existing["task_ids"] = sorted(set(existing["task_ids"]) | set(targets)) if existing["task_ids"] and targets else []
+        existing.setdefault("additional_reasons", []).append(reason)
+        return existing
+    request = {"request_id": _id("replan"), "author": _text(author, "author", 100),
+               "reason": _text(reason, "reason"), "task_ids": targets,
+               "status": "queued", "created_at": time.time()}
+    state["replan_requests"][request["request_id"]] = request
+    _invalidate_review(state)
+    _event(state, "rechunk_requested", **request)
+    return request
+
+
+def request_rechunk(forum_dir: Path, author: str, reason: str,
+                    task_ids: list[str] | None = None) -> dict:
+    """Queue an encoding change; the controller drains integration before replanning."""
     with transaction(forum_dir) as state:
         if state["phase"] not in {"formalizing", "critic"}:
             raise ValueError("re-chunking can only be requested during formalizing or critic")
-        formal = state["formalization"]
-        if formal_source(state).get("candidate_id") != formal.get("solution_candidate"):
+        if formal_source(state).get("candidate_id") != state["formalization"].get("solution_candidate"):
             raise ValueError("re-chunking requires the current bound formalization source")
+        request = _queue_replan(state, author, reason, task_ids)
+    return deepcopy(request)
+
+
+def begin_replan(forum_dir: Path, request_id: str, *, assignments: dict | None = None) -> dict:
+    """Controller-only transition, after owned jobs and workers have been drained."""
+    with transaction(forum_dir) as state:
+        request = state["replan_requests"].get(request_id)
+        if not request or request["status"] != "queued":
+            if (state.get("replan") or {}).get("request_id") == request_id:
+                return deepcopy(state)
+            raise ValueError("unknown or already consumed replan request")
+        if state["phase"] not in {"formalizing", "critic"}:
+            raise ValueError("replanning requires an active formalization")
+        state["replan"] = {"request_id": request_id, "request": deepcopy(request),
+                           "previous_formalization": deepcopy(state["formalization"]),
+                           "previous_tasks": deepcopy(state["formal_tasks"]),
+                           "assignments": deepcopy(assignments or {}), "status": "chunking"}
+        request["status"] = "processing"
         _invalidate_review(state)
-        formal.update({"revision": int(formal.get("revision", 0)) + 1,
-                       "status": "waiting", "contract": None, "requirements": [],
-                       "rechunk_reason": reason})
-        for task in state["formal_tasks"].values():
-            task["status"] = "superseded"
-        for candidate in state["formal_candidates"].values():
-            if candidate.get("status") in {"submitted", "merging"}:
-                candidate["status"] = "superseded"
-        for strategy in state["strategies"].values():
-            if strategy.get("phase") == "formalizing" and strategy.get("status") in _ACTIVE_STRATEGIES:
-                strategy["status"] = "cancelled"
+        state["formalization"]["status"] = "waiting"
+        state["formalization"]["rechunk_reason"] = request["reason"]
         for attempt in state["chunking_attempts"]:
-            if attempt.get("candidate_id") == formal.get("solution_candidate"):
+            if attempt.get("candidate_id") == state["formalization"].get("solution_candidate"):
                 attempt["obsolete"] = True
         state["phase"] = "chunking"
-        _event(state, "contract_reopened", author=author, reason=reason,
-               formalization_revision=formal["revision"], solution_candidate=formal.get("solution_candidate"))
+        _event(state, "contract_reopened", request_id=request_id, task_ids=request["task_ids"],
+               reason=request["reason"])
     return load_state(forum_dir)
 
 
@@ -675,6 +907,7 @@ def initialize_formal_tasks(
     main_sha: str,
     requirements: list[dict],
     contract: dict,
+    revalidation: dict | None = None,
 ) -> dict:
     with transaction(forum_dir) as state:
         if state["phase"] != "chunking":
@@ -739,9 +972,72 @@ def initialize_formal_tasks(
             raise ValueError("formalization contract requires its build environment")
         if "requirements" in contract and _validate_requirements(contract["requirements"], tasks, refs) != requirements:
             raise ValueError("requirements ledger differs from the frozen formalization contract")
+        spec = normalize_spec(contract.get("spec"), source=source, requirements=requirements, tasks=tasks)
+        if contract.get("spec_sha256") != digest(spec):
+            raise ValueError("source specification differs from its frozen digest")
+        adopted_repairs = {key for row in spec["arguments"] for key in row["repair_ids"]}
+        for key in adopted_repairs:
+            repair = state["source_repairs"].get(key)
+            if (not repair or repair.get("source_candidate") != solution_candidate
+                    or repair.get("source_sha256") != solution_sha256):
+                raise ValueError("spec references unknown or stale source repair")
+        for issue in state["source_issues"].values():
+            if (not adopted_repairs.intersection(_live_repair_ids(issue))
+                    or adopted_repairs.intersection(issue.get("rejected_repair_ids", []))):
+                raise ValueError("source issue needs an explicit adopted repair before freezing")
+            issue.update(status="resolved", owner=None, adopted_repairs=sorted(
+                adopted_repairs.intersection(issue["repair_ids"])))
+        old_tasks = state["formal_tasks"]
+        replan = state.get("replan") or {}
+        affected = set(replan.get("request", {}).get("task_ids", []))
+        if replan and not affected:
+            affected = set(old_tasks) | set(tasks)
+        for task_id, task in tasks.items():
+            task["spec_sha256"] = task_spec_hash(task, requirements, spec, contract)
+            if task["spec_sha256"] != old_tasks.get(task_id, {}).get("spec_sha256"):
+                affected.add(task_id)
+        affected |= old_tasks.keys() - tasks.keys()
+        while True:
+            expanded = _dependent_closure(tasks, affected) | _dependent_closure(old_tasks, affected)
+            if expanded == affected:
+                break
+            affected = expanded
+        receipt = revalidation or {}
+        carried = []
+        for task_id, task in tasks.items():
+            old = old_tasks.get(task_id)
+            unchanged = old and task_id not in affected
+            if unchanged and old.get("status") == "complete":
+                unchanged = (receipt.get("status") == "passed"
+                             and receipt.get("contract_sha256") == contract["sha256"]
+                             and receipt.get("main_sha") == main_sha
+                             and task_id in receipt.get("task_ids", []))
+            if unchanged:
+                for field in ("revision", "status", "accepted_candidate"):
+                    task[field] = old[field]
+                if old.get("status") == "complete":
+                    task["revalidation"] = deepcopy(receipt)
+                    carried.append(task_id)
+            else:
+                affected.add(task_id)
+                task["revision"] = int((old or {}).get("revision", 0)) + 1
+        # A failed carry-forward invalidates dependents too; no old active branch
+        # may remain current merely because its own declaration text is unchanged.
+        affected = _dependent_closure(tasks, affected)
+        for task_id in affected & tasks.keys():
+            task = tasks[task_id]
+            task.update(revision=int(old_tasks.get(task_id, {}).get("revision", 0)) + 1,
+                        status="pending", accepted_candidate=None)
+            task.pop("revalidation", None)
+        carried = [task_id for task_id in carried if task_id not in affected]
         revision = int(state["formalization"].get("revision", 0)) + 1
         state["formal_tasks"] = tasks
-        state["formal_candidates"] = {}
+        for candidate in state["formal_candidates"].values():
+            if not candidate_is_current(state, candidate) and candidate.get("status") in {"submitted", "merging"}:
+                candidate.update(status="superseded", supersession_reason="formal task revision changed")
+        for strategy in state["strategies"].values():
+            if (strategy.get("target") in affected or not strategy.get("target")) and strategy.get("status") in _ACTIVE_STRATEGIES:
+                strategy.update(status="cancelled", cancellation_reason="formal task revision changed")
         state["formalization"] = {
             "revision": revision,
             "status": "active",
@@ -750,12 +1046,16 @@ def initialize_formal_tasks(
             "main_sha": main_sha,
             "requirements": deepcopy(requirements),
             "contract": deepcopy(contract),
+            "spec": spec,
             "review_snapshot": None,
             "pending_verdict_id": None,
         }
         state["phase"] = "formalizing"
+        if replan:
+            replan.update(status="complete", affected_tasks=sorted(affected), carried_tasks=carried)
+            state["replan_requests"][replan["request_id"]]["status"] = "complete"
         _event(state, "formalization_initialized", formalization_revision=revision,
-               tasks=ids, solution_candidate=solution_candidate)
+               tasks=ids, solution_candidate=solution_candidate, affected_tasks=sorted(affected), carried_tasks=carried)
     return load_state(forum_dir)
 
 
@@ -770,31 +1070,7 @@ def _reference_list(value, field: str) -> list[str]:
 
 
 def _validate_requirements(requirements, tasks: dict, source_refs: set[str]) -> list[dict]:
-    if not isinstance(requirements, list) or not requirements:
-        raise ValueError("formalization requires a nonempty requirements ledger")
-    result, ids, covered_sources = [], set(), set()
-    for requirement in requirements:
-        if not isinstance(requirement, dict):
-            raise ValueError("each requirement must be an object")
-        requirement_id = _text(requirement.get("id"), "requirement id", 200)
-        if requirement_id in ids:
-            raise ValueError("requirements require unique nonempty ids")
-        ids.add(requirement_id)
-        statement = _text(requirement.get("statement"), "requirement statement", 16000)
-        sources = _reference_list(requirement.get("source_components"), "requirement source_components")
-        task_ids = _reference_list(requirement.get("tasks"), "requirement tasks")
-        if set(sources) - source_refs:
-            raise ValueError(f"requirement {requirement_id} has unknown source components")
-        if set(task_ids) - tasks.keys():
-            raise ValueError(f"requirement {requirement_id} has unknown tasks")
-        if set(sources) - {source for task_id in task_ids for source in tasks[task_id]["source_components"]}:
-            raise ValueError(f"requirement {requirement_id} sources are not covered by its tasks")
-        covered_sources.update(sources)
-        result.append({"id": requirement_id, "statement": statement,
-                       "source_components": sources, "tasks": task_ids})
-    if source_refs - covered_sources:
-        raise ValueError("requirements ledger does not cover every supplied source component")
-    return result
+    return normalize_requirements(requirements, tasks, source_refs)
 
 
 def ready_formal_tasks(state: dict) -> list[dict]:
@@ -802,6 +1078,7 @@ def ready_formal_tasks(state: dict) -> list[dict]:
     return [
         task for task in tasks.values()
         if task.get("status") == "pending"
+        and not source_issues_blocking_task(state, task["task_id"])
         and all(tasks.get(dep, {}).get("status") == "complete"
                 for dep in task.get("dependencies", []))
     ]
@@ -837,7 +1114,7 @@ def submit_formal_candidate(
             not strategy
             or strategy.get("phase") != "formalizing"
             or strategy.get("target") != task_id
-            or strategy.get("phase_revision") != state["formalization"]["revision"]
+            or not strategy_is_current(state, strategy)
         ):
             raise ValueError("candidate strategy does not target this formal task/revision")
         if strategy.get("status") not in {"claimed", "paused"}:
@@ -847,7 +1124,7 @@ def submit_formal_candidate(
         for existing in state["formal_candidates"].values():
             if (
                 existing.get("task_id") == task_id
-                and existing.get("formalization_revision") == state["formalization"]["revision"]
+                and candidate_is_current(state, existing)
                 and existing.get("status") in {"submitted", "merging"}
             ):
                 if (
@@ -875,6 +1152,7 @@ def submit_formal_candidate(
             "solution_candidate": state["formalization"]["solution_candidate"],
             "solution_sha256": state["formalization"]["solution_sha256"],
             "formalization_revision": state["formalization"]["revision"],
+            "task_revision": task["revision"],
             "source_components": list(task.get("source_components", [])),
             "notes": _text(notes, "notes", 2000, required=False),
             "supersedes": supersedes or None,
@@ -898,8 +1176,7 @@ def begin_formal_merge(forum_dir: Path, candidate_id: str) -> dict:
         if not candidate:
             raise ValueError(f"unknown formal candidate '{candidate_id}'")
         if (state["phase"] != "formalizing"
-                or candidate.get("formalization_revision") != state["formalization"].get("revision")
-                or candidate.get("solution_candidate") != state["formalization"].get("solution_candidate")):
+                or not candidate_is_current(state, candidate)):
             return {"candidate": candidate, "conflict": True}
         if candidate.get("status") == "merged":
             return {"candidate": candidate, "idempotent": True}
@@ -924,9 +1201,7 @@ def finish_formal_merge(
     with transaction(forum_dir) as state:
         candidate = state["formal_candidates"].get(candidate_id)
         if (state["phase"] != "formalizing" or not candidate
-                or candidate.get("formalization_revision") != state["formalization"].get("revision")
-                or candidate.get("solution_candidate") != state["formalization"].get("solution_candidate")
-                or candidate.get("solution_sha256") != state["formalization"].get("solution_sha256")):
+                or not candidate_is_current(state, candidate)):
             return {"candidate": candidate, "stale": True}
         if not candidate or candidate.get("status") != "merging":
             raise ValueError("formal candidate is not being merged")
@@ -969,6 +1244,19 @@ def finish_formal_merge(
     return {"candidate": candidate, "task": task}
 
 
+def defer_formal_merge(forum_dir: Path, candidate_id: str, reason: str = "") -> dict:
+    """Controller rollback completed: retain exact submitted bytes during replan."""
+    with transaction(forum_dir) as state:
+        candidate = state["formal_candidates"].get(candidate_id)
+        if not candidate or not candidate_is_current(state, candidate):
+            return {"candidate": candidate, "stale": True}
+        if candidate.get("status") == "merging":
+            candidate["status"] = "submitted"
+            candidate["deferred_reason"] = _text(reason, "reason", required=False)
+            _event(state, "formal_candidate_deferred", candidate_id=candidate_id, reason=reason)
+    return {"candidate": deepcopy(candidate)}
+
+
 def all_formal_tasks_complete(state: dict) -> bool:
     tasks = state.get("formal_tasks", {})
     return bool(tasks) and all(task.get("status") == "complete" for task in tasks.values())
@@ -979,6 +1267,8 @@ def _invalidate_review(state: dict) -> None:
     formal = state["formalization"]
     formal["review_snapshot"] = None
     formal["pending_verdict_id"] = None
+    if formal.get("status") == "approval_pending":
+        formal["status"] = "review"
 
 
 def _report_digest(report: dict | list) -> str:
@@ -1007,9 +1297,20 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
                 "solution_candidate": formal.get("solution_candidate"),
                 "solution_sha256": formal.get("solution_sha256"),
                 "formalization_revision": formal.get("revision"),
-                "contract_sha256": contract.get("sha256")}
+                "contract_sha256": contract.get("sha256"),
+                "spec_sha256": digest(formal.get("spec")),
+                "repairs_sha256": repair_digest(state)}
     if any(report.get(key) != value for key, value in expected.items()):
         raise ValueError("review snapshot is stale for the current formalization")
+    if (formal.get("spec") != contract.get("spec")
+            or contract.get("spec_sha256") != digest(formal.get("spec"))):
+        raise ValueError("source specification differs from its frozen contract")
+    external = {name: {key: row.get(key) for key in ("fingerprint", "module", "signature", "axioms")}
+                for name, row in contract.get("external_declarations", {}).items()}
+    if report.get("external_declarations", {}) != external:
+        raise ValueError("external prerequisite evidence differs from the frozen contract")
+    if require_passed and (pending_replan(state) or open_source_issues(state)):
+        raise ValueError("review cannot approve pending replanning or unresolved source issues")
     solution_id = formal.get("solution_candidate")
     source = formal_source(state)
     if not source or source.get("candidate_id") != solution_id:
@@ -1035,10 +1336,13 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
             continue
         candidate = state["formal_candidates"].get(candidate_id, {})
         if (candidate.get("status") != "merged" or candidate.get("task_id") != task_id
-                or candidate.get("solution_candidate") != solution_id
-                or candidate.get("solution_sha256") != formal.get("solution_sha256")
-                or candidate.get("formalization_revision") != formal.get("revision")):
+                or not candidate_is_current(state, candidate)):
             raise ValueError("review snapshot requires current merged candidates for every task")
+        if candidate.get("verification", {}).get("contract_sha256") != contract["sha256"]:
+            receipt = tasks[task_id].get("revalidation", {})
+            if (receipt.get("status") != "passed" or receipt.get("contract_sha256") != contract["sha256"]
+                    or task_id not in receipt.get("task_ids", [])):
+                raise ValueError("carried candidate requires fresh contract revalidation")
 
 
 def record_review_snapshot(forum_dir: Path, report: dict) -> dict:
@@ -1144,7 +1448,7 @@ def submit_critic_verdict(
         if state["phase"] != "critic" or state["formalization"].get("status") != "review":
             raise ValueError("critic verdicts are only accepted during critic")
         report = _current_snapshot(state, review["snapshot_id"])
-        _validate_semantic_review(state, review, approved=verdict == "approved")
+        _validate_semantic_review(state, review, approved=verdict == "approved", author=author)
         task_ids = list(dict.fromkeys(reopen_tasks or []))
         if verdict == "approved" and task_ids:
             raise ValueError("approved verdict cannot reopen formal tasks")
@@ -1173,6 +1477,15 @@ def submit_critic_verdict(
             state["formalization"]["status"] = "approval_pending"
             state["formalization"]["pending_verdict_id"] = item["verdict_id"]
         elif verdict == "lean_reopen":
+            for entry in review["repair_reviews"]:
+                if entry["status"] != "fail":
+                    continue
+                repair = state["source_repairs"][entry["repair_id"]]
+                issue = state["source_issues"][repair["issue_id"]]
+                issue.update(status="open", owner=None, review_feedback=entry["rationale"])
+                issue["rejected_repair_ids"] = sorted(set(issue.get("rejected_repair_ids", [])) | {entry["repair_id"]})
+                _event(state, "source_repair_rejected", issue_id=issue["issue_id"],
+                       repair_id=entry["repair_id"], verdict_id=item["verdict_id"])
             reopened = set(task_ids)
             while True:
                 dependents = {task_id for task_id, task in state["formal_tasks"].items()
@@ -1200,7 +1513,7 @@ def submit_critic_verdict(
     return {"verdict": item, "state": load_state(forum_dir)}
 
 
-def _validate_semantic_review(state: dict, review: dict, *, approved: bool) -> None:
+def _validate_semantic_review(state: dict, review: dict, *, approved: bool, author: str = "") -> None:
     ledger = {item["id"]: item for item in state["formalization"]["requirements"]}
     seen = set()
     declarations = state["formalization"]["review_snapshot"]["declarations"]
@@ -1211,8 +1524,14 @@ def _validate_semantic_review(state: dict, review: dict, *, approved: bool) -> N
         if requirement_id in seen:
             raise ValueError(f"duplicate reviewed requirement '{requirement_id}'")
         seen.add(requirement_id)
-        if not entry["rationale"].strip():
-            raise ValueError("requirement review rationale is required")
+        if not entry["rationale"].strip() or not entry["argument_rationale"].strip():
+            raise ValueError("requirement statement and argument review rationales are required")
+        anchors = entry["checked_anchor_ids"]
+        expected_anchors = set(ledger[requirement_id]["anchor_ids"])
+        if len(anchors) != len(set(anchors)) or set(anchors) - expected_anchors:
+            raise ValueError("requirement review has unknown or duplicate anchors")
+        if approved and set(anchors) != expected_anchors:
+            raise ValueError("approval requires checking every requirement source anchor")
         refs = entry["declarations"]
         if len(refs) != len(set(refs)):
             raise ValueError("requirement review has duplicate declaration references")
@@ -1225,6 +1544,21 @@ def _validate_semantic_review(state: dict, review: dict, *, approved: bool) -> N
             raise ValueError("approval requires every requirement to pass with declaration references")
     if approved and seen != set(ledger):
         raise ValueError("approval requires exact coverage of every requirement")
+    if not review["scope_rationale"].strip():
+        raise ValueError("review requires a rationale for source scope and exclusions")
+    adopted = {key for row in state["formalization"]["spec"]["arguments"] for key in row["repair_ids"]}
+    reviewed = set()
+    for entry in review["repair_reviews"]:
+        key = entry["repair_id"]
+        if key not in adopted or key in reviewed or not entry["rationale"].strip():
+            raise ValueError("repair review has unknown/duplicate repair or missing rationale")
+        reviewed.add(key)
+        if approved and author_key(state["source_repairs"][key]["author"]) == author_key(author):
+            raise ValueError("source repairs require an independent critic, not their proposal author")
+        if approved and entry["status"] != "pass":
+            raise ValueError("approval requires every adopted source repair to pass independent review")
+    if approved and reviewed != adopted:
+        raise ValueError("approval requires exact coverage of every adopted source repair")
 
 
 def complete_critic_review(forum_dir: Path, snapshot_id: str, verdict_id: str) -> dict:
@@ -1244,7 +1578,7 @@ def complete_critic_review(forum_dir: Path, snapshot_id: str, verdict_id: str) -
         review = SemanticReview.model_validate(verdict["review"]).model_dump()
         if review["snapshot_id"] != snapshot_id or verdict.get("reopen_tasks"):
             raise ValueError("critic approval does not target this snapshot")
-        _validate_semantic_review(state, review, approved=True)
+        _validate_semantic_review(state, review, approved=True, author=verdict["author"])
         formal["status"] = "accepted"
         formal["pending_verdict_id"] = None
         formal["accepted_verdict_id"] = verdict_id

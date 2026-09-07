@@ -21,8 +21,9 @@ A target has `name`,
 `meanings`, and full-environment `axioms`. Only `axioms` is proof-dependent.
 The caller hashes the other fields, not the entire record including `axioms`.
 
-Expressions, names, and universe levels use tagged structural JSON, never pretty
-printing. Non-kernel Expr.mdata annotations are erased; all other constructors,
+Expressions, names, and universe levels use tagged structural JSON for identity,
+never pretty printing. External signatures also have a display-only rendering,
+excluded from semantic fingerprints. Non-kernel Expr.mdata annotations are erased; all other constructors,
 binders, indices, and levels are preserved. Meanings follow types and definition
 values (including opaque values), inductive constructors and recursor rules, but
 never theorem proof bodies. A def/opaque target's own value is protected too.
@@ -211,7 +212,7 @@ private partial def collectMeanings (env : Environment) (projects : NameSet)
   modify fun s => { s with records := (n.toString, meaningJson env ci) :: s.records }
   for dep in meaningDeps env ci do collectMeanings env projects dep
 
-private def extract (modules targets : List String) : IO (Json × UInt32) := do
+private def extract (modules targets externals : List String) : IO (Json × UInt32) := do
   let started ← IO.monoMsNow
   initSearchPath (← findSysroot)
   let mods := modules.toArray.map fun a => ({ module := a.toName, importAll := true } : Import)
@@ -257,11 +258,36 @@ private def extract (modules targets : List String) : IO (Json × UInt32) := do
       ("meanings", Json.mkObj ms.records),
       ("axioms", Json.arr (axiomNames.toArray.map Json.str))]) :: records
   let targetsChecked ← IO.monoMsNow
+  -- Cited library prerequisites are inspected separately. They never become
+  -- project targets, project ownership roots, or proof-task completion evidence.
+  let mut externalRecords : List (String × Json) := []
+  for target in externals do
+    let n := target.toName
+    let some ci := env.checked.get.find? n | do
+      issues := issues.push s!"external declaration {target} was not found in the imported kernel"
+      continue
+    if (moduleOf env n).any projects.contains then
+      issues := issues.push s!"external declaration {target} is project-owned; resolve it as a task"
+      continue
+    let (_, auditState) := (audit env n).run { edges := edges }
+    edges := auditState.edges
+    issues := issues ++ auditState.issues
+    let axiomNames := auditState.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
+    let signature ← PrettyPrinter.ppExprLegacy env {} {} {} ci.type
+    externalRecords := (target, Json.mkObj [
+      ("name", Json.str ci.name.toString),
+      ("target_kind", Json.str (kindOf ci)),
+      ("module", Json.str (((moduleOf env n).getD .anonymous).toString)),
+      ("level_params", namesJson ci.levelParams),
+      ("type", exprJson ci.type),
+      ("signature", Json.str signature.pretty),
+      ("axioms", toJson axiomNames)]) :: externalRecords
   let (_, projectAudit) := (projectRoots.forM (audit env)).run { edges := edges }
   issues := issues ++ projectAudit.issues
   let projectUsedAxioms := projectAudit.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
   let audited ← IO.monoMsNow
   return (Json.mkObj [("targets", Json.mkObj records),
+    ("external_declarations", Json.mkObj externalRecords),
     ("project_axioms", toJson (projectAxioms.mergeSort (· ≤ ·))),
     ("project_sorries", toJson (projectSorries.mergeSort (· ≤ ·))),
     ("project_used_axioms", toJson projectUsedAxioms),
@@ -278,13 +304,15 @@ end UnityAutoformalizeContract
 def main (args : List String) : IO UInt32 := do
   let modules := args.takeWhile (· != "--")
   let rest := args.dropWhile (· != "--")
-  let targets := rest.drop 1
+  let requested := rest.drop 1
+  let targets := requested.takeWhile (· != "--external")
+  let externals := (requested.dropWhile (· != "--external")).drop 1
   if modules.isEmpty || targets.isEmpty then
     IO.println (Json.mkObj [("targets", Json.mkObj []), ("issues", toJson [
-      "usage: lake env <contract-executable> Module... -- Target..."])]).compress
+      "usage: lake env <contract-executable> Module... -- Target... [--external Declaration...]"])]).compress
     return 1
   try
-    let (result, code) ← UnityAutoformalizeContract.extract modules targets
+    let (result, code) ← UnityAutoformalizeContract.extract modules targets externals
     IO.println result.compress
     return code
   catch e =>

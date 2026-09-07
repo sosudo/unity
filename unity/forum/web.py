@@ -2544,6 +2544,7 @@ async function loadOverview() {
         findings = Object.values(af.findings || {}).filter(x => x.status === 'active'),
         obstacles = Object.values(af.obstacles || {}).filter(x => x.status === 'open');
       h += '<div class="sechead">autoformalize workspace<span class="r">phase ' + esc(af.phase || 'chunking') + ' · revision ' + (af.revision || 0) + '</span></div>';
+      if (af.final_report) h += '<div class="item">' + (af.final_report.status === 'accepted' ? 'accepted snapshot report' : 'incomplete run report') + artifactButton(af.final_report.artifact_id) + '</div>';
       h += '<div class="grid"><section><h2>immutable supplied source</h2><div class="item mono">' + esc(source.candidate_id || '') + '</div>' + artifactButton(source.artifact_id) +
         (source.source_refs || []).map(x => '<div class="item"><b>' + esc(x.ref_id) + '</b><div class="who">' + esc(x.path) + ' · ' + esc((x.sha256 || '').slice(0,12)) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') +
         '<div class="item"><b>Lean formalization</b><span class="badge ' + (formal.status === 'accepted' ? 'ok' : 'pending') + '">' + esc(formal.status || 'waiting') + '</span><div class="who mono">main ' + esc((formal.main_sha || '').slice(0,12)) + '</div></div></section>';

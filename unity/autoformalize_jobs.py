@@ -15,7 +15,58 @@ import subprocess
 import time
 import uuid
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from pathlib import Path
+from threading import Event
+
+
+class JobCancelled(ValueError):
+    """A controller check stopped cooperatively; callers must roll back main."""
+
+
+_cancellation: ContextVar[Event | None] = ContextVar("autoformalize_job_cancellation", default=None)
+
+
+@contextmanager
+def cancellation_scope(event: Event | None):
+    """Apply one integration's cancellation token to all its nested checks."""
+    token = _cancellation.set(event)
+    try:
+        yield
+    finally:
+        _cancellation.reset(token)
+
+
+def cancellation_disabled():
+    """Rollback must run even after the check that required it was cancelled."""
+    return cancellation_scope(None)
+
+
+def check_cancelled() -> None:
+    event = _cancellation.get()
+    if event is not None and event.is_set():
+        raise JobCancelled("autoformalize verification cancelled")
+
+
+def _signal_process(proc, sig: int, *, client_group: bool = False) -> None:
+    if (os.name != "posix" or client_group) and proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix" and not client_group:
+            os.killpg(proc.pid, sig)
+        else:
+            proc.send_signal(sig)
+    except ProcessLookupError:
+        pass
+
+
+def _cancel_process(proc, *, client_group: bool = False) -> None:
+    _signal_process(proc, signal.SIGTERM, client_group=client_group)
+    try:
+        proc.communicate(timeout=0.25)
+    except subprocess.TimeoutExpired:
+        _signal_process(proc, signal.SIGKILL, client_group=client_group)
+        proc.communicate()
 
 
 def _jobs_dir(project_root: Path) -> Path:
@@ -30,7 +81,14 @@ def _build_lock(project_root: Path):
     path = Path(project_root) / ".unity" / "forum" / "autoformalize-build.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        while True:
+            check_cancelled()
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                event = _cancellation.get()
+                event.wait(0.1) if event is not None else time.sleep(0.1)
         try:
             yield
         finally:
@@ -47,6 +105,7 @@ def run(
     serialize_build: bool = False,
     timings: dict | None = None,
     passthrough_stdio: bool = False,
+    input: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a registered job; interactive LSP keeps live stdio and its client's group."""
     if passthrough_stdio and serialize_build:
@@ -76,6 +135,7 @@ def run(
                     timings["process_seconds"] = finished - acquired
 
     with maybe_locked():
+        check_cancelled()
         # leanclient starts the Lake shim as a process-group leader, then kills
         # that group on close. Keep the real server inside it, not in a detached
         # group. Other callers still get a private, safely cancellable job group.
@@ -85,6 +145,7 @@ def run(
         proc = subprocess.Popen(
             args,
             cwd=cwd,
+            stdin=subprocess.PIPE if input is not None else None,
             stdout=None if passthrough_stdio else subprocess.PIPE,
             stderr=None if passthrough_stdio else subprocess.PIPE,
             text=True,
@@ -102,14 +163,30 @@ def run(
         }
         if passthrough_stdio:
             record["passthrough_stdio"] = True
-        temporary = record_path.with_suffix(".tmp")
-        temporary.write_text(json.dumps(record, sort_keys=True))
-        os.replace(temporary, record_path)
         try:
-            stdout, stderr = proc.communicate()
+            temporary = record_path.with_suffix(".tmp")
+            temporary.write_text(json.dumps(record, sort_keys=True))
+            os.replace(temporary, record_path)
+            check_cancelled()  # Closes the cancellation-before-registration race.
+            if _cancellation.get() is None:
+                stdout, stderr = proc.communicate(input=input) if input is not None else proc.communicate()
+            else:
+                pending_input = input
+                while True:
+                    check_cancelled()
+                    try:
+                        stdout, stderr = proc.communicate(input=pending_input, timeout=0.1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pending_input = None
+                check_cancelled()
             return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr)
+        except BaseException:
+            _cancel_process(proc, client_group=client_group)
+            raise
         finally:
             record_path.unlink(missing_ok=True)
+            record_path.with_suffix(".tmp").unlink(missing_ok=True)
 
 
 def terminate(project_root: Path, *, owner: str | None = None) -> int:

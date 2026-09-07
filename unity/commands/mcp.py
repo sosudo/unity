@@ -177,6 +177,12 @@ async def mcp(server, tool, args, args_file):
     autoformalize_profile = run_state.get("phase", "chunking")
     if autoformalize_profile not in {"chunking", "formalizing", "critic", "retrospective"}:
         autoformalize_profile = "chunking"
+    if active_autoformalize:
+        override = os.getenv("UNITY_AUTOFORMALIZE_PROFILE", "").strip()
+        if override:
+            if override not in {"chunking", "formalizing", "critic", "retrospective", "source_repair"}:
+                raise click.ClickException(f"unknown autoformalize tool profile '{override}'")
+            autoformalize_profile = override
     active_solve = run_state.get("command") == "solve" and run_state.get("phase") != "done"
     solve_profile = run_state.get("phase", "solving")
     if solve_profile not in {

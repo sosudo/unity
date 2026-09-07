@@ -18,6 +18,7 @@ import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Event
 
 from rich.console import Console
 
@@ -36,12 +37,12 @@ def configure_forum(paths, profile: str) -> None:
     autoformalize_server.configure(paths.forum, paths.project_root, profile)
 
 
-def forum_brief(paths, profile: str, author: str) -> str:
+def forum_brief(paths, profile: str, author: str, task_id: str = "") -> str:
     if os.getenv("UNITY_FORUM_BRIEF", "on").lower() == "off":
         return ""
     configure_forum(paths, profile)
     try:
-        return autoformalize_server.autoformalize_brief(author)
+        return autoformalize_server.autoformalize_brief(author, task_id=task_id)
     except Exception:
         return ""
 
@@ -99,6 +100,8 @@ def _agent_runtime_env(
         "TEMP": value,
         "PIP_REQUIRE_VIRTUALENV": "true",
         "PIP_DISABLE_PIP_VERSION_CHECK": "true",
+        "UNITY_AUTOFORMALIZE_PROJECT_ROOT": str(paths.project_root.resolve()),
+        "UNITY_AUTOFORMALIZE_TASK_ID": task_id,
     }
     if state.get("phase") == "formalizing":
         real_lake = shutil.which("lake")
@@ -157,6 +160,23 @@ def write_formalization_plan(paths, candidate: dict) -> Path:
         "solution_sha256": candidate["sha256"],
         "source_refs": source_refs,
     }
+    state = autoformalize_state.load_state(paths.forum)
+    replan = state.get("replan") or {}
+    if replan:
+        previous = replan.get("previous_formalization") or {}
+        plan["replan"] = {
+            "request": replan.get("request"), "previous_tasks": replan.get("previous_tasks", {}),
+            "previous_formalization": {"spec": previous.get("spec"),
+                                       "requirements": previous.get("requirements", [])},
+        }
+    plan["source_issues"] = {
+        key: {field: row.get(field) for field in (
+            "issue_id", "anchor_ids", "task_ids", "description", "status", "repair_ids",
+            "source_candidate", "source_sha256", "reason",
+        )}
+        for key, row in state.get("source_issues", {}).items()
+    }
+    plan["source_repairs"] = state.get("source_repairs", {})
     path = paths.unity / "formalization-plan.json"
     path.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n")
     return path
@@ -202,7 +222,6 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
     if any(not name for name in declarations) or len(set(declarations)) != len(declarations):
         raise ValueError("formalization declarations must be unique and nonempty")
     graph = {}
-    covered_refs: set[str] = set()
     for chunk in chunks:
         task_id = str(chunk["id"])
         if not str(chunk.get("lean_decl") or "").strip():
@@ -220,37 +239,14 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
                 raise ValueError(f"chunk {task_id} has unknown source components: {sorted(unknown_refs)}")
             if not source_refs:
                 raise ValueError(f"chunk {task_id} must name at least one source component")
-            covered_refs.update(source_refs)
         graph[task_id] = set(deps)
-    missing_refs = required_refs - covered_refs
-    if missing_refs:
-        raise ValueError("formalization DAG does not cover source components: " + ", ".join(sorted(missing_refs)))
-    requirements = dag.get("requirements")
-    if not isinstance(requirements, list) or not requirements:
-        raise ValueError("formalization DAG requires explicit mathematical requirements")
-    requirement_ids = set()
-    requirement_refs = set()
-    by_id = {chunk["id"]: chunk for chunk in chunks}
-    for requirement in requirements:
-        if not isinstance(requirement, dict):
-            raise ValueError("each mathematical requirement must be an object")
-        rid = requirement.get("id")
-        if not isinstance(rid, str) or not rid.strip() or rid in requirement_ids:
-            raise ValueError("mathematical requirement IDs must be unique and nonempty")
-        requirement_ids.add(rid)
-        if not isinstance(requirement.get("statement"), str) or not requirement["statement"].strip():
-            raise ValueError(f"requirement {rid} needs a precise statement")
-        refs, tasks = requirement.get("source_components"), requirement.get("tasks")
-        if not isinstance(refs, list) or not refs or not set(refs) <= required_refs:
-            raise ValueError(f"requirement {rid} has missing/unknown source references")
-        if not isinstance(tasks, list) or not tasks or not set(tasks) <= known:
-            raise ValueError(f"requirement {rid} has missing/unknown tasks")
-        mapped_refs = {ref for task in tasks for ref in by_id[task]["source_components"]}
-        if not set(refs) <= mapped_refs:
-            raise ValueError(f"requirement {rid} references sources not covered by its tasks")
-        requirement_refs.update(refs)
-    if required_refs - requirement_refs:
-        raise ValueError("mathematical requirements do not cover all accepted source components")
+    from .autoformalize_spec import normalize_requirements, normalize_spec
+    source = {"candidate_id": plan["solution_candidate"], "sha256": plan["solution_sha256"],
+              "source_refs": plan["source_refs"]}
+    dag["requirements"] = normalize_requirements(dag.get("requirements"), chunks, required_refs)
+    dag["spec"] = normalize_spec(dag.get("spec"), source=source,
+                                 requirements=dag["requirements"], tasks=chunks,
+                                 allow_unresolved=True)
     pending = dict(graph)
     while pending:
         ready = [node for node, deps in pending.items() if not (deps & pending.keys())]
@@ -262,9 +258,18 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
 
 
 def _git(project: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=project, capture_output=True, text=True, check=False,
+    return autoformalize_jobs.run(
+        project, ["git", *args], cwd=project, owner="Unity", task_id="integration-git",
     )
+
+
+def _rollback(root: Path, before: str) -> subprocess.CompletedProcess:
+    with autoformalize_jobs.cancellation_disabled():
+        result = _git(root, "reset", "--hard", before)
+    if result.returncode:
+        raise ValueError("Main rollback failed; inspect and reconcile main before resuming: "
+                         + (result.stderr.strip() or result.stdout.strip() or "git reset failed"))
+    return result
 
 
 def _formal_worktree(project_root: Path, author: str) -> Path:
@@ -299,7 +304,13 @@ def _merge_lock(project_root: Path):
     path = project_root / ".unity" / "forum" / "merge.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
+        while True:
+            autoformalize_jobs.check_cancelled()
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                time.sleep(0.1)
         try:
             yield
         finally:
@@ -342,7 +353,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     contract = current["formalization"].get("contract", {})
     if not contract:
         return {"ok": False, "error": "missing formal contract; request re-chunking before proving"}
-    if candidate.get("formalization_revision") != current["formalization"].get("revision"):
+    if not autoformalize_state.candidate_is_current(current, candidate):
         return {"ok": False, "error": "candidate belongs to a superseded formal contract"}
     try:
         resolved = worktree.verify_candidate_commit(root, candidate["author"], candidate["commit_sha"])
@@ -361,12 +372,13 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     if dirty.returncode or dirty.stdout.strip():
         return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
     before = worktree.main_commit(root)
-    applied = subprocess.run(
+    applied = autoformalize_jobs.run(
+        root,
         ["git", "apply", "--3way", "--index", "-"],
-        cwd=root, input=exact_diff, capture_output=True, text=True, check=False,
+        cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
     )
     if applied.returncode:
-        _git(root, "reset", "--hard", before)
+        _rollback(root, before)
         return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
     with autoformalize_contract.measure(timings, "workspace_seconds"):
         layout = autoformalize_contract.workspace_layout(root)
@@ -380,7 +392,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         )
     except OSError as exc:
         build_seconds = time.monotonic() - build_started
-        _git(root, "reset", "--hard", before)
+        _rollback(root, before)
         return {
             "ok": False, "error": f"could not run lake build: {exc}",
             "build": {"returncode": None, "seconds": build_seconds},
@@ -398,14 +410,14 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         )
         build_record.update({"artifact_id": record["artifact_id"], "sha256": record["sha256"]})
     if build["returncode"]:
-        _git(root, "reset", "--hard", before)
+        _rollback(root, before)
         return {
             "ok": False,
             "error": "lake build failed: " + artifacts.preview_text(output, 3000),
             "build": build_record,
         }
     if _git(root, "diff", "--quiet").returncode:
-        _git(root, "reset", "--hard", before)
+        _rollback(root, before)
         return {"ok": False, "error": "lake build changed tracked files", "build": build_record}
     staged = _git(root, "diff", "--cached", "--no-ext-diff", before).stdout
     verification_started = time.monotonic()
@@ -427,7 +439,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     )
     verification["artifact_id"] = record["artifact_id"]
     if verification["status"] != "passed":
-        _git(root, "reset", "--hard", before)
+        _rollback(root, before)
         return {
             "ok": False,
             "error": "; ".join(verification["issues"]),
@@ -437,7 +449,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     require_source_matches(paths, current)
     commit = _git(root, "commit", "-m", f"UNITY: merge {PIPELINE} task {task['task_id']}")
     if commit.returncode:
-        _git(root, "reset", "--hard", before)
+        _rollback(root, before)
         return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
     with autoformalize_contract.measure(timings, "postcommit_identity_seconds"):
         committed_source = autoformalize_contract.source_identity(root)
@@ -465,10 +477,11 @@ def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     result = {}
     try:
         result = _apply_formal_candidate(paths, candidate, task, timings=timings)
+        autoformalize_jobs.check_cancelled()
     except (OSError, ValueError, KeyError) as exc:
-        restored = _git(root, "reset", "--hard", before)
-        suffix = "" if restored.returncode == 0 else "; main rollback also failed: " + restored.stderr
-        result = {"ok": False, "error": f"candidate verification failed: {exc}{suffix}"}
+        _rollback(root, before)
+        result = {"ok": False, "error": f"candidate verification failed: {exc}",
+                  "cancelled": isinstance(exc, autoformalize_jobs.JobCancelled)}
     finally:
         timings["total_seconds"] = time.monotonic() - started
         # Detailed profiling is telemetry, never prompt memory or acceptance
@@ -493,16 +506,30 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
         return _integrate_checked(paths, candidate, task)
 
 
-def _integrate_and_record(paths, candidate: dict, task: dict) -> dict:
+def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Event | None = None) -> dict:
     """Serialize Git integration AND state publication under the same lock."""
-    with _merge_lock(paths.project_root):
-        result = _integrate_checked(paths, candidate, task)
+    def record(result: dict) -> dict:
+        if result.get("cancelled") and autoformalize_state.pending_replan(autoformalize_state.load_state(paths.forum)):
+            autoformalize_state.defer_formal_merge(paths.forum, candidate["candidate_id"], reason=result["error"])
+            return {**result, "deferred": True}
         autoformalize_state.finish_formal_merge(
             paths.forum, candidate["candidate_id"], success=bool(result.get("ok")),
             main_sha=result.get("main_sha", ""), error=result.get("error", ""),
             build=result.get("build"), verification=result.get("verification"),
         )
         return result
+
+    with autoformalize_jobs.cancellation_scope(cancel_event):
+        try:
+            with _merge_lock(paths.project_root):
+                try:
+                    result = _integrate_checked(paths, candidate, task)
+                except autoformalize_jobs.JobCancelled as exc:
+                    result = {"ok": False, "cancelled": True, "error": str(exc)}
+                return record(result)
+        except autoformalize_jobs.JobCancelled as exc:
+            # Cancellation before acquiring the lock made no source mutation.
+            return record({"ok": False, "cancelled": True, "error": str(exc)})
 
 
 def recover_interrupted_formal_merges(paths) -> None:
@@ -514,8 +541,7 @@ def recover_interrupted_formal_merges(paths) -> None:
             candidate for candidate in state["formal_candidates"].values()
             if state["phase"] == "formalizing"
             and candidate.get("status") == "merging"
-            and candidate.get("formalization_revision") == formal.get("revision")
-            and candidate.get("solution_candidate") == formal.get("solution_candidate")
+            and autoformalize_state.candidate_is_current(state, candidate)
         ]
         if not interrupted:
             return
@@ -553,20 +579,18 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     agent_names = {autoformalize_state.author_key(name): name for name in agents}
     worktrees: dict[str, Path] = {}
     tasks: dict[str, asyncio.Task] = {}
+    stopping: dict[str, asyncio.Task] = {}
+    roles: dict[str, str] = {}
+    repair_issues: dict[str, str] = {}
+    repair_exhausted: dict[str, set[str]] = {}
+    integration: asyncio.Task | None = None
+    integration_candidate: dict = {}
+    integration_cancel: Event | None = None
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
     blocked_launches: dict[str, str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     state = autoformalize_state.load_state(paths.forum)
-    seen = {
-        event["event_id"] for event in state.get("events", [])
-        if not (
-            event.get("kind") == "formal_candidate_submitted"
-            and state.get("formal_candidates", {}).get(
-                event.get("candidate_id"), {}
-            ).get("status") == "submitted"
-        )
-    }
     # Target notifications may arrive while verification runs in another thread.
     # Consume them separately: refreshing assignments must not consume candidates.
     target_events_seen = {event["event_id"] for event in state.get("events", [])}
@@ -581,7 +605,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         matches = [
             strategy for strategy in current.get("strategies", {}).values()
             if strategy.get("phase") == "formalizing"
-            and strategy.get("phase_revision") == current["formalization"]["revision"]
+            and autoformalize_state.strategy_is_current(current, strategy)
             and strategy.get("status") == "claimed"
             and autoformalize_state.participates(strategy, name)
             and (not task_id or strategy.get("target") == task_id)
@@ -591,7 +615,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     matches[0] if matches else None)
 
     def refresh_worker_targets(current: dict) -> None:
-        changed = set()
         for event in autoformalize_state.events_after(current, target_events_seen):
             target_events_seen.add(event["event_id"])
             if event.get("kind") not in {"strategy_registered", "strategy_claimed", "strategy_assisted"}:
@@ -599,10 +622,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             strategy = current.get("strategies", {}).get(event.get("strategy_id"), {})
             author = agent_names.get(autoformalize_state.author_key(event.get("author")))
             if (author and event.get("phase") == "formalizing"
-                    and strategy.get("phase_revision") == current["formalization"]["revision"]):
+                    and autoformalize_state.strategy_is_current(current, strategy)):
                 worker_targets[author] = event.get("target", "")
-                changed.add(author)
-        for name in changed:
+        for name in agents:
             # Registering an alternative is not abandoning an owned strategy.
             # Paused participation also pins workers while a candidate is queued.
             unresolved = autoformalize_server.unresolved_formal_tasks(current, name)
@@ -610,7 +632,15 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 strategy = participating_strategy(current, name)
                 worker_targets[name] = strategy["target"] if strategy else unresolved[0]
 
-    async def retire_completed_task(task_id: str) -> None:
+    def request_stop(name: str, reason: str) -> None:
+        running = tasks.get(name)
+        if running is not None and not running.done() and name not in stopping:
+            stopping[name] = asyncio.create_task(
+                _cancel(agents[name], running, interrupts[name], reason, paths.project_root),
+                name=f"autoformalize:stop:{name}",
+            )
+
+    def retire_completed_task(task_id: str) -> None:
         for name, running in list(tasks.items()):
             current = autoformalize_state.load_state(paths.forum)
             refresh_worker_targets(current)
@@ -618,13 +648,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 continue
             if autoformalize_server.unresolved_formal_tasks(current, name):
                 continue
-            await _cancel(
-                agents[name], running, interrupts[name],
-                f"formal task {task_id} completed", paths.project_root,
-            )
-            if running.done():
-                tasks.pop(name, None)
-                interrupts.pop(name, None)
+            if roles.get(name) == "formalizing":
+                request_stop(name, f"formal task {task_id} completed")
         # Retain assignments, claims, and source. Obsolete completed-task work
         # is reset only when a stopped worker is assigned its next task.
 
@@ -636,12 +661,15 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         return status, hashlib.sha256((status + "\n" + diff).encode()).hexdigest()
 
     def launch(name: str, task_id: str, followup: str = "") -> None:
+        if integration is not None or name in stopping:
+            return  # Worktree preparation takes merge.lock; never block this event loop on a review.
         if name in tasks and not tasks[name].done():
             return
         current = autoformalize_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
         if (not formal_task or formal_task.get("status") != "pending"
-                or autoformalize_server.has_pending_formal_candidate(current, name)):
+                or autoformalize_server.has_pending_formal_candidate(current, name)
+                or autoformalize_state.source_issues_blocking_task(current, task_id)):
             return
         prepared = autoformalize_server.prepare_formal_worktree(
             name, previous_task=worker_targets.get(name, ""), next_task=task_id,
@@ -654,7 +682,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         blocked_launches.pop(name, None)
         worker_targets[name] = task_id
         agent = agents[name]
-        brief = forum_brief(paths, "formalizing", name)
+        brief = forum_brief(paths, "formalizing", name, task_id=task_id)
         system = _preamble(agent, roster, icrl_enabled=False)
         if brief:
             system += f"\n{PIPELINE.capitalize()} workspace brief (refresh with autoformalize_brief):\n{brief}\n"
@@ -692,12 +720,14 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "Use direct shell checks only as a fallback or when compiled artifacts are needed. "
             "When the implementation is ready, call `finalize_formalization`; Unity will commit the "
             "exact source and perform the sole authoritative full build in main. Publish useful Lean/API findings "
-            "as you work. Supplied documents are read-only. Report source defects as obstacles; "
-            "do not change the source or silently formalize a different result. "
-            "Request re-chunking for encoding errors."
+            "as you work. Supplied documents are read-only. Use report_source_issue for source defects, "
+            "and submit_source_repair with evidence when you can repair the issue directly. "
+            "Do not change the source or silently formalize a different result. "
+            "Request re-chunking with the affected task IDs for encoding errors."
         ))
         event = asyncio.Event()
         interrupts[name] = event
+        roles[name] = "formalizing"
         tasks[name] = asyncio.create_task(
             spawn(
                 agent, system, task_prompt, worktrees[name], mcp,
@@ -714,12 +744,35 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         )
 
     def launch_idle() -> None:
+        if integration is not None:
+            return
         current = autoformalize_state.load_state(paths.forum)
+        if autoformalize_state.pending_replan(current):
+            return
         refresh_worker_targets(current)
+        from .autoformalize_repairs import repair_attempt_limit, source_repair_turn
+        issues = autoformalize_state.ready_source_issues(current)
+        assigned_issues = set(repair_issues.values())
+        for name in agents:
+            if name in tasks or name in stopping or autoformalize_server.has_pending_formal_candidate(current, name):
+                continue
+            issue = next((item for item in issues if item["issue_id"] not in assigned_issues
+                          and name not in repair_exhausted.get(item["issue_id"], set())), None)
+            if issue is None:
+                continue
+            issue_id = issue["issue_id"]
+            assigned_issues.add(issue_id)
+            repair_issues[name] = issue_id
+            roles[name] = "source_repair"
+            interrupts[name] = asyncio.Event()
+            tasks[name] = asyncio.create_task(source_repair_turn(
+                agents[name], roster, paths, issue_id, repair_attempt_limit(),
+                interrupt_event=interrupts[name],
+            ), name=f"autoformalize:source_repair:{name}:{issue_id}")
         ready = autoformalize_state.ready_formal_tasks(current)
         if not ready:
             return
-        idle = [name for name in agents if name not in tasks]
+        idle = [name for name in agents if name not in tasks and name not in stopping]
         ready_ids = {formal_task["task_id"] for formal_task in ready}
         unassigned = []
         for name in idle:
@@ -751,109 +804,161 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         for name, task_id in _formal_task_assignments(ready, unassigned, active_targets):
             launch(name, task_id)
 
-    launch_idle()
+    def candidate_workers(candidate: dict) -> list[str]:
+        return [
+            name for name, running in tasks.items()
+            if not running.done() and roles.get(name) == "formalizing" and (
+                worker_targets.get(name) == candidate["task_id"]
+                or autoformalize_state.author_key(name) == autoformalize_state.author_key(candidate["author"])
+            )
+        ]
+
     try:
+        launch_idle()
         while not stop_requested(paths.project_root):
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.1)
             state = autoformalize_state.load_state(paths.forum)
             refresh_worker_targets(state)
-            if state.get("phase") != "formalizing":
-                await asyncio.gather(*(
-                    _cancel(agents[name], task, interrupts[name], "formalization phase changed",
-                            paths.project_root)
-                    for name, task in list(tasks.items())
-                ))
-                return state
+            require_source_matches(paths, state)
+            replan = autoformalize_state.pending_replan(state)
+            if replan or state.get("phase") != "formalizing":
+                if integration_cancel is not None:
+                    integration_cancel.set()
+                for name in list(tasks):
+                    request_stop(name, "formalization replanning" if replan else "formalization phase changed")
 
-            for name, task in list(tasks.items()):
-                if not task.done():
+            # Cancelling one worker never delays observation of another candidate.
+            for name, stopper in list(stopping.items()):
+                if stopper.done():
+                    stopper.result()
+                    stopping.pop(name)
+                    if name in tasks and not tasks[name].done():
+                        raise ValueError(f"Worker {name} did not stop; source and pending candidates were preserved")
+
+            for name, running in list(tasks.items()):
+                if not running.done() or name in stopping:
                     continue
+                result = None
                 try:
-                    task.result()
+                    result = running.result()
                 except asyncio.CancelledError:
                     pass
                 except Exception as exc:
-                    _console.print(f"[red]formalizer {name} failed: {exc!r}[/red]")
+                    _console.print(f"[red]worker {name} failed: {exc!r}[/red]")
                 tasks.pop(name, None)
                 interrupts.pop(name, None)
-                current = autoformalize_state.load_state(paths.forum)
-                task_id = worker_targets.get(name, "")
-                formal_task = current.get("formal_tasks", {}).get(task_id, {})
-                dirty, digest = worktree_changes(name)
-                strategy = participating_strategy(current, name, task_id)
-                nudge_key = (name, task_id, digest)
-                if (
-                    formal_task.get("status") == "pending"
-                    and dirty
-                    and strategy
-                    and nudge_key not in submission_nudges
-                ):
-                    submission_nudges.add(nudge_key)
-                    launch(
-                        name,
-                        task_id,
-                        "Submission check only: inspect the existing worktree diff before doing "
-                        "new research. Your first substantive action must be either calling "
-                        "`finalize_formalization` if it completes the target, or publishing one "
-                        "precise blocker and continuing the currently claimed strategy. Do not "
-                        "register a new strategy or repeat unchanged searches in this turn.",
-                    )
+                role = roles.pop(name, "")
+                if role == "source_repair":
+                    issue_id = repair_issues.pop(name, "")
+                    if isinstance(result, dict) and result.get("status") == "exhausted":
+                        repair_exhausted.setdefault(issue_id, set()).add(name)
+                        if repair_exhausted[issue_id] == set(agents):
+                            autoformalize_state.mark_source_issue_unresolved(
+                                paths.forum, issue_id,
+                                "Every configured agent exhausted its source-repair attempts",
+                            )
 
+            # Consume all submissions while a separate serial integration owns main.
             state = autoformalize_state.load_state(paths.forum)
-            events = autoformalize_state.events_after(state, seen)
-            for event in events:
-                seen.add(event["event_id"])
-                kind = event.get("kind")
-                if kind != "formal_candidate_submitted":
-                    continue
-                candidate_id = event["candidate_id"]
-                current = autoformalize_state.load_state(paths.forum)
-                refresh_worker_targets(current)
-                candidate = current["formal_candidates"].get(candidate_id, {})
-                if candidate.get("status") != "submitted":
-                    continue
-                task_id = candidate["task_id"]
-                affected = [
-                    name for name, task in tasks.items()
-                    if not task.done() and (
-                        worker_targets.get(name) == task_id
-                        or autoformalize_state.author_key(name) == autoformalize_state.author_key(candidate["author"])
-                    )
-                ]
-                await asyncio.gather(*(
-                    _cancel(agents[name], tasks[name], interrupts[name],
-                            f"formal candidate {candidate_id} submitted for {task_id}",
-                            paths.project_root)
-                    for name in affected
-                ))
-                for name in affected:
-                    if tasks[name].done():
-                        tasks.pop(name, None)
-                        interrupts.pop(name, None)
-                started = autoformalize_state.begin_formal_merge(paths.forum, candidate_id)
-                if started.get("idempotent") or started.get("conflict"):
-                    continue
-                _console.print(f"[cyan]mechanically reviewing {candidate_id} for {task_id}[/cyan]")
-                result = await asyncio.to_thread(
-                    _integrate_and_record,
-                    paths,
-                    started["candidate"],
-                    current["formal_tasks"][task_id],
-                )
+            refresh_worker_targets(state)
+            for candidate in state.get("formal_candidates", {}).values():
+                if (candidate.get("status") in {"submitted", "merging"}
+                        and autoformalize_state.candidate_is_current(state, candidate)):
+                    for name in candidate_workers(candidate):
+                        request_stop(name, f"formal candidate {candidate['candidate_id']} submitted for {candidate['task_id']}")
+
+            if integration is not None and integration.done():
+                result = integration.result()
+                finished = integration_candidate
+                integration = None
+                integration_candidate = {}
+                integration_cancel = None
                 if result.get("ok"):
-                    await retire_completed_task(task_id)
-                else:
-                    # A changed supplied input cannot be repaired by retrying
-                    # Lean candidates against the now-obsolete source binding.
+                    retire_completed_task(finished["task_id"])
+                elif not result.get("deferred"):
                     require_source_matches(paths, autoformalize_state.load_state(paths.forum))
-                    _console.print(f"[red]candidate {candidate_id} failed: {result.get('error', '')}[/red]")
+                    _console.print(f"[red]candidate {finished['candidate_id']} failed: {result.get('error', '')}[/red]")
 
             state = autoformalize_state.load_state(paths.forum)
-            if autoformalize_state.all_formal_tasks_complete(state):
-                return state
-            launch_idle()
+            replan = autoformalize_state.pending_replan(state)
+            if replan:
+                if integration is None and not tasks and not stopping:
+                    assignments = {
+                        name: {"task_id": task_id,
+                               "task_revision": state.get("formal_tasks", {}).get(task_id, {}).get("revision"),
+                               "worktree": str(worktrees[name])}
+                        for name, task_id in worker_targets.items() if task_id
+                    }
+                    roots = replan.get("task_ids")
+                    affected = _affected_tasks(state, roots)
+                    assignments = checkpoint_replan_worktrees(paths, assignments, affected)
+                    with _merge_lock(paths.project_root):
+                        return autoformalize_state.begin_replan(
+                            paths.forum, replan["request_id"], assignments=assignments,
+                        )
+                continue
+            if state.get("phase") != "formalizing":
+                if integration is None and not tasks and not stopping:
+                    return state
+                continue
+
+            if integration is None:
+                candidates = sorted(
+                    (item for item in state.get("formal_candidates", {}).values()
+                     if item.get("status") == "submitted"
+                     and autoformalize_state.candidate_is_current(state, item)),
+                    key=lambda item: item.get("created_at", 0),
+                )
+                for candidate in candidates:
+                    if candidate_workers(candidate):
+                        continue
+                    # An old worker's stop job can still be reaping owner jobs.
+                    if any(worker_targets.get(name) == candidate["task_id"]
+                           or autoformalize_state.author_key(name) == autoformalize_state.author_key(candidate["author"])
+                           for name in stopping):
+                        continue
+                    started = autoformalize_state.begin_formal_merge(paths.forum, candidate["candidate_id"])
+                    if started.get("idempotent") or started.get("conflict"):
+                        continue
+                    integration_candidate = started["candidate"]
+                    integration_cancel = Event()
+                    _console.print(f"[cyan]mechanically reviewing {candidate['candidate_id']} for {candidate['task_id']}[/cyan]")
+                    integration = asyncio.create_task(asyncio.to_thread(
+                        _integrate_and_record, paths, integration_candidate,
+                        state["formal_tasks"][candidate["task_id"]], integration_cancel,
+                    ), name=f"autoformalize:integration:{candidate['candidate_id']}")
+                    break
+
+            if integration is None:
+                # These source checks/preparations must never wait on a build's merge lock.
+                for name in agents:
+                    if name in tasks or name in stopping:
+                        continue
+                    current = autoformalize_state.load_state(paths.forum)
+                    task_id = worker_targets.get(name, "")
+                    formal_task = current.get("formal_tasks", {}).get(task_id, {})
+                    if formal_task.get("status") != "pending" or autoformalize_server.has_pending_formal_candidate(current, name):
+                        continue
+                    dirty, source_digest = worktree_changes(name)
+                    strategy = participating_strategy(current, name, task_id)
+                    nudge_key = (name, task_id, source_digest)
+                    if dirty and strategy and nudge_key not in submission_nudges:
+                        submission_nudges.add(nudge_key)
+                        launch(name, task_id,
+                               "Submission check only: inspect the existing worktree diff before new research. "
+                               "Finalize a completed target, or publish a precise blocker and continue the "
+                               "claimed strategy. Do not register a replacement or repeat unchanged searches.")
+                launch_idle()
+
             state = autoformalize_state.load_state(paths.forum)
-            if not tasks and not autoformalize_server.has_pending_formal_candidate(state):
+            if (integration is None and not tasks and not stopping
+                    and autoformalize_state.all_formal_tasks_complete(state)):
+                if autoformalize_state.open_source_issues(state):
+                    raise ValueError("Formal declarations are complete, but source issues remain unresolved; "
+                                     "critic acceptance is blocked until a repair is adopted")
+                return state
+            if (integration is None and not tasks and not stopping
+                    and not autoformalize_server.has_pending_formal_candidate(state)):
                 if blocked_launches:
                     details = "; ".join(f"{name}: {reason}" for name, reason in blocked_launches.items())
                     raise ValueError("Autoformalize cannot launch workers without discarding preserved work. "
@@ -861,11 +966,27 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 return state
         return autoformalize_state.load_state(paths.forum)
     finally:
-        await asyncio.gather(*(
-            _cancel(agents[name], task, interrupts[name], "formalization runtime ending",
-                    paths.project_root)
-            for name, task in list(tasks.items())
-        ))
+        for name in list(tasks):
+            request_stop(name, "formalization runtime ending")
+        # Cancelling an asyncio wrapper would leave its thread mutating main.
+        # Signal cooperative subprocess cancellation, then drain its rollback.
+        interrupted_during_drain = False
+        if integration is not None:
+            if integration_cancel is not None:
+                integration_cancel.set()
+            while not integration.done():
+                try:
+                    await asyncio.shield(integration)
+                except asyncio.CancelledError:
+                    interrupted_during_drain = True
+                except Exception:
+                    break  # Retrieve/report below; still finish worker cleanup.
+            try:
+                integration.result()
+            except Exception as exc:
+                _console.print(f"[red]integration ended with an error; worktrees preserved: {exc!r}[/red]")
+        if stopping:
+            await asyncio.gather(*stopping.values(), return_exceptions=True)
         await asyncio.to_thread(autoformalize_jobs.terminate, paths.project_root)
         final_state = autoformalize_state.load_state(paths.forum)
         for agent in roster.agents:
@@ -873,11 +994,85 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             if running is not None and not running.done():
                 _console.print(f"[red]worker {agent.name} has not stopped; preserving its worktree[/red]")
                 continue
-            if not autoformalize_state.all_formal_tasks_complete(final_state):
-                continue  # Retain unfinished source, claims and candidate ancestry for --continue.
+            if (not autoformalize_state.all_formal_tasks_complete(final_state)
+                    or final_state.get("phase") == "chunking"
+                    or autoformalize_state.pending_replan(final_state)
+                    or autoformalize_state.open_source_issues(final_state)):
+                continue
             autoformalize_state.release_author_claims(
-                paths.forum, agent.name, "formalization runtime ended"
+                paths.forum, agent.name, "formalization runtime ended",
             )
             tree = worktrees.get(agent.name)
             if tree is not None:
                 worktree.cleanup_worktree(agent.name, tree, paths.project_root)
+        if interrupted_during_drain:
+            raise asyncio.CancelledError
+
+
+def _affected_tasks(state: dict, requested: list[str] | None) -> set[str]:
+    tasks = state.get("formal_tasks", {})
+    affected = set(tasks) if not requested else set(requested)
+    while True:
+        expanded = affected | {task_id for task_id, task in tasks.items()
+                               if affected.intersection(task.get("dependencies", []))}
+        if expanded == affected:
+            return affected
+        affected = expanded
+
+
+def checkpoint_replan_worktrees(paths, assignments: dict, affected: set[str]) -> dict:
+    """Preserve known obsolete work by commit/ref before a controller may refresh it."""
+    from copy import deepcopy
+    import uuid
+
+    saved = deepcopy(assignments)
+    with _merge_lock(paths.project_root):
+        for author, assignment in saved.items():
+            if assignment.get("task_id") not in affected:
+                continue
+            with autoformalize_server._finalization_lock(author):
+                tree = _formal_worktree(paths.project_root, author)
+                if assignment.get("worktree") != str(tree):
+                    raise ValueError(f"Unknown worktree ownership for {author}; source preserved")
+                status = _git(tree, "status", "--porcelain")
+                if status.returncode:
+                    raise ValueError(f"Cannot checkpoint {author}'s worktree; source preserved")
+                if status.stdout.strip():
+                    added = _git(tree, "add", "-A")
+                    if added.returncode:
+                        raise ValueError(added.stderr or "could not stage replan checkpoint")
+                    committed = _git(tree, "commit", "-m", "UNITY: preserve obsolete autoformalize work before replanning")
+                    if committed.returncode:
+                        raise ValueError(committed.stderr or "could not checkpoint replan work")
+                head = _git(tree, "rev-parse", "HEAD").stdout.strip()
+                safe_author = re.sub(r"[^a-zA-Z0-9_-]", "_", author)
+                reference = f"refs/unity/autoformalize-checkpoints/{safe_author}/{uuid.uuid4().hex}"
+                saved_ref = _git(tree, "update-ref", reference, head)
+                if saved_ref.returncode:
+                    raise ValueError(saved_ref.stderr or "could not retain replan checkpoint")
+                assignment["checkpoint"] = {"ref": reference, "commit_sha": head}
+    return saved
+
+
+def refresh_replanned_worktrees(paths, assignments: dict, state: dict) -> dict:
+    """Refresh only stopped, explicitly known assignments whose task revision changed."""
+    affected = {
+        assignment["task_id"] for assignment in assignments.values()
+        if assignment.get("task_id") not in state.get("formal_tasks", {})
+        or assignment.get("task_revision") != state["formal_tasks"][assignment["task_id"]].get("revision")
+    }
+    saved = checkpoint_replan_worktrees(paths, assignments, affected)
+    with _merge_lock(paths.project_root):
+        for author, assignment in saved.items():
+            if assignment.get("task_id") not in affected:
+                continue
+            with autoformalize_server._finalization_lock(author):
+                current = autoformalize_state.load_state(paths.forum)
+                if autoformalize_server.has_pending_formal_candidate(current, author):
+                    raise ValueError(f"Candidate review still protects {author}'s branch; source preserved")
+                if worktree.main_commit(paths.project_root) != current["formalization"]["main_sha"]:
+                    raise ValueError("Main changed before replanned worktree refresh; source preserved")
+                result = worktree.force_sync_from_main(paths.project_root, author)
+                if not result.get("ok"):
+                    raise ValueError(result.get("error") or "replanned worktree refresh failed")
+    return saved

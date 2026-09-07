@@ -8,7 +8,9 @@ This is one chunking attempt. Produce `.unity/dag.json` and an elaboratable Lean
 project files. Inspect the supplied documents directly, including their definitions, assumptions,
 intermediate claims, proof arguments, and cited prerequisites. If a file is unreadable or an in-scope
 statement is ambiguous or unsupported, report its exact location and the concrete blocker through the
-Forum instead of fabricating content. Finish with that blocker if you cannot create a faithful scaffold.
+`report_source_issue` instead of fabricating content. Investigate and propose a justified spot repair
+with `submit_source_repair` when possible. Otherwise finish this attempt after recording the issue;
+Unity gives the roster source-repair attempts. This is not a mandatory solving phase.
 
 Preserve both the source's mathematical meaning and its proof strategy. Make implicit types,
 quantifiers, binding, and scope explicit. Preserve case splits, inductions, and meaningful intermediate
@@ -52,6 +54,29 @@ Do not repeat minimization for unchanged source. If unavailable, select narrow i
 not update dependencies to obtain the tool. Use targeted diagnostics, not a project-wide build; Unity
 performs the authoritative scaffold build.
 
+Put precise document anchors in `spec.anchors`: a supplied source-reference ID, page/section/theorem or
+line range, and a short exact excerpt. In `spec.scope`, classify anchors as requested targets, supporting
+references, or explicit exclusions with reasons consistent with UNITY.md. Account for every document;
+do not turn reference-only material into unnecessary proof tasks. Each requirement cites target anchors
+and any relevant reference anchors. Source identities are checked mechanically; the critic must still
+check that the anchors and exclusions faithfully describe the actual source.
+
+For each requirement, `spec.arguments` records the actual mathematical argument, its source anchors,
+prerequisite IDs and any adopted `repair_ids`. Every prerequisite records its statement, anchors,
+consuming task IDs and resolution: `{"kind":"library","declaration":"Fully.Qualified.name"}` or
+`{"kind":"task","task_id":"other-task"}`. A task resolution requires a direct dependency edge from
+each consumer. Unity checks library identities and axioms; a plausible name alone is not evidence.
+If unresolved, use `{"kind":"unresolved","issue_id":"<reported-source-issue-id>"}` in the draft.
+That draft cannot freeze until exploration/repair resolves the prerequisite. Before a spec is frozen,
+report issues using the plan's supplied source-reference IDs and precise locations in the description.
+
+Read repair proposals and any replan information in the plan. Adopt justified corrections explicitly
+in argument mappings; preserve original documents byte-for-byte. Explain changed claims, assumptions,
+or arguments, never silently weaken the task. The independent critic reviews every adopted repair.
+On replan, produce a complete replacement DAG while preserving unchanged task IDs, target signatures,
+definitions and existing completed proofs. Edit only the affected encoding and necessary dependents.
+Unity retains unaffected work only after comparing task specifications and rechecking completed proofs.
+
 Copy the binding fields `solution_candidate` and `solution_sha256` exactly from
 `.unity/formalization-plan.json`. These compatibility names identify the supplied source snapshot and
 bundle hash, not a newly authored or independently approved paper. Copy `source_components` from the
@@ -70,9 +95,20 @@ Write this schema:
       "id": "R1",
       "statement": "precise in-scope mathematical requirement from the supplied source",
       "source_components": ["exact-source-reference-from-formalization-plan"],
+      "anchor_ids": ["A1"],
       "tasks": ["stable-task-id"]
     }
   ],
+  "spec": {
+    "version": 1,
+    "anchors": [{"id": "A1", "source_ref": "exact-source-reference-from-formalization-plan",
+                 "location": "Theorem 1 and its proof, page 2", "excerpt": "short exact source excerpt"}],
+    "scope": {"targets": ["A1"], "references": [], "excluded": []},
+    "prerequisites": [],
+    "arguments": [{"requirement_id": "R1", "anchor_ids": ["A1"],
+                   "outline": "Concrete source argument and its Lean representation",
+                   "prerequisites": [], "repair_ids": []}]
+  },
   "chunks": [
     {
       "id": "stable-task-id",
@@ -80,7 +116,7 @@ Write this schema:
       "summary": "mathematical content, source location, and role in the source argument",
       "lean_decl": "Expected.Namespace.declarationName",
       "lean_file": "Project/File.lean",
-      "dependencies": ["prerequisite-task-id"],
+      "dependencies": [],
       "source_components": ["exact-source-reference-from-formalization-plan"]
     }
   ]
@@ -89,8 +125,8 @@ Write this schema:
 
 Chunk IDs and target declaration names must be unique/nonempty. Dependencies must name other chunks,
 and the graph must be acyclic. Each task and requirement must cite valid source references; its mapped
-tasks must cover those references. Cover the plan's required source references in both tasks and
-requirements. Source-reference bookkeeping alone is not evidence of mathematical faithfulness.
+tasks must cover those references. Scope anchors account for all source files, including reference-only
+and explicitly excluded material. Source-reference bookkeeping alone is not evidence of mathematical faithfulness.
 
 Use `autoformalize_brief` for compact shared state and `forum_post`/`forum_read` for necessary clarification.
 Use the autoformalization Forum tools throughout the run. Do not repeat an unchanged failed
