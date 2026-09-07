@@ -927,6 +927,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             ).get("status") == "submitted"
         )
     }
+    # Target notifications may arrive while verification runs in another thread.
+    # Consume them separately: refreshing assignments must not consume candidates.
+    target_events_seen = {event["event_id"] for event in state.get("events", [])}
 
     for agent in roster.agents:
         tree = worktree.create_worktree(agent.name, paths.project_root)
@@ -934,14 +937,56 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         worktree.link_runtime_state(tree, paths.project_root)
         worktrees[agent.name] = tree
 
-    def owned_strategy(current: dict, name: str, task_id: str = "") -> dict | None:
-        return next((
+    def participating_strategy(current: dict, name: str, task_id: str = "") -> dict | None:
+        matches = [
             strategy for strategy in current.get("strategies", {}).values()
             if strategy.get("phase") == "formalizing"
+            and strategy.get("phase_revision") == current["formalization"]["revision"]
             and strategy.get("status") == "claimed"
-            and solve_state.author_key(strategy.get("owner")) == solve_state.author_key(name)
+            and solve_state.participates(strategy, name)
             and (not task_id or strategy.get("target") == task_id)
-        ), None)
+        ]
+        return next((strategy for strategy in matches
+                     if solve_state.author_key(strategy.get("owner")) == solve_state.author_key(name)),
+                    matches[0] if matches else None)
+
+    def refresh_worker_targets(current: dict) -> None:
+        changed = set()
+        for event in solve_state.events_after(current, target_events_seen):
+            target_events_seen.add(event["event_id"])
+            if event.get("kind") not in {"strategy_registered", "strategy_claimed", "strategy_assisted"}:
+                continue
+            strategy = current.get("strategies", {}).get(event.get("strategy_id"), {})
+            author = agent_names.get(solve_state.author_key(event.get("author")))
+            if (author and event.get("phase") == "formalizing"
+                    and strategy.get("phase_revision") == current["formalization"]["revision"]):
+                worker_targets[author] = event.get("target", "")
+                changed.add(author)
+        for name in changed:
+            # Registering an alternative is not abandoning an owned strategy.
+            # Paused participation also pins workers while a candidate is queued.
+            unresolved = solve_server.unresolved_formal_tasks(current, name)
+            if unresolved and worker_targets.get(name) not in unresolved:
+                strategy = participating_strategy(current, name)
+                worker_targets[name] = strategy["target"] if strategy else unresolved[0]
+
+    async def retire_completed_task(task_id: str) -> None:
+        for name, running in list(tasks.items()):
+            current = solve_state.load_state(paths.forum)
+            refresh_worker_targets(current)
+            if worker_targets.get(name) != task_id:
+                continue
+            if solve_server.unresolved_formal_tasks(current, name):
+                continue
+            await _cancel(
+                agents[name], running, interrupts[name],
+                f"formal task {task_id} completed", paths.project_root,
+            )
+            if running.done():
+                tasks.pop(name, None)
+                interrupts.pop(name, None)
+        # Retain assignments, claims, and source. Obsolete completed-task work
+        # is reset only when a stopped worker is assigned its next task.
 
     def worktree_changes(name: str) -> tuple[str, str]:
         status = _git(
@@ -955,7 +1000,15 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             return
         current = solve_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
-        if not formal_task or formal_task.get("status") != "pending":
+        if (not formal_task or formal_task.get("status") != "pending"
+                or solve_server.has_pending_formal_candidate(current, name)):
+            return
+        prepared = solve_server.prepare_formal_worktree(
+            name, previous_task=worker_targets.get(name, ""), next_task=task_id,
+            expected_revision=current["formalization"]["revision"],
+        )
+        if not prepared["ok"]:
+            _console.print(f"[yellow]preserving {name}'s worktree: {prepared.get('reason', '')}[/yellow]")
             return
         worker_targets[name] = task_id
         agent = agents[name]
@@ -966,7 +1019,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         system += base_prompt + "\n\n" + tools_prompt
         if context:
             system += "\n\n" + context
-        strategy = owned_strategy(current, name, task_id)
+        strategy = participating_strategy(current, name, task_id)
         dirty, _ = worktree_changes(name)
         resume = ""
         if strategy:
@@ -1019,6 +1072,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
 
     def launch_idle() -> None:
         current = solve_state.load_state(paths.forum)
+        refresh_worker_targets(current)
         ready = solve_state.ready_formal_tasks(current)
         if not ready:
             return
@@ -1026,11 +1080,26 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         ready_ids = {formal_task["task_id"] for formal_task in ready}
         unassigned = []
         for name in idle:
-            strategy = owned_strategy(current, name)
+            if solve_server.has_pending_formal_candidate(current, name):
+                continue
+            previous = worker_targets.get(name, "")
+            # Unregistered edits are work too. Keep their target rather than
+            # assigning the worker to a different ready task and resetting it.
+            if current["formal_tasks"].get(previous, {}).get("status") == "pending":
+                if previous in ready_ids:
+                    launch(name, previous)
+                continue
+            strategy = participating_strategy(current, name)
             if strategy and strategy.get("target") in ready_ids:
+                if not previous:
+                    # Existing claims/assistance on runtime entry are resumes,
+                    # not a request to abandon unresolved work for a new task.
+                    worker_targets[name] = strategy["target"]
                 launch(name, strategy["target"])
-            else:
-                unassigned.append(name)
+                continue
+            if solve_server.unresolved_formal_tasks(current, name):
+                continue  # Includes assistants paused for somebody else's candidate.
+            unassigned.append(name)
         active_targets = [
             worker_targets.get(name, "")
             for name, running in tasks.items()
@@ -1044,6 +1113,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         while not stop_requested(paths.project_root):
             await asyncio.sleep(0.5)
             state = solve_state.load_state(paths.forum)
+            refresh_worker_targets(state)
             if state.get("phase") != "formalizing":
                 await asyncio.gather(*(
                     _cancel(agents[name], task, interrupts[name], "formalization phase changed",
@@ -1067,7 +1137,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 task_id = worker_targets.get(name, "")
                 formal_task = current.get("formal_tasks", {}).get(task_id, {})
                 dirty, digest = worktree_changes(name)
-                strategy = owned_strategy(current, name, task_id)
+                strategy = participating_strategy(current, name, task_id)
                 nudge_key = (name, task_id, digest)
                 if (
                     formal_task.get("status") == "pending"
@@ -1091,14 +1161,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             for event in events:
                 seen.add(event["event_id"])
                 kind = event.get("kind")
-                if kind in {"strategy_registered", "strategy_claimed", "strategy_assisted"}:
-                    author = agent_names.get(solve_state.author_key(event.get("author")))
-                    if event.get("phase") == "formalizing" and author:
-                        worker_targets[author] = event.get("target", "")
                 if kind != "formal_candidate_submitted":
                     continue
                 candidate_id = event["candidate_id"]
                 current = solve_state.load_state(paths.forum)
+                refresh_worker_targets(current)
                 candidate = current["formal_candidates"].get(candidate_id, {})
                 if candidate.get("status") != "submitted":
                     continue
@@ -1117,8 +1184,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     for name in affected
                 ))
                 for name in affected:
-                    tasks.pop(name, None)
-                    interrupts.pop(name, None)
+                    if tasks[name].done():
+                        tasks.pop(name, None)
+                        interrupts.pop(name, None)
                 started = solve_state.begin_formal_merge(paths.forum, candidate_id)
                 if started.get("idempotent") or started.get("conflict"):
                     continue
@@ -1130,18 +1198,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     current["formal_tasks"][task_id],
                 )
                 if result.get("ok"):
-                    for name, running in list(tasks.items()):
-                        await _cancel(agents[name], running, interrupts[name],
-                                      f"task {task_id} merged; synchronizing main",
-                                      paths.project_root)
-                    tasks.clear()
-                    interrupts.clear()
-                    worker_targets.clear()
-                    for name in agents:
-                        solve_state.release_author_claims(
-                            paths.forum, name, f"formal task {task_id} merged"
-                        )
-                        worktree.force_sync_from_main(paths.project_root, name)
+                    await retire_completed_task(task_id)
                 else:
                     _console.print(f"[red]candidate {candidate_id} failed: {result.get('error', '')}[/red]")
 
@@ -1149,7 +1206,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             if solve_state.all_formal_tasks_complete(state):
                 return state
             launch_idle()
-            if not tasks:
+            state = solve_state.load_state(paths.forum)
+            if not tasks and not solve_server.has_pending_formal_candidate(state):
                 return state
         return solve_state.load_state(paths.forum)
     finally:
@@ -1160,6 +1218,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         ))
         await asyncio.to_thread(solve_jobs.terminate, paths.project_root)
         for agent in roster.agents:
+            running = tasks.get(agent.name)
+            if running is not None and not running.done():
+                _console.print(f"[red]worker {agent.name} has not stopped; preserving its worktree[/red]")
+                continue
             solve_state.release_author_claims(
                 paths.forum, agent.name, "formalization runtime ended"
             )

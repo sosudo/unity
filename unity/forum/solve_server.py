@@ -770,10 +770,11 @@ def emit_formalization_candidate(
 ) -> dict:
     """Compatibility API for submitting an already-committed implementation."""
     author = _author(author)
-    return _submit_formal_commit(
-        strategy_id, author, task_id, commit_sha,
-        notes=notes, supersedes=supersedes,
-    )
+    with _finalization_lock(author):
+        return _submit_formal_commit(
+            strategy_id, author, task_id, commit_sha,
+            notes=notes, supersedes=supersedes,
+        )
 
 
 def finalize_formalization(
@@ -888,12 +889,149 @@ def finalize_formalization(
         }
 
 
-def sync_from_main(author: str, reason: str = "") -> dict:
-    """Discard obsolete worktree changes and synchronize exactly to accepted main."""
+def _current_formal_candidate(state: dict, candidate: dict) -> bool:
+    formal = state.get("formalization", {})
+    return (
+        candidate.get("formalization_revision") == formal.get("revision")
+        and candidate.get("solution_candidate") == formal.get("solution_candidate")
+        and candidate.get("solution_sha256") == formal.get("solution_sha256")
+    )
+
+
+def has_pending_formal_candidate(state: dict, author: str = "") -> bool:
+    """Whether current-revision candidate bytes must remain on an author's branch."""
+    return any(
+        _current_formal_candidate(state, candidate)
+        and candidate.get("status") in {"submitted", "merging"}
+        and (not author or solve_state.author_key(candidate.get("author"))
+             == solve_state.author_key(author))
+        for candidate in state.get("formal_candidates", {}).values()
+    )
+
+
+def unresolved_formal_tasks(state: dict, author: str) -> list[str]:
+    """Current claimed/assisted work and queued candidate targets for an author."""
+    revision = state.get("formalization", {}).get("revision")
+    targets = {
+        strategy.get("target", "")
+        for strategy in state.get("strategies", {}).values()
+        if strategy.get("phase") == "formalizing"
+        and strategy.get("phase_revision") == revision
+        and strategy.get("status") in {"claimed", "paused"}
+        and solve_state.participates(strategy, author)
+    }
+    targets.update(
+        candidate.get("task_id", "")
+        for candidate in state.get("formal_candidates", {}).values()
+        if _current_formal_candidate(state, candidate)
+        and candidate.get("status") in {"submitted", "merging"}
+        and solve_state.author_key(candidate.get("author")) == solve_state.author_key(author)
+    )
+    return sorted(
+        target for target in targets
+        if target and state.get("formal_tasks", {}).get(target, {}).get("status")
+        in {"pending", "candidate_pending"}
+    )
+
+
+def _sync_blocked(reason: str, error: str) -> dict:
+    return {"ok": False, "blocked": True, "reason": reason, "error": error}
+
+
+def _accepted_formal_main(state: dict) -> str:
+    target = str(state.get("formalization", {}).get("main_sha") or "")
+    if not re.fullmatch(r"[0-9a-f]{40}", target) or worktree.main_commit(_root()) != target:
+        return ""
+    return target
+
+
+def prepare_formal_worktree(
+    author: str,
+    previous_task: str = "",
+    next_task: str = "",
+    *,
+    expected_revision: int | None = None,
+) -> dict:
+    """Prepare a stopped worker for another task without erasing unresolved work.
+
+    Only an explicitly completed previous assignment authorizes discarding its
+    obsolete attempt. This is controller-only, not an agent tool. The state lock
+    serializes the final guard with new claims; the author lock protects both
+    candidate submission APIs and their immutable commit ancestry.
+    """
     author = _author(author)
-    released = solve_state.release_author_claims(FORUM_DIR, author, reason or "syncing from main")
-    result = worktree.force_sync_from_main(_root(), author)
-    return {**result, "released_strategies": released}
+    with _merge_lock(), _finalization_lock(author), solve_state.transaction(FORUM_DIR) as state:
+        formal = state["formalization"]
+        if state.get("phase") != "formalizing" or (
+            expected_revision is not None and formal.get("revision") != expected_revision
+        ):
+            return _sync_blocked("phase_changed", "Formalization phase/revision changed; work preserved.")
+        target_task = state.get("formal_tasks", {}).get(next_task, {})
+        if target_task.get("status") != "pending":
+            return _sync_blocked("task_unavailable", "The next formal task is no longer pending.")
+        if any(
+            state.get("formal_tasks", {}).get(dependency, {}).get("status") != "complete"
+            for dependency in target_task.get("dependencies", [])
+        ):
+            return _sync_blocked("dependencies_pending", "The next formal task has unresolved dependencies.")
+        if has_pending_formal_candidate(state, author):
+            return _sync_blocked("candidate_pending", "Candidate review is pending; its branch is preserved.")
+        tree = worktree.agent_worktree(_root(), author)
+        if not tree.is_dir():
+            return _sync_blocked("missing_worktree", "The agent has no active worktree.")
+        if previous_task == next_task:
+            return {"ok": True, "preserved": True, "worktree": str(tree)}
+        previous = state.get("formal_tasks", {}).get(previous_task, {})
+        if unresolved_formal_tasks(state, author) or (
+            previous_task and previous.get("status") != "complete"
+        ):
+            return _sync_blocked("unresolved_work", "Unfinished task work is preserved; resume it first.")
+        main_sha = _accepted_formal_main(state)
+        if not main_sha:
+            return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
+        if previous.get("status") == "complete":
+            return worktree.force_sync_from_main(_root(), author)
+
+        # A fresh/unassigned tree has no known obsolete task. Never reset it:
+        # accept a clean ancestor of main, but preserve unexplained local work.
+        if _git(tree, "status", "--porcelain").stdout.strip():
+            return _sync_blocked("dirty_worktree", "Unassigned local edits are preserved.")
+        if _git(tree, "merge-base", "--is-ancestor", "HEAD", main_sha, check=False).returncode:
+            return _sync_blocked("local_commits", "Unassigned local commits are preserved.")
+        merged = _git(tree, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", main_sha, check=False)
+        if merged.returncode:
+            return _sync_blocked("local_commits", merged.stderr.strip() or "Unassigned commits are preserved.")
+        worktree.link_runtime_state(tree, _root())
+        worktree.symlink_lake_cache(tree, _root())
+        return {"ok": True, "main_sha": main_sha, "worktree": str(tree)}
+
+
+def sync_from_main(author: str, reason: str = "") -> dict:
+    """Merge accepted main without discarding edits, candidate commits, or claims."""
+    author = _author(author)
+    with _merge_lock(), _finalization_lock(author), solve_state.transaction(FORUM_DIR) as state:
+        if state.get("phase") != "formalizing":
+            return _sync_blocked("phase_changed", "Synchronization is only available during formalizing.")
+        if has_pending_formal_candidate(state, author):
+            return _sync_blocked("candidate_pending", "Candidate review is pending; its branch is preserved.")
+        tree = worktree.agent_worktree(_root(), author)
+        if not tree.is_dir():
+            return _sync_blocked("missing_worktree", "The agent has no active worktree.")
+        if _git(tree, "status", "--porcelain").stdout.strip():
+            return _sync_blocked("dirty_worktree", "Local changes preserved. Commit or resolve them before syncing.")
+        main_sha = _accepted_formal_main(state)
+        if not main_sha:
+            return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
+        merged = _git(tree, "merge", "--no-edit", "--no-autostash", "--no-overwrite-ignore", main_sha, check=False)
+        if merged.returncode:
+            return {
+                **_sync_blocked("merge_conflict", merged.stderr.strip() or merged.stdout.strip()),
+                "main_sha": main_sha,
+                "worktree": str(tree),
+            }
+        worktree.link_runtime_state(tree, _root())
+        worktree.symlink_lake_cache(tree, _root())
+        return {"ok": True, "main_sha": main_sha, "worktree": str(tree)}
 
 
 def propose_source_fix(

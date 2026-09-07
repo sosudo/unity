@@ -20,7 +20,9 @@ ready tasks, current strategies, findings, and candidate events.
 - `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?)` remains
   available for compatibility when you already made the exact commit yourself. Prefer
   `finalize_formalization`.
-- `sync_from_main(author, reason?)` discards obsolete local work and synchronizes to accepted main.
+- `sync_from_main(author, reason?)` merges accepted main without discarding local work. Dirty worktrees
+  and pending candidates block synchronization; merge conflicts remain for you to resolve. Claims are
+  retained. Do not sync merely because an unrelated task merged.
 - `propose_source_fix(author, path, reason, supersedes?)` snapshots corrected paper bytes and returns them
   to independent review.
 - `reopen_solving(author, reason)` returns to full informal solving for a substantive paper defect.

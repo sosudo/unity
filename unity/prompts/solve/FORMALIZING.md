@@ -43,7 +43,9 @@ For your assigned task:
   Axle equivalent;
 - after the proof and import edits pass a targeted check, immediately call `finalize_formalization` unless
   a concrete error remains; Unity commits the exact change and runs the sole authoritative full `lake build` in main; and
-- after a merge, synchronize from main before beginning new work.
+- when another task merges, refresh `solve_brief` and continue your current task without resetting your
+  worktree. Unity synchronizes obsolete worktrees before assigning a different task. If your current task
+  needs newly merged code, use `sync_from_main`; preserve and resolve local edits or conflicts.
 
 Do not run a project-wide `lake build` in your worktree; it duplicates Unity's authoritative main build and
 delays candidate discovery. Do not investigate or repair style, header, documentation, or unrelated linter
