@@ -76,6 +76,69 @@ async def _call_solve_stdio(paths, server, spec, tool, kwargs):
     return result, note
 
 
+def _autoformalize_shared_paths(paths) -> tuple[Path, Path]:
+    """Resolve autoformalize's own forum from main or a linked agent worktree."""
+    shared_unity = paths.unity.resolve()
+    return shared_unity / "forum" / "autoformalize", shared_unity.parent
+
+
+async def _call_autoformalize_stdio(paths, server, spec, tool, kwargs):
+    """Keep autoformalize's one-shot server diagnostics out of the tool result."""
+    import tempfile
+    import traceback
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+    from .. import artifacts
+
+    error = None
+    with tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace",
+    ) as stderr:
+        transport = StdioTransport(
+            command=spec["command"],
+            args=spec.get("args", []),
+            env=spec.get("env"),
+            cwd=spec.get("cwd"),
+            keep_alive=False,
+            log_file=stderr,
+        )
+        try:
+            async with Client(transport) as client:
+                result = await client.call_tool(tool, kwargs)
+        except Exception as exc:
+            error = exc
+
+        stderr.seek(0)
+        diagnostics = stderr.read()
+
+    if error is not None:
+        diagnostics += "\n" + "".join(traceback.format_exception(error))
+
+    note = ""
+    if diagnostics:
+        try:
+            record = artifacts.store_text(
+                paths.artifacts,
+                diagnostics,
+                kind="mcp_diagnostics",
+                producer=os.getenv("UNITY_AGENT_NAME", ""),
+                source=f"{server}.{tool}",
+            )
+        except OSError as exc:
+            # Diagnostic persistence must not replace the actual tool outcome.
+            note = f"Server diagnostics could not be saved: {artifacts.preview_text(str(exc))}"
+        else:
+            note = f"Server diagnostics: {record['artifact_id']}"
+
+    if error is not None:
+        message = artifacts.preview_text(f"{type(error).__name__}: {error}")
+        raise click.ClickException(
+            f"{server}.{tool} failed: {message}\n{note}"
+        ) from error
+
+    return result, note
+
+
 @click.command(name="mcp")
 @click.argument("server")
 @click.argument("tool")
@@ -108,6 +171,12 @@ async def mcp(server, tool, args, args_file):
         run_state = json.loads((paths.unity / "state.json").read_text())
     except (OSError, json.JSONDecodeError):
         run_state = {}
+    active_autoformalize = (
+        run_state.get("command") == "autoformalize" and run_state.get("phase") != "done"
+    )
+    autoformalize_profile = run_state.get("phase", "chunking")
+    if autoformalize_profile not in {"chunking", "formalizing", "critic", "retrospective"}:
+        autoformalize_profile = "chunking"
     active_solve = run_state.get("command") == "solve" and run_state.get("phase") != "done"
     solve_profile = run_state.get("phase", "solving")
     if solve_profile not in {
@@ -116,7 +185,12 @@ async def mcp(server, tool, args, args_file):
         solve_profile = "solving"
     client = None
     diagnostic_note = ""
-    if server in ("unity-forum", "forum") and active_solve:
+    if server in ("unity-forum", "forum") and active_autoformalize:
+        from ..forum import autoformalize_server
+        shared_forum, shared_root = _autoformalize_shared_paths(paths)
+        autoformalize_server.configure(shared_forum, shared_root, autoformalize_profile)
+        client = Client(autoformalize_server.build_server(autoformalize_profile))
+    elif server in ("unity-forum", "forum") and active_solve:
         from ..forum import solve_server
         # Worktrees expose the run-scoped .unity directory through a symlink.
         # Resolve it before deriving the source root so candidate verification and
@@ -133,11 +207,21 @@ async def mcp(server, tool, args, args_file):
         )
         client = Client(fsrv.mcp)  # in-process: no subprocess, same flock-safe storage
     else:
-        specs = build_solve_mcp(paths, solve_profile) if active_solve else build_mcp(paths)
+        if active_autoformalize:
+            from dataclasses import replace
+            from ..autoformalize_orchestrator import build_autoformalize_mcp
+            shared_forum, _ = _autoformalize_shared_paths(paths)
+            specs = build_autoformalize_mcp(replace(paths, forum=shared_forum), autoformalize_profile)
+        else:
+            specs = build_solve_mcp(paths, solve_profile) if active_solve else build_mcp(paths)
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
         spec = specs[server]
-        if active_solve and spec.get("command"):
+        if active_autoformalize and spec.get("command"):
+            res, diagnostic_note = await _call_autoformalize_stdio(
+                paths, server, spec, tool, kwargs,
+            )
+        elif active_solve and spec.get("command"):
             res, diagnostic_note = await _call_solve_stdio(
                 paths, server, spec, tool, kwargs,
             )
@@ -156,7 +240,7 @@ async def mcp(server, tool, args, args_file):
     bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
         "artifact_read", "artifact_snapshot_file",
     }
-    if (active_prove or active_solve) and output and not bounded_artifact_read:
+    if (active_prove or active_solve or active_autoformalize) and output and not bounded_artifact_read:
         from .. import artifacts
         compacted = artifacts.compact_text(
             paths.artifacts,

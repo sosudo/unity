@@ -73,6 +73,10 @@ Finally, press the settings icon in the top right, and set your max attempts (ho
 
 Once you're ready, hover over the `run` button, press `autoformalize`, and press the `start` button!
 
+From the CLI, add files or folders with `unity source add <path>`, put the scope and instructions in `.unity/UNITY.md`, then run `unity autoformalize`. The pipeline snapshots the supplied documents, prepares Lean, chunks and scaffolds the formalization, runs collaborative formalizers, verifies and merges candidates, and runs the final critic. `unity autoformalize --continue` resumes that state; changed source documents or scope require a fresh run. `RETROSPECTIVE=false` skips the optional retrospective.
+
+Autoformalize has its own runtime, agent launcher, verifier, prompts, and Forum interface. Its discussions and structured state live under `.unity/forum/autoformalize/`, separate from solve and prove. It does not run the English-solving phase or generate or rewrite a source paper. The existing project setup, roster, dependency cache, and generic worktree utilities are unchanged.
+
 ### Formalize
 
 First, go to the sources tab and add the documents you want formalized.

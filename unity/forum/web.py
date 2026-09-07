@@ -58,7 +58,7 @@ def _sorted_posts(posts: list[dict], sort: str) -> list[dict]:
 
 
 def _load_thread(thread_id: str) -> dict | None:
-    path = FORUM_DIR / f"{thread_id}.json"
+    path = _discussion_forum() / f"{thread_id}.json"
     if not path.exists():
         return None
     try:
@@ -75,7 +75,7 @@ _LEGACY_DIMENSIONS = ["correctness", "faithfulness", "style_alignment",
 
 
 def _load_config() -> dict:
-    path = FORUM_DIR / "config.json"
+    path = _discussion_forum() / "config.json"
     if not path.exists():
         return {"dimensions": {"active": list(_DEFAULT_DIMENSIONS), "pending": {}}, "tags": {}}
     try:
@@ -91,6 +91,8 @@ def _load_config() -> dict:
 
 def _icrl_visible() -> bool:
     """ICRL is not part of the prove or solve coordination workspaces."""
+    if _autoformalize_command():
+        return False
     try:
         return json.loads((ROOT_DIR / "state.json").read_text()).get("command") not in {"prove", "solve"}
     except (OSError, json.JSONDecodeError):
@@ -107,6 +109,44 @@ def _active_structured_command() -> str:
     if command in {"prove", "solve"} and state.get("phase") != "done":
         return command
     return ""
+
+
+def _autoformalize_command(*, active: bool = False) -> bool:
+    """Select the independent workspace without changing solve/prove routing."""
+    try:
+        state = json.loads((ROOT_DIR / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return state.get("command") == "autoformalize" and (not active or state.get("phase") != "done")
+
+
+def _autoformalize_forum() -> Path:
+    return FORUM_DIR / "autoformalize"
+
+
+def _discussion_forum() -> Path:
+    return _autoformalize_forum() if _autoformalize_command() else FORUM_DIR
+
+
+def _autoformalize_dag() -> dict:
+    """Autoformalize task dependencies and authoritative candidate completion."""
+    from ..autoformalize_state import load_state
+    state = load_state(_autoformalize_forum())
+    claimed = {
+        item.get("target") for item in state.get("strategies", {}).values()
+        if item.get("status") in {"claimed", "paused"}
+    }
+    colors = {"complete": "green", "candidate_pending": "blue", "blocked": "red"}
+    chunks = []
+    for task in state.get("formal_tasks", {}).values():
+        chunks.append({
+            "id": task["task_id"], "title": task.get("lean_decl", task["task_id"]),
+            "type": "formalization", "summary": task.get("description", ""),
+            "dependencies": task.get("dependencies", []),
+            "declarations": [task["lean_decl"]] if task.get("lean_decl") else [],
+            "status": colors.get(task.get("status"), "yellow" if task["task_id"] in claimed else "grey"),
+        })
+    return {"graph_kind": "autoformalize", "chunks": chunks}
 
 
 _SORRY_RE = re.compile(r'\bsorry\b')
@@ -170,7 +210,7 @@ def _chunk_status(chunk: dict, merged: set | None = None) -> str:
         return "yellow"
     # 3) typed forum acts on the chunk's thread
     for tid in dict.fromkeys([cid, f"chunk-{cid}"]):
-        thread_path = FORUM_DIR / f"{tid}.json"
+        thread_path = _discussion_forum() / f"{tid}.json"
         if not thread_path.exists():
             continue
         try:
@@ -197,7 +237,7 @@ def _chunk_status(chunk: dict, merged: set | None = None) -> str:
 def list_threads():
     """Returns threads, active dimensions, pending proposals, tags, and leaderboard."""
     threads = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_discussion_forum().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -216,7 +256,7 @@ def list_threads():
     # Pinned first, then by last_activity
     threads.sort(key=lambda t: (not t["pinned"], -t["last_activity"]))
     config = _load_config()
-    balances_path = FORUM_DIR / "balances.json"
+    balances_path = _discussion_forum() / "balances.json"
     leaderboard = []
     if _icrl_visible() and balances_path.exists():
         try:
@@ -272,7 +312,7 @@ def get_graph():
     thread_colors: dict[str, str] = {}
     nodes = []
     edges = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_discussion_forum().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -316,7 +356,7 @@ def get_tag(name: str):
     tag = tags[name]
     post_ids = set(tag["post_ids"])
     posts = []
-    for path in sorted(FORUM_DIR.glob("*.json")):
+    for path in sorted(_discussion_forum().glob("*.json")):
         if path.name in ("balances.json", "config.json"):
             continue
         try:
@@ -336,6 +376,8 @@ def get_tag(name: str):
 
 @app.get("/api/dag")
 def get_dag():
+    if _autoformalize_command():
+        return JSONResponse(_autoformalize_dag())
     if _active_structured_command() == "solve":
         state = _load_solve_state(FORUM_DIR)
         if state.get("phase") in {"solving", "solution_review"}:
@@ -385,7 +427,7 @@ async def events():
             await asyncio.sleep(1)
             try:
                 mtime = max(
-                    (p.stat().st_mtime for p in FORUM_DIR.glob("*.json")),
+                    (p.stat().st_mtime for p in _discussion_forum().glob("*.json")),
                     default=0.0,
                 )
                 dag_file = ROOT_DIR / "dag.json"
@@ -416,7 +458,7 @@ def get_workspace():
     questions: list = []
     ledger: list = []
     by_act: dict = {}
-    for tp in sorted(FORUM_DIR.glob("*.json")):
+    for tp in sorted(_discussion_forum().glob("*.json")):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
         try:
@@ -489,6 +531,24 @@ def get_solve_metrics():
         profile = "solving"
     solve_server.configure(FORUM_DIR, ROOT_DIR.parent, profile)
     return solve_server.solve_metrics()
+
+
+@app.get("/api/autoformalize-state")
+def get_autoformalize_state():
+    """Independent supplied-source formalization state; no informal approval gate."""
+    if not _autoformalize_command():
+        return {}
+    from ..autoformalize_state import load_state
+    return load_state(_autoformalize_forum())
+
+
+@app.get("/api/autoformalize-metrics")
+def get_autoformalize_metrics():
+    """Read telemetry without reconfiguring any live Forum server globals."""
+    if not _autoformalize_command():
+        return {}
+    from .autoformalize_server import read_metrics
+    return read_metrics(_autoformalize_forum(), ROOT_DIR.parent)
 
 
 @app.get("/api/artifacts")
@@ -572,6 +632,20 @@ def _agent_statuses(chunks: dict) -> list:
     elif active_command == "solve":
         solve = _load_solve_state(FORUM_DIR)
         for strategy in solve.get("strategies", {}).values():
+            if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+                claims[strategy["owner"]] = {
+                    "chunk": strategy.get("target", ""),
+                    "strategy": strategy.get("description", ""),
+                }
+                for assistant in strategy.get("assistants", []):
+                    claims[assistant] = {
+                        "chunk": strategy.get("target", ""),
+                        "strategy": "assisting: " + strategy.get("description", ""),
+                    }
+    elif _autoformalize_command(active=True):
+        from ..autoformalize_state import load_state
+        state = load_state(_autoformalize_forum())
+        for strategy in state.get("strategies", {}).values():
             if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
                 claims[strategy["owner"]] = {
                     "chunk": strategy.get("target", ""),
@@ -1482,7 +1556,7 @@ def _safe_unity_path(rel: str) -> Path:
 
 
 def _forum_nonempty() -> bool:
-    for tp in FORUM_DIR.glob("*.json"):
+    for tp in _discussion_forum().glob("*.json"):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
         try:
@@ -2374,6 +2448,9 @@ $('env-save').onclick = async () => {
 async function loadOverview() {
   try {
     const [w, r, p, s, sm, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/solve-state'), J('/api/solve-metrics'), J('/api/artifacts')]);
+    const [af, afm] = r.command === 'autoformalize'
+      ? await Promise.all([J('/api/autoformalize-state'), J('/api/autoformalize-metrics')])
+      : [{}, {}];
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
     let h = pagehead('Overview', '');
     // top row: run status + obstacles
@@ -2458,6 +2535,32 @@ async function loadOverview() {
         sstrategies.slice(-8).reverse().map(x => '<div class="item"><b class="mono">' + esc(x.strategy_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div>' + esc(x.description || '').slice(0,140) + '</div><div class="who">task ' + esc(x.target || 'global') + ' · owner ' + esc(x.owner || 'none') + '</div></div>').join('') +
         '<div class="item"><b>' + (sm.worker_turns || 0) + '</b> worker turns · ' + (sm.worker_seconds || 0) + ' agent-seconds</div>' +
         '<div class="item"><b>$' + Number(sm.cost_usd || 0).toFixed(4) + '</b> recorded cost' + (sm.time_to_first_candidate_seconds == null ? '' : ' · first candidate ' + sm.time_to_first_candidate_seconds + 's') + '</div></section></div>';
+    }
+    if (af.run_id && r.command === 'autoformalize') {
+      const source = af.input_source || {}, formal = af.formalization || {},
+        tasks = Object.values(af.formal_tasks || {}),
+        candidates = Object.values(af.formal_candidates || {}),
+        strategies = Object.values(af.strategies || {}).filter(x => ['registered','claimed','paused'].includes(x.status)),
+        findings = Object.values(af.findings || {}).filter(x => x.status === 'active'),
+        obstacles = Object.values(af.obstacles || {}).filter(x => x.status === 'open');
+      h += '<div class="sechead">autoformalize workspace<span class="r">phase ' + esc(af.phase || 'chunking') + ' · revision ' + (af.revision || 0) + '</span></div>';
+      h += '<div class="grid"><section><h2>immutable supplied source</h2><div class="item mono">' + esc(source.candidate_id || '') + '</div>' + artifactButton(source.artifact_id) +
+        (source.source_refs || []).map(x => '<div class="item"><b>' + esc(x.ref_id) + '</b><div class="who">' + esc(x.path) + ' · ' + esc((x.sha256 || '').slice(0,12)) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') +
+        '<div class="item"><b>Lean formalization</b><span class="badge ' + (formal.status === 'accepted' ? 'ok' : 'pending') + '">' + esc(formal.status || 'waiting') + '</span><div class="who mono">main ' + esc((formal.main_sha || '').slice(0,12)) + '</div></div></section>';
+      h += '<section><h2>formal tasks</h2>' + (tasks.length ? tasks.map(x =>
+        '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge ' + (x.status === 'complete' ? 'ok' : 'pending') + '">' + esc(x.status) + '</span><div>' + esc(x.lean_decl || '') + '</div>' +
+        '<div class="who">depends on ' + (x.dependencies || []).map(esc).join(', ') + ' · source ' + (x.source_components || []).map(esc).join(', ') + '</div></div>').join('') : '<div class="empty">not chunked yet</div>') + '</section>';
+      h += '<section><h2>formal candidates</h2>' + (candidates.length ? candidates.slice(-8).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'merged' ? 'ok' : x.status === 'failed' ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
+        '<div class="who">' + esc(x.task_id) + ' · ' + esc(x.author) + ' · ' + esc((x.commit_sha || '').slice(0,12)) + '</div><div>' + esc(x.error || '') + '</div>' +
+        '<div class="who">verification: ' + esc((x.verification || {}).status || 'pending') + '</div>' + artifactButton((x.build || {}).artifact_id) + artifactButton((x.verification || {}).artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>coordination & telemetry</h2>' + strategies.slice(-12).map(x =>
+        '<div class="item"><b>' + esc(x.strategy_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div>' + esc(x.description) + '</div><div class="who">task ' + esc(x.target) + ' · owner ' + esc(x.owner || 'none') + ' · assistants ' + (x.assistants || []).map(esc).join(', ') + '</div></div>').join('') +
+        '<div class="item">' + (afm.worker_turns || 0) + ' worker turns · $' + Number(afm.cost_usd || 0).toFixed(4) + ' recorded cost</div></section>';
+      h += '<section><h2>live findings</h2>' + (findings.length ? findings.slice(-10).reverse().map(x =>
+        '<div class="item"><b>' + esc(x.title) + '</b><span class="badge pending">' + esc(x.confidence) + '/100</span><div>' + esc(x.content) + '</div>' + artifactButton(x.evidence_artifact_id) + '</div>').join('') : '<div class="empty">none active</div>') + '</section>';
+      h += '<section><h2>open source & formalization obstacles</h2>' + (obstacles.length ? obstacles.slice(-10).map(x =>
+        '<div class="item"><b>' + esc(x.obstacle_id) + '</b><div>' + esc(x.goal_state) + '</div><div class="who">' + esc(x.author) + ' · ' + esc(x.target || 'global') + '</div></div>').join('') : '<div class="empty">none open</div>') + '</section></div>';
     }
     // agents
     const ags = w.agents || [];
