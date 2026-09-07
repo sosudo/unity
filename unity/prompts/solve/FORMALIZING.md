@@ -4,8 +4,14 @@ the solve Forum.
 
 This is a continuous research-and-implementation phase. Inspect definitions and imports, search the
 project and Mathlib, test scratch declarations, derive bridge lemmas, debug tactics, and ask other agents
-for help whenever useful. Publish checked API facts, working proof patterns, and concrete failures as
-findings so the team does not repeat work.
+for help whenever useful. Before substantial follow-on work, publish reusable checked API facts,
+working proof patterns, and concrete failures as findings with the formal task target and evidence;
+do not wait until the whole proof is complete. Reuse existing findings so the team does not repeat work.
+Routine reads and unchanged checks do not need posts.
+
+When using the shell MCP bridge with multiline Lean, serialize the argument object with a JSON
+serializer and pass a file or stdin via `--args-file`; never manually embed Lean in shell-quoted JSON.
+Use the injected tool guidance for the invocation and the tool's schema for its fields.
 
 Your chunk is a complete proof task, not a restriction to editing one declaration. Its `lean_decl` is
 the required result; introduce and prove any routine auxiliary lemmas needed for that result within its

@@ -84,6 +84,9 @@ def run(
     serialize = command == "build" or (
         env_index is not None and "lean" in args[env_index + 1:]
     )
+    # The LSP protocol is bidirectional: buffering until server exit deadlocks
+    # initialization. Only serve uses live stdio; batch checks stay captured.
+    interactive = bool(args) and args[0] == "serve"
     completed = solve_jobs.run(
         Path(project_root),
         [real_lake, *args],
@@ -91,6 +94,7 @@ def run(
         owner=str(env.get("UNITY_AGENT_NAME") or "solve-worker"),
         task_id=str(env.get("UNITY_SOLVE_TASK_ID") or ""),
         serialize_build=serialize,
+        **({"passthrough_stdio": True} if interactive else {}),
     )
     if completed.stdout:
         sys.stdout.write(completed.stdout)

@@ -9,7 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from .spawn import spawn
+from .spawn import solve_mcp_with_runtime_env, spawn
 from . import worktree, library
 
 _console = Console()
@@ -136,7 +136,9 @@ def build_solve_mcp(paths, profile: str) -> dict:
             "args": ["-m", "unity.aristotle"],
             "env": {"ARISTOTLE_API_KEY": aristotle_key},
         }
-    return servers
+    # Shell bridges run inside the worker. Native backends rebind this mapping
+    # in spawn() using their own runtime overrides instead of controller values.
+    return solve_mcp_with_runtime_env(servers, os.environ)
 
 
 def _effective_ranking(roster, forum_dir) -> dict:

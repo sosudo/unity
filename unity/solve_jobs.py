@@ -46,8 +46,11 @@ def run(
     task_id: str = "",
     serialize_build: bool = False,
     timings: dict | None = None,
+    passthrough_stdio: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Run and register one deterministic solve job in its own process group."""
+    """Run a registered job; interactive LSP keeps live stdio and its client's group."""
+    if passthrough_stdio and serialize_build:
+        raise ValueError("an interactive server must not hold the build lock")
     project_root = Path(project_root).resolve()
     cwd = Path(cwd or project_root).resolve()
     job_id = uuid.uuid4().hex
@@ -73,24 +76,32 @@ def run(
                     timings["process_seconds"] = finished - acquired
 
     with maybe_locked():
+        # leanclient starts the Lake shim as a process-group leader, then kills
+        # that group on close. Keep the real server inside it, not in a detached
+        # group. Other callers still get a private, safely cancellable job group.
+        client_group = (
+            passthrough_stdio and os.name == "posix" and os.getpgrp() == os.getpid()
+        )
         proc = subprocess.Popen(
             args,
             cwd=cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=None if passthrough_stdio else subprocess.PIPE,
+            stderr=None if passthrough_stdio else subprocess.PIPE,
             text=True,
-            start_new_session=os.name == "posix",
+            start_new_session=os.name == "posix" and not client_group,
         )
         record = {
             "job_id": job_id,
             "pid": proc.pid,
-            "pgid": proc.pid if os.name == "posix" else None,
+            "pgid": (os.getpgrp() if client_group else proc.pid) if os.name == "posix" else None,
             "owner": owner,
             "task_id": task_id,
             "command": args,
             "cwd": str(cwd),
             "started_at": time.time(),
         }
+        if passthrough_stdio:
+            record["passthrough_stdio"] = True
         temporary = record_path.with_suffix(".tmp")
         temporary.write_text(json.dumps(record, sort_keys=True))
         os.replace(temporary, record_path)
@@ -112,6 +123,18 @@ def terminate(project_root: Path, *, owner: str | None = None) -> int:
             path.unlink(missing_ok=True)
             continue
         if owner is None or record.get("owner") == owner:
+            # LSP clients may SIGKILL their whole group, including the shim
+            # before its finally block runs. Prune that stale registration;
+            # never signal a different group after a PID has been reused.
+            if record.get("passthrough_stdio") and os.name == "posix":
+                try:
+                    live_group = os.getpgid(int(record["pid"]))
+                except ProcessLookupError:
+                    path.unlink(missing_ok=True)
+                    continue
+                if live_group != record.get("pgid"):
+                    path.unlink(missing_ok=True)
+                    continue
             records.append((path, record))
 
     for sig in (signal.SIGTERM, signal.SIGKILL):

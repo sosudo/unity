@@ -12,6 +12,7 @@ import os
 import signal
 import sys
 import tempfile
+from collections.abc import Mapping
 from pathlib import Path
 
 from rich.console import Console
@@ -22,6 +23,38 @@ _console = Console()
 
 
 # ── env (per-agent, never global) ──────────────────────────────────────────────
+
+_SOLVE_MCP_ENV_KEYS = (
+    "PATH",
+    "UNITY_REAL_LAKE",
+    "UNITY_SOLVE_PROJECT_ROOT",
+    "UNITY_SOLVE_TASK_ID",
+    "UNITY_AGENT_NAME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+)
+
+
+def solve_mcp_with_runtime_env(
+    servers: dict, environ: Mapping[str, str],
+) -> dict:
+    """Bind solve's local Lean MCP server to a worker's non-secret runtime.
+
+    Stdio SDKs may inherit the guarded PATH without its companion variables.
+    Copy only the local server mapping and its env; never forward the whole
+    worker environment (which contains credentials) or alter shared mappings.
+    """
+    lean = servers.get("lean-lsp")
+    if not lean or not lean.get("command"):
+        return servers
+    server_env = {
+        key: value for key, value in (lean.get("env") or {}).items()
+        if key not in _SOLVE_MCP_ENV_KEYS
+    }
+    server_env.update({key: environ[key] for key in _SOLVE_MCP_ENV_KEYS if key in environ})
+    return {**servers, "lean-lsp": {**lean, "env": server_env}}
+
 
 def _agent_env(
     agent: Agent,
@@ -362,7 +395,7 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
         if cfg.get("env"):
             lines.append(f"[mcp_servers.{name}.env]")
             for k, v in cfg["env"].items():
-                lines.append(f'{k} = "{v}"')
+                lines.append(f'{k} = {json.dumps(str(v), ensure_ascii=False)}')
             lines.append("")
     (home / "config.toml").write_text("\n".join(lines))
     return provider
@@ -796,6 +829,10 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
         # Other solve phases keep their own prompts, without proof-development catalogs.
         if mcp_profile == "solve" and (log_context or {}).get("phase") == "formalizing":
             system_prompt += "\n\n" + _solve_external_tools_prompt(mcp_servers)
+        if mcp_profile == "solve":
+            worker_env = dict(os.environ)
+            worker_env.update(_agent_env(agent, env_overrides=env_overrides))
+            mcp_servers = solve_mcp_with_runtime_env(mcp_servers, worker_env)
         kwargs = {
             "permission": permission,
             "idle_timeout": idle_timeout,

@@ -19,22 +19,89 @@ def _solve_shared_paths(paths) -> tuple[Path, Path]:
     return shared_unity / "forum", shared_unity.parent
 
 
+async def _call_solve_stdio(paths, server, spec, tool, kwargs):
+    """Keep solve's one-shot server diagnostics out of the tool result."""
+    import tempfile
+    import traceback
+    from fastmcp import Client
+    from fastmcp.client.transports import StdioTransport
+    from .. import artifacts
+
+    error = None
+    with tempfile.TemporaryFile(
+        mode="w+", encoding="utf-8", errors="replace",
+    ) as stderr:
+        transport = StdioTransport(
+            command=spec["command"],
+            args=spec.get("args", []),
+            env=spec.get("env"),
+            cwd=spec.get("cwd"),
+            keep_alive=False,
+            log_file=stderr,
+        )
+        try:
+            async with Client(transport) as client:
+                result = await client.call_tool(tool, kwargs)
+        except Exception as exc:
+            error = exc
+
+        stderr.seek(0)
+        diagnostics = stderr.read()
+
+    if error is not None:
+        diagnostics += "\n" + "".join(traceback.format_exception(error))
+
+    note = ""
+    if diagnostics:
+        try:
+            record = artifacts.store_text(
+                paths.artifacts,
+                diagnostics,
+                kind="mcp_diagnostics",
+                producer=os.getenv("UNITY_AGENT_NAME", ""),
+                source=f"{server}.{tool}",
+            )
+        except OSError as exc:
+            # Diagnostic persistence must not replace the actual tool outcome.
+            note = f"Server diagnostics could not be saved: {artifacts.preview_text(str(exc))}"
+        else:
+            note = f"Server diagnostics: {record['artifact_id']}"
+
+    if error is not None:
+        message = artifacts.preview_text(f"{type(error).__name__}: {error}")
+        raise click.ClickException(
+            f"{server}.{tool} failed: {message}\n{note}"
+        ) from error
+
+    return result, note
+
+
 @click.command(name="mcp")
 @click.argument("server")
 @click.argument("tool")
-@click.argument("args", required=False, default="{}")
-async def mcp(server, tool, args):
+@click.argument("args", required=False)
+@click.option("--args-file", type=click.File("r", encoding="utf-8"),
+              help="Read the JSON argument object from a UTF-8 file, or - for stdin.")
+async def mcp(server, tool, args, args_file):
     """Call TOOL on MCP SERVER with JSON ARGS (e.g. unity mcp unity-forum forum_stats '{}')."""
+    if args is not None and args_file is not None:
+        raise click.UsageError("Pass either positional JSON args or --args-file, not both.")
+    try:
+        if args_file is not None:
+            kwargs = json.load(args_file)
+        else:
+            # Preserve the original positional interface, including empty args.
+            kwargs = json.loads(args) if args is not None and args.strip() else {}
+    except json.JSONDecodeError as e:
+        raise click.ClickException(f"args must be a JSON object: {e}")
+    except (OSError, UnicodeError) as e:
+        raise click.ClickException(f"cannot read JSON args: {e}")
+    if not isinstance(kwargs, dict):
+        raise click.ClickException("args must be a JSON object")
+
     from ..config import load_paths
     from ..orchestrator import build_mcp, build_solve_mcp
     from fastmcp import Client
-
-    try:
-        kwargs = json.loads(args) if args.strip() else {}
-    except json.JSONDecodeError as e:
-        raise click.ClickException(f"args must be a JSON object: {e}")
-    if not isinstance(kwargs, dict):
-        raise click.ClickException("args must be a JSON object")
 
     paths = load_paths()
     try:
@@ -47,6 +114,8 @@ async def mcp(server, tool, args):
         "solving", "solution_review", "chunking", "formalizing", "critic", "retrospective",
     }:
         solve_profile = "solving"
+    client = None
+    diagnostic_note = ""
     if server in ("unity-forum", "forum") and active_solve:
         from ..forum import solve_server
         # Worktrees expose the run-scoped .unity directory through a symlink.
@@ -67,10 +136,17 @@ async def mcp(server, tool, args):
         specs = build_solve_mcp(paths, solve_profile) if active_solve else build_mcp(paths)
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
-        client = Client({"mcpServers": {server: specs[server]}})
+        spec = specs[server]
+        if active_solve and spec.get("command"):
+            res, diagnostic_note = await _call_solve_stdio(
+                paths, server, spec, tool, kwargs,
+            )
+        else:
+            client = Client({"mcpServers": {server: spec}})
 
-    async with client as c:
-        res = await c.call_tool(tool, kwargs)
+    if client is not None:
+        async with client as c:
+            res = await c.call_tool(tool, kwargs)
     rendered = []
     for block in getattr(res, "content", None) or []:
         text = getattr(block, "text", None)
@@ -92,6 +168,8 @@ async def mcp(server, tool, args):
         print(artifacts.format_compacted(compacted))
     elif output:
         print(output)
+    if diagnostic_note:
+        print(diagnostic_note, flush=True)
 
 
 command = mcp
