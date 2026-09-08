@@ -131,7 +131,9 @@ def worktree_matches_main(project_path: Path, name: str) -> bool:
     return not _git(worktree_path, "status", "--porcelain", check=True).stdout.strip()
 
 
-def verify_candidate_commit(project_path: Path, name: str, commit_sha: str) -> str:
+def verify_candidate_commit(
+    project_path: Path, name: str, commit_sha: str, *, allow_unchanged: bool = False,
+) -> str:
     """Resolve a candidate SHA and require it to belong to the caller's worktree branch."""
     project_path = Path(project_path)
     if not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit_sha.strip()):
@@ -142,7 +144,9 @@ def verify_candidate_commit(project_path: Path, name: str, commit_sha: str) -> s
         raise ValueError(f"no active worktree branch for agent '{name}'")
     if _git(project_path, "merge-base", "--is-ancestor", resolved, branch).returncode != 0:
         raise ValueError(f"commit {resolved} does not belong to agent '{name}'")
-    if _git(project_path, "diff", "--quiet", main_commit(project_path), resolved).returncode == 0:
+    if not allow_unchanged and _git(
+        project_path, "diff", "--quiet", main_commit(project_path), resolved,
+    ).returncode == 0:
         raise ValueError("candidate commit contains no changes relative to main")
     return resolved
 

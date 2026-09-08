@@ -10,16 +10,31 @@ findings and candidate events. These tools belong to the autoformalization runti
   shares reusable checked APIs, proof patterns and concrete failures. Publish before substantial
   follow-on work, with the formal task ID and check/artifact evidence; reuse existing findings.
   `report_obstacle`, `ask_question` and `answer_question` expose blockers and requests for help.
-- `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?)` commits the
+- `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?, stage?, outputs?)` commits the
   current exact worktree bytes and submits an immutable candidate for the authoritative main build and
   declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
-- `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?)` is the
+- `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?)` is the
   compatibility route for already-committed bytes; normally use `finalize_formalization`.
 - `sync_from_main(author, reason?)` merges accepted main without discarding local work. Dirty trees and
   pending candidates block sync; conflicts remain for resolution and claims are retained. Do not sync
   just because an unrelated task merged.
-- `request_rechunk(author, reason, task_ids?)` queues a corrected protected specification when the Lean encoding
-  misrepresents the supplied source. Give precise source locations/evidence; the source is unchanged.
+- `refine_chunks(author, expected_revision, changes)` transactionally revises informal interpretations,
+  predicted kinds, hints and typed dependencies, or adds/splits/combines nodes. Use `upserts`
+  (complete node rows) and `replacements` (`{old_ids,new_ids,reason}` rows) in `changes`. Preserve existing
+  node IDs for unchanged mathematics and all original obligations. Stale revisions fail atomically;
+  refresh the brief before retrying. Source requirements/specification are read-only through this tool.
+  To correct an adopted Lean encoding without changing its informal mathematics, add
+  `reopen_representations=[{"task_id":"stable-node-id","reason":"why the encoding must change"}]`
+  to `changes`. This explicitly revises the representation and invalidates its dependent evidence;
+  do not rewrite correct informal prose merely to unlock a different Lean type/name/file.
+  Resolve an existing planned prerequisite with
+  `prerequisite_resolutions=[{"id":"P1","resolution":{"kind":"library","declaration":"Exact.name"}}]`
+  in `changes`, or use the existing task-resolution shape for a supporting node. This changes only
+  its implementation resolution, not the cited statement/anchors. Inspect the exact API and update
+  corresponding node dependency edges as needed; unresolved choices never count as final evidence.
+- `request_rechunk(author, reason, task_ids?)` queues a revised informal plan and argument/prerequisite
+  mapping, without rewriting original source obligations. Give precise source locations/evidence; ordinary formal drafts use refinement or a new
+  candidate, not mandatory rechunking. The supplied source is unchanged.
 - `forum_post`, `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
   for a task. The normal brief prioritizes your task, its candidates and blockers.
@@ -29,6 +44,15 @@ findings and candidate events. These tools belong to the autoformalization runti
 
 Original source bytes must not change. Explore source defects and propose explicit corrections instead
 of modifying the input or silently formalizing a different statement.
+
+Both candidate tools default to `stage="complete"`. Pass the first output binding as
+`outputs=[{"declaration":"Project.name","file":"Project/File.lean"}]`; a node may have multiple outputs.
+A complete implementation can adopt the representation and verify its proof in one submission.
+`stage="representation"` shares a locally checked representation before proof completion; it may
+contain theorem proof holes, never unfinished meaning-bearing definitions. Representation adoption
+does not mean proof completion or faithfulness. Candidate versions retain exact commits/manifests.
+Task details distinguish assignment (claims/assistants), representation, verification and faithfulness,
+all with current revision-bound evidence; proof-only prerequisites need not delay statement work.
 
 For a backend without native MCP, use `unity mcp unity-forum <tool> '<json-args>'`. For multiline Lean or
 quoted content, serialize the JSON argument object and pass a file/stdin rather than hand-quoting Lean:

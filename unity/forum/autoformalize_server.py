@@ -13,13 +13,16 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 
 from .. import artifacts, autoformalize_state, worktree
 from ..autoformalize_review import SemanticReview
+from ..autoformalize_spec import normalize_outputs
 from . import server as discussion
 
 
@@ -124,8 +127,12 @@ def _submit_formal_commit(
     *,
     notes: str = "",
     supersedes: str = "",
+    stage: str = "complete",
+    outputs: list[dict] | None = None,
 ) -> dict:
-    resolved = worktree.verify_candidate_commit(_root(), author, commit_sha)
+    resolved = worktree.verify_candidate_commit(
+        _root(), author, commit_sha, allow_unchanged=True,
+    )
     base = _git(_root(), "merge-base", resolved, worktree.main_commit(_root())).stdout.strip()
     diff = _git(
         _root(), "diff", "--no-ext-diff", "--no-textconv",
@@ -134,7 +141,7 @@ def _submit_formal_commit(
     diff_sha = hashlib.sha256(diff.encode()).hexdigest()
     result = autoformalize_state.submit_formal_candidate(
         FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
-        notes=notes, supersedes=supersedes,
+        notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
     )
     if result["status"] == "submitted":
         candidate = result["candidate"]
@@ -313,7 +320,7 @@ def autoformalize_task(task_id: str) -> str:
     """Read one task's exact requirements, source citations and current evidence."""
     state = autoformalize_state.load_state(FORUM_DIR)
     tasks = state.get("formal_tasks", {})
-    task = tasks.get(task_id)
+    task = tasks.get(task_id) or state.get("retired_tasks", {}).get(task_id)
     if task is None:
         raise ValueError(f"unknown task '{task_id}'")
     requirements = [
@@ -328,17 +335,18 @@ def autoformalize_task(task_id: str) -> str:
     return _detail({
         "run_id": state.get("run_id"), "revision": state.get("revision"),
         "contract_sha256": (state["formalization"].get("contract") or {}).get("sha256"),
-        "task": task, "requirements": requirements,
+        "task": task, "assignment": autoformalize_state.assignment_view(state, task_id),
+        "requirements": requirements,
         "source_refs": [
             ref for ref in (state.get("input_source") or {}).get("source_refs", [])
             if ref["ref_id"] in source_ids
         ],
         **spec,
-        "dependencies": [tasks[dep] for dep in task.get("dependencies", [])],
+        "dependencies": [tasks.get(dep, state.get("retired_tasks", {}).get(dep, {"task_id": dep}))
+                         for dep in task.get("dependencies", [])],
         "candidates": [
             item for item in state.get("formal_candidates", {}).values()
             if item.get("task_id") == task_id
-            and autoformalize_state.candidate_is_current(state, item)
         ],
         "source_issues": [
             item for item in state.get("source_issues", {}).values()
@@ -379,7 +387,7 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         lines.extend(["", "YOUR ASSIGNED/CLAIMED TASKS"])
         for target in sorted(focus):
             task = tasks[target]
-            lines.append(f"- {target} [{task.get('status')}]: {task.get('lean_decl')} "
+            lines.append(f"- {target} [{task.get('status')}]: {task.get('title') or task.get('lean_decl')} "
                          f"{task.get('description', '')[:220]}")
         lines.append("Exact requirements, source citations and evidence: autoformalize_task(task_id).")
     candidates = [
@@ -394,7 +402,7 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
     if candidates:
         lines.extend(["", "CURRENT FORMALIZATION CANDIDATES"])
         for item in candidates[:6]:
-            lines.append(f"- {item['candidate_id']} [{item['status']}] task={item['task_id']} "
+            lines.append(f"- {item['candidate_id']} [{item['status']}] stage={item.get('stage', 'complete')} task={item['task_id']} "
                          f"by {item['author']} at {item['commit_sha'][:12]}")
             if item.get("error"):
                 lines.append(f"  failure: {item['error'][:240]}")
@@ -474,8 +482,14 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
     if visible_tasks:
         lines.extend(["", "RELEVANT TASK STATUS" if related else "TASK PREVIEW"])
         for task in visible_tasks[:10]:
-            lines.append(f"- {task['task_id']} [{task['status']}]: {task.get('lean_decl')}; "
-                         f"dependencies={','.join(task.get('dependencies', []))}")
+            assignment = autoformalize_state.assignment_view(state, task['task_id'])
+            lines.append(f"- {task['task_id']} [{task['status']}]: {task.get('title') or task.get('lean_decl')}; "
+                         f"representation={task.get('representation', {}).get('status', 'legacy')}, "
+                         f"verification={task.get('verification', {}).get('status', 'pending')}, "
+                         f"faithfulness={task.get('faithfulness', {}).get('status', 'unreviewed')}; "
+                         f"owners={','.join(assignment['owners'])}; "
+                         f"statement deps={','.join(task.get('statement_dependencies', []))}; "
+                         f"proof deps={','.join(task.get('proof_dependencies', task.get('dependencies', [])))}")
     findings = [
         item for item in state.get("findings", {}).values()
         if item.get("status") == "active" and (not related or item.get("target") in related | {"", None})
@@ -648,13 +662,15 @@ def emit_formalization_candidate(
     commit_sha: str,
     notes: str = "",
     supersedes: str = "",
+    stage: Literal["representation", "complete"] = "complete",
+    outputs: list[dict] | None = None,
 ) -> dict:
     """Compatibility API for submitting an already-committed implementation."""
     author = _author(author)
     with _finalization_lock(author):
         return _submit_formal_commit(
             strategy_id, author, task_id, commit_sha,
-            notes=notes, supersedes=supersedes,
+            notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
         )
 
 
@@ -665,14 +681,21 @@ def finalize_formalization(
     changed_paths: list[str] | None = None,
     notes: str = "",
     supersedes: str = "",
+    stage: Literal["representation", "complete"] = "complete",
+    outputs: list[dict] | None = None,
 ) -> dict:
     """Commit current worktree bytes and submit one immutable formal candidate.
+
+    Unchanged work submits the existing commit for authoritative re-verification.
 
     This is deliberately not a build assertion.  The autoformalize controller applies
     the exact resulting commit to main and performs the sole authoritative full
     build and declaration review there.
     """
     author = _author(author)
+    if stage not in {"representation", "complete"}:
+        raise ValueError("candidate stage must be representation or complete")
+    outputs = normalize_outputs(outputs) if outputs is not None else None
     with _finalization_lock(author):
         state = autoformalize_state.load_state(FORUM_DIR)
         task = state.get("formal_tasks", {}).get(task_id)
@@ -680,6 +703,9 @@ def finalize_formalization(
             raise ValueError("formalization task is unavailable")
         if task.get("status") != "pending":
             raise ValueError(f"formalization task is {task.get('status')}, not finalizable")
+        if ((state['formalization'].get('contract') or {}).get('version') == 3
+                and not (outputs or task.get('outputs'))):
+            raise ValueError("a first candidate requires its declaration/file outputs")
         strategy = state.get("strategies", {}).get(strategy_id)
         if (
             not strategy
@@ -741,7 +767,8 @@ def finalize_formalization(
             candidate_paths = _git(
                 tree, "diff", "--cached", "--name-only", "-z", base,
             ).stdout.split("\0")
-            if expected_file and expected_file not in candidate_paths:
+            if ((state['formalization'].get('contract') or {}).get('version') != 3
+                    and expected_file and expected_file not in candidate_paths):
                 _git(tree, "reset", check=False)
                 raise ValueError(
                     f"candidate does not change the target file '{expected_file}'"
@@ -760,7 +787,7 @@ def finalize_formalization(
         head = _git(tree, "rev-parse", "HEAD").stdout.strip()
         result = _submit_formal_commit(
             strategy_id, author, task_id, head,
-            notes=notes, supersedes=supersedes,
+            notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
         )
         return {
             **result,
@@ -820,6 +847,31 @@ def _accepted_formal_main(state: dict) -> str:
     return target
 
 
+def ready_statement_prerequisites(state: dict, task_id: str) -> list[dict]:
+    """Ready missing interfaces upstream of a blocked informal assignment only."""
+    tasks = state.get("formal_tasks", {})
+    task = tasks.get(task_id, {})
+    if ((state.get("formalization", {}).get("contract") or {}).get("version") != 3
+            or task.get("status") != "pending" or autoformalize_state.task_ready(state, task)
+            or autoformalize_state.source_issues_blocking_task(state, task_id)):
+        return []
+    pending = list(task.get("statement_dependencies", []))
+    seen, ready = {task_id}, []
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        dependency = tasks.get(key, {})
+        if autoformalize_state.interface_available(state, dependency):
+            continue
+        if autoformalize_state.task_ready(state, dependency):
+            ready.append(dependency)
+        else:
+            pending.extend(dependency.get("statement_dependencies", []))
+    return sorted(ready, key=lambda item: item["task_id"])
+
+
 def prepare_formal_worktree(
     author: str,
     previous_task: str = "",
@@ -844,21 +896,37 @@ def prepare_formal_worktree(
         target_task = state.get("formal_tasks", {}).get(next_task, {})
         if target_task.get("status") != "pending":
             return _sync_blocked("task_unavailable", "The next formal task is no longer pending.")
-        if any(
-            state.get("formal_tasks", {}).get(dependency, {}).get("status") != "complete"
-            for dependency in target_task.get("dependencies", [])
-        ):
+        if not autoformalize_state.task_ready(state, target_task):
             return _sync_blocked("dependencies_pending", "The next formal task has unresolved dependencies.")
         if has_pending_formal_candidate(state, author):
             return _sync_blocked("candidate_pending", "Candidate review is pending; its branch is preserved.")
         tree = worktree.agent_worktree(_root(), author)
         if not tree.is_dir():
             return _sync_blocked("missing_worktree", "The agent has no active worktree.")
-        if previous_task == next_task:
-            return {"ok": True, "preserved": True, "worktree": str(tree)}
+        retired = state.get("retired_tasks", {}).get(previous_task, {})
+        continuing_refinement = next_task in retired.get("replaced_by", [])
+        if previous_task == next_task or continuing_refinement:
+            result = {"ok": True, "preserved": True, "worktree": str(tree)}
+            # Representation-only adoption keeps this task alive. Bring a clean
+            # stopped tree onto accepted main so later candidates do not submit
+            # its already-integrated representation again. Never erase edits.
+            main_sha = _accepted_formal_main(state)
+            if ((formal.get("contract") or {}).get("version") == 3 and main_sha
+                    and not _git(tree, "status", "--porcelain").stdout.strip()):
+                merged = _git(tree, "merge", "--no-edit", "--no-autostash", "--no-overwrite-ignore",
+                              main_sha, check=False)
+                if merged.returncode:
+                    result["sync_warning"] = "Resolve the preserved worktree merge conflict before finalizing."
+            return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
+        # A refinement can introduce a missing interface and block every former
+        # assignment. Only an unclaimed clean ancestor tree may move upstream;
+        # this exception never resets or parks private work.
+        prerequisite_reassignment = next_task in {
+            item["task_id"] for item in ready_statement_prerequisites(state, previous_task)
+        }
         if unresolved_formal_tasks(state, author) or (
-            previous_task and previous.get("status") != "complete"
+            previous_task and previous.get("status") != "complete" and not prerequisite_reassignment
         ):
             return _sync_blocked("unresolved_work", "Unfinished task work is preserved; resume it first.")
         main_sha = _accepted_formal_main(state)
@@ -870,9 +938,14 @@ def prepare_formal_worktree(
         # A fresh/unassigned tree has no known obsolete task. Never reset it:
         # accept a clean ancestor of main, but preserve unexplained local work.
         if _git(tree, "status", "--porcelain").stdout.strip():
-            return _sync_blocked("dirty_worktree", "Unassigned local edits are preserved.")
+            return _sync_blocked("dirty_worktree", "Local edits are preserved; reconcile them before changing tasks.")
+        if prerequisite_reassignment:
+            ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").stdout
+            if any(path.split("/", 1)[0] not in {".unity", ".lake"}
+                   for path in ignored.split("\0") if path):
+                return _sync_blocked("ignored_work", "Ignored private files are preserved; reconcile them before changing tasks.")
         if _git(tree, "merge-base", "--is-ancestor", "HEAD", main_sha, check=False).returncode:
-            return _sync_blocked("local_commits", "Unassigned local commits are preserved.")
+            return _sync_blocked("local_commits", "Private commits are preserved; reconcile them before changing tasks.")
         merged = _git(tree, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", main_sha, check=False)
         if merged.returncode:
             return _sync_blocked("local_commits", merged.stderr.strip() or "Unassigned commits are preserved.")
@@ -907,6 +980,38 @@ def sync_from_main(author: str, reason: str = "") -> dict:
         worktree.link_runtime_state(tree, _root())
         worktree.symlink_lake_cache(tree, _root())
         return {"ok": True, "main_sha": main_sha, "worktree": str(tree)}
+
+
+def refine_chunks(author: str, expected_revision: int,
+                  changes: autoformalize_state.ChunkRefinement) -> dict:
+    """Revise informal nodes with an atomic state-revision check and explicit split/merge lineage.
+
+    Upserts are complete informal node rows. Replacements name old_ids, new_ids,
+    and a reason. Source obligations and machine-owned status cannot be edited.
+    """
+    author = _author(author)
+    with _merge_lock():
+        result = autoformalize_state.refine_chunks(FORUM_DIR, author, expected_revision, changes)
+        if result.get("status") == "conflict":
+            return result
+        state = autoformalize_state.load_state(FORUM_DIR)
+        formal = state["formalization"]
+        dag = {key: formal[key] for key in ("solution_candidate", "solution_sha256", "requirements", "spec")}
+        dag["chunks"] = list(state["formal_tasks"].values())
+        # This is a recoverable materialized view, not a second source of truth.
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", dir=_root() / ".unity", delete=False) as handle:
+                temporary = Path(handle.name)
+                json.dump(dag, handle, indent=2, sort_keys=True)
+                handle.write("\n")
+            os.replace(temporary, _root() / ".unity" / "dag.json")
+        except OSError as exc:
+            result["view_warning"] = f"State saved; dag.json view could not be refreshed: {exc}"
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+        return result
 
 
 def report_source_issue(
@@ -1009,7 +1114,7 @@ PROFILE_TOOLS = {
     "chunking": COMMON + SOURCE_FEEDBACK,
     "formalizing": COMMON + COORDINATION + (
         finalize_formalization, emit_formalization_candidate, sync_from_main, request_rechunk,
-        report_source_issue, submit_source_repair,
+        report_source_issue, submit_source_repair, refine_chunks,
     ),
     "critic": COMMON + SOURCE_FEEDBACK + (request_rechunk, submit_formalization_verdict),
     "retrospective": COMMON,

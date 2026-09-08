@@ -129,22 +129,44 @@ def _discussion_forum() -> Path:
 
 
 def _autoformalize_dag() -> dict:
-    """Autoformalize task dependencies and authoritative candidate completion."""
-    from ..autoformalize_state import load_state
+    """Informal source DAG with independent implementation/review evidence."""
+    from ..autoformalize_state import assignment_view, load_state
     state = load_state(_autoformalize_forum())
-    claimed = {
-        item.get("target") for item in state.get("strategies", {}).values()
-        if item.get("status") in {"claimed", "paused"}
-    }
-    colors = {"complete": "green", "candidate_pending": "blue", "blocked": "red"}
     chunks = []
     for task in state.get("formal_tasks", {}).values():
+        if task.get("status") == "superseded":
+            continue
+        assignment = assignment_view(state, task["task_id"])
+        representation = task.get("representation") or {"status": "missing"}
+        verification = task.get("verification") or {"status": "pending"}
+        faithfulness = task.get("faithfulness") or {"status": "unreviewed"}
+        outputs = task.get("outputs") or []
+        statement_dependencies = task.get("statement_dependencies", [])
+        proof_dependencies = task.get("proof_dependencies", [])
+        if faithfulness["status"] == "approved" and verification["status"] == "verified":
+            color = "green"
+        elif faithfulness["status"] == "changes_requested" or task.get("status") == "blocked":
+            color = "red"
+        elif task.get("status") == "candidate_pending" or representation["status"] == "adopted":
+            color = "blue"
+        else:
+            color = "yellow" if assignment.get("status") == "assigned" else "grey"
         chunks.append({
-            "id": task["task_id"], "title": task.get("lean_decl", task["task_id"]),
-            "type": "formalization", "summary": task.get("description", ""),
-            "dependencies": task.get("dependencies", []),
-            "declarations": [task["lean_decl"]] if task.get("lean_decl") else [],
-            "status": colors.get(task.get("status"), "yellow" if task["task_id"] in claimed else "grey"),
+            "id": task["task_id"], "title": task.get("title") or task["task_id"],
+            "type": task.get("predicted_kind") or "unknown",
+            "summary": task.get("informal_statement", ""),
+            "informal_proof": task.get("informal_proof"),
+            "source_components": task.get("source_components", []),
+            "anchor_ids": task.get("anchor_ids", []),
+            "requirement_ids": task.get("requirement_ids", []),
+            "statement_dependencies": statement_dependencies,
+            "proof_dependencies": proof_dependencies,
+            "dependencies": sorted(set(statement_dependencies) | set(proof_dependencies)),
+            "outputs": outputs,
+            "declarations": [row["declaration"] for row in outputs],
+            "assignment": assignment, "representation": representation,
+            "verification": verification, "faithfulness": faithfulness,
+            "revision": task.get("revision"), "status": color,
         })
     return {"graph_kind": "autoformalize", "chunks": chunks}
 
@@ -1249,6 +1271,8 @@ function updateHeaderLegend(data) {
   const el = document.getElementById('hlegend');
   const legend = data.graph_kind === 'informal_tasks'
     ? [['green','Resolved','#2e7d32'], ['yellow','Claimed','#7c5cbf'], ['grey','Open','#d97706'], ['red','Blocked','#c62828']]
+    : data.graph_kind === 'autoformalize'
+    ? [['green','Verified + faithful','#2e7d32'], ['yellow','In progress','#7c5cbf'], ['grey','Unstarted','#d97706'], ['red','Needs attention','#c62828']]
     : LEGEND;
   if (el) el.innerHTML = legend.map(([k, label, col]) =>
     '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+col+';margin-right:6px"></span>'+label+' '+counts[k]+'</span>').join('');
@@ -1333,6 +1357,28 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
+  if (graphKind === 'autoformalize') {
+    const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
+    const assignment = c.assignment || {};
+    document.getElementById('info-content').innerHTML =
+      field('node / revision', c.id + ' / ' + (c.revision || 0))
+      + field('informal title', c.title)
+      + field('predicted kind', c.type)
+      + field('statement / definition', c.summary)
+      + field('proof / construction', c.informal_proof == null ? 'Not supplied in source' : c.informal_proof)
+      + field('source references', (c.source_components || []).join(', '))
+      + field('anchors / obligations', (c.anchor_ids || []).join(', ') + ' / ' + (c.requirement_ids || []).join(', '))
+      + field('statement dependencies', (c.statement_dependencies || []).join(', ') || 'none')
+      + field('proof dependencies', (c.proof_dependencies || []).join(', ') || 'none')
+      + field('Lean outputs', (c.outputs || []).map(x => x.declaration + ' · ' + x.file).join('; ') || 'Not bound yet')
+      + field('assignment', (assignment.status || 'unassigned') + ' · ' + (assignment.owners || []).join(', '))
+      + field('assistants', (assignment.assistants || []).join(', ') || 'none')
+      + field('representation', (c.representation || {}).status || 'missing')
+      + field('verification', (c.verification || {}).status || 'pending')
+      + field('faithfulness', (c.faithfulness || {}).status || 'unreviewed');
+    document.getElementById('info-panel').classList.add('visible');
+    return;
+  }
   const labels = graphKind === 'informal_tasks'
     ? { grey:'open', yellow:'claimed', green:'resolved', blue:'result under review', red:'blocked' }
     : { grey:'not started', yellow:'in progress', green:'fully formalized', blue:'partially formalized', red:'by sorry' };
@@ -1362,8 +1408,8 @@ async function loadDag(forceRebuild) {
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : 'Formalization chunks';
-  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>c.id).sort().join(',');
+  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : data.graph_kind === 'autoformalize' ? 'Informal formalization DAG' : 'Formalization chunks';
+  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>data.graph_kind === 'autoformalize' ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
   if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
   updateHeaderLegend(data);
@@ -2538,7 +2584,7 @@ async function loadOverview() {
     }
     if (af.run_id && r.command === 'autoformalize') {
       const source = af.input_source || {}, formal = af.formalization || {},
-        tasks = Object.values(af.formal_tasks || {}),
+        tasks = Object.values(af.formal_tasks || {}).filter(x => x.status !== 'superseded'),
         candidates = Object.values(af.formal_candidates || {}),
         strategies = Object.values(af.strategies || {}).filter(x => ['registered','claimed','paused'].includes(x.status)),
         findings = Object.values(af.findings || {}).filter(x => x.status === 'active'),
@@ -2548,12 +2594,26 @@ async function loadOverview() {
       h += '<div class="grid"><section><h2>immutable supplied source</h2><div class="item mono">' + esc(source.candidate_id || '') + '</div>' + artifactButton(source.artifact_id) +
         (source.source_refs || []).map(x => '<div class="item"><b>' + esc(x.ref_id) + '</b><div class="who">' + esc(x.path) + ' · ' + esc((x.sha256 || '').slice(0,12)) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') +
         '<div class="item"><b>Lean formalization</b><span class="badge ' + (formal.status === 'accepted' ? 'ok' : 'pending') + '">' + esc(formal.status || 'waiting') + '</span><div class="who mono">main ' + esc((formal.main_sha || '').slice(0,12)) + '</div></div></section>';
-      h += '<section><h2>formal tasks</h2>' + (tasks.length ? tasks.map(x =>
-        '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge ' + (x.status === 'complete' ? 'ok' : 'pending') + '">' + esc(x.status) + '</span><div>' + esc(x.lean_decl || '') + '</div>' +
-        '<div class="who">depends on ' + (x.dependencies || []).map(esc).join(', ') + ' · source ' + (x.source_components || []).map(esc).join(', ') + '</div></div>').join('') : '<div class="empty">not chunked yet</div>') + '</section>';
+      h += '<section><h2>informal source nodes</h2>' + (tasks.length ? tasks.map(x => {
+        const representation = (x.representation || {}).status || 'missing',
+          verification = (x.verification || {}).status || 'pending',
+          faithfulness = (x.faithfulness || {}).status || 'unreviewed',
+          claims = strategies.filter(s => s.target === x.task_id && s.task_revision === x.revision
+            && s.solution_candidate === source.candidate_id && s.solution_sha256 === source.sha256
+            && ['claimed','paused'].includes(s.status)),
+          owners = [...new Set(claims.map(s => s.owner).filter(Boolean))],
+          assistants = [...new Set(claims.flatMap(s => s.assistants || []))];
+        return '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge pending">' + esc(x.predicted_kind || 'unknown') + '</span><div>' + esc(x.title || x.task_id) + '</div>' +
+          '<div class="sub">' + esc(x.informal_statement || '') + '</div>' +
+          '<div class="who">assignment: ' + (owners.length ? owners.map(esc).join(', ') : 'unassigned') + (assistants.length ? ' · assistants ' + assistants.map(esc).join(', ') : '') + '</div>' +
+          '<div class="who">representation: ' + esc(representation) + ' · verification: ' + esc(verification) + ' · faithfulness: ' + esc(faithfulness) + '</div>' +
+          '<div class="who">statement dependencies: ' + ((x.statement_dependencies || []).map(esc).join(', ') || 'none') + ' · proof dependencies: ' + ((x.proof_dependencies || []).map(esc).join(', ') || 'none') + '</div>' +
+          '<div class="who">source: ' + (x.source_components || []).map(esc).join(', ') + '</div>' +
+          '<div class="who">outputs: ' + ((x.outputs || []).map(o => esc(o.declaration) + ' · ' + esc(o.file)).join('; ') || 'not bound yet') + '</div></div>';
+      }).join('') : '<div class="empty">not chunked yet</div>') + '</section>';
       h += '<section><h2>formal candidates</h2>' + (candidates.length ? candidates.slice(-8).reverse().map(x =>
         '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'merged' ? 'ok' : x.status === 'failed' ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +
-        '<div class="who">' + esc(x.task_id) + ' · ' + esc(x.author) + ' · ' + esc((x.commit_sha || '').slice(0,12)) + '</div><div>' + esc(x.error || '') + '</div>' +
+        '<div class="who">' + esc(x.task_id) + ' · revision ' + esc(x.task_revision) + ' · stage ' + esc(x.stage || 'complete') + ' · ' + esc(x.author) + ' · ' + esc((x.commit_sha || '').slice(0,12)) + '</div><div>' + esc(x.error || '') + '</div>' +
         '<div class="who">verification: ' + esc((x.verification || {}).status || 'pending') + '</div>' + artifactButton((x.build || {}).artifact_id) + artifactButton((x.verification || {}).artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
       h += '<section><h2>coordination & telemetry</h2>' + strategies.slice(-12).map(x =>
         '<div class="item"><b>' + esc(x.strategy_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div>' + esc(x.description) + '</div><div class="who">task ' + esc(x.target) + ' · owner ' + esc(x.owner || 'none') + ' · assistants ' + (x.assistants || []).map(esc).join(', ') + '</div></div>').join('') +

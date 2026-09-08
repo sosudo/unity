@@ -242,13 +242,15 @@ private def extract (modules targets externals : List String) : IO (Json × UInt
       issues := issues.push s!"target declaration {target} is not owned by a supplied project module"
       continue
     let roots := match ci with
-      | .defnInfo _ | .opaqueInfo _ => (usedConstants ci.type).push n
-      | _ => usedConstants ci.type
+      | .thmInfo _ => usedConstants ci.type
+      | _ => (usedConstants ci.type).push n
     let (_, ms) := (roots.forM (collectMeanings env projects)).run {}
     let (_, auditState) := (audit env n).run { edges := edges }
     edges := auditState.edges
     issues := issues ++ ms.issues ++ auditState.issues
     let axiomNames := auditState.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
+    let proofDeps := auditState.visited.toList.filter fun name =>
+      (moduleOf env name).any projects.contains
     records := (target, Json.mkObj [
       ("name", Json.str ci.name.toString),
       ("target_kind", Json.str (kindOf ci)),
@@ -256,6 +258,10 @@ private def extract (modules targets externals : List String) : IO (Json × UInt
       ("level_params", namesJson ci.levelParams),
       ("type", exprJson ci.type),
       ("meanings", Json.mkObj ms.records),
+      -- Evidence dependencies are not part of statement identity. Changing a
+      -- proof keeps its target, but revising a used definition invalidates the
+      -- affected proof receipt even when no informal DAG edge predicted it.
+      ("proof_dependencies", toJson ((proofDeps.map Name.toString).mergeSort (· ≤ ·))),
       ("axioms", Json.arr (axiomNames.toArray.map Json.str))]) :: records
   let targetsChecked ← IO.monoMsNow
   -- Cited library prerequisites are inspected separately. They never become

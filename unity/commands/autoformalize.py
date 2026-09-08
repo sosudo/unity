@@ -14,7 +14,7 @@ from ..config import load_paths
 from ..autoformalize_input import autoformalize_paths, require_source_matches, snapshot_sources
 from ..autoformalize_orchestrator import (
     build_autoformalize_mcp, dispatch, load_prompt, mark_done, mark_phase,
-    resume_point, stop_requested, toposort,
+    resume_point, stop_requested,
 )
 from ..roster import load_roster
 from ..autoformalize_runtime import (
@@ -199,7 +199,6 @@ async def _chunk_source(
             )
             attempt_number = int(attempt["attempt"])
             plan = write_formalization_plan(paths, candidate)
-            (paths.unity / "dag.json").unlink(missing_ok=True)
             prior = failures[-3:]
             prior_context = (
                 " Previous failed attempts: " + " | ".join(prior)
@@ -214,13 +213,15 @@ async def _chunk_source(
                 + f"the mechanical coverage scaffold at `{plan.relative_to(paths.project_root)}`. Its input SHA-256 is "
                 f"`{candidate['sha256']}`. Produce `.unity/dag.json` bound to that candidate and hash, with "
                 "explicit mathematical requirements, anchored scope/argument/prerequisite spec, and an acyclic graph. "
-                "Create an elaboratable Lean scaffold for each chunk's exact declaration and complete "
-                "meaning-bearing definitions. Only theorem proofs may remain as scaffold sorry holes. "
+                "Extract informal nodes for definitions, structures, instances and results; include "
+                "source citations, statements, supplied proofs (null when absent), predicted kinds, "
+                "and separate statement/proof dependencies. Lean predictions are optional hints. "
+                "Do not write Lean declarations or build a scaffold during chunking. "
                 "Use meaningful proof units, keeping tightly coupled steps together and splitting "
                 "substantial independently useful work. Record genuine proof prerequisites, not "
-                "paper order or shared-definition dependencies. Minimize scaffold imports using "
-                "the installed min_imports tools. Read any repair proposals and replan context in the plan; "
-                "preserve unchanged task IDs, signatures and completed proofs. Report source gaps with "
+                "paper order; shared definitions belong in statement dependencies. Reuse and correct "
+                "any existing dag.json draft. Read repair proposals and replan context in the plan; "
+                "preserve unchanged task IDs and source obligations. Report source gaps with "
                 "report_source_issue; propose justified local repairs without editing original source files."
                 + prior_context,
                 paths.project_root,
@@ -255,26 +256,17 @@ async def _chunk_source(
                 raise click.ClickException("Source-repair attempts exhausted; see source issues and repair evidence")
             try:
                 dag = validate_formalization_dag(paths, candidate["sha256"])
-                toposort(paths)
                 with _merge_lock(paths.project_root):
                     current = autoformalize_state.load_state(paths.forum)
                     if (current["phase"] != "chunking"
                             or autoformalize_state.formal_source(current).get("candidate_id") != candidate_id):
                         return
-                    contract = autoformalize_contract.freeze_formal_contract(paths, dag)
+                    contract = autoformalize_contract.initialize_source_contract(paths, dag)
                     require_source_matches(paths, current)
-                    revalidation = autoformalize_contract.carry_forward_revalidation(
-                        paths, contract, current, dag["chunks"], dag["requirements"],
-                    )
-                    initialized = autoformalize_state.initialize_formal_tasks(
-                        paths.forum,
-                        dag["chunks"],
-                        solution_candidate=candidate_id,
-                        solution_sha256=candidate["sha256"],
+                    initialized = autoformalize_state.initialize_informal_plan(
+                        paths.forum, dag,
                         main_sha=worktree.main_commit(paths.project_root),
-                        requirements=dag["requirements"],
                         contract=contract,
-                        revalidation=revalidation,
                     )
             except autoformalize_contract.ContractEnvironmentError as exc:
                 autoformalize_state.finish_chunking_attempt(
@@ -293,7 +285,6 @@ async def _chunk_source(
                 autoformalize_state.finish_chunking_attempt(
                     paths.forum, attempt["attempt_id"], succeeded=False, reason=reason,
                 )
-                (paths.unity / "dag.json").unlink(missing_ok=True)
                 click.echo(
                     f"chunker {chunker.name} attempt {attempt_number}/{limit_label} failed: "
                     f"{reason[:500]}"
@@ -493,7 +484,7 @@ async def autoformalize(continue_):
         )
     fresh = not continue_ or not previous.get("run_id")
     if (not fresh and previous.get("phase") != "chunking"
-            and (previous.get("formalization", {}).get("contract") or {}).get("version") != 2):
+            and (previous.get("formalization", {}).get("contract") or {}).get("version") not in {2, 3}):
         raise click.ClickException(
             "This autoformalize run predates the source-evidence contract; rerun without --continue. "
             "Original sources and historical artifacts are preserved."

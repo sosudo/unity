@@ -32,6 +32,8 @@ Keep the controller-owned shared `.lake/packages` cache intact. Do not run `lake
 Use a targeted `lake build <target>` only when compiled local artifacts are needed; otherwise use
 MCP diagnostics or the permitted local fallback. Reuse successful checks of unchanged source.
 
-Respect the current phase: chunking may inspect APIs and validate statement scaffolds, not complete
-proofs; critics remain read-only and reuse current verification records unless a concrete concern
+Respect the current phase: chunking produces an informal source-linked DAG; it does not create or
+validate Lean statement scaffolds. API inspection is optional, not a chunking prerequisite.
+Formalizers create and check Lean representations and proofs; critics remain read-only and reuse
+current verification records unless a concrete concern
 requires another check. External success never replaces validation in the actual local project.

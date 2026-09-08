@@ -61,6 +61,10 @@ def completion_report(state: dict, *, accepted: bool = True) -> dict:
             implementation.append({
                 "task_id": task_id, "status": task.get("status", "missing"),
                 "lean_file": task.get("lean_file"), "lean_decl": task.get("lean_decl"),
+                "outputs": task.get("outputs", []),
+                "representation": task.get("representation"),
+                "implementation_verification": task.get("verification"),
+                "faithfulness": task.get("faithfulness"),
                 "candidate_id": task.get("accepted_candidate"),
                 "candidate_commit_sha": candidate.get("commit_sha"),
                 "candidate_diff_sha256": candidate.get("diff_sha256"),

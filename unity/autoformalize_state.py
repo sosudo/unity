@@ -18,13 +18,16 @@ import uuid
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import Iterator
+from typing import Iterator, TypedDict
 
 from .autoformalize_review import SemanticReview
-from .autoformalize_spec import digest, normalize_requirements, normalize_spec, task_spec_hash
+from .autoformalize_spec import (
+    digest, informal_interpretation_hash, normalize_informal_nodes, normalize_outputs,
+    normalize_requirements, normalize_spec, task_spec_hash,
+)
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 PHASES = {"chunking", "formalizing", "critic", "complete"}
 STRATEGY_PHASES = {"formalizing"}
 STRATEGY_STATUSES = {"registered", "claimed", "paused", "incorrect", "succeeded", "cancelled"}
@@ -72,6 +75,8 @@ def _default_state() -> dict:
         "questions": {},
         "solution_candidates": {},
         "formal_tasks": {},
+        "retired_tasks": {},
+        "refinements": [],
         "formal_candidates": {},
         "source_issues": {},
         "source_repairs": {},
@@ -99,6 +104,7 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "solution_candidates", "formal_tasks", "formal_candidates",
         "review_snapshots",
         "source_issues", "source_repairs", "replan_requests",
+        "retired_tasks",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
@@ -108,12 +114,27 @@ def _read_unlocked(forum_dir: Path) -> dict:
         base["chunking_attempts"] = []
     if not isinstance(base.get("critic_verdicts"), list):
         base["critic_verdicts"] = []
+    if not isinstance(base.get("refinements"), list):
+        base["refinements"] = []
     solution = _default_state()["solution"]
     solution.update(base.get("solution") or {})
     base["solution"] = solution
     formalization = _default_state()["formalization"]
     formalization.update(base.get("formalization") or {})
     base["formalization"] = formalization
+    # Old runs retain their scheduling and contract semantics. Expose honest,
+    # independent statuses without manufacturing new verification evidence.
+    for task in base["formal_tasks"].values():
+        candidate_id = task.get("accepted_candidate")
+        candidate = base["formal_candidates"].get(candidate_id, {})
+        merged = candidate.get("status") == "merged"
+        task.setdefault("outputs", ([{"declaration": task["lean_decl"], "file": task["lean_file"]}]
+                                    if task.get("lean_decl") and task.get("lean_file") else []))
+        task.setdefault("representation", {"status": "adopted" if task.get("lean_decl") else "missing",
+                                            "candidate_id": candidate_id if merged else None})
+        task.setdefault("verification", {"status": "verified" if merged and task.get("status") == "complete" else "pending",
+                                          "candidate_id": candidate_id if merged else None})
+        task.setdefault("faithfulness", {"status": "unreviewed", "verdict_id": None})
     return base
 
 
@@ -898,6 +919,297 @@ def begin_replan(forum_dir: Path, request_id: str, *, assignments: dict | None =
     return load_state(forum_dir)
 
 
+def _contract_digest(contract: dict) -> str:
+    return digest({key: value for key, value in contract.items() if key not in {"sha256", "artifact_id"}})
+
+
+def _source_obligations(requirements, spec) -> dict:
+    return {"requirements": [{key: value for key, value in row.items() if key != "tasks"}
+                             for row in requirements], "anchors": deepcopy(spec["anchors"]),
+            "scope": deepcopy(spec["scope"])}
+
+
+def _invalidate_informal_tasks(state: dict, seeds: set[str], *, reason: str) -> set[str]:
+    """Invalidate representations, including actual kernel meaning dependencies."""
+    from .autoformalize_contract import invalidate_bindings
+
+    tasks = state["formal_tasks"]
+    affected = _dependent_closure(tasks, seeds)
+    contract = state["formalization"]["contract"]
+    while True:
+        contract, kernel_affected = invalidate_bindings(contract, affected)
+        expanded = _dependent_closure(tasks, affected | set(kernel_affected))
+        if expanded == affected:
+            break
+        affected = expanded
+    state["formalization"]["contract"] = contract
+    for task_id in affected & tasks.keys():
+        task = tasks[task_id]
+        task.setdefault("history", []).append({"revision": task.get("revision", 1),
+            "reason": reason, "timestamp": time.time(), "outputs": deepcopy(task.get("outputs", [])),
+            "representation": deepcopy(task.get("representation")),
+            "verification": deepcopy(task.get("verification")), "faithfulness": deepcopy(task.get("faithfulness")),
+            "accepted_candidate": task.get("accepted_candidate")})
+        task.update(revision=task.get("revision", 1) + 1, status="pending", accepted_candidate=None,
+                    outputs=[], lean_decl="", lean_file="")
+        task["representation"] = {"status": "stale", "candidate_id": None}
+        task["verification"] = {"status": "stale", "candidate_id": None}
+        task["faithfulness"] = {"status": "stale", "verdict_id": None}
+    for candidate in state["formal_candidates"].values():
+        if candidate.get("task_id") in affected and candidate.get("status") in {"submitted", "merging"}:
+            candidate.update(status="superseded", supersession_reason=reason)
+    for strategy in state["strategies"].values():
+        if strategy.get("target") in affected and strategy.get("status") in _ACTIVE_STRATEGIES:
+            strategy.update(status="cancelled", cancellation_reason=reason)
+    _invalidate_review(state)
+    return affected
+
+
+def _adopt_repairs(state, spec) -> None:
+    adopted = {key for row in spec["arguments"] for key in row["repair_ids"]}
+    source = formal_source(state)
+    for key in adopted:
+        repair = state["source_repairs"].get(key)
+        if (not repair or repair.get("source_candidate") != source["candidate_id"]
+                or repair.get("source_sha256") != source["sha256"]):
+            raise ValueError("spec references unknown or stale source repair")
+    for issue in state["source_issues"].values():
+        if issue.get("status") == "resolved":
+            continue
+        if (not adopted.intersection(_live_repair_ids(issue))
+                or adopted.intersection(issue.get("rejected_repair_ids", []))):
+            raise ValueError("source issue needs an explicit adopted repair before replanning")
+        issue.update(status="resolved", owner=None, adopted_repairs=sorted(adopted.intersection(issue["repair_ids"])))
+
+
+def initialize_informal_plan(forum_dir: Path, dag: dict, *, main_sha: str, contract: dict) -> dict:
+    """Controller-only initial plan/replan publication; no Lean scaffold required."""
+    with transaction(forum_dir) as state:
+        if state["phase"] != "chunking":
+            raise ValueError("informal plans can only be initialized during chunking")
+        source = formal_source(state)
+        if not _FULL_SHA_RE.fullmatch(main_sha):
+            raise ValueError("formalization requires a full main commit")
+        requirements = normalize_requirements(dag["requirements"], dag["chunks"], source_refs(state))
+        spec = normalize_spec(dag["spec"], source=source, requirements=requirements,
+                              tasks=dag["chunks"], allow_unresolved=True)
+        nodes = normalize_informal_nodes(dag["chunks"], requirements, spec, source)
+        if (contract.get("version") != 3 or contract.get("sha256") != _contract_digest(contract)
+                or contract.get("solution_candidate") != source.get("candidate_id")
+                or contract.get("solution_sha256") != source.get("sha256")
+                or contract.get("spec_sha256") != digest(spec)
+                or contract.get("requirements") != requirements
+                or not isinstance(contract.get("environment"), dict)):
+            raise ValueError("informal plan requires a current controller-built source contract")
+        previous = state["formalization"]
+        obligations = _source_obligations(requirements, spec)
+        if previous.get("source_obligations") and previous["source_obligations"] != obligations:
+            raise ValueError("replanning cannot rewrite original source obligations")
+        old = state["formal_tasks"]
+        if old.keys() - nodes.keys():
+            raise ValueError("removing chunks requires explicit refine_chunks replacement history")
+        _adopt_repairs(state, spec)
+        tasks, affected = {}, set()
+        for key, node in nodes.items():
+            prior = old.get(key)
+            tasks[key] = {**deepcopy(prior or {}), **node,
+                "description": node["informal_statement"],
+                "revision": (prior or {}).get("revision", 1),
+                "interpretation_sha256": informal_interpretation_hash(node)}
+            if prior and informal_interpretation_hash(prior) != informal_interpretation_hash(node):
+                tasks[key].setdefault("interpretation_history", []).append({
+                    "timestamp": time.time(), "interpretation": {field: deepcopy(prior.get(field)) for field in node}})
+                affected.add(key)
+            if not prior:
+                tasks[key].update(status="pending", accepted_candidate=None, outputs=[], lean_decl="", lean_file="",
+                    representation={"status": "missing", "candidate_id": None},
+                    verification={"status": "pending", "candidate_id": None},
+                    faithfulness={"status": "unreviewed", "verdict_id": None})
+        # Carry existing exact target protections across unrelated metadata edits;
+        # newly generated source contracts must not silently drop adopted targets.
+        if (previous.get("contract") or {}).get("version") == 3:
+            if contract.get("environment") != previous["contract"].get("environment"):
+                raise ValueError("replanning cannot silently replace the protected Lean environment")
+            contract = deepcopy(contract)
+            for field in ("targets", "bindings", "external_declarations"):
+                contract[field] = deepcopy(previous["contract"].get(field, {}))
+        contract = deepcopy(contract)
+        contract["obligation_ids"] = sorted(tasks)
+        contract["sha256"] = _contract_digest(contract)
+        state["formal_tasks"] = tasks
+        revision = previous.get("revision", 0) + 1
+        state["formalization"] = {"revision": revision, "status": "active",
+            "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
+            "main_sha": main_sha, "requirements": requirements, "spec": spec, "contract": contract,
+            "source_obligations": obligations, "review_snapshot": None, "pending_verdict_id": None}
+        if affected:
+            affected = _invalidate_informal_tasks(state, affected, reason="informal interpretation changed")
+        carried = [key for key, task in tasks.items() if task["status"] == "complete"]
+        state["phase"] = "formalizing"
+        replan = state.get("replan") or {}
+        if replan:
+            replan.update(status="complete", affected_tasks=sorted(affected), carried_tasks=carried)
+            state["replan_requests"][replan["request_id"]]["status"] = "complete"
+        _event(state, "formalization_initialized", formalization_revision=revision,
+               tasks=list(tasks), solution_candidate=source["candidate_id"],
+               affected_tasks=sorted(affected), carried_tasks=carried)
+    return load_state(forum_dir)
+
+
+class ChunkReplacement(TypedDict):
+    old_ids: list[str]
+    new_ids: list[str]
+    reason: str
+
+
+class ChunkRefinement(TypedDict, total=False):
+    upserts: list[dict]
+    replacements: list[ChunkReplacement]
+    reopen_representations: list[dict]
+    prerequisite_resolutions: list[dict]
+
+
+def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes: ChunkRefinement) -> dict:
+    """Atomic graph edits, never model-written proof/faithfulness statuses."""
+    author = _text(author, "author", 100)
+    if not isinstance(changes, dict) or set(changes) - {"upserts", "replacements", "reopen_representations", "prerequisite_resolutions"}:
+        raise ValueError("refinement requires upserts, replacements or reopen_representations")
+    upserts, replacements = changes.get("upserts", []), changes.get("replacements", [])
+    reopens = changes.get("reopen_representations", [])
+    resolutions = changes.get("prerequisite_resolutions", [])
+    if (not isinstance(upserts, list) or not isinstance(replacements, list) or not isinstance(reopens, list)
+            or not isinstance(resolutions, list) or not (upserts or replacements or reopens or resolutions)):
+        raise ValueError("refinement requires nonempty changes")
+    with transaction(forum_dir) as state:
+        if type(expected_revision) is not int or expected_revision != state["revision"]:
+            return {"status": "conflict", "revision": state["revision"]}
+        if state["phase"] != "formalizing" or (state["formalization"].get("contract") or {}).get("version") != 3:
+            raise ValueError("refinement requires an active informal formalization plan")
+        formal, tasks = state["formalization"], state["formal_tasks"]
+        if any(row.get("status") == "merging" for row in state["formal_candidates"].values()):
+            raise ValueError("cannot refine while an exact candidate is integrating")
+        node_fields = {"id", "task_id", "title", "predicted_kind", "informal_statement", "informal_proof",
+                       "statement_dependencies", "proof_dependencies", "dependencies", "source_components",
+                       "anchor_ids", "requirement_ids", "proposed_formal_statement", "proposed_formal_strategy"}
+        rows = {key: {field: deepcopy(task[field]) for field in node_fields if field in task}
+                for key, task in tasks.items()}
+        reopen_ids = set()
+        for row in reopens:
+            if not isinstance(row, dict) or set(row) != {"task_id", "reason"}:
+                raise ValueError("representation reopening requires task_id and reason")
+            key = _text(row["task_id"], "task_id")
+            _text(row["reason"], "representation correction reason")
+            if key not in tasks or key in reopen_ids:
+                raise ValueError("representation reopening has unknown or duplicate task ids")
+            reopen_ids.add(key)
+        changed_ids = set()
+        for row in upserts:
+            if not isinstance(row, dict) or set(row) - node_fields:
+                raise ValueError("node updates may only contain informal metadata, not runtime status or outputs")
+            key = _text(row.get("id", row.get("task_id")), "node id")
+            if key in changed_ids:
+                raise ValueError("duplicate upsert id")
+            if key in state["retired_tasks"] and key not in tasks:
+                raise ValueError("retired node ids cannot be reused; choose a fresh stable id")
+            changed_ids.add(key)
+            rows[key] = {**rows.get(key, {}), **deepcopy(row), "id": key, "task_id": key}
+        removed, replacement_map = set(), {}
+        for row in replacements:
+            if not isinstance(row, dict) or set(row) != {"old_ids", "new_ids", "reason"}:
+                raise ValueError("replacement requires old_ids, new_ids and reason")
+            old_ids = _reference_list(row["old_ids"], "old_ids")
+            new_ids = _reference_list(row["new_ids"], "new_ids")
+            _text(row["reason"], "replacement reason")
+            if (set(old_ids) - tasks.keys() or set(new_ids) - rows.keys()
+                    or set(old_ids) & set(new_ids) or removed & set(old_ids)):
+                raise ValueError("replacement references unknown, overlapping or repeated nodes")
+            removed.update(old_ids)
+            replacement_map.update({key: new_ids for key in old_ids})
+        if removed & {key for values in replacement_map.values() for key in values}:
+            raise ValueError("replacement cannot refer to another removed node")
+        for key in removed:
+            rows.pop(key)
+        def remap(ids):
+            return sorted({new for key in ids for new in replacement_map.get(key, [key])})
+        requirements = deepcopy(formal["requirements"])
+        for requirement in requirements:
+            requirement["tasks"] = remap(requirement["tasks"])
+        # Adding a supporting node is an explicit additional implementation of its
+        # cited obligations. It cannot remove another node's coverage implicitly.
+        for key in changed_ids - tasks.keys():
+            for requirement in requirements:
+                if requirement["id"] in rows[key].get("requirement_ids", []):
+                    requirement["tasks"] = sorted(set(requirement["tasks"]) | {key})
+        spec = deepcopy(formal["spec"])
+        prerequisites = {row["id"]: row for row in spec["prerequisites"]}
+        resolved_ids, correspondence_affected = set(), set()
+        for row in resolutions:
+            if not isinstance(row, dict) or set(row) != {"id", "resolution"}:
+                raise ValueError("prerequisite resolution edit requires id and resolution")
+            key = _text(row["id"], "prerequisite id")
+            if key not in prerequisites or key in resolved_ids:
+                raise ValueError("prerequisite resolution has unknown or duplicate ids")
+            resolved_ids.add(key)
+            if prerequisites[key]["resolution"] != row["resolution"]:
+                correspondence_affected.update(prerequisites[key]["needed_by"])
+            prerequisites[key]["resolution"] = deepcopy(row["resolution"])
+        for prerequisite in spec["prerequisites"]:
+            prerequisite["needed_by"] = remap(prerequisite["needed_by"])
+            resolution = prerequisite["resolution"]
+            if resolution.get("kind") == "task" and resolution["task_id"] in replacement_map:
+                replacement = replacement_map[resolution["task_id"]]
+                if len(replacement) != 1:
+                    raise ValueError("split a referenced prerequisite only after refining its explicit resolution")
+                resolution["task_id"] = replacement[0]
+        for row in rows.values():
+            for field in ("statement_dependencies", "proof_dependencies"):
+                row[field] = remap(row.get(field, []))
+            row["dependencies"] = sorted(set(row["statement_dependencies"]) | set(row["proof_dependencies"]))
+            row["requirement_ids"] = sorted(req["id"] for req in requirements if row["id"] in req["tasks"])
+        requirements = normalize_requirements(requirements, rows, source_refs(state))
+        spec = normalize_spec(spec, source=formal_source(state), requirements=requirements, tasks=rows, allow_unresolved=True)
+        nodes = normalize_informal_nodes(rows, requirements, spec, formal_source(state))
+        affected = removed | reopen_ids | {key for key in nodes.keys() & tasks.keys()
+                              if informal_interpretation_hash(nodes[key]) != informal_interpretation_hash(tasks[key])}
+        affected = _invalidate_informal_tasks(state, affected, reason="informal graph refined") if affected else set()
+        for key in removed:
+            retired = tasks.pop(key)
+            retired.update(status="superseded", replaced_by=replacement_map[key])
+            state["retired_tasks"][key] = retired
+        for key, node in nodes.items():
+            previous = deepcopy(tasks.get(key, {}))
+            tasks[key] = {**previous, **node, "description": node["informal_statement"],
+                          "interpretation_sha256": informal_interpretation_hash(node)}
+            if previous and any(previous.get(field) != node.get(field) for field in node):
+                tasks[key].setdefault("interpretation_history", []).append({"author": author, "timestamp": time.time(),
+                    "interpretation": {field: previous.get(field) for field in node_fields}})
+            if not previous:
+                tasks[key].update(revision=1, status="pending", accepted_candidate=None, outputs=[], lean_decl="", lean_file="",
+                    representation={"status": "missing", "candidate_id": None},
+                    verification={"status": "pending", "candidate_id": None},
+                    faithfulness={"status": "unreviewed", "verdict_id": None})
+        formal.update(requirements=requirements, spec=spec)
+        formal["contract"].update(requirements=deepcopy(requirements), spec=deepcopy(spec),
+                                  spec_sha256=digest(spec), obligation_ids=sorted(tasks))
+        libraries = {row["resolution"]["declaration"] for row in spec["prerequisites"]
+                     if row["resolution"]["kind"] == "library"}
+        formal["contract"]["external_declarations"] = {key: row for key, row in
+            formal["contract"].get("external_declarations", {}).items() if key in libraries}
+        for task_id in _dependent_closure(tasks, correspondence_affected) & tasks.keys():
+            task = tasks[task_id]
+            task.setdefault("history", []).append({"timestamp": time.time(), "reason": "prerequisite resolution refined",
+                                                    "faithfulness": deepcopy(task["faithfulness"])})
+            task["faithfulness"] = {"status": "stale", "verdict_id": None}
+        formal["contract"]["sha256"] = _contract_digest(formal["contract"])
+        _invalidate_review(state)
+        record = {"author": author, "timestamp": time.time(), "previous_revision": expected_revision,
+                  "changes": deepcopy(changes), "affected_tasks": sorted(affected)}
+        state["refinements"].append(record)
+        _event(state, "chunks_refined", author=author, affected_tasks=sorted(affected),
+               task_ids=sorted(changed_ids), replacements=deepcopy(replacements))
+    return {"status": "refined", "revision": expected_revision + 1, "affected_tasks": sorted(affected)}
+
+
 def initialize_formal_tasks(
     forum_dir: Path,
     chunks: list[dict],
@@ -1075,13 +1387,34 @@ def _validate_requirements(requirements, tasks: dict, source_refs: set[str]) -> 
 
 def ready_formal_tasks(state: dict) -> list[dict]:
     tasks = state.get("formal_tasks", {})
-    return [
-        task for task in tasks.values()
-        if task.get("status") == "pending"
-        and not source_issues_blocking_task(state, task["task_id"])
-        and all(tasks.get(dep, {}).get("status") == "complete"
-                for dep in task.get("dependencies", []))
-    ]
+    return [task for task in tasks.values() if task_ready(state, task)]
+
+
+def interface_available(state: dict, task: dict | str) -> bool:
+    task = state.get("formal_tasks", {}).get(task, {}) if isinstance(task, str) else task
+    return bool(task and (task.get("status") == "complete"
+                         or task.get("representation", {}).get("status") == "adopted"))
+
+
+def task_ready(state: dict, task: dict | str) -> bool:
+    task = state.get("formal_tasks", {}).get(task, {}) if isinstance(task, str) else task
+    if (not task or task.get("status") != "pending"
+            or source_issues_blocking_task(state, task["task_id"])):
+        return False
+    if "statement_dependencies" in task:
+        return all(interface_available(state, dep) for dep in task["statement_dependencies"])
+    return all(state["formal_tasks"].get(dep, {}).get("status") == "complete"
+               for dep in task.get("dependencies", []))
+
+
+def assignment_view(state: dict, task_id: str) -> dict:
+    strategies = [row for row in state.get("strategies", {}).values()
+                  if row.get("target") == task_id and row.get("status") in {"claimed", "paused"}
+                  and strategy_is_current(state, row) and row.get("owner")]
+    return {"status": "assigned" if strategies else "unassigned",
+            "owners": sorted({row["owner"] for row in strategies}),
+            "assistants": sorted({name for row in strategies for name in row.get("assistants", [])}),
+            "strategy_ids": [row["strategy_id"] for row in strategies]}
 
 
 def submit_formal_candidate(
@@ -1095,7 +1428,12 @@ def submit_formal_candidate(
     *,
     notes: str = "",
     supersedes: str = "",
+    stage: str = "complete",
+    outputs: list[dict] | None = None,
 ) -> dict:
+    if stage not in {"representation", "complete"}:
+        raise ValueError("candidate stage must be representation or complete")
+    normalized_outputs = normalize_outputs(outputs) if outputs is not None else None
     commit_sha = commit_sha.casefold()
     if not _FULL_SHA_RE.fullmatch(commit_sha):
         raise ValueError("commit_sha must be a full 40-character commit")
@@ -1109,6 +1447,9 @@ def submit_formal_candidate(
         task = state["formal_tasks"].get(task_id)
         if not task or task.get("status") == "complete":
             raise ValueError("formal task is unknown or already complete")
+        bindings = normalized_outputs if normalized_outputs is not None else deepcopy(task.get("outputs", []))
+        if (state["formalization"].get("contract") or {}).get("version") == 3 and not bindings:
+            raise ValueError("a first candidate requires its declaration/file outputs")
         strategy = state["strategies"].get(strategy_id)
         if (
             not strategy
@@ -1133,6 +1474,8 @@ def submit_formal_candidate(
                     and existing.get("commit_sha") == commit_sha
                     and existing.get("base_main_sha") == base_main_sha.casefold()
                     and existing.get("diff_sha256") == diff_sha256
+                    and existing.get("stage", "complete") == stage
+                    and existing.get("outputs", []) == bindings
                 ):
                     return {"status": "submitted", "candidate": existing, "idempotent": True}
                 return {"status": "conflict", "candidate": existing}
@@ -1153,6 +1496,8 @@ def submit_formal_candidate(
             "solution_sha256": state["formalization"]["solution_sha256"],
             "formalization_revision": state["formalization"]["revision"],
             "task_revision": task["revision"],
+            "stage": stage,
+            "outputs": bindings,
             "source_components": list(task.get("source_components", [])),
             "notes": _text(notes, "notes", 2000, required=False),
             "supersedes": supersedes or None,
@@ -1197,6 +1542,7 @@ def finish_formal_merge(
     error: str = "",
     build: dict | None = None,
     verification: dict | None = None,
+    proposed_contract: dict | None = None,
 ) -> dict:
     with transaction(forum_dir) as state:
         candidate = state["formal_candidates"].get(candidate_id)
@@ -1212,26 +1558,67 @@ def finish_formal_merge(
         if success:
             if not _FULL_SHA_RE.fullmatch(main_sha.casefold()):
                 raise ValueError("successful merge requires a full main commit")
+            current_contract = state["formalization"].get("contract") or {}
+            proposed = proposed_contract or (verification or {}).get("proposed_contract")
+            contract = proposed or current_contract
             if (not verification or verification.get("status") != "passed"
-                    or verification.get("contract_sha256") != (state["formalization"].get("contract") or {}).get("sha256")
-                    or not state["formalization"].get("contract")):
+                    or verification.get("contract_sha256") != contract.get("sha256") or not contract):
                 raise ValueError("successful merge requires verification against the current formal contract")
+            incremental = current_contract.get("version") == 3
+            if incremental:
+                if (contract.get("sha256") != _contract_digest(contract)
+                        or contract.get("solution_candidate") != current_contract["solution_candidate"]
+                        or contract.get("solution_sha256") != current_contract["solution_sha256"]
+                        or contract.get("spec_sha256") != current_contract["spec_sha256"]
+                        or contract.get("requirements") != current_contract["requirements"]
+                        or contract.get("environment") != current_contract["environment"]
+                        or contract.get("obligation_ids") != current_contract.get("obligation_ids")):
+                    raise ValueError("candidate contract extension changed the bound source plan or environment")
+                for name, target in current_contract.get("targets", {}).items():
+                    # Proof-only dependency receipts may refresh after a proof is
+                    # filled. The protected semantic fingerprint must not change.
+                    if contract.get("targets", {}).get(name, {}).get("fingerprint") != target.get("fingerprint"):
+                        raise ValueError("candidate contract extension changed an adopted target")
+                for key, bindings in current_contract.get("bindings", {}).items():
+                    if contract.get("bindings", {}).get(key) != bindings:
+                        raise ValueError("candidate contract extension changed an adopted binding")
+                bindings = normalize_outputs(contract.get("bindings", {}).get(task["task_id"], []))
+                if not bindings or bindings != candidate["outputs"]:
+                    raise ValueError("candidate outputs differ from the verified task binding")
+                if candidate.get("stage", "complete") == "complete":
+                    expected = {row["declaration"]: contract["targets"][row["declaration"]]["fingerprint"] for row in bindings}
+                    if any(verification.get("verified_targets", {}).get(key) != value for key, value in expected.items()):
+                        raise ValueError("complete candidate requires exact task-local kernel receipts")
+                state["formalization"]["contract"] = deepcopy(contract)
             candidate["status"] = "merged"
             candidate["main_sha"] = main_sha.casefold()
-            task["status"] = "complete"
-            task["accepted_candidate"] = candidate_id
+            representation_only = candidate.get("stage", "complete") == "representation"
+            task["status"] = "pending" if representation_only else "complete"
+            task["accepted_candidate"] = None if representation_only else candidate_id
+            task["outputs"] = deepcopy(candidate.get("outputs", task.get("outputs", [])))
+            if task["outputs"]:
+                task["lean_decl"] = task["outputs"][0]["declaration"]
+                task["lean_file"] = task["outputs"][0]["file"]
+            task["representation"] = {"status": "adopted", "candidate_id": candidate_id}
+            task["verification"] = {"status": "pending" if representation_only else "verified",
+                                    "candidate_id": None if representation_only else candidate_id,
+                                    "verified_targets": deepcopy(verification.get("verified_targets", {}))}
+            task["faithfulness"] = {"status": "unreviewed", "verdict_id": None}
             state["formalization"]["main_sha"] = main_sha.casefold()
             _invalidate_review(state)
             for obstacle in state["obstacles"].values():
-                if obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
+                if not representation_only and obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
                     obstacle["status"] = "resolved"
                     obstacle["resolved_by"] = candidate_id
             for strategy in state["strategies"].values():
                 if strategy.get("phase") == "formalizing" and strategy.get("target") == task["task_id"] and strategy.get("status") in _ACTIVE_STRATEGIES:
-                    strategy["status"] = "succeeded" if strategy["strategy_id"] == candidate["strategy_id"] else "cancelled"
-                    strategy.pop("paused_from", None)
+                    if representation_only:
+                        strategy["status"] = strategy.pop("paused_from", "registered")
+                    else:
+                        strategy["status"] = "succeeded" if strategy["strategy_id"] == candidate["strategy_id"] else "cancelled"
+                        strategy.pop("paused_from", None)
             _event(state, "formal_candidate_merged", candidate_id=candidate_id,
-                   task_id=task["task_id"], main_sha=main_sha.casefold())
+                   task_id=task["task_id"], main_sha=main_sha.casefold(), stage=candidate.get("stage", "complete"))
         else:
             candidate["status"] = "failed"
             candidate["error"] = _text(error, "error", 4000, required=False)
@@ -1324,7 +1711,9 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
     accepted = {task_id: task.get("accepted_candidate") for task_id, task in tasks.items()}
     if report.get("accepted_candidates") != accepted:
         raise ValueError("review snapshot has stale accepted candidates")
-    expected_declarations = {task["lean_decl"]: task_id for task_id, task in tasks.items()}
+    expected_declarations = ({row["declaration"]: task_id for task_id, task in tasks.items()
+                              for row in task.get("outputs", [])} if contract.get("version") == 3 else
+                             {task["lean_decl"]: task_id for task_id, task in tasks.items()})
     if report.get("declarations") != expected_declarations:
         raise ValueError("review snapshot declarations do not match the formal tasks")
     if set(contract.get("targets", {})) != set(expected_declarations):
@@ -1338,7 +1727,15 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
         if (candidate.get("status") != "merged" or candidate.get("task_id") != task_id
                 or not candidate_is_current(state, candidate)):
             raise ValueError("review snapshot requires current merged candidates for every task")
-        if candidate.get("verification", {}).get("contract_sha256") != contract["sha256"]:
+        if contract.get("version") == 3:
+            expected = {row["declaration"]: contract["targets"][row["declaration"]]["fingerprint"]
+                        for row in tasks[task_id].get("outputs", [])}
+            receipt = candidate.get("verification", {})
+            if (not expected or receipt.get("status") != "passed"
+                    or candidate.get("stage", "complete") != "complete"
+                    or any(receipt.get("verified_targets", {}).get(key) != value for key, value in expected.items())):
+                raise ValueError("review requires exact task-local kernel verification receipts")
+        elif candidate.get("verification", {}).get("contract_sha256") != contract["sha256"]:
             receipt = tasks[task_id].get("revalidation", {})
             if (receipt.get("status") != "passed" or receipt.get("contract_sha256") != contract["sha256"]
                     or task_id not in receipt.get("task_ids", [])):
@@ -1348,9 +1745,32 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
 def record_review_snapshot(forum_dir: Path, report: dict) -> dict:
     """Record controller checks; this internal API is not exposed to workers via MCP."""
     report = deepcopy(report)
+    proposed = report.pop("proposed_contract", None)
+    base_contract_sha256 = report.pop("base_contract_sha256", None)
     with transaction(forum_dir) as state:
         if state["phase"] not in {"formalizing", "critic"}:
             raise ValueError("review snapshots can only be recorded for an active formalization")
+        current = state["formalization"].get("contract") or {}
+        recorded_extension = (proposed is not None and current == proposed
+                              and state["review_snapshots"].get(report.get("snapshot_id")) == report)
+        if proposed is not None and not recorded_extension:
+            if (report.get("passed") is not True or current.get("version") != 3
+                    or not isinstance(proposed, dict) or proposed.get("version") != 3
+                    or base_contract_sha256 != current.get("sha256")
+                    or proposed.get("sha256") != _contract_digest(proposed)
+                    or report.get("contract_sha256") != proposed.get("sha256")):
+                raise ValueError("final contract evidence has a stale or invalid controller binding")
+            for field in ("solution_candidate", "solution_sha256", "environment", "requirements",
+                          "spec", "spec_sha256", "bindings", "obligation_ids"):
+                if proposed.get(field) != current.get(field):
+                    raise ValueError("final evidence cannot change source, environment or adopted bindings")
+            if (set(proposed.get("targets", {})) != set(current.get("targets", {}))
+                    or any(proposed["targets"][name].get("fingerprint") != row.get("fingerprint")
+                           for name, row in current.get("targets", {}).items())):
+                raise ValueError("final evidence cannot change protected target meanings")
+            # Only the controller can call this function. Remaining snapshot
+            # checks bind its exact source/main and receipts inside this same CAS.
+            state["formalization"]["contract"] = deepcopy(proposed)
         _validate_snapshot_binding(state, report, require_passed=report.get("passed") is True)
         existing = state["review_snapshots"].get(report["snapshot_id"])
         if existing is not None and existing != report:
@@ -1385,6 +1805,8 @@ def reopen_after_machine_failure(forum_dir: Path, report: dict) -> dict:
                 state["formal_candidates"][candidate_id]["status"] = "superseded"
             task["status"] = "pending"
             task["accepted_candidate"] = None
+            task["verification"] = {"status": "stale", "candidate_id": candidate_id}
+            task["faithfulness"] = {"status": "stale", "verdict_id": None}
         for strategy in state["strategies"].values():
             if strategy.get("phase") == "formalizing" and strategy.get("status") in _ACTIVE_STRATEGIES:
                 strategy["status"] = "cancelled"
@@ -1497,10 +1919,13 @@ def submit_critic_verdict(
             for task_id in reopened:
                 task = state["formal_tasks"][task_id]
                 accepted = task.get("accepted_candidate")
-                if accepted in state["formal_candidates"]:
+                incremental = state["formalization"]["contract"].get("version") == 3
+                if accepted in state["formal_candidates"] and not incremental:
                     state["formal_candidates"][accepted]["status"] = "superseded"
                 task["status"] = "pending"
-                task["accepted_candidate"] = None
+                if not incremental:
+                    task["accepted_candidate"] = None
+                task["faithfulness"] = {"status": "changes_requested", "verdict_id": item["verdict_id"]}
             for strategy in state["strategies"].values():
                 if (strategy.get("phase") == "formalizing" and strategy.get("target") in reopened
                         and strategy.get("status") in _ACTIVE_STRATEGIES):
@@ -1542,6 +1967,11 @@ def _validate_semantic_review(state: dict, review: dict, *, approved: bool, auth
                 raise ValueError(f"declaration '{declaration}' is unrelated to requirement '{requirement_id}'")
         if approved and (entry["status"] != "pass" or not refs):
             raise ValueError("approval requires every requirement to pass with declaration references")
+        if approved and state["formalization"]["contract"].get("version") == 3:
+            expected_outputs = {row["declaration"] for task_id in ledger[requirement_id]["tasks"]
+                                for row in state["formal_tasks"][task_id].get("outputs", [])}
+            if set(refs) != expected_outputs:
+                raise ValueError("approval must review every adopted output, including definitions, for the requirement")
     if approved and seen != set(ledger):
         raise ValueError("approval requires exact coverage of every requirement")
     if not review["scope_rationale"].strip():
@@ -1583,6 +2013,8 @@ def complete_critic_review(forum_dir: Path, snapshot_id: str, verdict_id: str) -
         formal["pending_verdict_id"] = None
         formal["accepted_verdict_id"] = verdict_id
         state["phase"] = "complete"
+        for task in state["formal_tasks"].values():
+            task["faithfulness"] = {"status": "approved", "verdict_id": verdict_id}
         for obstacle in state["obstacles"].values():
             if obstacle.get("status") == "open":
                 obstacle["status"] = "resolved"

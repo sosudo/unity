@@ -7,12 +7,14 @@ that judgment. No printed-expression or textual-discovery fallback is allowed.
 This is not an adversarial Lean sandbox or an external proof checker. It assumes
 a trusted toolchain/dependency installation; arbitrary elaborator I/O outside the
 recorded project inputs is not isolated. Structural identity is intentionally
-conservative and may reject harmless refactors, which require re-chunking.
+conservative and may reject harmless refactors, which require an explicit
+representation revision rather than silently changing an adopted target.
 """
 
 from __future__ import annotations
 
 import hashlib
+import copy
 import json
 import os
 import re
@@ -287,7 +289,8 @@ def inspect_declarations(root: Path, tasks: list[dict]) -> dict:
 
 
 def _semantic_record(record: dict) -> dict:
-    return {key: value for key, value in record.items() if key not in {"axioms", "signature"}}
+    return {key: value for key, value in record.items()
+            if key not in {"axioms", "signature", "proof_dependencies"}}
 
 
 def _external_records(records: dict) -> dict:
@@ -423,17 +426,213 @@ def freeze_formal_contract(paths, dag: dict) -> dict:
     return contract
 
 
+def _seal_contract(contract: dict) -> dict:
+    body = {key: copy.deepcopy(value) for key, value in contract.items()
+            if key not in {"sha256", "artifact_id"}}
+    return {**body, "sha256": digest(body)}
+
+
+def initialize_source_contract(paths, dag: dict) -> dict:
+    """Pin an informal plan without generating, building, or inspecting Lean.
+
+    A plan records obligations, not trusted declarations. Only successful exact
+    candidate checks can extend ``bindings`` and ``targets`` later.
+    """
+    from . import autoformalize_state
+
+    source = autoformalize_state.formal_source(autoformalize_state.load_state(paths.forum))
+    if (not source or dag.get("solution_candidate") != source["candidate_id"]
+            or dag.get("solution_sha256") != source["sha256"]):
+        raise ValueError("informal plan must target the current supplied-source snapshot")
+    chunks = dag["chunks"]
+    requirements = normalize_requirements(dag["requirements"], chunks,
+                                         {row["ref_id"] for row in source["source_refs"]})
+    spec = normalize_spec(dag.get("spec"), source=source, requirements=requirements,
+                          tasks=chunks, allow_unresolved=True)
+    contract = _seal_contract({
+        "version": 3,
+        "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
+        "requirements": requirements, "spec": spec, "spec_sha256": digest(spec),
+        "environment": environment_identity(paths.project_root),
+        "source_main_sha": _git(paths.project_root, "rev-parse", "HEAD"),
+        "obligation_ids": sorted(row.get("task_id", row.get("id")) for row in chunks),
+        "bindings": {}, "targets": {}, "external_declarations": {},
+    })
+    record = artifacts.store_text(paths.artifacts, json.dumps({"contract": contract}, sort_keys=True) + "\n",
+                                  kind="autoformalize_source_contract", producer="Unity")
+    return {**contract, "artifact_id": record["artifact_id"]}
+
+
+def invalidate_bindings(contract: dict, task_ids: set[str]) -> tuple[dict, set[str]]:
+    """Explicit revisions invalidate actual meaning dependencies, not just DAG hints.
+
+    Return new current state; never edit historical contracts or candidates. A
+    removed binding can only be adopted again by another checked candidate.
+    """
+    result = copy.deepcopy(contract)
+    affected = set(task_ids)
+    bindings = result.get("bindings", {})
+    targets = result.get("targets", {})
+    while True:
+        names = {output["declaration"] for key in affected for output in bindings.get(key, [])}
+        added = {key for key, outputs in bindings.items()
+                 if any(names.intersection(
+                     targets.get(output["declaration"], {}).get("meaning_dependencies", [])
+                     + targets.get(output["declaration"], {}).get("verification_dependencies", []))
+                     for output in outputs)} - affected
+        if not added:
+            break
+        affected.update(added)
+    removed_names = {output["declaration"] for key in affected for output in bindings.get(key, [])}
+    result["bindings"] = {key: outputs for key, outputs in bindings.items() if key not in affected}
+    result["targets"] = {name: row for name, row in targets.items() if name not in removed_names}
+    return _seal_contract(result), affected
+
+
+def _binding_tasks(contract: dict) -> list[dict]:
+    return [{"task_id": task_id, "lean_decl": output["declaration"], "lean_file": output["file"]}
+            for task_id, outputs in contract.get("bindings", {}).items() for output in outputs]
+
+
+def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *, completed: set[str],
+                                proposed_outputs: list[dict] | None, task_id: str | None,
+                                stage: str, final: bool, layout: dict | None,
+                                environment: dict | None, timings: dict | None) -> dict:
+    issues = []
+    proposed = copy.deepcopy(contract)
+    task_ids = {task.get("task_id", task.get("id")) for task in tasks}
+    if stage not in {"representation", "complete"}:
+        return {"passed": False, "issues": ["invalid candidate formalization stage"], "targets": {}}
+    if set(contract.get("obligation_ids", [])) != task_ids:
+        issues.append("source contract obligations differ from the current task graph")
+    if set(completed) - task_ids:
+        issues.append("completion references unknown formalization tasks")
+    try:
+        bindings = proposed.setdefault("bindings", {})
+        if not isinstance(bindings, dict) or not isinstance(proposed.get("targets"), dict):
+            raise ValueError("source contract has invalid adopted output bindings")
+        old_names = [row["lean_decl"] for row in _binding_tasks(contract)]
+        if len(set(old_names)) != len(old_names) or set(old_names) != set(contract["targets"]):
+            raise ValueError("source contract target identities do not match adopted bindings")
+        if set(bindings) - task_ids or any(not rows for rows in bindings.values()):
+            raise ValueError("source contract contains invalid task bindings")
+        if proposed_outputs is not None:
+            if task_id not in task_ids or not isinstance(proposed_outputs, list) or not proposed_outputs:
+                raise ValueError("candidate outputs require a current task and nonempty declaration/file list")
+            outputs = []
+            for output in proposed_outputs:
+                if (not isinstance(output, dict) or set(output) != {"declaration", "file"}
+                        or any(not isinstance(value, str) or not value.strip()
+                               or value != value.strip() for value in output.values())
+                        or output["declaration"].startswith("-")):
+                    raise ValueError("candidate outputs require exact declaration and file names")
+                outputs.append(dict(output))
+            outputs.sort(key=lambda row: row["declaration"])
+            names = {row["declaration"] for row in outputs}
+            if len(names) != len(outputs):
+                raise ValueError("candidate outputs repeat declarations")
+            owners = {output["declaration"]: owner for owner, rows in bindings.items() for output in rows}
+            if any(owners.get(name, task_id) != task_id for name in names):
+                raise ValueError("candidate output already belongs to another source obligation")
+            if task_id in bindings and sorted(bindings[task_id], key=lambda row: row["declaration"]) != outputs:
+                raise ValueError("adopted output manifest changed; explicitly revise the node before replacing it")
+            bindings[task_id] = outputs
+        actual_tasks = _binding_tasks(proposed)
+        if not actual_tasks:
+            raise ValueError("no Lean representations have been adopted or proposed")
+        layout = workspace_layout(root) if layout is None else layout
+        for row in actual_tasks:
+            module_for_file(root, row["lean_file"], layout["modules"])
+        expected = sorted({row["resolution"]["declaration"] for row in contract["spec"]["prerequisites"]
+                           if row["resolution"]["kind"] == "library"
+                           and (final or set(row["needed_by"]).intersection(bindings))})
+        # Retain already inspected prerequisite identities across unrelated node
+        # additions. Future, merely predicted prerequisites need not be imported.
+        expected = sorted(set(expected) | set(contract.get("external_declarations", {})))
+        inspection = inspect_environment(root, actual_tasks, layout=layout, timings=timings,
+                                         external_declarations=expected)
+        external_records = _external_records(inspection["external_declarations"])
+    except autoformalize_jobs.JobCancelled:
+        raise
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"passed": False, "issues": [*issues, str(exc)], "targets": {}}
+    environment = environment_identity(root) if environment is None else environment
+    if environment != contract["environment"]:
+        issues.append("toolchain or dependency environment changed from the formal contract")
+    for name, previous in contract.get("external_declarations", {}).items():
+        if external_records[name]["fingerprint"] != previous.get("fingerprint"):
+            issues.append(f"external prerequisite signature changed: {name}")
+    native = _native_axioms(inspection["project_used_axioms"])
+    if native:
+        issues.append("project uses native evaluation axioms: " + ", ".join(sorted(native)))
+    targets = inspection["targets"]
+    checked_complete = set(completed)
+    if task_id is not None:
+        if stage == "complete":
+            checked_complete.add(task_id)
+        else:
+            checked_complete.discard(task_id)
+    if checked_complete - set(bindings):
+        issues.append("completed tasks have no adopted output manifest")
+    if final:
+        if set(bindings) != task_ids or checked_complete != task_ids:
+            issues.append("not every source obligation has a complete Lean representation")
+        if any(row["resolution"]["kind"] == "unresolved" for row in contract["spec"]["prerequisites"]):
+            issues.append("source prerequisites remain unresolved")
+        if inspection["project_axioms"]:
+            issues.append("project retains custom axioms: " + ", ".join(inspection["project_axioms"]))
+        if inspection["project_sorries"]:
+            issues.append("project retains proof holes: " + ", ".join(inspection["project_sorries"]))
+    verified_targets = {}
+    for task in actual_tasks:
+        name, owner = task["lean_decl"], task["task_id"]
+        row = targets[name]
+        fingerprint = digest(_semantic_record(row))
+        if row["module"] != module_for_file(root, task["lean_file"], layout["modules"]):
+            issues.append(f"candidate declaration {name} is not in {task['lean_file']}")
+        if name in contract["targets"] and fingerprint != contract["targets"][name].get("fingerprint"):
+            issues.append(f"contract changed for {name}: type, definition, or declaration identity differs")
+        if row["target_kind"] == "axiom":
+            issues.append(f"candidate declaration {name} is an axiom")
+        if '"sorryAx"' in json.dumps(_semantic_record(row)):
+            issues.append(f"{name} has a proof hole in its type or meaning-bearing definitions")
+        allowed = AXIOMS | ({"sorryAx"} if owner not in checked_complete and row["target_kind"] == "theorem" else set())
+        unexpected = set(row["axioms"]) - allowed
+        if unexpected:
+            issues.append(f"{name} depends on forbidden axioms: {', '.join(sorted(unexpected))}")
+        proposed["targets"][name] = {"target_kind": row["target_kind"], "module": row["module"],
+                                     "fingerprint": fingerprint,
+                                     "meaning_dependencies": sorted(row.get("meanings", {})),
+                                     "verification_dependencies": sorted(row.get("proof_dependencies", []))}
+        if owner in checked_complete:
+            verified_targets[name] = fingerprint
+    proposed["external_declarations"] = external_records
+    return {"passed": not issues, "issues": issues, "targets": targets,
+            "external_declarations": external_records,
+            "verified_tasks": sorted(checked_complete), "verified_targets": verified_targets,
+            "final": final,
+            **({"proposed_contract": _seal_contract(proposed)} if not issues else {})}
+
+
 def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
                           *, completed: set[str], layout: dict | None = None,
-                          environment: dict | None = None, timings: dict | None = None) -> dict:
-    """Identity is conservative: harmless signature refactors require re-chunking."""
+                          environment: dict | None = None, timings: dict | None = None,
+                          proposed_outputs: list[dict] | None = None, task_id: str | None = None,
+                          stage: str = "complete", final: bool = False) -> dict:
+    """Check exact adopted meaning; new representations extend it only on success."""
     body = {key: value for key, value in contract.items() if key not in {"sha256", "artifact_id"}}
     if not contract or digest(body) != contract.get("sha256"):
         return {"passed": False, "issues": ["formal contract is missing or corrupt"], "targets": {}}
-    if contract.get("version") != 2 or not isinstance(contract.get("spec"), dict):
+    if contract.get("version") not in {2, 3} or not isinstance(contract.get("spec"), dict):
         return {"passed": False, "issues": ["formal contract lacks source-evidence metadata; re-chunk it"], "targets": {}}
     if digest(contract["spec"]) != contract.get("spec_sha256"):
         return {"passed": False, "issues": ["formal contract spec digest is inconsistent"], "targets": {}}
+    if contract.get("version") == 3:
+        return _check_incremental_contract(
+            root, contract, tasks, completed=completed, proposed_outputs=proposed_outputs,
+            task_id=task_id, stage=stage, final=final, layout=layout,
+            environment=environment, timings=timings,
+        )
     issues = []
     environment = environment_identity(root) if environment is None else environment
     if environment != contract["environment"]:
@@ -539,7 +738,12 @@ def snapshot_is_current(paths, state: dict, snapshot: dict) -> bool:
         and current["source_sha256"] == snapshot.get("source_sha256")
         and current["environment"] == snapshot.get("environment")
         and contract.get("sha256") == snapshot.get("contract_sha256")
-        and contract.get("version") == 2
+        and contract.get("version") in {2, 3}
+        and (contract.get("version") != 3
+             or (contract.get("sha256") == _seal_contract(contract)["sha256"]
+                 and {row["lean_decl"]: row["task_id"] for row in _binding_tasks(contract)}
+                 == snapshot.get("declarations")
+                 and all(task.get("status") == "complete" for task in state["formal_tasks"].values())))
         and contract.get("spec_sha256") == snapshot.get("spec_sha256")
         == digest(formal.get("spec")) == digest(contract.get("spec"))
         and snapshot.get("repairs_sha256") == repair_digest(state)
@@ -569,27 +773,47 @@ def verify_final_project(paths, state: dict) -> dict:
                  if candidate.get("status") == "merged" and candidate.get("main_sha") == before["main_sha"]), {})
     verification = last.get("verification") or {}
     complete_ids = set(state["formal_tasks"])
-    reusable = (verification.get("status") == "passed"
-                and verification.get("source_identity") == before
+    build_reusable = (verification.get("status") == "passed"
+                      and verification.get("source_identity") == before
+                      and last.get("build", {}).get("returncode") == 0)
+    reusable = (build_reusable
                 and verification.get("contract_sha256") == formal.get("contract", {}).get("sha256")
-                and set(verification.get("verified_tasks", [])) == complete_ids
-                and last.get("build", {}).get("returncode") == 0)
+                and set(verification.get("verified_tasks", [])) == complete_ids)
+    if contract.get("version") == 3:
+        expected_targets = {name: row["fingerprint"] for name, row in contract.get("targets", {}).items()}
+        reusable = (reusable and verification.get("final") is True
+                    and verification.get("verified_targets") == expected_targets
+                    and set(contract.get("bindings", {})) == complete_ids)
     if reusable:
         build = {"returncode": 0, "reused_candidate": last["candidate_id"]}
         check = {"passed": True, "issues": [], "targets": {},
                  "reused_verification": verification.get("artifact_id")}
     else:
-        build = build_sources(root, full=True)
-        check = (check_formal_contract(root, formal.get("contract", {}), tasks, completed=complete_ids)
+        # Even if a plan's evidence metadata changed, exactly unchanged checked
+        # source needs no second build. Its current source contract is inspected
+        # afresh, including global holes and coverage, before semantic review.
+        build = ({"returncode": 0, "reused_candidate": last["candidate_id"]}
+                 if contract.get("version") == 3 and build_reusable else build_sources(root, full=True))
+        check = (check_formal_contract(root, formal.get("contract", {}), tasks,
+                                       completed=complete_ids, final=True)
                  if not build["returncode"] else
                  {"passed": False, "issues": ["final project build failed"], "targets": {}})
     issues = list(check["issues"])
-    if (contract.get("version") != 2 or not isinstance(formal.get("spec"), dict)
+    if (contract.get("version") not in {2, 3} or not isinstance(formal.get("spec"), dict)
             or digest(formal.get("spec")) != contract.get("spec_sha256")
             or digest(contract.get("spec")) != contract.get("spec_sha256")):
         issues.append("source-evidence spec is missing or inconsistent; re-chunk it")
     if any(task.get("status") != "complete" for task in tasks) or not tasks:
         issues.append("formal tasks are incomplete")
+    if contract.get("version") == 3:
+        if contract.get("sha256") != _seal_contract(contract)["sha256"]:
+            issues.append("source contract is corrupt")
+        if (set(contract.get("obligation_ids", [])) != complete_ids
+                or set(contract.get("bindings", {})) != complete_ids
+                or any(not outputs for outputs in contract.get("bindings", {}).values())):
+            issues.append("source obligations lack adopted Lean outputs")
+        if any(row["resolution"]["kind"] == "unresolved" for row in contract["spec"]["prerequisites"]):
+            issues.append("source prerequisites remain unresolved")
     if source_identity(root) != before:
         issues.append("source changed during final mechanical verification")
     if before["main_sha"] != formal.get("main_sha"):
@@ -598,6 +822,13 @@ def verify_final_project(paths, state: dict) -> dict:
         issues.append("original problem changed or is missing; start a fresh run")
     if not source_matches(paths, state):
         issues.append("supplied source bytes changed or are missing")
+    # Resolution-only graph refinements do not change Lean statements/proofs.
+    # The final fresh check can bind their new external evidence without making
+    # a worker submit an artificial source diff. The state publisher must CAS
+    # against this base digest and the exact source identity before adopting it.
+    review_contract = check.get("proposed_contract", contract) if not issues else contract
+    extension = ({"proposed_contract": review_contract, "base_contract_sha256": contract["sha256"]}
+                 if not issues and review_contract.get("sha256") != contract.get("sha256") else {})
     report = {
         **before,
         "passed": not issues,
@@ -605,14 +836,16 @@ def verify_final_project(paths, state: dict) -> dict:
         "solution_candidate": formal["solution_candidate"],
         "solution_sha256": formal["solution_sha256"],
         "formalization_revision": formal["revision"],
-        "contract_sha256": formal.get("contract", {}).get("sha256"),
+        "contract_sha256": review_contract.get("sha256"),
         "spec_sha256": digest(formal.get("spec")),
         "repairs_sha256": repair_digest(state),
-        "external_declarations": _external_evidence(contract),
+        "external_declarations": _external_evidence(review_contract),
         "accepted_candidates": {task["task_id"]: task.get("accepted_candidate") for task in tasks},
-        "declarations": {task["lean_decl"]: task["task_id"] for task in tasks},
+        "declarations": {task["lean_decl"]: task["task_id"] for task in
+                         (_binding_tasks(contract) if contract.get("version") == 3 else tasks)},
         "build": build,
         "targets": check["targets"],
+        **extension,
     }
     report["snapshot_id"] = "review-" + uuid.uuid4().hex
     artifact = artifacts.store_text(paths.artifacts, json.dumps(report, sort_keys=True) + "\n",

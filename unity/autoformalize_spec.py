@@ -156,12 +156,19 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
         field = {"library": "declaration", "task": "task_id", "unresolved": "issue_id"}.get(kind)
         if field is None:
             raise ValueError("prerequisite resolution must be library, task, or unresolved")
-        _object(resolution, {"kind", field}, "prerequisite resolution")
-        resolution = {"kind": kind, field: _text(resolution[field], f"prerequisite {field}")}
+        if kind == "unresolved" and allow_unresolved and set(resolution) == {"kind"}:
+            resolution = {"kind": kind}
+        else:
+            _object(resolution, {"kind", field}, "prerequisite resolution")
+            resolution = {"kind": kind, field: _text(resolution[field], f"prerequisite {field}")}
         if kind == "task":
             _known([resolution[field]], tasks, "prerequisite task")
             for task_id in needed:
-                if resolution[field] == task_id or resolution[field] not in tasks[task_id].get("dependencies", []):
+                task = tasks[task_id]
+                dependencies = (set(task.get("statement_dependencies", [])) | set(task.get("proof_dependencies", []))
+                                if "statement_dependencies" in task or "proof_dependencies" in task else
+                                set(task.get("dependencies", [])))
+                if resolution[field] == task_id or resolution[field] not in dependencies:
                     raise ValueError("task prerequisite requires a direct consumer dependency edge")
         if kind == "unresolved" and not allow_unresolved:
             raise ValueError("unresolved prerequisite needs exploration or a source repair before freezing")
@@ -201,9 +208,99 @@ def library_declarations(spec: dict) -> list[str]:
                    if row["resolution"]["kind"] == "library"})
 
 
+def normalize_outputs(value) -> list[dict]:
+    """Canonical public declaration bindings; actual existence is a kernel check."""
+    from pathlib import PurePosixPath
+
+    result, seen = [], set()
+    for row in _rows(value, "outputs"):
+        _object(row, {"declaration", "file"}, "output")
+        name = _text(row["declaration"], "output declaration")
+        path = _text(row["file"], "output file")
+        parsed = PurePosixPath(path)
+        if (parsed.is_absolute() or ".." in parsed.parts or "\\" in path
+                or parsed.suffix != ".lean" or str(parsed) != path):
+            raise ValueError("output file must be a normalized project-relative Lean path")
+        if name in seen:
+            raise ValueError("outputs have duplicate declarations")
+        seen.add(name)
+        result.append({"declaration": name, "file": path})
+    return sorted(result, key=lambda row: row["declaration"])
+
+
+def normalize_informal_nodes(chunks, requirements, spec, source) -> dict[str, dict]:
+    """Extract a source-linked plan without requiring Lean names, files or builds."""
+    rows = _task_map(chunks)
+    if not rows:
+        raise ValueError("informal DAG contains no chunks")
+    refs = {row["ref_id"] for row in source.get("source_refs", [])}
+    anchors = {row["id"]: row for row in spec["anchors"]}
+    ledger = {row["id"]: row for row in requirements}
+    result = {}
+    for identifier, row in rows.items():
+        sources = _refs(row.get("source_components"), "node source_components")
+        _known(sources, refs, "node source_components")
+        reqs = _refs(row.get("requirement_ids", [key for key, req in ledger.items()
+                                               if identifier in req["tasks"]]), "node requirement_ids")
+        _known(reqs, ledger, "node requirement_ids")
+        if set(reqs) != {key for key, req in ledger.items() if identifier in req["tasks"]}:
+            raise ValueError("node requirement_ids must match the requirements ledger")
+        ids = _refs(row.get("anchor_ids", sorted({key for req in reqs for key in ledger[req]["anchor_ids"]
+                                                  if anchors[key]["source_ref"] in sources})), "node anchor_ids")
+        _known(ids, anchors, "node anchor_ids")
+        if {anchors[key]["source_ref"] for key in ids} != set(sources):
+            raise ValueError("node anchors do not match its source components")
+        statement_deps = _refs(row.get("statement_dependencies", []), "statement_dependencies", nonempty=False)
+        proof_deps = _refs(row.get("proof_dependencies", row.get("dependencies", [])), "proof_dependencies", nonempty=False)
+        dependencies = sorted(set(statement_deps) | set(proof_deps))
+        _known(dependencies, rows, "node dependencies")
+        if identifier in dependencies:
+            raise ValueError("informal DAG contains a self dependency")
+        proof = row.get("informal_proof")
+        if proof is not None and not isinstance(proof, str):
+            raise ValueError("informal_proof must be text or null when no source proof is supplied")
+        proposed = {}
+        for key in ("proposed_formal_statement", "proposed_formal_strategy"):
+            value = row.get(key)
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"{key} must be text or null")
+            proposed[key] = value.strip() if isinstance(value, str) else None
+        result[identifier] = {
+            "id": identifier, "task_id": identifier,
+            "title": _text(row.get("title", identifier), "node title"),
+            "predicted_kind": _text(row.get("predicted_kind", "theorem"), "predicted_kind"),
+            "source_components": sources, "anchor_ids": ids, "requirement_ids": reqs,
+            "informal_statement": _text(row.get("informal_statement"), "informal_statement"),
+            "informal_proof": proof.strip() if isinstance(proof, str) else None,
+            "statement_dependencies": statement_deps, "proof_dependencies": proof_deps,
+            "dependencies": dependencies, **proposed,
+        }
+    remaining = set(result)
+    while remaining:
+        ready = {key for key in remaining if not set(result[key]["dependencies"]) & remaining}
+        if not ready:
+            raise ValueError("informal DAG contains a dependency cycle")
+        remaining -= ready
+    return result
+
+
+def informal_interpretation_hash(task: dict) -> str:
+    """Display names, predicted kinds and optional strategies are not mathematics."""
+    return digest({key: task.get(key) for key in (
+        "informal_statement", "informal_proof", "statement_dependencies", "proof_dependencies",
+        "source_components", "anchor_ids", "requirement_ids",
+    )})
+
+
 def task_spec_hash(task: dict, requirements: list[dict], spec: dict, contract: dict) -> str:
     """Hash task-local meaning/evidence; callers propagate dependency invalidation."""
     task_id = task.get("task_id", task.get("id"))
+    if contract.get("version") == 3:
+        bindings = contract.get("bindings", {}).get(task_id, [])
+        return digest({"interpretation": informal_interpretation_hash(task),
+                       "outputs": {row["declaration"]: contract["targets"][row["declaration"]]["fingerprint"]
+                                   for row in bindings},
+                       "source": contract["solution_sha256"], "environment": contract["environment"]})
     rows = [row for row in requirements if task_id in row["tasks"]]
     ids = {row["id"] for row in rows}
     arguments = [row for row in spec["arguments"] if row["requirement_id"] in ids]

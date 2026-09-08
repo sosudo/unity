@@ -217,43 +217,16 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
         required_refs = {str(item.get("ref_id")) for item in plan.get("source_refs", [])}
         if not required_refs or "None" in required_refs:
             raise ValueError("formalization plan has invalid source references")
-    known = set(ids)
-    declarations = [str(item.get("lean_decl") or "").strip() for item in chunks]
-    if any(not name for name in declarations) or len(set(declarations)) != len(declarations):
-        raise ValueError("formalization declarations must be unique and nonempty")
-    graph = {}
-    for chunk in chunks:
-        task_id = str(chunk["id"])
-        if not str(chunk.get("lean_decl") or "").strip():
-            raise ValueError(f"chunk {task_id} must name its expected lean_decl")
-        if not isinstance(chunk.get("lean_file"), str) or not chunk["lean_file"].strip():
-            raise ValueError(f"chunk {task_id} must name its Lean scaffold file")
-        deps = [str(item) for item in chunk.get("dependencies", [])]
-        unknown = set(deps) - known
-        if unknown:
-            raise ValueError(f"chunk {task_id} has unknown dependencies: {sorted(unknown)}")
-        source_refs = [str(item) for item in chunk.get("source_components", [])]
-        if required_refs:
-            unknown_refs = set(source_refs) - required_refs
-            if unknown_refs:
-                raise ValueError(f"chunk {task_id} has unknown source components: {sorted(unknown_refs)}")
-            if not source_refs:
-                raise ValueError(f"chunk {task_id} must name at least one source component")
-        graph[task_id] = set(deps)
-    from .autoformalize_spec import normalize_requirements, normalize_spec
+    from .autoformalize_spec import normalize_requirements, normalize_spec, normalize_informal_nodes
     source = {"candidate_id": plan["solution_candidate"], "sha256": plan["solution_sha256"],
               "source_refs": plan["source_refs"]}
     dag["requirements"] = normalize_requirements(dag.get("requirements"), chunks, required_refs)
     dag["spec"] = normalize_spec(dag.get("spec"), source=source,
                                  requirements=dag["requirements"], tasks=chunks,
                                  allow_unresolved=True)
-    pending = dict(graph)
-    while pending:
-        ready = [node for node, deps in pending.items() if not (deps & pending.keys())]
-        if not ready:
-            raise ValueError("formalization DAG contains a dependency cycle")
-        for node in ready:
-            pending.pop(node)
+    nodes = normalize_informal_nodes(chunks, dag["requirements"], dag["spec"], source)
+    dag["chunks"] = list(nodes.values())
+    dag["solution_sha256"] = expected_solution_sha
     return dag
 
 
@@ -321,16 +294,24 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
                             contract: dict | None = None,
                             formal_tasks: list[dict] | None = None,
                             layout: dict | None = None, environment: dict | None = None,
-                            timings: dict | None = None) -> dict:
+                            timings: dict | None = None, candidate: dict | None = None) -> dict:
     issues = []
     expected = task.get("lean_decl", "")
     tasks = formal_tasks or [task]
+    stage = (candidate or {}).get("stage", "complete")
     completed = {item["task_id"] for item in tasks
-                 if item.get("status") == "complete" or item["task_id"] == task["task_id"]}
+                 if item.get("status") == "complete"
+                 or (item["task_id"] == task["task_id"] and stage == "complete")}
+    incremental = {}
+    if (contract or {}).get("version") == 3:
+        incremental = {"task_id": task["task_id"], "stage": stage,
+                       "proposed_outputs": (candidate or {}).get("outputs"),
+                       "final": len(completed) == len(tasks)}
     try:
         check = autoformalize_contract.check_formal_contract(project_root, contract or {}, tasks,
                                                      completed=completed, layout=layout,
-                                                     environment=environment, timings=timings)
+                                                     environment=environment, timings=timings,
+                                                     **incremental)
     except (OSError, ValueError) as exc:
         check = {"passed": False, "issues": [f"formal contract verification unavailable: {exc}"]}
     issues.extend(check["issues"])
@@ -339,14 +320,25 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
         "expected_decl": expected,
         "source_components": list(task.get("source_components", [])),
         "mode": "formal_contract",
-        "contract_sha256": (contract or {}).get("sha256"),
-        "verified_tasks": sorted(completed),
+        "contract_sha256": check.get("proposed_contract", contract or {}).get("sha256"),
+        "stage": stage,
+        "verified_tasks": check.get("verified_tasks", sorted(completed)),
+        **{key: check[key] for key in ("proposed_contract", "verified_targets", "final") if key in check},
         "issues": issues,
     }
 
 
+def _checked_tree(root: Path, revision: str | None = None) -> str:
+    """Read a committed or index tree, failing closed on Git errors."""
+    result = (_git(root, "rev-parse", f"{revision}^{{tree}}") if revision is not None
+              else _git(root, "write-tree"))
+    if result.returncode or not result.stdout.strip():
+        raise ValueError(result.stderr.strip() or "could not read candidate source tree")
+    return result.stdout.strip()
+
+
 def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict | None = None) -> dict:
-    """Apply, build, review, and commit one immutable formalization candidate."""
+    """Verify an immutable candidate; commit only if its integration changes main."""
     root = paths.project_root
     current = autoformalize_state.load_state(paths.forum)
     require_source_matches(paths, current)
@@ -356,7 +348,9 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     if not autoformalize_state.candidate_is_current(current, candidate):
         return {"ok": False, "error": "candidate belongs to a superseded formal contract"}
     try:
-        resolved = worktree.verify_candidate_commit(root, candidate["author"], candidate["commit_sha"])
+        resolved = worktree.verify_candidate_commit(
+            root, candidate["author"], candidate["commit_sha"], allow_unchanged=True,
+        )
     except Exception as exc:
         return {"ok": False, "error": f"candidate identity failed: {exc}"}
     diff_result = _git(
@@ -372,19 +366,28 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     if dirty.returncode or dirty.stdout.strip():
         return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
     before = worktree.main_commit(root)
-    applied = autoformalize_jobs.run(
-        root,
-        ["git", "apply", "--3way", "--index", "-"],
-        cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
-    )
-    if applied.returncode:
-        _rollback(root, before)
-        return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
+    before_tree = _checked_tree(root, before)
+    if exact_diff:
+        applied = autoformalize_jobs.run(
+            root,
+            ["git", "apply", "--3way", "--index", "-"],
+            cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
+        )
+        if applied.returncode:
+            _rollback(root, before)
+            return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
+    elif _checked_tree(root, resolved) != before_tree:
+        return {"ok": False, "error": "Main differs from this empty candidate; sync_from_main and resubmit."}
     with autoformalize_contract.measure(timings, "workspace_seconds"):
         layout = autoformalize_contract.workspace_layout(root)
     with autoformalize_contract.measure(timings, "initial_identity_seconds"):
         checked_source = autoformalize_contract.source_identity(root, layout=layout)
-    checked_tree = _git(root, "write-tree").stdout.strip()
+    checked_tree = _checked_tree(root)
+    no_tree_change = checked_tree == before_tree
+    if not exact_diff and not no_tree_change:
+        raise ValueError("source tree changed before empty candidate verification")
+    if checked_source["main_sha"] != before:
+        raise ValueError("main changed before candidate verification")
     build_started = time.monotonic()
     try:
         build = autoformalize_contract.build_sources(
@@ -425,11 +428,12 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         root, task, staged, contract=contract,
         formal_tasks=list(current["formal_tasks"].values()),
         layout=layout, environment=checked_source["environment"], timings=timings,
+        candidate=candidate,
     )
     with autoformalize_contract.measure(timings, "postcheck_identity_seconds"):
         reviewed_source = autoformalize_contract.source_identity(root)
     if (reviewed_source != checked_source
-            or _git(root, "write-tree").stdout.strip() != checked_tree):
+            or _checked_tree(root) != checked_tree):
         raise ValueError("source changed during candidate build or kernel inspection")
     verification["seconds"] = time.monotonic() - verification_started
     record = artifacts.store_text(
@@ -447,19 +451,23 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             "verification": verification,
         }
     require_source_matches(paths, current)
-    commit = _git(root, "commit", "-m", f"UNITY: merge {PIPELINE} task {task['task_id']}")
-    if commit.returncode:
-        _rollback(root, before)
-        return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
+    if not no_tree_change:
+        commit = _git(root, "commit", "-m", f"UNITY: merge {PIPELINE} task {task['task_id']}")
+        if commit.returncode:
+            _rollback(root, before)
+            return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
     with autoformalize_contract.measure(timings, "postcommit_identity_seconds"):
         committed_source = autoformalize_contract.source_identity(root)
-    if (committed_source != {**checked_source, "main_sha": committed_source["main_sha"]}
-            or _git(root, "rev-parse", "HEAD^{tree}").stdout.strip() != checked_tree):
+    expected_source = (checked_source if no_tree_change
+                       else {**checked_source, "main_sha": committed_source["main_sha"]})
+    if (committed_source != expected_source
+            or _checked_tree(root, "HEAD") != checked_tree
+            or _checked_tree(root) != checked_tree):
         raise ValueError("commit changed the verified candidate source")
     verification["source_identity"] = committed_source
     return {
         "ok": True,
-        "main_sha": worktree.main_commit(root),
+        "main_sha": committed_source["main_sha"],
         "build": build_record,
         "verification": verification,
     }
@@ -588,6 +596,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     integration_cancel: Event | None = None
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
+    worker_revisions: dict[str, tuple[str, int]] = {}
     blocked_launches: dict[str, str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     state = autoformalize_state.load_state(paths.forum)
@@ -667,7 +676,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             return
         current = autoformalize_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
-        if (not formal_task or formal_task.get("status") != "pending"
+        if (not formal_task or not autoformalize_state.task_ready(current, formal_task)
                 or autoformalize_server.has_pending_formal_candidate(current, name)
                 or autoformalize_state.source_issues_blocking_task(current, task_id)):
             return
@@ -681,6 +690,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             return
         blocked_launches.pop(name, None)
         worker_targets[name] = task_id
+        worker_revisions[name] = (task_id, formal_task.get("revision", 0))
         agent = agents[name]
         brief = forum_brief(paths, "formalizing", name, task_id=task_id)
         system = _preamble(agent, roster, icrl_enabled=False)
@@ -702,6 +712,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 "Your worktree already has source changes. Inspect the current diff before any new "
                 "search or edit. If the target is complete, call `finalize_formalization` immediately. "
             )
+        if prepared.get("sync_warning"):
+            resume += prepared["sync_warning"] + " "
         strategy_instruction = (
             "Continue the claimed strategy for this task. "
             if strategy else
@@ -711,19 +723,22 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         )
         task_prompt = resume + (followup or (
             f"Your current formalization target is task `{task_id}`: "
-            f"{formal_task.get('description', '')}. The required Lean declaration is "
-            f"`{formal_task.get('lean_decl')}`. Its formalization source references are "
-            f"{formal_task.get('source_components', [])}. Dependencies have already been integrated. "
+            f"{formal_task.get('description', '')}. Current adopted outputs: "
+            f"{formal_task.get('outputs', [])}. Its formalization source references are "
+            f"{formal_task.get('source_components', [])}. Statement prerequisites are available; "
+            "proof-only dependencies may still be unfinished. "
             "Refresh autoformalize_brief. " + strategy_instruction +
             "Edit in your worktree using MCP tools while iterating: prefer compatible Axle tools "
             "when enabled over equivalent Lean LSP tools, and Lean LSP for local goals and diagnostics. "
             "Use direct shell checks only as a fallback or when compiled artifacts are needed. "
-            "When the implementation is ready, call `finalize_formalization`; Unity will commit the "
+            "Choose Lean representations as needed. Submit explicit outputs with `finalize_formalization`; "
+            "stage='representation' shares checked statements/definitions before proofs, while "
+            "stage='complete' implements the whole node (and can adopt its outputs directly). Unity will commit the "
             "exact source and perform the sole authoritative full build in main. Publish useful Lean/API findings "
             "as you work. Supplied documents are read-only. Use report_source_issue for source defects, "
             "and submit_source_repair with evidence when you can repair the issue directly. "
             "Do not change the source or silently formalize a different result. "
-            "Request re-chunking with the affected task IDs for encoding errors."
+            "Use refine_chunks for explicit graph/interpretation revisions; use source repair for source defects."
         ))
         event = asyncio.Event()
         interrupts[name] = event
@@ -779,11 +794,26 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             if autoformalize_server.has_pending_formal_candidate(current, name):
                 continue
             previous = worker_targets.get(name, "")
+            successors = current.get("retired_tasks", {}).get(previous, {}).get("replaced_by", [])
+            successor = next((key for key in successors if key in ready_ids), None)
+            if successor:
+                launch(name, successor, "Your prior informal node was replaced. Read autoformalize_task "
+                       "for this successor and its lineage. Your worktree was preserved; reuse relevant "
+                       "work, then claim a strategy for this node before finalizing.")
+                continue
             # Unregistered edits are work too. Keep their target rather than
             # assigning the worker to a different ready task and resetting it.
             if current["formal_tasks"].get(previous, {}).get("status") == "pending":
                 if previous in ready_ids:
                     launch(name, previous)
+                elif not autoformalize_server.unresolved_formal_tasks(current, name):
+                    prerequisites = autoformalize_server.ready_statement_prerequisites(current, previous)
+                    active = [worker_targets.get(owner, "") for owner, running in tasks.items()
+                              if not running.done()]
+                    for _, prerequisite in _formal_task_assignments(prerequisites, [name], active):
+                        # prepare_formal_worktree rechecks under locks and permits
+                        # this move only with no private edits/commits to discard.
+                        launch(name, prerequisite)
                 continue
             strategy = participating_strategy(current, name)
             if strategy and strategy.get("target") in ready_ids:
@@ -820,6 +850,13 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             state = autoformalize_state.load_state(paths.forum)
             refresh_worker_targets(state)
             require_source_matches(paths, state)
+            for name in list(tasks):
+                if roles.get(name) != "formalizing":
+                    continue
+                target, revision = worker_revisions.get(name, ("", 0))
+                latest = state.get("formal_tasks", {}).get(target)
+                if target and (latest is None or latest.get("revision", 0) != revision):
+                    request_stop(name, f"informal task {target} was refined; refresh its current interpretation")
             replan = autoformalize_state.pending_replan(state)
             if replan or state.get("phase") != "formalizing":
                 if integration_cancel is not None:

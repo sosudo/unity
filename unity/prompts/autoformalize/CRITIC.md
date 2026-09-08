@@ -5,9 +5,10 @@ not a newly generated or independently approved solution paper. Do not edit Lean
 during this independent review.
 
 Use the controller's current machine-review snapshot/artifact for exact final source verification.
-Unity has checked builds, exact declaration identities, protected types/definitions and axiom usage.
-The frozen specification records the pre-proof scaffold; its historical axiom lists may contain
-`sorryAx` from unfinished proofs. Those historical entries alone do not justify repeating checks or
+Unity has checked builds, the adopted output manifests, current types/definitions and axiom usage.
+The source-linked DAG records informal obligations, not a chunker-compiled scaffold. Formalizers'
+versioned representation candidates and historical axiom lists may contain `sorryAx` from unfinished
+theorem proofs. Those historical entries alone do not justify repeating checks or
 reopening. Do not rerun `lake build` or query every already-verified declaration unless current evidence
 is missing, stale, inconsistent with main or exposes a concrete concern.
 
@@ -16,6 +17,8 @@ Check semantic and structural faithfulness against the actual source, not merely
 - every in-scope mathematical requirement is covered by the DAG and actual Lean statements; do not
   silently omit source results, converse directions, uniqueness or relevant boundary cases;
 - domains, hypotheses, quantifiers, definitions and dependency assumptions match the source;
+- informal definitions/structures/instances and theorem/lemma nodes map to the actual manifested Lean
+  outputs, including constructions; a predicted kind or proposed Lean hint is not itself evidence;
 - proofs implement the source's mathematical arguments, not an easier or unrelated substitute;
 - incorporated source references and cited prerequisites are accounted for; no task was completed using
   an irrelevant or weakened declaration; and
@@ -32,10 +35,18 @@ until `next_offset` is null, keeping the same revision; restart if it changes. R
 `autoformalize_task`. Check each source anchor against the original document, each scope exclusion
 against UNITY.md, and each argument mapping against the actual Lean proof. Inspect prerequisite evidence
 and every adopted source repair. Mechanical bookkeeping cannot prove natural-language equivalence.
+For a missing source proof, distinguish the recorded gap and any justified repair from an argument
+invented by a worker. Refinements and split/merge lineage must preserve the original source obligations.
+Read current candidate versions and revisions, not a superseded interpretation or earlier file name.
+
+Assignment, representation, verification and faithfulness are separate. You provide the final
+faithfulness review, not an additional representation-adoption phase. An adopted representation alone
+is neither a completed proof nor source approval. A verified implementation can still be unfaithful;
+reject its correspondence with precise evidence without claiming that its kernel check failed.
 
 Submit one structured verdict with `submit_formalization_verdict`. Use `approved` only if all in-scope
 requirements are completely and faithfully formalized. Use `lean_reopen` with exact task IDs and evidence
-for implementation/faithfulness defects within the existing contract. Supply mandatory `review` with
+for implementation/faithfulness defects in the current versioned implementation. Supply mandatory `review` with
 the exact `snapshot_id` from the brief and `requirements`, for example:
 
 ```json
@@ -57,14 +68,20 @@ the exact `snapshot_id` from the brief and `requirements`, for example:
 ```
 
 Approval needs every recorded requirement exactly once, all passing, with declaration references and
-concrete rationale. Rejections can provide partial coverage to report a defect promptly. Missing,
+concrete rationale. For each requirement, list all adopted outputs of its implementing nodes in
+`declarations`, including definition, structure and instance outputs, not only a final theorem.
+Compare every such output with the source and its role in the argument. Rejections can provide
+partial coverage to report a defect promptly. Missing,
 duplicate, unknown or stale evidence cannot approve; Unity rechecks source identity before accepting.
 For adopted source repairs, include exactly one `{repair_id, status, rationale}` review each. Explain
 whether the correction is justified, what changed, and whether it still satisfies the requested scope.
 An altered claim outside the requested scope cannot pass merely because its Lean proof builds.
 
-If the frozen encoding or requirement mapping is wrong, call `request_rechunk` with exact source
-locations/evidence; this regenerates the specification without changing the supplied source. If the
+If the original source obligation ledger or scope mapping is wrong, call `request_rechunk` with exact
+source locations/evidence; this revisits the specification without changing the supplied source.
+For a mutable node interpretation or Lean representation defect, use `lean_reopen` with exact task
+IDs so formalizers can correct it with `refine_chunks` and a new candidate. Do not edit the DAG during
+independent review. If the
 source itself has an error or unreadable/missing argument, use `report_source_issue` with exact anchors
 and task IDs, then end this review attempt. Unity routes the issue to exploration/spot-repair rather
 than asking you to approve it. Do not edit Lean/source during review or review a correction you just
