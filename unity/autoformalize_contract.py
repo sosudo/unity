@@ -132,6 +132,52 @@ def _file_hashes(
     return result
 
 
+def _dependency_file_hashes(root: Path) -> dict:
+    """Exclude conventional Lake hash caches, not their actual source inputs."""
+    hashes = _file_hashes(root, allow_internal_file_symlinks=True)
+
+    # Without package-local Git metadata, retain every input.
+    if not (root / ".git").exists():
+        return hashes
+
+    candidates = {
+        name for name, value in hashes.items()
+        if name.endswith(".hash")
+        and name[:-5] in hashes
+        and isinstance(value, str)  # Regular file, not a symlink.
+    }
+    if not candidates:
+        return hashes
+
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            cwd=root,
+            input=b"".join(
+                os.fsencode(name) + b"\0" for name in sorted(candidates)
+            ),
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return hashes
+
+    if result.returncode not in (0, 1):
+        return hashes
+
+    ignored = {
+        os.fsdecode(name)
+        for name in result.stdout.split(b"\0") if name
+    } & candidates
+
+    for name in ignored:
+        # Keep the underlying input; handle nested .hash files conservatively.
+        if name[:-5] not in ignored:
+            del hashes[name]
+
+    return hashes
+
+
 def _dependencies(root: Path) -> dict:
     """Pin actual dependency source bytes, including local/path dependencies.
 
@@ -157,7 +203,7 @@ def _dependencies(root: Path) -> dict:
             directory = directory.resolve()
             if not directory.is_dir():
                 raise ValueError(f"missing dependency source: {name}")
-            hashes = _file_hashes(directory, allow_internal_file_symlinks=True)
+            hashes = _dependency_file_hashes(directory)
         except (OSError, ValueError, RuntimeError) as exc:
             raise ContractEnvironmentError(
                 f"Cannot fingerprint dependency {name}: {exc}"
