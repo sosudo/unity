@@ -8,6 +8,7 @@ and any replacement statement explicitly. Preserve the original source files and
 Use separate scratch files or artifacts for exploration. Never silently add assumptions or weaken
 a requested theorem. If no faithful repair is found, publish what you tried and the concrete blocker,
 then finish; Unity rotates outer attempts through the roster. No heartbeat or per-call quota is needed.
+If you cannot submit a proposal, finish with a concise explanation of what prevented submission.
 
 A proposal is not accepted truth. Chunking must adopt it explicitly into the source-linked specification,
 and an independent final critic must review it. Do not edit coordination JSON or mark the issue resolved

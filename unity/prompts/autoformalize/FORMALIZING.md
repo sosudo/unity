@@ -54,6 +54,9 @@ On the first binding, pass `outputs=[{"declaration":"Project.name","file":"Proje
 to `finalize_formalization` (or the compatibility `emit_formalization_candidate`). One informal node
 can have multiple output declarations. The output manifest and exact commit identify an immutable
 candidate version; previous failed/superseded attempts remain evidence, not current approval.
+Routine proof helpers need not be listed as outputs. To expose additional outputs, submit the complete
+existing output list plus additions. Renaming, removing, relocating or changing an adopted
+representation still requires explicit refinement.
 Use `stage="complete"` (the default) when the representation and proof/construction are ready. A short
 complete implementation can adopt its representation and verify its proof in one call.
 Use `stage="representation"` only when a useful representation is ready before its proof. Temporary

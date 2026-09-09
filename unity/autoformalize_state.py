@@ -332,7 +332,8 @@ def claim_source_issue(forum_dir: Path, issue_id: str, author: str,
 
 
 def finish_source_repair_attempt(forum_dir: Path, issue_id: str, author: str,
-                                 attempt_id: str, *, error: str = "") -> dict:
+                                 attempt_id: str, *, error: str = "",
+                                 output_artifact: str = "") -> dict:
     with transaction(forum_dir) as state:
         issue = state["source_issues"].get(issue_id)
         if not issue:
@@ -342,12 +343,22 @@ def finish_source_repair_attempt(forum_dir: Path, issue_id: str, author: str,
             raise ValueError("unknown source repair attempt/owner")
         if attempt["status"] != "active":
             return deepcopy(issue)
-        attempt.update(status="proposed" if _live_repair_ids(issue) else "failed",
-                       error=_text(error, "error", required=False), finished_at=time.time())
+        proposed = bool(_live_repair_ids(issue))
+        # Diagnostics must not leave an attempt claimed when an exception is verbose.
+        reason = _text(str(error or "")[:4000], "error", required=False)
+        output_artifact = _text(output_artifact, "output_artifact", 100, required=False)
+        if not proposed and not reason:
+            reason = (
+                "Agent turn ended without submitting a source-repair proposal; "
+                + ("see output_artifact." if output_artifact
+                   else "no final response was returned.")
+            )
+        attempt.update(status="proposed" if proposed else "failed", error=reason,
+                       output_artifact=output_artifact, finished_at=time.time())
         if author_key(issue.get("owner")) == author_key(author):
-            issue.update(status="proposed" if _live_repair_ids(issue) else "open", owner=None)
+            issue.update(status="proposed" if proposed else "open", owner=None)
         _event(state, "source_repair_attempt_finished", issue_id=issue_id, attempt_id=attempt_id,
-               status=attempt["status"])
+               status=attempt["status"], error=reason, output_artifact=output_artifact)
     return deepcopy(issue)
 
 
@@ -1579,9 +1590,14 @@ def finish_formal_merge(
                     # filled. The protected semantic fingerprint must not change.
                     if contract.get("targets", {}).get(name, {}).get("fingerprint") != target.get("fingerprint"):
                         raise ValueError("candidate contract extension changed an adopted target")
-                for key, bindings in current_contract.get("bindings", {}).items():
-                    if contract.get("bindings", {}).get(key) != bindings:
-                        raise ValueError("candidate contract extension changed an adopted binding")
+                old_bindings = current_contract.get("bindings", {})
+                new_bindings = contract.get("bindings", {})
+                for key in old_bindings.keys() | new_bindings.keys():
+                    if key == task["task_id"]:
+                        if any(old not in new_bindings.get(key, []) for old in old_bindings.get(key, [])):
+                            raise ValueError("candidate removed or relocated an adopted output")
+                    elif new_bindings.get(key) != old_bindings.get(key):
+                        raise ValueError("candidate changed another task's outputs")
                 bindings = normalize_outputs(contract.get("bindings", {}).get(task["task_id"], []))
                 if not bindings or bindings != candidate["outputs"]:
                     raise ValueError("candidate outputs differ from the verified task binding")

@@ -155,6 +155,25 @@ def autoformalize_status() -> dict:
     return autoformalize_state.load_state(FORUM_DIR)
 
 
+def validate_chunks() -> dict:
+    """Check dag.json bookkeeping without builds, adoption or faithfulness approval."""
+    from ..config import Paths
+    from ..autoformalize_input import autoformalize_paths, require_source_matches
+    from ..autoformalize_runtime import validate_formalization_dag
+
+    try:
+        state = autoformalize_state.load_state(FORUM_DIR)
+        source = autoformalize_state.formal_source(state)
+        if state.get("phase") != "chunking" or not source:
+            raise ValueError("validate_chunks is only available during chunking")
+        paths = autoformalize_paths(Paths.from_unity_dir(_root() / ".unity"))
+        require_source_matches(paths, state)
+        dag = validate_formalization_dag(paths, source["sha256"])
+    except (OSError, ValueError) as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:2000]}
+    return {"ok": True, "chunk_count": len(dag["chunks"])}
+
+
 def read_metrics(forum_dir: Path, project_root: Path) -> dict:
     """Read one workspace's telemetry without changing process-global tool routing."""
     state = autoformalize_state.load_state(forum_dir)
@@ -1111,7 +1130,7 @@ COORDINATION = (
 SOURCE_FEEDBACK = (publish_finding, report_obstacle, ask_question, answer_question,
                    report_source_issue, submit_source_repair)
 PROFILE_TOOLS = {
-    "chunking": COMMON + SOURCE_FEEDBACK,
+    "chunking": COMMON + SOURCE_FEEDBACK + (validate_chunks,),
     "formalizing": COMMON + COORDINATION + (
         finalize_formalization, emit_formalization_candidate, sync_from_main, request_rechunk,
         report_source_issue, submit_source_repair, refine_chunks,

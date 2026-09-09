@@ -33,7 +33,12 @@ def _refs(value, field: str, *, nonempty: bool = True) -> list[str]:
 
 def _object(value, fields: set[str], name: str) -> dict:
     if not isinstance(value, dict) or set(value) != fields:
-        raise ValueError(f"{name} requires exactly: {', '.join(sorted(fields))}")
+        detail = (
+            f"; missing: {', '.join(sorted(fields - set(value))) or '(none)'}"
+            f"; unexpected: {', '.join(sorted(map(str, set(value) - fields))) or '(none)'}"
+            if isinstance(value, dict) else f"; got {type(value).__name__}"
+        )
+        raise ValueError(f"{name} requires exactly: {', '.join(sorted(fields))}{detail}")
     return value
 
 
@@ -111,8 +116,12 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
     requirement_anchors = set()
     for row in requirements:
         _known(row["anchor_ids"], anchors, "requirement anchor_ids")
-        if {anchors[key]["source_ref"] for key in row["anchor_ids"]} != set(row["source_components"]):
-            raise ValueError(f"requirement {row['id']} anchors do not match its source components")
+        anchor_sources = {anchors[key]["source_ref"] for key in row["anchor_ids"]}
+        if anchor_sources != set(row["source_components"]):
+            raise ValueError(
+                f"requirement {row['id']} anchors do not match its source components: "
+                f"anchor sources={sorted(anchor_sources)}, source_components={row['source_components']}"
+            )
         requirement_anchors.update(row["anchor_ids"])
     scope = _object(value["scope"], {"targets", "references", "excluded"}, "scope")
     targets = _refs(scope["targets"], "scope targets")
@@ -248,8 +257,12 @@ def normalize_informal_nodes(chunks, requirements, spec, source) -> dict[str, di
         ids = _refs(row.get("anchor_ids", sorted({key for req in reqs for key in ledger[req]["anchor_ids"]
                                                   if anchors[key]["source_ref"] in sources})), "node anchor_ids")
         _known(ids, anchors, "node anchor_ids")
-        if {anchors[key]["source_ref"] for key in ids} != set(sources):
-            raise ValueError("node anchors do not match its source components")
+        anchor_sources = {anchors[key]["source_ref"] for key in ids}
+        if anchor_sources != set(sources):
+            raise ValueError(
+                f"node anchors do not match its source components for {identifier}: "
+                f"anchor sources={sorted(anchor_sources)}, source_components={sources}"
+            )
         statement_deps = _refs(row.get("statement_dependencies", []), "statement_dependencies", nonempty=False)
         proof_deps = _refs(row.get("proof_dependencies", row.get("dependencies", [])), "proof_dependencies", nonempty=False)
         dependencies = sorted(set(statement_deps) | set(proof_deps))

@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 
-from . import autoformalize_state, worktree
+from . import artifacts, autoformalize_state, worktree
 from .autoformalize_orchestrator import _preamble, build_autoformalize_mcp, load_prompt, load_role_prompt, stop_requested
 from .autoformalize_spawn import spawn
 
@@ -29,6 +29,7 @@ async def source_repair_turn(
     if claim["status"] != "claimed":
         return claim
     error = ""
+    output_artifact = ""
     try:
         state = autoformalize_state.load_state(paths.forum)
         tree = _formal_worktree(paths.project_root, agent.name)
@@ -58,6 +59,12 @@ async def source_repair_turn(
         )
         if isinstance(result, BaseException):
             error = f"{type(result).__name__}: {result}"
+        elif isinstance(result, str) and result.strip():
+            output_artifact = artifacts.store_text(
+                paths.artifacts, result,
+                kind="source_repair_output", producer=agent.name, source=issue_id,
+                metadata={"attempt_id": claim["attempt_id"]},
+            )["artifact_id"]
     except asyncio.CancelledError:
         error = "source repair interrupted"
         raise
@@ -66,8 +73,10 @@ async def source_repair_turn(
     finally:
         issue = autoformalize_state.finish_source_repair_attempt(
             paths.forum, issue_id, agent.name, claim["attempt_id"], error=error,
+            output_artifact=output_artifact,
         )
-    return {"status": "attempted", "issue": issue, "error": error}
+    attempt = next(row for row in issue["attempts"] if row["attempt_id"] == claim["attempt_id"])
+    return {"status": "attempted", "issue": issue, "error": attempt["error"]}
 
 
 async def run_source_repairs(roster, paths, max_attempts, issue_ids=None) -> dict:

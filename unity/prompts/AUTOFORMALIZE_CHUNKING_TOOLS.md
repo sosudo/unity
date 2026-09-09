@@ -16,6 +16,11 @@ the supplied-source snapshot and bundle hash, not a generated solution or an inf
 Unity validates source links and the dependency graph before formalization. Formalizers create and
 submit versioned Lean outputs later. Do not edit the supplied source files or silently drop obligations.
 
+After saving `dag.json`, call `validate_chunks()`. Correct reported errors in the existing draft and
+validate again before ending the current attempt. Preserve source obligations and node IDs; do not
+restart source analysis for a schema correction. This is read-only bookkeeping validation, not Lean
+compilation, adoption or mathematical faithfulness approval.
+
 Use prior candidate-bound chunking failures to avoid repeating unchanged unsuccessful searches.
 `report_source_issue(author, anchor_ids, description, task_ids?)` records source gaps with exact locations.
 Before freezing, use the plan's source-reference IDs as anchors. `submit_source_repair(author, issue_id,

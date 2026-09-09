@@ -53,6 +53,10 @@ do not turn reference-only material into unnecessary proof tasks. Each requireme
 and any relevant reference anchors. Source identities are checked mechanically; the critic must still
 check that the anchors and exclusions faithfully describe the actual source.
 
+For each requirement and node, `source_components` must equal the distinct `source_ref` values of its
+`anchor_ids`. Do not copy every supplied document into every row merely because it exists. Account for
+every supplied file through scope anchors; reference-only documents need not appear in every requirement.
+
 For each requirement, `spec.arguments` records the actual mathematical argument, its source anchors,
 prerequisite IDs and any adopted `repair_ids`. Every prerequisite records its statement, anchors,
 consuming task IDs and resolution: `{"kind":"library","declaration":"Fully.Qualified.name"}` or
@@ -64,6 +68,11 @@ optional `issue_id` only for a genuine reported source defect, not ordinary miss
 Unresolved prerequisites are permitted in the informal DAG and remain visible to formalizers; do not
 invent a Lean name to make the plan appear resolved. Report source defects using the plan's supplied
 source-reference IDs and precise locations in the description.
+
+Each prerequisite row has exactly these keys:
+`{"id":"P1","statement":"The mathematical prerequisite","anchor_ids":["A1"],"needed_by":["stable-task-id"],"resolution":{"kind":"unresolved"}}`.
+Use `needed_by` for consuming node IDs. Put library/task/issue metadata inside `resolution`, using only
+the documented keys for that resolution kind.
 
 Read repair proposals and any replan information in the plan. Adopt justified corrections explicitly
 in argument mappings; preserve original documents byte-for-byte. Explain changed claims, assumptions,
@@ -129,6 +138,11 @@ Chunk IDs must be unique/nonempty and remain stable; do not derive them from edi
 Lean names. Dependencies must name other chunks, and their union must be acyclic. Each task and requirement must cite valid source references; its mapped
 tasks must cover those references. Scope anchors account for all source files, including reference-only
 and explicitly excluded material. Source-reference bookkeeping alone is not evidence of mathematical faithfulness.
+
+After writing `dag.json`, call `validate_chunks()`. If it returns `ok=false`, correct the reported fields
+in the existing draft and validate again before ending this attempt. Preserve source obligations and
+unchanged node IDs. Do not restart source analysis for a schema correction. This checks bookkeeping
+only, not mathematical faithfulness or Lean compilation.
 
 Use `autoformalize_brief` for compact shared state and `forum_post`/`forum_read` for necessary clarification.
 Use the autoformalization Forum tools throughout the run. Do not repeat an unchanged failed
