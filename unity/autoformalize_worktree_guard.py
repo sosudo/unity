@@ -87,6 +87,7 @@ class WorkspaceGuard:
         self._ready = False
         self._last_poll = -float("inf")
         self._incident: WorkspaceIncident | None = None
+        self._incident_metadata: dict | None = None
         self._observations: dict[tuple[str, str, str], dict] = {}
         self._observed_changes: dict[str, _Change] = {}
         self._peer_changes: dict[str, _Change] = {}
@@ -346,7 +347,8 @@ class WorkspaceGuard:
             path = self._observed_path(observation)
             operation = str(observation.get("operation", "")).lower()
             event = observation.get("event")
-            if not agent or not tool_id or path is None or operation not in _WRITES:
+            if (not agent or not tool_id or path is None or operation not in _WRITES
+                    or event not in {"started", "completed"}):
                 return
             own = self.worktrees.get(str(agent))
             if own is not None and path.is_relative_to(own):
@@ -366,25 +368,25 @@ class WorkspaceGuard:
                 except OSError:
                     current = _Image("unsafe", b"")
                 if event == "started":
-                    self._observations[key] = {"agent": str(agent), "before": current, "valid": False, "peer": True}
+                    self._observations.setdefault(key, {"agent": str(agent), "before": current,
+                                                        "valid": False, "peer": True})
                 if event == "completed" and str(observation.get("status", "")).lower() in _SUCCESS:
                     entry = self._observations.setdefault(key, {"agent": str(agent), "peer": True})
                     entry["valid"] = True
-                    self._peer_changes[name] = _Change(entry.get("before"), current, peer=True)
+                    self._peer_changes.setdefault(name, _Change(entry.get("before"), current, peer=True))
                     self._preserve({name: self._peer_changes[name]})
                 return
             try:
                 current = self._read(name)
             except OSError:
                 current = _Image("unsafe", b"")
-            if event == "started":
-                self._observations[key] = {"agent": str(agent), "before": current,
-                                           "started_expected": current == self._expected.get(name), "valid": False}
-            elif event == "completed":
-                entry = self._observations.setdefault(key, {"agent": str(agent), "valid": False})
+            # Native notifications may arrive after the write, or even out of
+            # order. Only Unity's baseline supplies authoritative original bytes.
+            # A late started event must not erase already received completion.
+            entry = self._observations.setdefault(key, {"agent": str(agent), "valid": False})
+            if event == "completed" and "after" not in entry:
                 entry["after"] = current
-                entry["valid"] = (bool(entry.get("started_expected"))
-                                  and str(observation.get("status", "")).lower() in _SUCCESS)
+                entry["valid"] = str(observation.get("status", "")).lower() in _SUCCESS
                 if str(observation.get("status", "")).lower() in _SUCCESS and current != self._expected.get(name):
                     # Retain exact completed writes even if the worker cleans up
                     # before polling. Coalesce paths only during poll: a native
@@ -394,23 +396,28 @@ class WorkspaceGuard:
                     self._preserve({name: change})
 
     def _author(self, changes: dict[str, _Change]) -> str | None:
+        """Identify the worker to stop, independently of permission to undo."""
         authors = set()
-        for path, change in changes.items():
+        for path in changes:
             evidence = [item for (_, _, name), item in self._observations.items() if name == path]
             writers = {item["agent"] for item in evidence}
-            valid = {item["agent"] for item in evidence if item.get("valid") and
-                     (change.peer or (item.get("before") == change.before and item.get("after") == change.observed))}
-            if len(writers) != 1 or valid != writers:
+            if len(writers) != 1:
                 return None
-            authors.update(valid)
+            authors.update(writers)
         return next(iter(authors)) if len(authors) == 1 else None
 
-    def _preserve(self, changes: dict[str, _Change], *, metadata: dict | None = None) -> WorkspaceIncident:
+    def _classify(self, changes: dict[str, _Change], *, metadata: bool = False) -> tuple[str | None, bool]:
         author = None if metadata else self._author(changes)
         recoverable = self.supports_safe_recovery and bool(changes) and author is not None and not metadata and all(
             not change.peer and all(image is None or image.kind == "file"
                                     for image in (change.before, change.observed))
-            for change in changes.values())
+            and any(item.get("valid") and item.get("after") == change.observed
+                    for (_, _, name), item in self._observations.items() if name == path)
+            for path, change in changes.items())
+        return author, recoverable
+
+    def _preserve(self, changes: dict[str, _Change], *, metadata: dict | None = None) -> WorkspaceIncident:
+        author, recoverable = self._classify(changes, metadata=bool(metadata))
         directory = self.artifacts_dir / "workspace-incidents" / uuid.uuid4().hex
         directory.mkdir(parents=True, mode=0o700)
         artifact = directory / "incident.json"
@@ -430,12 +437,27 @@ class WorkspaceGuard:
             os.fsync(handle.fileno())
         return WorkspaceIncident(paths, author, artifact, message, recoverable, changes, bool(metadata))
 
+    def _refresh_incident(self) -> WorkspaceIncident:
+        """Reclassify delayed evidence without replacing any preserved bytes."""
+        incident = self._incident
+        assert incident is not None
+        changes = dict(incident.changes)
+        # Further native writes can arrive during cancellation. Retain new paths
+        # (including peer writes), never replacing an earlier path's snapshot.
+        for observed in (self._observed_changes, self._peer_changes):
+            for name, change in observed.items():
+                changes.setdefault(name, change)
+        author, recoverable = self._classify(changes, metadata=incident.metadata_changed)
+        if changes != incident.changes or (author, recoverable) != (incident.author, incident.recoverable):
+            self._incident = self._preserve(changes, metadata=self._incident_metadata)
+        return self._incident
+
     def poll_due(self, force: bool = False) -> WorkspaceIncident | None:
         with self._lock:
             if not self._ready:
                 raise RuntimeError("Workspace baseline has not been established")
             if self._incident is not None:
-                return self._incident
+                return self._refresh_incident()
             now = time.monotonic()
             if not force and not self._observed_changes and not self._peer_changes and now - self._last_poll < self.poll_interval:
                 return None
@@ -446,7 +468,7 @@ class WorkspaceGuard:
                        for name in set(current) | set(self._expected)
                        if self._expected.get(name) != current.get(name)}
             for name, change in self._observed_changes.items():
-                changes.setdefault(name, change)
+                changes[name] = change  # Keep the first preserved postimage, even before the first poll.
             changes.update(self._peer_changes)
             metadata = None
             if (head, index) != (self._head, self._index):
@@ -454,6 +476,7 @@ class WorkspaceGuard:
                             "expected_index_base64": base64.b64encode(self._index).decode(),
                             "observed_index_base64": base64.b64encode(index).decode()}
             if changes or metadata:
+                self._incident_metadata = metadata
                 self._incident = self._preserve(changes, metadata=metadata)
             return self._incident
 
@@ -463,8 +486,10 @@ class WorkspaceGuard:
             raise WorkspaceContamination(incident)
 
     def recover(self, incident: WorkspaceIncident) -> bool:
-        """Targeted undo only; caller must first stop/drain workers and lock merges."""
+        """Targeted undo; caller must drain the offending worker/integration and lock merges."""
         with self._lock:
+            if self._incident is not None:
+                self._refresh_incident()
             if incident is not self._incident or not incident.recoverable:
                 raise WorkspaceContamination(incident)
             if self._git_state() != (self._head, self._index):
@@ -514,6 +539,7 @@ class WorkspaceGuard:
             except OSError as exc:
                 raise WorkspaceContamination(incident) from exc
             self._incident = None
+            self._incident_metadata = None
             self._observed_changes.clear()
             self._peer_changes.clear()
             self._observations.clear()

@@ -77,6 +77,7 @@ def forum_brief(paths, profile: str, author: str, task_id: str = "") -> str:
 
 _CANCEL_GRACE_SECONDS = 20.0
 _CANCEL_HARD_SECONDS = 10.0
+_WORKSPACE_EVIDENCE_GRACE_SECONDS = 2.0
 
 
 async def _cancel(
@@ -699,6 +700,16 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
         )
         return result
 
+    def cancelled_result(exc: autoformalize_jobs.JobCancelled, before: str | None = None) -> dict:
+        # The workspace guard also signals cancellation. That interruption is
+        # not a failed proof, even if it arrived before acquiring merge.lock.
+        incident = guard.poll_due(force=True) if guard is not None else None
+        if incident is not None:
+            return {"ok": False, "workspace_recovery": True,
+                    "incident": incident, "rollback_sha": before,
+                    "candidate_id": candidate["candidate_id"], "error": incident.message}
+        return record({"ok": False, "cancelled": True, "error": str(exc)})
+
     with autoformalize_jobs.cancellation_scope(cancel_event), _guard_scope(guard):
         try:
             with _merge_lock(paths.project_root):
@@ -716,11 +727,11 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
                             "incident": exc.incident, "rollback_sha": before,
                             "candidate_id": candidate["candidate_id"], "error": str(exc)}
                 except autoformalize_jobs.JobCancelled as exc:
-                    result = {"ok": False, "cancelled": True, "error": str(exc)}
+                    return cancelled_result(exc, before)
                 return record(result)
         except autoformalize_jobs.JobCancelled as exc:
             # Cancellation before acquiring the lock made no source mutation.
-            return record({"ok": False, "cancelled": True, "error": str(exc)})
+            return cancelled_result(exc)
 
 
 def _recover_main_workspace(paths, guard: WorkspaceGuard, recovery: dict) -> None:
@@ -855,6 +866,20 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 _cancel(agents[name], running, interrupts[name], reason, paths.project_root),
                 name=f"autoformalize:stop:{name}",
             )
+
+    def record_recovery(incident, details: dict | None = None) -> None:
+        nonlocal recovery
+        if recovery is None:
+            # Filesystem writes can precede their native tool notifications.
+            # This bounds notification delivery, not the worker's stop/drain.
+            recovery = {"evidence_deadline": time.monotonic() + _WORKSPACE_EVIDENCE_GRACE_SECONDS}
+        if details:
+            recovery.update({key: value for key, value in details.items() if key != "incident"})
+        recovery["incident"] = incident
+        if integration_cancel is not None:
+            integration_cancel.set()
+        if incident.author in agents:
+            request_stop(incident.author, incident.message)
 
     def retire_completed_task(task_id: str) -> None:
         for name, running in list(tasks.items()):
@@ -1059,14 +1084,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             await asyncio.sleep(0.1)
             incident = await asyncio.to_thread(guard.poll_due)
             if incident is not None:
-                recovery = recovery or {"incident": incident}
-                if integration_cancel is not None:
-                    integration_cancel.set()
-                if incident.author in agents:
-                    request_stop(incident.author, incident.message)
-                else:
-                    # A filesystem difference alone cannot identify its writer.
-                    raise WorkspaceContamination(incident)
+                record_recovery(incident)
             state = autoformalize_state.load_state(paths.forum)
             refresh_worker_targets(state)
             require_source_matches(paths, state)
@@ -1131,11 +1149,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 integration_candidate = {}
                 integration_cancel = None
                 if result.get("workspace_recovery"):
-                    recovery = result
-                    incident = result["incident"]
-                    if incident.author not in agents:
-                        raise WorkspaceContamination(incident)
-                    request_stop(incident.author, incident.message)
+                    # Integration may return an incident captured before later
+                    # notifications arrived. Keep its rollback/candidate data,
+                    # but only use the guard's current evidence for recovery.
+                    incident = await asyncio.to_thread(guard.poll_due, force=True)
+                    record_recovery(incident or result["incident"], result)
                 elif result.get("ok"):
                     retire_completed_task(finished["task_id"])
                 elif not result.get("deferred"):
@@ -1143,23 +1161,30 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     _console.print(f"[red]candidate {finished['candidate_id']} failed: {result.get('error', '')}[/red]")
 
             if recovery is not None:
+                incident = await asyncio.to_thread(guard.poll_due, force=True)
+                record_recovery(incident or recovery["incident"])
                 incident = recovery["incident"]
                 author = incident.author
+                if integration is not None or author in tasks or author in stopping:
+                    # The violator's cancellation can deliver the completion
+                    # evidence needed to undo its write. Other workers remain
+                    # active in their private worktrees throughout this drain.
+                    continue
                 if author not in agents or not incident.recoverable:
+                    if time.monotonic() < recovery["evidence_deadline"]:
+                        continue
+                    # Never guess a shell writer or discard unsafe changes.
                     raise WorkspaceContamination(incident)
-                if integration is None and author not in tasks and author not in stopping:
-                    # This short critical section must not be abandoned in a
-                    # background thread if the runtime itself is cancelled.
-                    _recover_main_workspace(paths, guard, recovery)
-                    recovery_notices[author] = (
-                        f"Your previous turn modified {', '.join(incident.paths)} outside your worktree. "
-                        f"Unity preserved the incident at {incident.artifact} and restored main. "
-                        f"Continue in {worktrees[author]}; inspect the preserved work before repeating it. "
-                    )
-                    _console.print(f"[yellow]recovered misplaced work from {author}; continuing its existing task[/yellow]")
-                    recovery = None
-                else:
-                    continue  # Neither workers nor candidates launch during recovery.
+                # This short critical section must not be abandoned in a
+                # background thread if the runtime itself is cancelled.
+                _recover_main_workspace(paths, guard, recovery)
+                recovery_notices[author] = (
+                    f"Your previous turn modified {', '.join(incident.paths)} outside your worktree. "
+                    f"Unity preserved the incident at {incident.artifact} and restored main. "
+                    f"Continue in {worktrees[author]}; inspect the preserved work before repeating it. "
+                )
+                _console.print(f"[yellow]recovered misplaced work from {author}; continuing its existing task[/yellow]")
+                recovery = None
 
             state = autoformalize_state.load_state(paths.forum)
             replan = autoformalize_state.pending_replan(state)
