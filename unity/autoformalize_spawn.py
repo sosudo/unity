@@ -20,6 +20,8 @@ from pathlib import Path
 from rich.console import Console
 
 from .roster import Agent
+from .autoformalize_access import restricted_backend
+from .autoformalize_sandbox import WriteSandboxPolicy
 
 _console = Console()
 
@@ -192,16 +194,21 @@ def _agent_env(
     return env
 
 
-def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tuple[Path, Path]:
+def _process_group_wrapper(executable: Path, directory: Path, label: str,
+                           sandbox_policy: WriteSandboxPolicy | None = None) -> tuple[Path, Path]:
     """Wrap a CLI so its entire process tree has an autoformalize-owned process group."""
     wrapper = directory / f"{label}-group-wrapper"
     pid_file = directory / f"{label}-group.pid"
+    argv = [str(executable)]
+    if sandbox_policy is not None:
+        from .autoformalize_sandbox import command
+        argv = command(sandbox_policy, argv)
     wrapper.write_text(
-        f"#!{sys.executable}\n"
+        f"#!{sys.executable} -I\n"
         "import os, sys\n"
         "os.setsid()\n"
         f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-        f"os.execv({str(executable)!r}, [{str(executable)!r}, *sys.argv[1:]])\n"
+        f"os.execv({argv[0]!r}, {argv!r} + sys.argv[1:])\n"
     )
     wrapper.chmod(0o700)
     return wrapper, pid_file
@@ -457,11 +464,14 @@ def _log(name: str, msg, cwd=None) -> None:
 
 # ── backends ────────────────────────────────────────────────────────────────────
 
+@restricted_backend
 async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                          mcp_servers: dict, *, permission: str = "bypassPermissions",
                          idle_timeout: float = 600.0, subagents=(),
                          env_overrides: dict[str, str] | None = None,
-                         own_process_group: bool = False) -> str | None:
+                         own_process_group: bool = False,
+                         sandbox_policy: WriteSandboxPolicy | None = None,
+                         sandbox_control: Path | None = None) -> str | None:
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
     import shutil
 
@@ -472,8 +482,14 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
         real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
         if real_cli.is_file():
-            group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
-            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
+            group_dir = sandbox_control or Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
+            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude", sandbox_policy)
+    if sandbox_policy is not None and cli_path is None:
+        raise RuntimeError("Claude CLI unavailable; cannot enforce autoformalize workspace restriction")
+    child_env = _agent_env(agent, env_overrides=env_overrides)
+    if sandbox_policy is not None:
+        from .autoformalize_claude_auth import seed_claude_session
+        child_env = seed_claude_session(Path(child_env["UNITY_AUTOFORMALIZE_SESSIONS"]) / "claude", child_env)
 
     agents_def = {
         s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
@@ -487,7 +503,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         permission_mode=permission,
         model=agent.model,
         max_budget_usd=agent.budget,
-        env=_agent_env(agent, env_overrides=env_overrides),
+        env=child_env,
         cli_path=cli_path,
     )
     attempt = 0
@@ -541,8 +557,7 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
             import shutil
             shutil.copy2(user_auth, home / "auth.json")
     lines: list[str] = []
-    # Unity agents run under workspace_write: they need network (lake, arXiv, MCP)
-    # and, from a worktree cwd, write access to the main project (.unity/dag.json).
+    # Shared mutations use the controller bridge, never a writable main root.
     lines += ["[sandbox_workspace_write]", "network_access = true"]
     if writable_root is not None:
         lines.append(f'writable_roots = ["{writable_root}"]')
@@ -563,12 +578,11 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
     for name, cfg in (mcp_servers or {}).items():
         lines.append(f"[mcp_servers.{name}]")
         if cfg.get("command"):
-            lines.append(f'command = "{cfg["command"]}"')
+            lines.append("command = " + json.dumps(cfg["command"]))
             if cfg.get("args"):
-                args = ", ".join(f'"{a}"' for a in cfg["args"])
-                lines.append(f"args = [{args}]")
+                lines.append("args = " + json.dumps(cfg["args"]))
         elif cfg.get("url"):
-            lines.append(f'url = "{cfg["url"]}"')
+            lines.append("url = " + json.dumps(cfg["url"]))
         lines.append("")
         if cfg.get("env"):
             lines.append(f"[mcp_servers.{name}.env]")
@@ -665,26 +679,28 @@ async def _codex_notifications(
         await stream.aclose()
 
 
+@restricted_backend
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                         mcp_servers: dict, *, permission: str = "bypassPermissions",
                         idle_timeout: float = 600.0, subagents=(),
                         interrupt_event: asyncio.Event | None = None,
                         env_overrides: dict[str, str] | None = None,
                         own_process_group: bool = False,
-                        mcp_profile: str = "autoformalize") -> str | None:
+                        mcp_profile: str = "autoformalize",
+                        sandbox_policy: WriteSandboxPolicy | None = None,
+                        sandbox_control: Path | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
     system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
 
-    home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    # from a worktree cwd, the agent still needs write access to the main project (.unity/)
-    from .config import find_unity_dir
-    unity_dir = find_unity_dir(Path(cwd))
-    provider = _write_codex_config(home, agent, mcp_servers,
-                                   writable_root=unity_dir.parent if unity_dir else None)
+    session_dir = (env_overrides or {}).get("UNITY_AUTOFORMALIZE_SESSIONS")
+    home = Path(session_dir) / "codex" if sandbox_policy is not None else Path(tempfile.mkdtemp(prefix="unity-codex-"))
+    provider = _write_codex_config(home, agent, mcp_servers)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
-    sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
+    # The outer OS boundary includes native tools and MCP children; avoid nested
+    # Seatbelt sandboxes. Full access here cannot remove the inherited boundary.
+    sandbox = Sandbox.full_access if sandbox_policy is not None or permission == "bypassPermissions" else Sandbox.workspace_write
 
     # Prefer the user's installed codex CLI (kept current by its own updater) over the
     # SDK's pinned bundled binary — newest models often require a newer runtime.
@@ -699,15 +715,17 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             except ImportError:
                 pass
         if codex_bin:
-            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), home, "codex")
+            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), sandbox_control or home, "codex", sandbox_policy)
             codex_bin = str(wrapped)
+    if sandbox_policy is not None and pid_file is None:
+        raise RuntimeError("Codex CLI unavailable; cannot enforce autoformalize workspace restriction")
     attempt = 0
     while True:
         attempt += 1
         _begin_workspace_attempt()
         agent_env = _agent_env(agent, home, env_overrides)
         config_kwargs = {}
-        if mcp_profile == "autoformalize" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
+        if mcp_profile == "autoformalize" and (sandbox_policy is not None or (env_overrides or {}).get("UNITY_REAL_LAKE")):
             # Login startup and cached shell state can move elan ahead of autoformalize's
             # Lake shim even when the app-server process receives the right PATH.
             config_kwargs["config_overrides"] = (
@@ -843,7 +861,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
     full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
-    if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
+    if unity_dir is not None and mcp_profile != "autoformalize":
         cmd += ["--add-dir", str(unity_dir.parent)]
 
     attempt = 0
@@ -1049,6 +1067,10 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             "env_overrides": env_overrides,
             "own_process_group": own_process_group,
         }
+        if mcp_profile == "autoformalize" and agent.backend in {"claude_code", "codex"}:
+            kwargs["workspace_request"] = dict(log_context or {})
+        elif mcp_profile == "autoformalize" and agent.backend == "antigravity":
+            _console.print(f"[yellow]\\[{agent.name}] Antigravity workspace isolation is best-effort only[/yellow]")
         if agent.backend == "codex":
             kwargs["interrupt_event"] = interrupt_event
             kwargs["mcp_profile"] = mcp_profile

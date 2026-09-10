@@ -69,16 +69,29 @@ def _cancel_process(proc, *, client_group: bool = False) -> None:
         proc.communicate()
 
 
+def _worker_state() -> Path | None:
+    value = os.environ.get("UNITY_AUTOFORMALIZE_WORKER_STATE")
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        raise ValueError("UNITY_AUTOFORMALIZE_WORKER_STATE must be an absolute private directory")
+    return path
+
+
 def _jobs_dir(project_root: Path) -> Path:
-    path = Path(project_root) / ".unity" / "jobs" / "autoformalize"
+    private = _worker_state()
+    path = private / "jobs" if private is not None else Path(project_root) / ".unity" / "jobs" / "autoformalize"
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
 @contextmanager
 def _build_lock(project_root: Path):
-    """Serialize authoritative autoformalize builds across controller processes."""
-    path = Path(project_root) / ".unity" / "forum" / "autoformalize-build.lock"
+    """Keep worker checks private; serialize authoritative controller builds."""
+    private = _worker_state()
+    path = (private / "autoformalize-build.lock" if private is not None
+            else Path(project_root) / ".unity" / "forum" / "autoformalize-build.lock")
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
         while True:
@@ -191,7 +204,22 @@ def run(
 
 def terminate(project_root: Path, *, owner: str | None = None) -> int:
     """Terminate registered jobs, optionally restricted to one worker owner."""
-    directory = _jobs_dir(project_root)
+    return _terminate_directory(_jobs_dir(project_root), owner=owner)
+
+
+def terminate_worker_state(worker_state: Path, *, owner: str | None = None) -> int:
+    """Reap one spawn's private registry without redirecting the controller's env.
+
+    Shared-registry cleanup cannot discover these detached job groups. The
+    controller must call this when stopping/finishing the corresponding spawn.
+    """
+    private = Path(worker_state)
+    if not private.is_absolute():
+        raise ValueError("worker_state must be an absolute private directory")
+    return _terminate_directory(private / "jobs", owner=owner)
+
+
+def _terminate_directory(directory: Path, *, owner: str | None = None) -> int:
     records: list[tuple[Path, dict]] = []
     for path in directory.glob("*.json"):
         try:

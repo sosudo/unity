@@ -77,6 +77,10 @@ From the CLI, add files or folders with `unity source add <path>`, put the scope
 
 Autoformalize has its own runtime, agent launcher, verifier, prompts, and Forum interface. Its discussions and structured state live under `.unity/forum/autoformalize/`, separate from solve and prove. It does not run the English-solving phase or generate or rewrite a source paper. The existing project setup, roster, dependency cache, and generic worktree utilities are unchanged.
 
+Autoformalize's Claude/Codex launches enforce filesystem write boundaries using macOS Seatbelt or Linux Landlock (ABI 3 or newer). Formalizers can write their own worktree and private session/scratch directories; other roles get scratch plus their authorized outputs. Main, shared Git/runtime state, and linked dependencies are not native write targets. Forum and candidate operations go through a per-worker controller bridge. The chunker saves `.unity/dag.json` using `workspace.write_phase_output`, also available through `unity mcp workspace write_phase_output`. Unsupported hosts fail closed; Antigravity remains explicitly best-effort. Solve/prove permissions are unchanged.
+
+This prevents misplaced file-content writes; it is not hostile-process isolation: reads, network and IPC remain available, and Landlock does not restrict all metadata operations. Existing candidate/faithfulness checks remain necessary. Claude uses private runtime configuration and explicit roster credentials or a reusable, unexpired subscription access token; if the existing login cannot be read without interaction, configure `CLAUDE_CODE_OAUTH_TOKEN` using `claude setup-token`. Long unattended Claude subscription runs should use that explicit token. No global login or permission settings are changed.
+
 ### Formalize
 
 First, go to the sources tab and add the documents you want formalized.
