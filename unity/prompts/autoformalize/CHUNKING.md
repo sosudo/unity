@@ -9,9 +9,13 @@ scaffold. No Lean builds, proof search, import minimization, or theorem proving 
 Inspect the supplied documents directly, including their definitions, assumptions,
 intermediate claims, proof arguments, and cited prerequisites. If a file is unreadable or an in-scope
 statement is ambiguous or unsupported, report its exact location and the concrete blocker through the
-`report_source_issue` instead of fabricating content. Record missing source proofs with `informal_proof: null`
-and state the gap explicitly in the corresponding argument mapping. Distinguish a proof omitted in the
-source from an unreadable document or an ambiguous claim. Do not invent an argument merely to fill a field.
+`report_source_issue` instead of fabricating content. Use `informal_proof: null` only when no source
+argument is supplied, and record that omission in the argument mapping. An abbreviated argument such as
+“analogously to the preceding proof” is supplied proof guidance: preserve its method and cross-reference
+in `informal_proof` and the argument mapping. Do not invent missing details during chunking.
+Null records source provenance, not unprovability or permission to leave a final proof unfinished.
+An omitted or abbreviated proof alone is not evidence of a source defect; distinguish it from an
+unreadable document, an ambiguous claim, or a concrete mathematical obstruction.
 Unity gives the roster optional source-repair attempts. This is not a mandatory solving phase.
 
 Preserve both the source's mathematical meaning and its proof strategy. Make implicit types,

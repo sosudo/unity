@@ -17,6 +17,10 @@ Check semantic and structural faithfulness against the actual source, not merely
 - every in-scope mathematical requirement is covered by the DAG and actual Lean statements; do not
   silently omit source results, converse directions, uniqueness or relevant boundary cases;
 - domains, hypotheses, quantifiers, definitions and dependency assumptions match the source;
+- inspect theorem premises, including section variables, typeclass assumptions and hypotheses hidden
+  behind `Prop`-valued definitions. A conditional helper does not complete an unconditional source
+  result: require the source-shaped result to discharge the helper's extra dependency assumption using
+  a proved theorem. Preserve legitimate source hypotheses; do not reject them merely for being premises;
 - informal definitions/structures/instances and theorem/lemma nodes map to the actual manifested Lean
   outputs, including constructions; a predicted kind or proposed Lean hint is not itself evidence;
 - proofs implement the source's mathematical arguments, not an easier or unrelated substitute;
@@ -35,8 +39,12 @@ until `next_offset` is null, keeping the same revision; restart if it changes. R
 `autoformalize_task`. Check each source anchor against the original document, each scope exclusion
 against UNITY.md, and each argument mapping against the actual Lean proof. Inspect prerequisite evidence
 and every adopted source repair. Mechanical bookkeeping cannot prove natural-language equivalence.
-For a missing source proof, distinguish the recorded gap and any justified repair from an argument
-invented by a worker. Refinements and split/merge lineage must preserve the original source obligations.
+For an omitted or abbreviated source proof, review the reconstructed reasoning and its evidence.
+Reconstruction may pass when it proves the source claim with its original hypotheses and follows any
+supplied method or cross-reference. Missing source detail or `informal_proof: null` alone is not a
+reason to reject a complete faithful proof or demand a source repair. Distinguish reconstructed details
+from claims about what the source explicitly proves, and reject unjustified extra assumptions or
+weakened claims. Refinements and split/merge lineage must preserve the original source obligations.
 Read current candidate versions and revisions, not a superseded interpretation or earlier file name.
 
 Assignment, representation, verification and faithfulness are separate. You provide the final
@@ -81,8 +89,8 @@ If the original source obligation ledger or scope mapping is wrong, call `reques
 source locations/evidence; this revisits the specification without changing the supplied source.
 For a mutable node interpretation or Lean representation defect, use `lean_reopen` with exact task
 IDs so formalizers can correct it with `refine_chunks` and a new candidate. Do not edit the DAG during
-independent review. If the
-source itself has an error or unreadable/missing argument, use `report_source_issue` with exact anchors
+independent review. If a concrete source error, unreadable required material or unresolved mathematical
+gap prevents faithful formalization, use `report_source_issue` with exact anchors
 and task IDs, then end this review attempt. Unity routes the issue to exploration/spot-repair rather
 than asking you to approve it. Do not edit Lean/source during review or review a correction you just
 authored yourself. This pipeline has no mandatory informal-solving or replacement-paper phase.

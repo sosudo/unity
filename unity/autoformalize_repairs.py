@@ -19,6 +19,8 @@ def repair_attempt_limit() -> int | float:
 async def source_repair_turn(
     agent, roster, paths, issue_id: str, max_attempts: int | float,
     *, interrupt_event: asyncio.Event | None = None,
+    workspace_observer=None,
+    workspace_notice: str = "",
 ) -> dict:
     """Atomically claim one issue and run exactly one outer repair attempt."""
     from .autoformalize_runtime import _agent_runtime_env, _formal_worktree, forum_brief
@@ -45,7 +47,7 @@ async def source_repair_turn(
         )
         result = await spawn(
             agent, system,
-            "Repair this exact source issue, or report why it cannot be repaired faithfully:\n"
+            workspace_notice + "Repair this exact source issue, or report why it cannot be repaired faithfully:\n"
             + json.dumps(claim["issue"], sort_keys=True)
             + "\nSubmit an evidence-backed source-repair proposal through the Forum. "
               "Never edit supplied source files or Lean project files during this repair turn. "
@@ -53,6 +55,7 @@ async def source_repair_turn(
             tree, build_autoformalize_mcp(paths, "source_repair"),
             interrupt_event=interrupt_event, env_overrides=env, own_process_group=True,
             mcp_profile="autoformalize",
+            workspace_observer=workspace_observer,
             log_context={"command": "autoformalize", "run_id": state.get("run_id"),
                          "phase": state["phase"], "role": "source_repair", "issue_id": issue_id,
                          "attempt_id": claim["attempt_id"]},

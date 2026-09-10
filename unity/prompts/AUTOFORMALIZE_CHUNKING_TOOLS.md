@@ -11,6 +11,8 @@ Write only `.unity/dag.json`: an informal, source-linked DAG with stable node ID
 Retain anchored `requirements` and `spec` (scope, arguments and prerequisites). Unresolved library
 matches are allowed in the plan. Do not generate Lean files or a compilable scaffold, run builds,
 or perform proof search/import minimization for chunking.
+Preserve abbreviated source arguments and cross-references in `informal_proof`. Use null only for an
+absent source argument; null is provenance, not unprovability or permission to leave final proof holes.
 Copy the plan's `solution_candidate` and `solution_sha256` compatibility fields exactly: they identify
 the supplied-source snapshot and bundle hash, not a generated solution or an informal review result.
 Unity validates source links and the dependency graph before formalization. Formalizers create and

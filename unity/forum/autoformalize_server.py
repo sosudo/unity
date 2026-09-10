@@ -21,6 +21,7 @@ from typing import Literal
 from fastmcp import FastMCP
 
 from .. import artifacts, autoformalize_state, worktree
+from ..autoformalize_diagnostics import failure_excerpt
 from ..autoformalize_review import SemanticReview
 from ..autoformalize_spec import normalize_outputs
 from . import server as discussion
@@ -107,14 +108,20 @@ def _finalization_lock(author: str):
 
 
 @contextmanager
-def _merge_lock():
+def _merge_lock(*, blocking: bool = True):
     """Serialize contract/source reopen with controller integration and final acceptance."""
     path = _root() / ".unity" / "forum" / "merge.lock"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
-        fcntl.flock(handle, fcntl.LOCK_EX)
         try:
-            yield
+            fcntl.flock(handle, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            if blocking:
+                raise
+            yield False
+            return
+        try:
+            yield True
         finally:
             fcntl.flock(handle, fcntl.LOCK_UN)
 
@@ -139,11 +146,35 @@ def _submit_formal_commit(
         "--binary", "--full-index", base, resolved,
     ).stdout
     diff_sha = hashlib.sha256(diff.encode()).hexdigest()
-    result = autoformalize_state.submit_formal_candidate(
-        FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
-        notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
+
+    def submit(retry_context=None):
+        return autoformalize_state.submit_formal_candidate(
+            FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
+            notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
+            retry_context=retry_context,
+        )
+
+    state = autoformalize_state.load_state(FORUM_DIR)
+    previous = autoformalize_state.matching_failed_candidate(
+        state, task_id=task_id, base_main_sha=base, diff_sha256=diff_sha,
+        stage=stage, outputs=outputs,
     )
-    if result["status"] == "submitted":
+    if previous:
+        # Never fingerprint main halfway through another integration. Keep this
+        # lock through state submission; ordinary first submissions pay no cost.
+        with _merge_lock(blocking=False) as acquired:
+            retry_context = None
+            if acquired:
+                from ..autoformalize_runtime import candidate_retry_context
+
+                state = autoformalize_state.load_state(FORUM_DIR)
+                retry_context = candidate_retry_context(
+                    _root(), state["formalization"].get("contract") or {},
+                )
+            result = submit(retry_context)
+    else:
+        result = submit()
+    if result["status"] == "submitted" and not result.get("idempotent"):
         candidate = result["candidate"]
         _mirror(author, f"FORMAL CANDIDATE {candidate['candidate_id']}",
                 f"task {task_id}, commit {resolved}, diff SHA-256 {diff_sha}", task_id)
@@ -416,18 +447,28 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
     ]
     candidates.sort(key=lambda item: (
         item.get("status") not in {"submitted", "merging"},
-        item.get("status") != "failed", -(item.get("created_at") or 0),
+        item.get("status") != "failed", bool(focus and item.get("task_id") not in focus),
+        -(item.get("created_at") or 0),
     ))
     if candidates:
         lines.extend(["", "CURRENT FORMALIZATION CANDIDATES"])
-        for item in candidates[:6]:
+        shown, failures = 0, set()
+        for item in candidates:
+            if shown == 6:
+                break
+            failure = item.get("error")
+            failure_key = (item.get("task_id"), item.get("stage", "complete"), failure)
+            if failure and failure_key in failures:
+                continue  # Old identical failures remain available through task detail.
+            shown += 1
             lines.append(f"- {item['candidate_id']} [{item['status']}] stage={item.get('stage', 'complete')} task={item['task_id']} "
                          f"by {item['author']} at {item['commit_sha'][:12]}")
-            if item.get("error"):
-                lines.append(f"  failure: {item['error'][:240]}")
+            if failure:
+                lines.append(f"  failure: {failure_excerpt(failure, 2000 if not failures else 600)}")
+                failures.add(failure_key)
             for record in (item.get("build") or {}, item.get("verification") or {}):
                 if record.get("artifact_id"):
-                    lines.append(f"  artifact {record['artifact_id']}")
+                    lines.append(f"  Full diagnostic: artifact_read('{record['artifact_id']}')")
     if issues:
         lines.extend(["", "SOURCE ISSUES — RESOLVE WITH EVIDENCE, NEVER SILENTLY REWRITE"])
         relevant = sorted(issues, key=lambda item: bool(
@@ -549,9 +590,9 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         lines.append(f"Run report: artifact {state['final_report'].get('artifact_id')}")
     text = "\n".join(lines)
     try:
-        limit = max(2_000, min(32_000, int(os.getenv("UNITY_AUTOFORMALIZE_BRIEF_CHARS", "12000"))))
+        limit = max(2_000, min(32_000, int(os.getenv("UNITY_AUTOFORMALIZE_BRIEF_CHARS", "16000"))))
     except ValueError:
-        limit = 12_000
+        limit = 16_000
     suffix = "\n...[brief truncated] Use autoformalize_task or autoformalize_requirements."
     return text if len(text) <= limit else text[:limit - len(suffix)].rstrip() + suffix
 
@@ -705,7 +746,9 @@ def finalize_formalization(
 ) -> dict:
     """Commit current worktree bytes and submit one immutable formal candidate.
 
-    Unchanged work submits the existing commit for authoritative re-verification.
+    Unchanged work reuses its existing commit. An unchanged deterministic failure
+    returns its prior diagnostic without another verification; changed main or
+    verification inputs permit a retry.
 
     This is deliberately not a build assertion.  The autoformalize controller applies
     the exact resulting commit to main and performs the sole authoritative full

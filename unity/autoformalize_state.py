@@ -1428,6 +1428,46 @@ def assignment_view(state: dict, task_id: str) -> dict:
             "strategy_ids": [row["strategy_id"] for row in strategies]}
 
 
+_DETERMINISTIC_FAILURES = {"merge_conflict", "build_failed", "contract_failed"}
+
+
+def _current_retry_context(state: dict, context: dict | None) -> bool:
+    if not isinstance(context, dict):
+        return False
+    formal = state["formalization"]
+    contract = formal.get("contract") or {}
+    return (context.get("main_sha") == formal.get("main_sha")
+            and context.get("contract_sha256") == contract.get("sha256")
+            and contract.get("sha256") == _contract_digest(contract)
+            and all(isinstance(context.get(key), str) and _ARTIFACT_SHA_RE.fullmatch(context[key])
+                    for key in ("contract_sha256", "source_sha256", "environment_sha256")))
+
+
+def matching_failed_candidate(
+    state: dict, *, task_id: str, base_main_sha: str, diff_sha256: str,
+    stage: str = "complete", outputs: list[dict] | None = None,
+    retry_context: dict | None = None,
+) -> dict | None:
+    """Find exact failed work; a context-free lookup only identifies a cache prospect."""
+    if retry_context is not None and not _current_retry_context(state, retry_context):
+        return None
+    bindings = normalize_outputs(outputs) if outputs is not None else state["formal_tasks"].get(task_id, {}).get("outputs", [])
+    for candidate in reversed(list(state["formal_candidates"].values())):
+        context = candidate.get("failure_context")
+        if (candidate.get("status") == "failed"
+                and candidate.get("failure_kind") in _DETERMINISTIC_FAILURES
+                and _current_retry_context(state, context)
+                and candidate_is_current(state, candidate)
+                and candidate.get("task_id") == task_id
+                and candidate.get("base_main_sha") == base_main_sha.casefold()
+                and candidate.get("diff_sha256") == diff_sha256
+                and candidate.get("stage", "complete") == stage
+                and candidate.get("outputs", []) == bindings
+                and (retry_context is None or context == retry_context)):
+            return candidate
+    return None
+
+
 def submit_formal_candidate(
     forum_dir: Path,
     strategy_id: str,
@@ -1441,6 +1481,7 @@ def submit_formal_candidate(
     supersedes: str = "",
     stage: str = "complete",
     outputs: list[dict] | None = None,
+    retry_context: dict | None = None,
 ) -> dict:
     if stage not in {"representation", "complete"}:
         raise ValueError("candidate stage must be representation or complete")
@@ -1494,6 +1535,16 @@ def submit_formal_candidate(
             raise ValueError("formal strategy/task is not accepting a new candidate")
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
+        failed = (matching_failed_candidate(
+            state, task_id=task_id, base_main_sha=base_main_sha,
+            diff_sha256=diff_sha256, stage=stage, outputs=bindings,
+            retry_context=retry_context,
+        ) if retry_context is not None else None)
+        if failed:
+            return {"status": "unchanged_failed", "candidate": failed, "idempotent": True,
+                    "error": failed.get("error", "unchanged failed candidate"),
+                    "artifact_id": (failed.get("build") or {}).get("artifact_id")
+                    or (failed.get("verification") or {}).get("artifact_id")}
         candidate_id = _id("formal")
         candidate = {
             "candidate_id": candidate_id,
@@ -1554,6 +1605,8 @@ def finish_formal_merge(
     build: dict | None = None,
     verification: dict | None = None,
     proposed_contract: dict | None = None,
+    failure_context: dict | None = None,
+    failure_kind: str = "",
 ) -> dict:
     with transaction(forum_dir) as state:
         candidate = state["formal_candidates"].get(candidate_id)
@@ -1638,6 +1691,9 @@ def finish_formal_merge(
         else:
             candidate["status"] = "failed"
             candidate["error"] = _text(error, "error", 4000, required=False)
+            if failure_kind in _DETERMINISTIC_FAILURES and _current_retry_context(state, failure_context):
+                candidate["failure_context"] = deepcopy(failure_context)
+                candidate["failure_kind"] = failure_kind
             task["status"] = "pending"
             for strategy in state["strategies"].values():
                 if strategy.get("phase") == "formalizing" and strategy.get("target") == task["task_id"] and strategy.get("status") == "paused":
