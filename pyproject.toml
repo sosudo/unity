@@ -1,6 +1,6 @@
 [project]
 name = "unity"
-version = "0.5.116896484"
+version = "0.5.443562468"
 description = "Multi-agent proving, solving, autoformalization, and optimization harness for Lean 4"
 readme = "README.md"
 license = { file = "LICENSE" }
