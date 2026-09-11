@@ -121,6 +121,11 @@ def run(
     input: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a registered job; interactive LSP keeps live stdio and its client's group."""
+    # Internal checks must not re-enter the worker shim and reacquire our lock.
+    real_lake = os.environ.get("UNITY_REAL_LAKE")
+    if args and args[0] == "lake" and real_lake:
+        args = [real_lake, *args[1:]]
+
     if passthrough_stdio and serialize_build:
         raise ValueError("an interactive server must not hold the build lock")
     project_root = Path(project_root).resolve()
