@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 
-from . import artifacts, autoformalize_state, worktree
+from . import autoformalize_state, worktree
 from .autoformalize_orchestrator import _preamble, build_autoformalize_mcp, load_prompt, load_role_prompt, stop_requested
 from .autoformalize_spawn import spawn
 
@@ -19,8 +19,6 @@ def repair_attempt_limit() -> int | float:
 async def source_repair_turn(
     agent, roster, paths, issue_id: str, max_attempts: int | float,
     *, interrupt_event: asyncio.Event | None = None,
-    workspace_observer=None,
-    workspace_notice: str = "",
 ) -> dict:
     """Atomically claim one issue and run exactly one outer repair attempt."""
     from .autoformalize_runtime import _agent_runtime_env, _formal_worktree, forum_brief
@@ -31,7 +29,6 @@ async def source_repair_turn(
     if claim["status"] != "claimed":
         return claim
     error = ""
-    output_artifact = ""
     try:
         state = autoformalize_state.load_state(paths.forum)
         tree = _formal_worktree(paths.project_root, agent.name)
@@ -47,7 +44,7 @@ async def source_repair_turn(
         )
         result = await spawn(
             agent, system,
-            workspace_notice + "Repair this exact source issue, or report why it cannot be repaired faithfully:\n"
+            "Repair this exact source issue, or report why it cannot be repaired faithfully:\n"
             + json.dumps(claim["issue"], sort_keys=True)
             + "\nSubmit an evidence-backed source-repair proposal through the Forum. "
               "Never edit supplied source files or Lean project files during this repair turn. "
@@ -55,19 +52,12 @@ async def source_repair_turn(
             tree, build_autoformalize_mcp(paths, "source_repair"),
             interrupt_event=interrupt_event, env_overrides=env, own_process_group=True,
             mcp_profile="autoformalize",
-            workspace_observer=workspace_observer,
             log_context={"command": "autoformalize", "run_id": state.get("run_id"),
                          "phase": state["phase"], "role": "source_repair", "issue_id": issue_id,
                          "attempt_id": claim["attempt_id"]},
         )
         if isinstance(result, BaseException):
             error = f"{type(result).__name__}: {result}"
-        elif isinstance(result, str) and result.strip():
-            output_artifact = artifacts.store_text(
-                paths.artifacts, result,
-                kind="source_repair_output", producer=agent.name, source=issue_id,
-                metadata={"attempt_id": claim["attempt_id"]},
-            )["artifact_id"]
     except asyncio.CancelledError:
         error = "source repair interrupted"
         raise
@@ -76,10 +66,8 @@ async def source_repair_turn(
     finally:
         issue = autoformalize_state.finish_source_repair_attempt(
             paths.forum, issue_id, agent.name, claim["attempt_id"], error=error,
-            output_artifact=output_artifact,
         )
-    attempt = next(row for row in issue["attempts"] if row["attempt_id"] == claim["attempt_id"])
-    return {"status": "attempted", "issue": issue, "error": attempt["error"]}
+    return {"status": "attempted", "issue": issue, "error": error}
 
 
 async def run_source_repairs(roster, paths, max_attempts, issue_ids=None) -> dict:

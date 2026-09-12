@@ -16,8 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from contextlib import contextmanager, nullcontext
-from contextvars import ContextVar
+from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
 
@@ -25,40 +24,13 @@ from rich.console import Console
 
 from . import artifacts, library, autoformalize_contract, autoformalize_jobs, autoformalize_state, worktree
 from .autoformalize_input import require_source_matches
-from .autoformalize_diagnostics import failure_excerpt
 from .forum import autoformalize_server
 from .autoformalize_orchestrator import _preamble, load_prompt, stop_requested
 from .autoformalize_spawn import spawn
-from .autoformalize_worktree_guard import WorkspaceGuard, WorkspaceContamination
 
 
 _console = Console()
 PIPELINE = "autoformalize"
-_workspace_guard: ContextVar[WorkspaceGuard | None] = ContextVar("autoformalize_workspace_guard", default=None)
-
-
-@contextmanager
-def _guard_scope(guard: WorkspaceGuard | None):
-    token = _workspace_guard.set(guard)
-    try:
-        yield
-    finally:
-        _workspace_guard.reset(token)
-
-
-def _check_workspace() -> None:
-    guard = _workspace_guard.get()
-    if guard is not None:
-        guard.assert_expected()
-
-
-@contextmanager
-def _main_write():
-    """Only short controller mutations exclude scans, never an entire review."""
-    guard = _workspace_guard.get()
-    with guard.unity_write() if guard is not None else nullcontext():
-        _check_workspace()
-        yield guard
 
 
 def configure_forum(paths, profile: str) -> None:
@@ -77,7 +49,6 @@ def forum_brief(paths, profile: str, author: str, task_id: str = "") -> str:
 
 _CANCEL_GRACE_SECONDS = 20.0
 _CANCEL_HARD_SECONDS = 10.0
-_WORKSPACE_EVIDENCE_GRACE_SECONDS = 2.0
 
 
 async def _cancel(
@@ -265,74 +236,12 @@ def _git(project: Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
-class MainWorkspaceContaminationError(ValueError):
-    """Unsafe integration state: stop the run instead of retrying proof workers."""
-
-
-def _assert_main_inputs_tracked(root: Path, *, candidate_paths: list[str] | None = None) -> None:
-    indexed = _git(root, "ls-files", "-z")
-    if indexed.returncode:
-        raise MainWorkspaceContaminationError("Cannot inspect main's index; reconcile main before resuming")
-    tracked = set(indexed.stdout.split("\0"))
-    try:
-        unknown = {str(path.relative_to(root)) for path in autoformalize_contract.source_files(root)
-                   if str(path.relative_to(root)) not in tracked}
-    except (OSError, ValueError) as exc:
-        raise MainWorkspaceContaminationError(
-            "Cannot safely inspect main source inputs; reconcile main before resuming. Files were preserved."
-        ) from exc
-    if unknown:
-        # Custom Lake build directories are disposable outputs, not source. Only
-        # discover the layout on this exceptional path; clean merges pay no extra
-        # Lean invocation. A broken layout cannot make unknown source safe.
-        try:
-            layout = autoformalize_contract.workspace_layout(root)
-            build_dir = layout.get("build_dir")
-            if build_dir:
-                unknown = {str(path.relative_to(root))
-                           for path in autoformalize_contract.source_files(root, build_dir=build_dir)
-                           if str(path.relative_to(root)) not in tracked}
-        except (OSError, ValueError):
-            pass
-    collisions = {name for name in candidate_paths or []
-                  if name not in tracked and os.path.lexists(root / name)}
-    if unknown or collisions:
-        names = ", ".join(sorted(unknown | collisions)[:20])
-        raise MainWorkspaceContaminationError(
-            "Main has untracked build inputs or candidate-path collisions: " + names
-            + ". Files were preserved. Inspect and reconcile main before resuming; "
-              "agents must edit only their assigned worktrees."
-        )
-
-
-def candidate_retry_context(root: Path, contract: dict, *, layout: dict | None = None) -> dict:
-    """Fingerprint actual inputs, not merely HEAD; called under the merge lock."""
-    identity = autoformalize_contract.source_identity(root, layout=layout)
-    return {"main_sha": identity["main_sha"], "contract_sha256": contract.get("sha256", ""),
-            "source_sha256": identity["source_sha256"],
-            "environment_sha256": autoformalize_contract.digest(identity["environment"])}
-
-
-def _is_patch_conflict(result: subprocess.CompletedProcess) -> bool:
-    """Conservative negative-cache classification, never an acceptance check."""
-    if result.returncode != 1:
-        return False
-    lines = [line.strip() for line in (result.stdout + "\n" + result.stderr).splitlines() if line.strip()]
-    conflict = r"(?:error: patch failed: .+:\d+|error: .+: patch does not apply|Applied patch to '.+' with conflicts\.)"
-    progress = r"(?:Performing three-way merge\.\.\.|Falling back to direct application\.\.\.|Applied patch to '.+' cleanly\.|U .+)"
-    return (any(re.fullmatch(conflict, line) for line in lines)
-            and all(re.fullmatch(conflict, line) or re.fullmatch(progress, line) for line in lines))
-
-
 def _rollback(root: Path, before: str) -> subprocess.CompletedProcess:
-    with autoformalize_jobs.cancellation_disabled(), _main_write() as guard:
+    with autoformalize_jobs.cancellation_disabled():
         result = _git(root, "reset", "--hard", before)
-        if result.returncode:
-            raise MainWorkspaceContaminationError("Main rollback failed; inspect and reconcile main before resuming: "
-                             + (result.stderr.strip() or result.stdout.strip() or "git reset failed"))
-        if guard is not None:
-            guard.expect_git_index(expected_head=before)
-        _assert_main_inputs_tracked(root)
+    if result.returncode:
+        raise ValueError("Main rollback failed; inspect and reconcile main before resuming: "
+                         + (result.stderr.strip() or result.stdout.strip() or "git reset failed"))
     return result
 
 
@@ -416,9 +325,6 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
         "verified_tasks": check.get("verified_tasks", sorted(completed)),
         **{key: check[key] for key in ("proposed_contract", "verified_targets", "final") if key in check},
         "issues": issues,
-        # Empty inspection results also represent unavailable/crashed inspectors;
-        # do not turn those failures into persistent negative cache entries.
-        "deterministic_failure": bool(check.get("targets")),
     }
 
 
@@ -434,7 +340,6 @@ def _checked_tree(root: Path, revision: str | None = None) -> str:
 def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict | None = None) -> dict:
     """Verify an immutable candidate; commit only if its integration changes main."""
     root = paths.project_root
-    _check_workspace()
     current = autoformalize_state.load_state(paths.forum)
     require_source_matches(paths, current)
     contract = current["formalization"].get("contract", {})
@@ -457,52 +362,24 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     exact_diff = diff_result.stdout
     if hashlib.sha256(exact_diff.encode()).hexdigest() != candidate["diff_sha256"]:
         return {"ok": False, "error": "candidate commit no longer matches its submitted diff hash"}
-    changed_paths = _git(root, "diff", "--name-only", "-z", candidate["base_main_sha"], resolved)
-    if changed_paths.returncode:
-        return {"ok": False, "error": "could not inspect candidate paths"}
-    _assert_main_inputs_tracked(root, candidate_paths=[name for name in changed_paths.stdout.split("\0") if name])
     dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
     if dirty.returncode or dirty.stdout.strip():
         return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
     before = worktree.main_commit(root)
     before_tree = _checked_tree(root, before)
     if exact_diff:
-        with _main_write() as guard:
-            if guard is not None:
-                # Conflicts must not leave an unmerged index whose conflict-marker
-                # bytes cannot be distinguished from an unauthorized worker edit.
-                checked = autoformalize_jobs.run(
-                    root, ["git", "apply", "--check", "--3way", "--index", "-"],
-                    cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
-                )
-                guard.assert_expected()
-                # --check --3way can exit zero while predicting conflicts. Do
-                # not perform that known-conflicting write against live main.
-                predicted_conflict = bool(re.search(r"(?m)^Applied patch to '.+' with conflicts\.$", checked.stderr))
-                if checked.returncode or predicted_conflict:
-                    return {"ok": False, "error": checked.stderr.strip() or "candidate conflicts with main",
-                            "failure_kind": "merge_conflict" if predicted_conflict or _is_patch_conflict(checked) else ""}
-            # Drain the short mutation before honoring cancellation; otherwise a
-            # half-applied patch cannot safely become a recovery baseline.
-            with autoformalize_jobs.cancellation_disabled():
-                applied = autoformalize_jobs.run(
-                    root,
-                    ["git", "apply", "--3way", "--index", "-"],
-                    cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
-                )
-                if guard is not None:
-                    guard.expect_git_index()
+        applied = autoformalize_jobs.run(
+            root,
+            ["git", "apply", "--3way", "--index", "-"],
+            cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
+        )
         if applied.returncode:
             _rollback(root, before)
-            return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main",
-                    "failure_kind": "merge_conflict" if _is_patch_conflict(applied) else ""}
+            return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
     elif _checked_tree(root, resolved) != before_tree:
         return {"ok": False, "error": "Main differs from this empty candidate; sync_from_main and resubmit."}
     with autoformalize_contract.measure(timings, "workspace_seconds"):
         layout = autoformalize_contract.workspace_layout(root)
-    if (guard := _workspace_guard.get()) is not None:
-        guard.set_build_dir(layout.get("build_dir"))
-        guard.assert_expected()
     with autoformalize_contract.measure(timings, "initial_identity_seconds"):
         checked_source = autoformalize_contract.source_identity(root, layout=layout)
     checked_tree = _checked_tree(root)
@@ -524,7 +401,6 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             "build": {"returncode": None, "seconds": build_seconds},
         }
     build_seconds = time.monotonic() - build_started
-    _check_workspace()
     # Invalidation precedes BOTH build passes, whose complete duration/output is
     # recorded. Default targets alone need not include every inspected module.
     output = build["output"]
@@ -540,13 +416,8 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         _rollback(root, before)
         return {
             "ok": False,
-            "error": "lake build failed: " + failure_excerpt(output, 3000),
+            "error": "lake build failed: " + artifacts.preview_text(output, 3000),
             "build": build_record,
-            # Cache actual Lean diagnostics, not exit-1 transport/tool failures.
-            "failure_kind": "build_failed" if build["returncode"] == 1 and re.search(
-                r"(?m)(?:^error: [^\n]*\.lean:\d+:\d+:|^[^\n]*\.lean:\d+:\d+: error:)", output,
-            ) else "",
-            "failure_environment_sha256": autoformalize_contract.digest(checked_source["environment"]),
         }
     if _git(root, "diff", "--quiet").returncode:
         _rollback(root, before)
@@ -559,7 +430,6 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         layout=layout, environment=checked_source["environment"], timings=timings,
         candidate=candidate,
     )
-    _check_workspace()
     with autoformalize_contract.measure(timings, "postcheck_identity_seconds"):
         reviewed_source = autoformalize_contract.source_identity(root)
     if (reviewed_source != checked_source
@@ -579,15 +449,10 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             "error": "; ".join(verification["issues"]),
             "build": build_record,
             "verification": verification,
-            "failure_kind": "contract_failed" if verification.get("deterministic_failure") else "",
-            "failure_environment_sha256": autoformalize_contract.digest(checked_source["environment"]),
         }
     require_source_matches(paths, current)
     if not no_tree_change:
-        with autoformalize_jobs.cancellation_disabled(), _main_write() as guard:
-            commit = _git(root, "commit", "-m", f"UNITY: merge {PIPELINE} task {task['task_id']}")
-            if guard is not None:
-                guard.expect_git_index(expected_head=worktree.main_commit(root) if not commit.returncode else before)
+        commit = _git(root, "commit", "-m", f"UNITY: merge {PIPELINE} task {task['task_id']}")
         if commit.returncode:
             _rollback(root, before)
             return {"ok": False, "error": commit.stderr.strip() or "could not commit candidate"}
@@ -599,7 +464,6 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             or _checked_tree(root, "HEAD") != checked_tree
             or _checked_tree(root) != checked_tree):
         raise ValueError("commit changed the verified candidate source")
-    _check_workspace()
     verification["source_identity"] = committed_source
     return {
         "ok": True,
@@ -611,7 +475,6 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
 
 def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     root = paths.project_root
-    _assert_main_inputs_tracked(root)
     # Nothing below may discard pre-existing tracked edits.
     dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
     if dirty.returncode or dirty.stdout.strip():
@@ -621,42 +484,8 @@ def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     started = time.monotonic()
     result = {}
     try:
-        current = autoformalize_state.load_state(paths.forum)
-        contract = current["formalization"].get("contract") or {}
-        lookup = {"task_id": candidate["task_id"], "base_main_sha": candidate["base_main_sha"],
-                  "diff_sha256": candidate["diff_sha256"], "stage": candidate.get("stage", "complete"),
-                  "outputs": candidate.get("outputs", [])}
-        prior = autoformalize_state.matching_failed_candidate(current, **lookup)
-        if prior:
-            context = candidate_retry_context(root, contract)
-            prior = autoformalize_state.matching_failed_candidate(current, **lookup, retry_context=context)
-        if prior:
-            result = {"ok": False, "error": prior.get("error", "unchanged failed candidate"),
-                      "failure_kind": prior["failure_kind"], "failure_context": context,
-                      **{key: dict(prior[key]) for key in ("build", "verification")
-                         if isinstance(prior.get(key), dict)},
-                      "unchanged_failed": prior["candidate_id"]}
-        else:
-            baseline_files = autoformalize_contract._file_hashes(root)
-            result = _apply_formal_candidate(paths, candidate, task, timings=timings)
+        result = _apply_formal_candidate(paths, candidate, task, timings=timings)
         autoformalize_jobs.check_cancelled()
-        if result.get("failure_kind") and not result.get("failure_context"):
-            # The failed integration has rolled back. Cache only the actual clean
-            # baseline, with dependencies and non-Lean inputs included. A failed
-            # fingerprint disables caching, never proof verification.
-            _assert_main_inputs_tracked(root)
-            try:
-                context = candidate_retry_context(root, contract)
-                if (baseline_files == autoformalize_contract._file_hashes(root)
-                        and (not result.get("failure_environment_sha256")
-                             or result["failure_environment_sha256"] == context["environment_sha256"])):
-                    result["failure_context"] = context
-            except autoformalize_jobs.JobCancelled:
-                raise
-            except (OSError, ValueError, KeyError):
-                pass
-    except MainWorkspaceContaminationError:
-        raise
     except (OSError, ValueError, KeyError) as exc:
         _rollback(root, before)
         result = {"ok": False, "error": f"candidate verification failed: {exc}",
@@ -679,14 +508,13 @@ def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     return result
 
 
-def _integrate_formal_candidate(paths, candidate: dict, task: dict, *, guard: WorkspaceGuard | None = None) -> dict:
+def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
     """Apply one candidate under the merge lock (also useful for integration tests)."""
-    with _merge_lock(paths.project_root), _guard_scope(guard):
+    with _merge_lock(paths.project_root):
         return _integrate_checked(paths, candidate, task)
 
 
-def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Event | None = None,
-                          guard: WorkspaceGuard | None = None) -> dict:
+def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Event | None = None) -> dict:
     """Serialize Git integration AND state publication under the same lock."""
     def record(result: dict) -> dict:
         if result.get("cancelled") and autoformalize_state.pending_replan(autoformalize_state.load_state(paths.forum)):
@@ -696,62 +524,25 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
             paths.forum, candidate["candidate_id"], success=bool(result.get("ok")),
             main_sha=result.get("main_sha", ""), error=result.get("error", ""),
             build=result.get("build"), verification=result.get("verification"),
-            failure_context=result.get("failure_context"), failure_kind=result.get("failure_kind", ""),
         )
         return result
 
-    def cancelled_result(exc: autoformalize_jobs.JobCancelled, before: str | None = None) -> dict:
-        # The workspace guard also signals cancellation. That interruption is
-        # not a failed proof, even if it arrived before acquiring merge.lock.
-        incident = guard.poll_due(force=True) if guard is not None else None
-        if incident is not None:
-            return {"ok": False, "workspace_recovery": True,
-                    "incident": incident, "rollback_sha": before,
-                    "candidate_id": candidate["candidate_id"], "error": incident.message}
-        return record({"ok": False, "cancelled": True, "error": str(exc)})
-
-    with autoformalize_jobs.cancellation_scope(cancel_event), _guard_scope(guard):
+    with autoformalize_jobs.cancellation_scope(cancel_event):
         try:
             with _merge_lock(paths.project_root):
-                before = None
                 try:
-                    if guard is not None:
-                        guard.assert_expected()
-                        before = worktree.main_commit(paths.project_root)
                     result = _integrate_checked(paths, candidate, task)
-                    _check_workspace()
-                except WorkspaceContamination as exc:
-                    # No rollback or proof-failure record until the writer is
-                    # stopped and its exact bytes have been safely preserved.
-                    return {"ok": False, "workspace_recovery": True,
-                            "incident": exc.incident, "rollback_sha": before,
-                            "candidate_id": candidate["candidate_id"], "error": str(exc)}
                 except autoformalize_jobs.JobCancelled as exc:
-                    return cancelled_result(exc, before)
+                    result = {"ok": False, "cancelled": True, "error": str(exc)}
                 return record(result)
         except autoformalize_jobs.JobCancelled as exc:
             # Cancellation before acquiring the lock made no source mutation.
-            return cancelled_result(exc)
-
-
-def _recover_main_workspace(paths, guard: WorkspaceGuard, recovery: dict) -> None:
-    """Called only after the offending worker and any integration have drained."""
-    with autoformalize_jobs.cancellation_disabled(), _merge_lock(paths.project_root), _guard_scope(guard):
-        guard.recover(recovery["incident"])
-        if recovery.get("rollback_sha"):
-            _rollback(paths.project_root, recovery["rollback_sha"])
-        guard.assert_expected()
-        if recovery.get("candidate_id"):
-            # Leave it 'merging' until recovery AND rollback actually succeeded.
-            autoformalize_state.defer_formal_merge(
-                paths.forum, recovery["candidate_id"], reason="Workspace contamination recovered; retry verification",
-            )
+            return record({"ok": False, "cancelled": True, "error": str(exc)})
 
 
 def recover_interrupted_formal_merges(paths) -> None:
     """Reopen clean interrupted merges; never discard ambiguous main changes."""
     with _merge_lock(paths.project_root):
-        _assert_main_inputs_tracked(paths.project_root)
         state = autoformalize_state.load_state(paths.forum)
         formal = state["formalization"]
         interrupted = [
@@ -789,8 +580,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     configure_forum(paths, "formalizing")
     state = autoformalize_state.load_state(paths.forum)
     require_source_matches(paths, state)
-    with _merge_lock(paths.project_root):
-        _assert_main_inputs_tracked(paths.project_root)
     tools_prompt = load_prompt(f"{PIPELINE.upper()}_FORMALIZING_TOOLS")
     context = library.library_context()
     subagents = library.library_subagents()
@@ -805,9 +594,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     integration: asyncio.Task | None = None
     integration_candidate: dict = {}
     integration_cancel: Event | None = None
-    recovery: dict | None = None
-    recovery_notices: dict[str, str] = {}
-    workspace_unsafe = False
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
     worker_revisions: dict[str, tuple[str, int]] = {}
@@ -823,10 +609,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         worktree.symlink_lake_cache(tree, paths.project_root)
         worktree.link_runtime_state(tree, paths.project_root)
         worktrees[agent.name] = tree
-
-    guard = WorkspaceGuard(paths.project_root, paths.artifacts, worktrees=worktrees)
-    with _merge_lock(paths.project_root):
-        guard.capture_baseline()
 
     def participating_strategy(current: dict, name: str, task_id: str = "") -> dict | None:
         matches = [
@@ -867,20 +649,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 name=f"autoformalize:stop:{name}",
             )
 
-    def record_recovery(incident, details: dict | None = None) -> None:
-        nonlocal recovery
-        if recovery is None:
-            # Filesystem writes can precede their native tool notifications.
-            # This bounds notification delivery, not the worker's stop/drain.
-            recovery = {"evidence_deadline": time.monotonic() + _WORKSPACE_EVIDENCE_GRACE_SECONDS}
-        if details:
-            recovery.update({key: value for key, value in details.items() if key != "incident"})
-        recovery["incident"] = incident
-        if integration_cancel is not None:
-            integration_cancel.set()
-        if incident.author in agents:
-            request_stop(incident.author, incident.message)
-
     def retire_completed_task(task_id: str) -> None:
         for name, running in list(tasks.items()):
             current = autoformalize_state.load_state(paths.forum)
@@ -902,7 +670,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         return status, hashlib.sha256((status + "\n" + diff).encode()).hexdigest()
 
     def launch(name: str, task_id: str, followup: str = "") -> None:
-        if stop_requested(paths.project_root) or integration is not None or recovery is not None or name in stopping:
+        if integration is not None or name in stopping:
             return  # Worktree preparation takes merge.lock; never block this event loop on a review.
         if name in tasks and not tasks[name].done():
             return
@@ -953,7 +721,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "is materially different. You may investigate or edit before registering, but claim a "
             "strategy before finalizing. "
         )
-        task_prompt = recovery_notices.pop(name, "") + resume + (followup or (
+        task_prompt = resume + (followup or (
             f"Your current formalization target is task `{task_id}`: "
             f"{formal_task.get('description', '')}. Current adopted outputs: "
             f"{formal_task.get('outputs', [])}. Its formalization source references are "
@@ -986,13 +754,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 env_overrides=_agent_runtime_env(paths, current, name, task_id=task_id),
                 own_process_group=True,
                 mcp_profile="autoformalize",
-                workspace_observer=guard.observe_tool,
             ),
             name=f"{PIPELINE}:formalizing:{name}:{task_id}",
         )
 
     def launch_idle() -> None:
-        if stop_requested(paths.project_root) or integration is not None or recovery is not None:
+        if integration is not None:
             return
         current = autoformalize_state.load_state(paths.forum)
         if autoformalize_state.pending_replan(current):
@@ -1016,8 +783,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             tasks[name] = asyncio.create_task(source_repair_turn(
                 agents[name], roster, paths, issue_id, repair_attempt_limit(),
                 interrupt_event=interrupts[name],
-                workspace_observer=guard.observe_tool,
-                workspace_notice=recovery_notices.pop(name, ""),
             ), name=f"autoformalize:source_repair:{name}:{issue_id}")
         ready = autoformalize_state.ready_formal_tasks(current)
         if not ready:
@@ -1082,9 +847,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         launch_idle()
         while not stop_requested(paths.project_root):
             await asyncio.sleep(0.1)
-            incident = await asyncio.to_thread(guard.poll_due)
-            if incident is not None:
-                record_recovery(incident)
             state = autoformalize_state.load_state(paths.forum)
             refresh_worker_targets(state)
             require_source_matches(paths, state)
@@ -1148,43 +910,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 integration = None
                 integration_candidate = {}
                 integration_cancel = None
-                if result.get("workspace_recovery"):
-                    # Integration may return an incident captured before later
-                    # notifications arrived. Keep its rollback/candidate data,
-                    # but only use the guard's current evidence for recovery.
-                    incident = await asyncio.to_thread(guard.poll_due, force=True)
-                    record_recovery(incident or result["incident"], result)
-                elif result.get("ok"):
+                if result.get("ok"):
                     retire_completed_task(finished["task_id"])
                 elif not result.get("deferred"):
                     require_source_matches(paths, autoformalize_state.load_state(paths.forum))
                     _console.print(f"[red]candidate {finished['candidate_id']} failed: {result.get('error', '')}[/red]")
-
-            if recovery is not None:
-                incident = await asyncio.to_thread(guard.poll_due, force=True)
-                record_recovery(incident or recovery["incident"])
-                incident = recovery["incident"]
-                author = incident.author
-                if integration is not None or author in tasks or author in stopping:
-                    # The violator's cancellation can deliver the completion
-                    # evidence needed to undo its write. Other workers remain
-                    # active in their private worktrees throughout this drain.
-                    continue
-                if author not in agents or not incident.recoverable:
-                    if time.monotonic() < recovery["evidence_deadline"]:
-                        continue
-                    # Never guess a shell writer or discard unsafe changes.
-                    raise WorkspaceContamination(incident)
-                # This short critical section must not be abandoned in a
-                # background thread if the runtime itself is cancelled.
-                _recover_main_workspace(paths, guard, recovery)
-                recovery_notices[author] = (
-                    f"Your previous turn modified {', '.join(incident.paths)} outside your worktree. "
-                    f"Unity preserved the incident at {incident.artifact} and restored main. "
-                    f"Continue in {worktrees[author]}; inspect the preserved work before repeating it. "
-                )
-                _console.print(f"[yellow]recovered misplaced work from {author}; continuing its existing task[/yellow]")
-                recovery = None
 
             state = autoformalize_state.load_state(paths.forum)
             replan = autoformalize_state.pending_replan(state)
@@ -1232,7 +962,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     _console.print(f"[cyan]mechanically reviewing {candidate['candidate_id']} for {candidate['task_id']}[/cyan]")
                     integration = asyncio.create_task(asyncio.to_thread(
                         _integrate_and_record, paths, integration_candidate,
-                        state["formal_tasks"][candidate["task_id"]], integration_cancel, guard,
+                        state["formal_tasks"][candidate["task_id"]], integration_cancel,
                     ), name=f"autoformalize:integration:{candidate['candidate_id']}")
                     break
 
@@ -1272,9 +1002,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                                      "Reconcile these worktrees before resuming: " + details)
                 return state
         return autoformalize_state.load_state(paths.forum)
-    except WorkspaceContamination:
-        workspace_unsafe = True
-        raise
     finally:
         for name in list(tasks):
             request_stop(name, "formalization runtime ending")
@@ -1292,10 +1019,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 except Exception:
                     break  # Retrieve/report below; still finish worker cleanup.
             try:
-                result = integration.result()
-                if result.get("workspace_recovery"):
-                    workspace_unsafe = True
-                    _console.print(f"[red]{result['error']}; main and worktrees preserved[/red]")
+                integration.result()
             except Exception as exc:
                 _console.print(f"[red]integration ended with an error; worktrees preserved: {exc!r}[/red]")
         if stopping:
@@ -1307,7 +1031,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             if running is not None and not running.done():
                 _console.print(f"[red]worker {agent.name} has not stopped; preserving its worktree[/red]")
                 continue
-            if (workspace_unsafe or not autoformalize_state.all_formal_tasks_complete(final_state)
+            if (not autoformalize_state.all_formal_tasks_complete(final_state)
                     or final_state.get("phase") == "chunking"
                     or autoformalize_state.pending_replan(final_state)
                     or autoformalize_state.open_source_issues(final_state)):

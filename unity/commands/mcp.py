@@ -162,24 +162,6 @@ async def mcp(server, tool, args, args_file):
     if not isinstance(kwargs, dict):
         raise click.ClickException("args must be a JSON object")
 
-    # Autoformalize's restricted workers cannot instantiate privileged Forum
-    # servers or write shared artifacts. Their parent owns those operations.
-    # No environment marker is set by solve/prove; their path is unchanged.
-    if os.getenv("UNITY_AUTOFORMALIZE_BROKER_URL"):
-        import asyncio
-        from ..autoformalize_access import request
-        try:
-            result = await asyncio.to_thread(request, server, "tools/call", {
-                "name": tool, "arguments": kwargs, "unityCompact": True,
-            })
-        except Exception as exc:
-            raise click.ClickException(str(exc)) from exc
-        for content in result.get("content", []):
-            click.echo(content.get("text", json.dumps(content)))
-        if result.get("isError"):
-            raise click.ClickException("autoformalize tool failed")
-        return
-
     from ..config import load_paths
     from ..orchestrator import build_mcp, build_solve_mcp
     from fastmcp import Client

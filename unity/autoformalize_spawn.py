@@ -12,119 +12,14 @@ import os
 import signal
 import sys
 import tempfile
-import uuid
-from collections.abc import Callable, Mapping
-from contextvars import ContextVar
+from collections.abc import Mapping
 from pathlib import Path
 
 from rich.console import Console
 
 from .roster import Agent
-from .autoformalize_access import restricted_backend
-from .autoformalize_sandbox import WriteSandboxPolicy
 
 _console = Console()
-
-# Each concurrent spawn owns its observer and its native-tool/result correlation.
-# No provider credentials, command bodies, or tool-result bodies enter this state.
-_workspace_observer: ContextVar[Callable[[dict], None] | None] = ContextVar(
-    "autoformalize_workspace_observer", default=None,
-)
-_workspace_calls: ContextVar[dict | None] = ContextVar("autoformalize_workspace_calls", default=None)
-
-
-def _begin_workspace_attempt() -> None:
-    """A reconnected backend must not complete a previous process's tool call."""
-    calls = _workspace_calls.get()
-    if calls is not None:
-        calls.clear()
-        calls["attempt"] = uuid.uuid4().hex
-
-
-def _workspace_tool_id(tool_id):
-    calls = _workspace_calls.get()
-    attempt = calls.get("attempt") if calls is not None else None
-    return f"{attempt}:{tool_id}" if attempt and tool_id else tool_id
-
-
-def _field(value, key, default=None):
-    return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
-
-
-def _write_status(status):
-    status = str(getattr(status, "value", status) or "").lower()
-    if status in {"completed", "success", "succeeded"}:
-        return "success"
-    if status in {"failed", "declined", "error", "cancelled", "canceled"}:
-        return "failed"
-    return None
-
-
-def _workspace_observation(name, tool_id, event, operation, path=None, execution_cwd=None, status=None):
-    return {
-        "agent": name, "tool_id": _workspace_tool_id(tool_id), "event": event,
-        "operation": operation, "path": str(path) if path else None,
-        "execution_cwd": str(execution_cwd) if execution_cwd else None, "status": status,
-    }
-
-
-def _native_write_observations(name, tool, args, tool_id, cwd):
-    """Use explicit native editor inputs only; never parse a shell to guess writes."""
-    args = args if isinstance(args, dict) else {}
-    if tool in {"Bash", "shell", "run_command", "command_execution"}:
-        return [_workspace_observation(
-            name, tool_id, "started", "shell",
-            execution_cwd=args.get("cwd") or args.get("workdir") or args.get("Cwd"),
-        )]
-    operations = {
-        "Write": "modify", "Edit": "modify", "MultiEdit": "modify", "NotebookEdit": "modify",
-        "write_to_file": "modify", "edit_file": "modify", "replace_file_content": "modify",
-        "multi_replace_file_content": "modify", "delete_file": "delete", "create_file": "create",
-    }
-    if tool not in operations:
-        return []
-    path = (args.get("file_path") or args.get("path") or args.get("notebook_path")
-            or args.get("TargetFile"))
-    return [_workspace_observation(name, tool_id, "started", operations[tool], path, cwd)]
-
-
-def _remember_workspace_calls(observations):
-    calls = _workspace_calls.get()
-    if calls is not None and observations and observations[0]["tool_id"]:
-        first = observations[0]
-        calls[(first["agent"], first["tool_id"])] = observations
-
-
-def _complete_workspace_call(name, tool_id, status):
-    calls = _workspace_calls.get()
-    prior = calls.pop((name, _workspace_tool_id(tool_id)), []) if calls is not None else []
-    return [{**item, "event": "completed", "status": status} for item in prior]
-
-
-def _antigravity_write_observations(name, step, cwd):
-    """AG versions vary; absent IDs/inputs/results remain absent evidence.
-
-    DONE describes a finished step, not a successful filesystem mutation. Only
-    an explicit success/error result permits successful-write attribution.
-    """
-    tool_id = step.get("tool_call_id") or step.get("step_id") or step.get("id")
-    phase = step.get("state")
-    calls = _workspace_calls.get()
-    if phase in {"DONE", "FAILED", "ERROR", "CANCELLED"}:
-        status = _write_status(step.get("status")) or _write_status(phase)
-        if step.get("is_error") is True:
-            status = "failed"
-        elif step.get("is_error") is False:
-            status = "success"
-        return _complete_workspace_call(name, tool_id, status)
-    if phase not in {"RUNNING", "STARTED", "IN_PROGRESS"}:
-        return []
-    if calls is not None and tool_id and (name, _workspace_tool_id(tool_id)) in calls:
-        return []  # Repeated progress updates do not establish a new pre-write snapshot.
-    args = step.get("input") or step.get("arguments") or {}
-    observations = _native_write_observations(name, step.get("step_type"), args, tool_id, cwd)
-    _remember_workspace_calls(observations)
-    return observations
 
 
 # ── env (per-agent, never global) ──────────────────────────────────────────────
@@ -194,21 +89,16 @@ def _agent_env(
     return env
 
 
-def _process_group_wrapper(executable: Path, directory: Path, label: str,
-                           sandbox_policy: WriteSandboxPolicy | None = None) -> tuple[Path, Path]:
+def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tuple[Path, Path]:
     """Wrap a CLI so its entire process tree has an autoformalize-owned process group."""
     wrapper = directory / f"{label}-group-wrapper"
     pid_file = directory / f"{label}-group.pid"
-    argv = [str(executable)]
-    if sandbox_policy is not None:
-        from .autoformalize_sandbox import command
-        argv = command(sandbox_policy, argv)
     wrapper.write_text(
-        f"#!{sys.executable} -I\n"
+        f"#!{sys.executable}\n"
         "import os, sys\n"
         "os.setsid()\n"
         f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
-        f"os.execv({argv[0]!r}, {argv!r} + sys.argv[1:])\n"
+        f"os.execv({str(executable)!r}, [{str(executable)!r}, *sys.argv[1:]])\n"
     )
     wrapper.chmod(0o700)
     return wrapper, pid_file
@@ -310,15 +200,10 @@ def _stop_requested(cwd) -> bool:
     return u is not None and (u / "stop-requested").exists()
 
 
-def _tool_log(cwd, name: str, tool: str, detail: str = "", *,
-              changed_paths=None, file_change=None, observations=None) -> None:
+def _tool_log(cwd, name: str, tool: str, detail: str = "") -> None:
     """Per-call tool telemetry → .unity/logs/tools.jsonl (best-effort)."""
     from .config import find_unity_dir
     import json, time
-    observer = _workspace_observer.get()
-    for observation in observations or []:
-        if observer is not None:
-            observer(dict(observation))
     u = find_unity_dir(Path(cwd)) if cwd else None
     if u is None:
         return
@@ -328,15 +213,6 @@ def _tool_log(cwd, name: str, tool: str, detail: str = "", *,
         entry = {"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "agent": name, "tool": tool}
         if detail:
             entry["detail"] = detail[:160]
-        if changed_paths is not None:
-            # File paths, never patch bodies or credentials. Preserve the worker
-            # cwd so misplaced edits can be traced without guessing from times.
-            entry["cwd"] = str(Path(cwd).resolve()) if cwd else None
-            entry["changed_paths"] = changed_paths
-        if file_change is not None:
-            entry["file_change"] = file_change
-        if observations:
-            entry["workspace_observations"] = observations
         with (logs / "tools.jsonl").open("a") as f:
             f.write(json.dumps(entry) + "\n")
     except OSError:
@@ -347,26 +223,12 @@ def _log(name: str, msg, cwd=None) -> None:
     content = getattr(msg, "content", None)
     if isinstance(content, list):  # AssistantMessage-like
         for b in content:
-            tool_use_id = _field(b, "tool_use_id")
-            if tool_use_id:
-                error = _field(b, "is_error")
-                observations = _complete_workspace_call(
-                    name, tool_use_id, "failed" if error is True else "success" if error is False else None,
-                )
-                if observations:
-                    _tool_log(cwd, name, "tool/result", observations=observations)
-                continue
             text = getattr(b, "text", "")
             if isinstance(text, str) and text.strip():
                 _console.print(f"[dim]{_ts()} \\[{name}][/dim] {text[:500]}")
-            elif _field(b, "name"):
-                tool = _field(b, "name")
-                observations = _native_write_observations(
-                    name, tool, _field(b, "input"), _field(b, "id"), cwd,
-                )
-                _remember_workspace_calls(observations)
-                _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {tool}[/cyan]")
-                _tool_log(cwd, name, tool, observations=observations)
+            elif getattr(b, "name", None):
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {b.name}[/cyan]")
+                _tool_log(cwd, name, b.name)
         return
     if type(msg).__name__ == "ResultMessage":
         cost = getattr(msg, "total_cost_usd", None)
@@ -386,64 +248,19 @@ def _log(name: str, msg, cwd=None) -> None:
                 if line.strip():
                     _console.print(f"[dim]{_ts()} \\[{name}][/dim] {line[:300]}")
             _delta_buf[name] = buf
-        elif method in ("item/started", "item/completed"):
+        elif method == "item/started":
             root = getattr(getattr(payload, "item", None), "root", None)
             rtype = getattr(root, "type", "")
-            if method == "item/completed" and rtype not in {"fileChange", "commandExecution"}:
-                return  # Other tool calls retain their existing one-record logging.
             if rtype == "commandExecution":
                 cmd = str(getattr(root, "command", ""))
-                status = _write_status(getattr(root, "status", None))
-                if getattr(root, "exit_code", None) not in (None, 0):
-                    status = "failed"
-                observation = _workspace_observation(
-                    name, getattr(root, "id", None), method.split("/")[-1], "shell",
-                    execution_cwd=getattr(root, "cwd", None),
-                    status=status if method == "item/completed" else None,
-                )
-                if method == "item/started":
-                    _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {cmd[:160]}[/cyan]")
-                _tool_log(cwd, name, "shell" if method == "item/started" else "shell/result",
-                          cmd if method == "item/started" else "", observations=[observation])
+                _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {cmd[:160]}[/cyan]")
+                _tool_log(cwd, name, "shell", cmd)
             elif rtype == "mcpToolCall":
                 server = str(getattr(root, "server", "") or "")
                 tool = str(getattr(root, "tool", "") or "")
                 label = f"{server}.{tool}".strip(".")
                 _console.print(f"[dim]{_ts()} \\[{name}][/dim] [cyan]⚙ {label}[/cyan]")
                 _tool_log(cwd, name, label)
-            elif rtype == "fileChange":
-                changes, paths, observations = [], [], []
-                event = method.split("/")[-1]
-                status = _write_status(getattr(root, "status", None)) if event == "completed" else None
-                for change in getattr(root, "changes", None) or []:
-                    get = change.get if isinstance(change, dict) else lambda key, default=None: getattr(change, key, default)
-                    kind = get("kind")
-                    kind = getattr(kind, "root", kind)  # SDK PatchChangeKind RootModel.
-                    kind_get = kind.get if isinstance(kind, dict) else lambda key, default=None: getattr(kind, key, default)
-                    path, move_path = get("path", ""), kind_get("move_path")
-                    changes.append({"path": path, "kind": kind_get("type"), "move_path": move_path})
-                    paths.extend(path for path in (path, move_path) if path)
-                    operation = {"add": "create", "delete": "delete", "update": "modify"}.get(kind_get("type"), "unknown")
-                    observations.append(_workspace_observation(
-                        name, getattr(root, "id", None), event,
-                        "delete" if move_path else operation, path, cwd, status,
-                    ))
-                    if move_path:
-                        observations.append(_workspace_observation(
-                            name, getattr(root, "id", None), event, "create", move_path, cwd, status,
-                        ))
-                raw_status = getattr(root, "status", None)
-                _tool_log(
-                    cwd, name, "fileChange" if method == "item/started" else "fileChange/result",
-                    changed_paths=list(dict.fromkeys(paths)),
-                    file_change={
-                        "event": method, "item_id": getattr(root, "id", None),
-                        "thread_id": getattr(payload, "thread_id", None),
-                        "turn_id": getattr(payload, "turn_id", None),
-                        "status": getattr(raw_status, "value", raw_status), "changes": changes,
-                    },
-                    observations=observations,
-                )
             elif rtype and rtype not in ("agentMessage", "reasoning", "error"):
                 _tool_log(cwd, name, rtype)
         elif method in ("error", "turn/failed"):
@@ -464,14 +281,11 @@ def _log(name: str, msg, cwd=None) -> None:
 
 # ── backends ────────────────────────────────────────────────────────────────────
 
-@restricted_backend
 async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                          mcp_servers: dict, *, permission: str = "bypassPermissions",
                          idle_timeout: float = 600.0, subagents=(),
                          env_overrides: dict[str, str] | None = None,
-                         own_process_group: bool = False,
-                         sandbox_policy: WriteSandboxPolicy | None = None,
-                         sandbox_control: Path | None = None) -> str | None:
+                         own_process_group: bool = False) -> str | None:
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
     import shutil
 
@@ -482,14 +296,8 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
         real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
         if real_cli.is_file():
-            group_dir = sandbox_control or Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
-            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude", sandbox_policy)
-    if sandbox_policy is not None and cli_path is None:
-        raise RuntimeError("Claude CLI unavailable; cannot enforce autoformalize workspace restriction")
-    child_env = _agent_env(agent, env_overrides=env_overrides)
-    if sandbox_policy is not None:
-        from .autoformalize_claude_auth import seed_claude_session
-        child_env = seed_claude_session(Path(child_env["UNITY_AUTOFORMALIZE_SESSIONS"]) / "claude", child_env)
+            group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
+            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
 
     agents_def = {
         s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
@@ -503,13 +311,12 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         permission_mode=permission,
         model=agent.model,
         max_budget_usd=agent.budget,
-        env=child_env,
+        env=_agent_env(agent, env_overrides=env_overrides),
         cli_path=cli_path,
     )
     attempt = 0
     while True:
         attempt += 1
-        _begin_workspace_attempt()
         try:
             final = None
             stream = query(prompt=prompt, options=options)
@@ -557,7 +364,8 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
             import shutil
             shutil.copy2(user_auth, home / "auth.json")
     lines: list[str] = []
-    # Shared mutations use the controller bridge, never a writable main root.
+    # Unity agents run under workspace_write: they need network (lake, arXiv, MCP)
+    # and, from a worktree cwd, write access to the main project (.unity/dag.json).
     lines += ["[sandbox_workspace_write]", "network_access = true"]
     if writable_root is not None:
         lines.append(f'writable_roots = ["{writable_root}"]')
@@ -578,11 +386,12 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
     for name, cfg in (mcp_servers or {}).items():
         lines.append(f"[mcp_servers.{name}]")
         if cfg.get("command"):
-            lines.append("command = " + json.dumps(cfg["command"]))
+            lines.append(f'command = "{cfg["command"]}"')
             if cfg.get("args"):
-                lines.append("args = " + json.dumps(cfg["args"]))
+                args = ", ".join(f'"{a}"' for a in cfg["args"])
+                lines.append(f"args = [{args}]")
         elif cfg.get("url"):
-            lines.append("url = " + json.dumps(cfg["url"]))
+            lines.append(f'url = "{cfg["url"]}"')
         lines.append("")
         if cfg.get("env"):
             lines.append(f"[mcp_servers.{name}.env]")
@@ -679,28 +488,26 @@ async def _codex_notifications(
         await stream.aclose()
 
 
-@restricted_backend
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                         mcp_servers: dict, *, permission: str = "bypassPermissions",
                         idle_timeout: float = 600.0, subagents=(),
                         interrupt_event: asyncio.Event | None = None,
                         env_overrides: dict[str, str] | None = None,
                         own_process_group: bool = False,
-                        mcp_profile: str = "autoformalize",
-                        sandbox_policy: WriteSandboxPolicy | None = None,
-                        sandbox_control: Path | None = None) -> str | None:
+                        mcp_profile: str = "autoformalize") -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
     system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
 
-    session_dir = (env_overrides or {}).get("UNITY_AUTOFORMALIZE_SESSIONS")
-    home = Path(session_dir) / "codex" if sandbox_policy is not None else Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    provider = _write_codex_config(home, agent, mcp_servers)
+    home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
+    # from a worktree cwd, the agent still needs write access to the main project (.unity/)
+    from .config import find_unity_dir
+    unity_dir = find_unity_dir(Path(cwd))
+    provider = _write_codex_config(home, agent, mcp_servers,
+                                   writable_root=unity_dir.parent if unity_dir else None)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
-    # The outer OS boundary includes native tools and MCP children; avoid nested
-    # Seatbelt sandboxes. Full access here cannot remove the inherited boundary.
-    sandbox = Sandbox.full_access if sandbox_policy is not None or permission == "bypassPermissions" else Sandbox.workspace_write
+    sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
 
     # Prefer the user's installed codex CLI (kept current by its own updater) over the
     # SDK's pinned bundled binary — newest models often require a newer runtime.
@@ -715,17 +522,14 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             except ImportError:
                 pass
         if codex_bin:
-            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), sandbox_control or home, "codex", sandbox_policy)
+            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), home, "codex")
             codex_bin = str(wrapped)
-    if sandbox_policy is not None and pid_file is None:
-        raise RuntimeError("Codex CLI unavailable; cannot enforce autoformalize workspace restriction")
     attempt = 0
     while True:
         attempt += 1
-        _begin_workspace_attempt()
         agent_env = _agent_env(agent, home, env_overrides)
         config_kwargs = {}
-        if mcp_profile == "autoformalize" and (sandbox_policy is not None or (env_overrides or {}).get("UNITY_REAL_LAKE")):
+        if mcp_profile == "autoformalize" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
             # Login startup and cached shell state can move elan ahead of autoformalize's
             # Lake shim even when the app-server process receives the right PATH.
             config_kwargs["config_overrides"] = (
@@ -861,13 +665,12 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
     full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
-    if unity_dir is not None and mcp_profile != "autoformalize":
+    if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
         cmd += ["--add-dir", str(unity_dir.parent)]
 
     attempt = 0
     while True:
         attempt += 1
-        _begin_workspace_attempt()
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
@@ -894,17 +697,12 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                 if ev == "step_update":
                     su = e.get("step_update", {})
                     st = su.get("step_type", "")
-                    observations = _antigravity_write_observations(agent.name, su, cwd)
-                    if observations:
-                        _tool_log(cwd, agent.name, st if observations[0]["event"] == "started" else st + "/result",
-                                  observations=observations)
                     if st == "agent_response" and su.get("text_delta"):
                         _emit_delta(agent.name, su["text_delta"])
                     elif (su.get("state") == "DONE"
                           and st not in ("agent_response", "checkpoint", "user_input", "unknown", "")):
                         _console.print(f"[dim]{_ts()} \\[{agent.name}][/dim] [cyan]⚙ {st[:80]}[/cyan]")
-                        if not observations:
-                            _tool_log(cwd, agent.name, st)
+                        _tool_log(cwd, agent.name, st)
                 elif ev == "result":
                     r = e.get("result", {})
                     final = r.get("response") or final
@@ -1002,36 +800,6 @@ def _autoformalize_external_tools_prompt(mcp_servers: dict) -> str:
     return "\n\n".join(sections)
 
 
-def _workspace_policy(cwd: Path, log_context=None, env_overrides=None) -> str:
-    """One role-aware policy for every autoformalize backend and its subagents."""
-    from .config import find_unity_dir
-    from .library import library_dir
-
-    context = log_context or {}
-    role = context.get("role") or context.get("phase") or "unknown"
-    directory = Path(cwd).resolve()
-    unity = find_unity_dir(directory)
-    unity = unity.resolve() if unity is not None else directory / ".unity"
-    scratch = (env_overrides or {}).get("TMPDIR")
-    scratch_scope = (f"private scratch under `{Path(scratch).resolve()}`" if scratch else
-                     "a private scratch directory you create with `mktemp -d` outside all project checkouts")
-    if role == "source_repair" or role == "critic":
-        scope = f"{scratch_scope} only. Project files, including your existing worktree, are read-only"
-    elif role in {"chunker", "chunking"}:
-        scope = f"`{unity / 'dag.json'}` and {scratch_scope}; no Lean or other project-file edits"
-    elif role == "retrospective":
-        scope = (f"Markdown knowledge additions under `{library_dir().resolve()}`, "
-                 f"`{unity / 'retrospective.json'}`, and {scratch_scope}; preserve existing useful content")
-    elif context.get("phase") == "formalizing" or role in {"formalizer", "formalizing", "worker"}:
-        scope = (f"project files in your assigned worktree `{directory}` and {scratch_scope}. "
-                 "Main and other worktrees are read-only. The shared .unity link is not permission "
-                 "to edit shared state directly")
-    else:
-        scope = f"{scratch_scope} only; use only additional output paths explicitly authorized by your task"
-    template = Path(__file__).parent / "prompts" / "autoformalize" / "WORKSPACE_POLICY.md"
-    return template.read_text().format(cwd=directory, write_scope=scope)
-
-
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=(),
@@ -1039,20 +807,12 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 log_context: dict | None = None,
                 env_overrides: dict[str, str] | None = None,
                 own_process_group: bool = False,
-                mcp_profile: str = "autoformalize",
-                workspace_observer: Callable[[dict], None] | None = None) -> str | None:
+                mcp_profile: str = "autoformalize") -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
     t0 = time.monotonic()
-    observer_token = _workspace_observer.set(workspace_observer)
-    calls_token = _workspace_calls.set({})
     try:
-        if mcp_profile == "autoformalize":
-            policy = _workspace_policy(cwd, log_context, env_overrides)
-            system_prompt += "\n\n" + policy
-            subagents = [{**subagent, "prompt": subagent["prompt"] + "\n\n" + policy}
-                         for subagent in subagents]
         # Other autoformalize phases keep their own prompts, without proof-development catalogs.
         if mcp_profile == "autoformalize" and (log_context or {}).get("phase") == "formalizing":
             system_prompt += "\n\n" + _autoformalize_external_tools_prompt(mcp_servers)
@@ -1067,10 +827,6 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             "env_overrides": env_overrides,
             "own_process_group": own_process_group,
         }
-        if mcp_profile == "autoformalize" and agent.backend in {"claude_code", "codex"}:
-            kwargs["workspace_request"] = dict(log_context or {})
-        elif mcp_profile == "autoformalize" and agent.backend == "antigravity":
-            _console.print(f"[yellow]\\[{agent.name}] Antigravity workspace isolation is best-effort only[/yellow]")
         if agent.backend == "codex":
             kwargs["interrupt_event"] = interrupt_event
             kwargs["mcp_profile"] = mcp_profile
@@ -1078,6 +834,4 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             kwargs["mcp_profile"] = mcp_profile
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
     finally:
-        _workspace_calls.reset(calls_token)
-        _workspace_observer.reset(observer_token)
         _write_run_log(agent, cwd, time.monotonic() - t0, log_context)

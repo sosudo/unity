@@ -38,8 +38,6 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `forum_post`, `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
   for a task. The normal brief prioritizes your task, its candidates and blockers.
-  If `informal_proof` is null or abbreviated, use these details to reconstruct omitted reasoning;
-  null alone is not a blocker or a source defect.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` records a source defect.
   `submit_source_repair(author, issue_id, explanation, evidence, replacement?)` proposes an explicit
   evidence-backed spot repair. Unity routes it through chunking and independent review.
@@ -50,11 +48,6 @@ of modifying the input or silently formalizing a different statement.
 Both candidate tools default to `stage="complete"`. Pass the first output binding as
 `outputs=[{"declaration":"Project.name","file":"Project/File.lean"}]`; a node may have multiple outputs.
 A complete implementation can adopt the representation and verify its proof in one submission.
-An extra hypothesis assuming an unproved dependency does not complete the source claim. Conditional
-helpers may support development, but outputs must include the source-shaped result with legitimate
-source hypotheses and no extra assumed conclusion or dependency. Discharge the helper's assumption
-using a proved dependency before `stage="complete"`; while unfinished, publish the helper as a finding
-or submit the source-shaped result at `stage="representation"`.
 `stage="representation"` shares a locally checked representation before proof completion; it may
 contain theorem proof holes, never unfinished meaning-bearing definitions. Representation adoption
 does not mean proof completion or faithfulness. Candidate versions retain exact commits/manifests.

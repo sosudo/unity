@@ -580,8 +580,8 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
             owners = {output["declaration"]: owner for owner, rows in bindings.items() for output in rows}
             if any(owners.get(name, task_id) != task_id for name in names):
                 raise ValueError("candidate output already belongs to another source obligation")
-            if any(old not in outputs for old in bindings.get(task_id, [])):
-                raise ValueError("adopted outputs were removed or relocated; explicitly revise the node")
+            if task_id in bindings and sorted(bindings[task_id], key=lambda row: row["declaration"]) != outputs:
+                raise ValueError("adopted output manifest changed; explicitly revise the node before replacing it")
             bindings[task_id] = outputs
         actual_tasks = _binding_tasks(proposed)
         if not actual_tasks:

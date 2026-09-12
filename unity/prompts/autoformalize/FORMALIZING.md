@@ -26,11 +26,6 @@ For your assigned task:
 - read `informal_statement` and `informal_proof` (which can be null for a missing source proof), and
   distinguish `statement_dependencies` from `proof_dependencies`. `predicted_kind`,
   `proposed_formal_statement` and `proposed_formal_strategy` are revisable hints, not frozen Lean types;
-- if `informal_proof` is null or abbreviated, inspect the source and argument mapping, expand the
-  omitted reasoning, or locate a checked prerequisite. Continue normal proof development; null alone
-  is not a blocker. Record reconstructed reasoning as such, not as a quotation from the source.
-  Report the concrete mathematical obstruction if reconstruction requires a corrected claim or
-  additional assumption;
 - choose the actual Lean representation, declaration names and files, and implement meaning-bearing
   definitions as well as proofs. Routine helpers belong inside the task's module, not automatically in
   separate DAG nodes. Do not submit unfinished meaning-bearing definition bodies;
@@ -59,18 +54,8 @@ On the first binding, pass `outputs=[{"declaration":"Project.name","file":"Proje
 to `finalize_formalization` (or the compatibility `emit_formalization_candidate`). One informal node
 can have multiple output declarations. The output manifest and exact commit identify an immutable
 candidate version; previous failed/superseded attempts remain evidence, not current approval.
-Routine proof helpers need not be listed as outputs. To expose additional outputs, submit the complete
-existing output list plus additions. Renaming, removing, relocating or changing an adopted
-representation still requires explicit refinement.
 Use `stage="complete"` (the default) when the representation and proof/construction are ready. A short
 complete implementation can adopt its representation and verify its proof in one call.
-A complete candidate must prove the source statement with its actual source hypotheses. Do not add
-a hypothesis that assumes an unproved dependency or the missing part of the result. A conditional
-helper is useful intermediate work, not completion of an unconditional source result. Keep the
-source-shaped result among the outputs and apply a proved dependency theorem to discharge the helper's
-assumption. While that proof is pending, publish the helper as a finding or submit the source-shaped
-result at `stage="representation"`; do not mark the task complete merely because a conditional helper
-compiles. Legitimate hypotheses stated in the source must remain.
 Use `stage="representation"` only when a useful representation is ready before its proof. Temporary
 theorem proof holes are allowed in that stage, never unfinished meaning-bearing definition bodies.
 A representation candidate is not a completed proof or a faithfulness approval. Check source fidelity
@@ -93,8 +78,7 @@ in the same refinement, or resolve it to a supporting node with the task-resolut
 the prerequisite's source statement/anchors and update the node dependency edges when necessary.
 Refresh the brief after any refinement before submitting against its new revision.
 
-If reconstruction exposes a false, ambiguous or genuinely unsupported source claim, call
-`report_source_issue` with exact anchors,
+If the supplied source is false, incomplete or ambiguous, call `report_source_issue` with exact anchors,
 affected task IDs and evidence. Explore a local repair or ask teammates for help. Use
 `submit_source_repair` to record a justified correction with evidence and explicit replacement text
 when needed. Original source bytes remain unchanged. Proposed repairs return through chunking and
