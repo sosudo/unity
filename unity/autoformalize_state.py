@@ -1448,8 +1448,15 @@ def submit_formal_candidate(
         if not task or task.get("status") == "complete":
             raise ValueError("formal task is unknown or already complete")
         bindings = normalized_outputs if normalized_outputs is not None else deepcopy(task.get("outputs", []))
-        if (state["formalization"].get("contract") or {}).get("version") == 3 and not bindings:
+        contract = state["formalization"].get("contract") or {}
+        if contract.get("version") == 3 and not bindings:
             raise ValueError("a first candidate requires its declaration/file outputs")
+        owners = {output["declaration"]: owner
+                  for owner, rows in contract.get("bindings", {}).items() for output in rows}
+        for output in bindings:
+            name = output["declaration"]
+            if name in owners and owners[name] != task_id:
+                raise ValueError(f"candidate output '{name}' belongs to task '{owners[name]}', not '{task_id}'")
         strategy = state["strategies"].get(strategy_id)
         if (
             not strategy
@@ -1483,6 +1490,25 @@ def submit_formal_candidate(
             raise ValueError("formal strategy/task is not accepting a new candidate")
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
+        for existing in state["formal_candidates"].values():
+            if (
+                existing.get("status") == "failed"
+                and existing.get("failure_kind") == "merge_conflict"
+                and candidate_is_current(state, existing)
+                and existing.get("task_id") == task_id
+                and existing.get("failure_main_sha")
+                and existing["failure_main_sha"] == state["formalization"]["main_sha"]
+                and existing.get("base_main_sha") == base_main_sha.casefold()
+                and existing.get("diff_sha256") == diff_sha256
+                and existing.get("stage", "complete") == stage
+                and existing.get("outputs", []) == bindings
+            ):
+                return {
+                    "status": "unchanged_failed",
+                    "candidate": existing,
+                    "error": existing.get("error", ""),
+                    "next_action": "Synchronize accepted main and resolve the conflict before resubmitting.",
+                }
         candidate_id = _id("formal")
         candidate = {
             "candidate_id": candidate_id,
@@ -1543,6 +1569,8 @@ def finish_formal_merge(
     build: dict | None = None,
     verification: dict | None = None,
     proposed_contract: dict | None = None,
+    failure_kind: str = "",
+    failure_main_sha: str = "",
 ) -> dict:
     with transaction(forum_dir) as state:
         candidate = state["formal_candidates"].get(candidate_id)
@@ -1620,8 +1648,15 @@ def finish_formal_merge(
             _event(state, "formal_candidate_merged", candidate_id=candidate_id,
                    task_id=task["task_id"], main_sha=main_sha.casefold(), stage=candidate.get("stage", "complete"))
         else:
+            if failure_kind == "merge_conflict" or failure_main_sha:
+                if not _FULL_SHA_RE.fullmatch(failure_main_sha.casefold()):
+                    raise ValueError("merge failure context requires a full main commit")
             candidate["status"] = "failed"
             candidate["error"] = _text(error, "error", 4000, required=False)
+            if failure_kind:
+                candidate["failure_kind"] = _text(failure_kind, "failure_kind", 100)
+            if failure_main_sha:
+                candidate["failure_main_sha"] = failure_main_sha.casefold()
             task["status"] = "pending"
             for strategy in state["strategies"].values():
                 if strategy.get("phase") == "formalizing" and strategy.get("target") == task["task_id"] and strategy.get("status") == "paused":

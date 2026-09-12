@@ -374,8 +374,13 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             cwd=root, input=exact_diff, owner="Unity", task_id=task["task_id"],
         )
         if applied.returncode:
+            unmerged = _git(root, "ls-files", "--unmerged", "-z")
+            conflict = not unmerged.returncode and bool(unmerged.stdout)
             _rollback(root, before)
-            return {"ok": False, "error": applied.stderr.strip() or "candidate conflicts with main"}
+            return {
+                "ok": False, "error": applied.stderr.strip() or "candidate conflicts with main",
+                **({"failure_kind": "merge_conflict", "failure_main_sha": before} if conflict else {}),
+            }
     elif _checked_tree(root, resolved) != before_tree:
         return {"ok": False, "error": "Main differs from this empty candidate; sync_from_main and resubmit."}
     with autoformalize_contract.measure(timings, "workspace_seconds"):
@@ -524,6 +529,8 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
             paths.forum, candidate["candidate_id"], success=bool(result.get("ok")),
             main_sha=result.get("main_sha", ""), error=result.get("error", ""),
             build=result.get("build"), verification=result.get("verification"),
+            failure_kind=result.get("failure_kind", ""),
+            failure_main_sha=result.get("failure_main_sha", ""),
         )
         return result
 
@@ -538,6 +545,38 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
         except autoformalize_jobs.JobCancelled as exc:
             # Cancellation before acquiring the lock made no source mutation.
             return record({"ok": False, "cancelled": True, "error": str(exc)})
+
+
+def _rejection_recovery_prompt(state: dict, author: str, task_id: str) -> str:
+    """A current rejection takes priority over opportunistic submission nudges."""
+    relevant = [
+        item for item in state.get("formal_candidates", {}).values()
+        if item.get("task_id") == task_id
+        and autoformalize_state.candidate_is_current(state, item)
+        and (item.get("status") == "merged" or (
+            item.get("status") == "failed"
+            and (autoformalize_state.author_key(item.get("author")) == autoformalize_state.author_key(author)
+                 or autoformalize_state.participates(
+                     state.get("strategies", {}).get(item.get("strategy_id"), {}), author))
+        ))
+    ]
+    latest = max(relevant, key=lambda item: item.get("updated_at", item.get("created_at", 0)), default=None)
+    if not latest or latest["status"] != "failed":
+        return ""
+    evidence = " ".join(
+        f"Read artifact {record['artifact_id']} for full evidence."
+        for record in (latest.get("build") or {}, latest.get("verification") or {})
+        if record.get("artifact_id")
+    )
+    return (
+        f"RECOVER REJECTED CANDIDATE {latest['candidate_id']} at {latest['commit_sha']}: "
+        f"{latest.get('error', '')[:2000]}\n{evidence}\n"
+        "Fix the reported rejection before finalizing again; do not resubmit the unchanged failure. "
+        "For merge conflicts, commit intended private edits, call sync_from_main, and resolve conflicts "
+        "without removing accepted work. Preserve adopted declarations at their exact fully-qualified "
+        "names, including namespace scope. A successful private build does not resolve an integration "
+        "or declaration-identity failure. Inspect the rejected diff and evidence before new research.\n"
+    )
 
 
 def recover_interrupted_formal_merges(paths) -> None:
@@ -721,7 +760,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "is materially different. You may investigate or edit before registering, but claim a "
             "strategy before finalizing. "
         )
-        task_prompt = resume + (followup or (
+        recovery = _rejection_recovery_prompt(current, name, task_id)
+        if recovery and prepared.get("sync_warning"):
+            recovery += prepared["sync_warning"] + " "
+        task_prompt = (recovery or resume) + ((followup if not recovery else "") or (
             f"Your current formalization target is task `{task_id}`: "
             f"{formal_task.get('description', '')}. Current adopted outputs: "
             f"{formal_task.get('outputs', [])}. Its formalization source references are "

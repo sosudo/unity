@@ -15,8 +15,9 @@ findings and candidate events. These tools belong to the autoformalization runti
   declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
 - `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?)` is the
   compatibility route for already-committed bytes; normally use `finalize_formalization`.
-- `sync_from_main(author, reason?)` merges accepted main without discarding local work. Dirty trees and
-  pending candidates block sync; conflicts remain for resolution and claims are retained. Do not sync
+- `sync_from_main(author, reason?)` merges accepted main without discarding local work. Uncommitted
+  tracked edits and pending candidates block sync; unrelated untracked files do not. Git refuses to
+  overwrite colliding untracked files. Conflicts remain for resolution and claims are retained. Do not sync
   just because an unrelated task merged.
 - `refine_chunks(author, expected_revision, changes)` transactionally revises informal interpretations,
   predicted kinds, hints and typed dependencies, or adds/splits/combines nodes. Use `upserts`

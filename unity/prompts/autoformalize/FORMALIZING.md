@@ -41,7 +41,8 @@ For your assigned task:
   tools; use Lean LSP for local goals, project-aware search, and checks without a suitable Axle equivalent.
   Consider Aristotle for a stubborn proof when useful; its availability does not make it mandatory;
 - after a successful targeted local check of the exact implementation/import bytes, immediately call
-  `finalize_formalization` unless a concrete error remains. Unity commits the candidate, applies it to
+  `finalize_formalization` unless a concrete error or unresolved candidate rejection remains.
+  Unity commits the candidate, applies it to
   current main, and performs the sole authoritative full build and mechanical declaration review;
 - when an unrelated task merges, refresh the brief and keep working without resetting your worktree.
   Unity synchronizes obsolete worktrees before assigning another task. If your current work needs a
@@ -54,6 +55,11 @@ On the first binding, pass `outputs=[{"declaration":"Project.name","file":"Proje
 to `finalize_formalization` (or the compatibility `emit_formalization_candidate`). One informal node
 can have multiple output declarations. The output manifest and exact commit identify an immutable
 candidate version; previous failed/superseded attempts remain evidence, not current approval.
+Preserve adopted declarations at their exact fully-qualified names, including namespace scope.
+Do not wrap existing shared declarations in a new namespace. `outputs` lists only this task's
+deliverables, not dependencies or every declaration in the file. After rejection, fix the reported
+cause before resubmitting. For merge conflicts, commit intended private edits, use `sync_from_main`,
+and resolve conflicts while preserving accepted work; a private build alone does not resolve rejection.
 Use `stage="complete"` (the default) when the representation and proof/construction are ready. A short
 complete implementation can adopt its representation and verify its proof in one call.
 Use `stage="representation"` only when a useful representation is ready before its proof. Temporary

@@ -298,20 +298,38 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
             cwd=root, owner="Unity", task_id="contract", serialize_build=True,
             timings=job_timings,
         )
-    if result.returncode:
-        raise ValueError("formal contract inspection failed: " +
-                         artifacts.preview_text(result.stderr or result.stdout, 2000))
+    def failure(message: str) -> ValueError:
+        record = artifacts.store_text(
+            root / ".unity" / "artifacts",
+            json.dumps({"returncode": result.returncode, "stdout": result.stdout,
+                        "stderr": result.stderr}, ensure_ascii=False),
+            kind="autoformalize_inspection", producer="Unity", source="formal contract inspector",
+        )
+        return ValueError(f"{message}; full output: artifact {record['artifact_id']}")
+
     try:
         data = json.loads(result.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError) as exc:
-        raise ValueError("formal contract inspector did not return valid JSON") from exc
+        message = "formal contract inspector did not return valid JSON"
+        if result.returncode:
+            message = "formal contract inspection failed: " + artifacts.preview_text(
+                result.stderr or result.stdout or f"inspector exited {result.returncode}", 2000)
+        raise failure(message) from exc
     if not isinstance(data, dict):
-        raise ValueError("formal contract inspector did not return a JSON object")
-    if data.get("issues") or set(data.get("targets", {})) != set(names):
-        raise ValueError("formal contract inspection incomplete: " + str(data.get("issues", [])))
+        raise failure("formal contract inspector did not return a JSON object")
+    issues = data.get("issues", [])
+    if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
+        raise failure("formal contract inspector returned invalid issues")
+    if issues:
+        raise failure("formal contract inspection failed: " + artifacts.preview_text("; ".join(issues), 2000))
+    if result.returncode:
+        raise failure("formal contract inspection failed: " + artifacts.preview_text(
+            result.stderr or f"inspector exited {result.returncode} without reporting issues", 2000))
+    if set(data.get("targets", {})) != set(names):
+        raise failure("formal contract inspection incomplete: target declarations do not match")
     external_records = data.get("external_declarations", {})
     if not isinstance(external_records, dict) or set(external_records) != set(externals):
-        raise ValueError("formal contract inspection omitted requested external declarations")
+        raise failure("formal contract inspection omitted requested external declarations")
     for name, row in external_records.items():
         if (not isinstance(row, dict) or row.get("name") != name
                 or not isinstance(row.get("module"), str) or not row["module"]
@@ -320,11 +338,11 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
                 or not isinstance(row.get("level_params"), list)
                 or not isinstance(row.get("signature"), str) or not row["signature"].strip()
                 or not isinstance(row.get("axioms"), list)):
-            raise ValueError(f"incomplete kernel evidence for external declaration {name}")
+            raise failure(f"incomplete kernel evidence for external declaration {name}")
     data["external_declarations"] = external_records
     if any(not isinstance(data.get(key), list)
            for key in ("project_axioms", "project_sorries", "project_used_axioms")):
-        raise ValueError("formal contract inspector omitted project-wide axiom/placeholder audit")
+        raise failure("formal contract inspector omitted project-wide axiom/placeholder audit")
     if timings is not None:
         timings["kernel_ms"] = data.get("timings_ms", {})
     return data

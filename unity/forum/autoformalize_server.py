@@ -912,7 +912,7 @@ def prepare_formal_worktree(
             # its already-integrated representation again. Never erase edits.
             main_sha = _accepted_formal_main(state)
             if ((formal.get("contract") or {}).get("version") == 3 and main_sha
-                    and not _git(tree, "status", "--porcelain").stdout.strip()):
+                    and not _git(tree, "status", "--porcelain", "--untracked-files=no").stdout.strip()):
                 merged = _git(tree, "merge", "--no-edit", "--no-autostash", "--no-overwrite-ignore",
                               main_sha, check=False)
                 if merged.returncode:
@@ -965,8 +965,8 @@ def sync_from_main(author: str, reason: str = "") -> dict:
         tree = worktree.agent_worktree(_root(), author)
         if not tree.is_dir():
             return _sync_blocked("missing_worktree", "The agent has no active worktree.")
-        if _git(tree, "status", "--porcelain").stdout.strip():
-            return _sync_blocked("dirty_worktree", "Local changes preserved. Commit or resolve them before syncing.")
+        if _git(tree, "status", "--porcelain", "--untracked-files=no").stdout.strip():
+            return _sync_blocked("dirty_worktree", "Tracked changes preserved. Commit or resolve them before syncing.")
         main_sha = _accepted_formal_main(state)
         if not main_sha:
             return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
