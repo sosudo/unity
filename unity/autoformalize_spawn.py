@@ -22,6 +22,56 @@ from .roster import Agent
 _console = Console()
 
 
+def _worktree_write_roots(cwd: Path) -> tuple[Path, ...]:
+    """Grant worker source access, plus the shared paths used by existing tools.
+
+    Main-checkout phases retain their existing permissions. Resolve .unity and
+    package links: granting their parent would also grant writes to main source.
+    This isolates source edits, not mutually distrustful agents' shared state.
+    """
+    import shutil
+    import subprocess
+    from .config import find_unity_dir
+
+    cwd = Path(cwd).resolve()
+    unity = find_unity_dir(cwd)
+    if unity is None or unity.resolve().parent == cwd:
+        return ()
+    unity = unity.resolve()
+    git = subprocess.run(
+        ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
+        cwd=cwd, capture_output=True, text=True, check=True,
+    )
+    git_dir, common = (Path(line).resolve() for line in git.stdout.splitlines())
+    # Candidate commits share Git objects/refs/maintenance locks with main.
+    # Grant metadata, never the enclosing source checkout.
+    roots = [cwd, unity, git_dir, common]
+    packages = cwd / ".lake" / "packages"
+    if packages.is_dir():
+        roots.append(packages.resolve())
+    # `unity mcp` uses uvx for local services; keep its existing global cache.
+    uv = shutil.which("uv")
+    if uv:
+        cache = subprocess.run([uv, "cache", "dir"], capture_output=True, text=True, check=True)
+        roots.append(Path(cache.stdout.strip()).resolve())
+    if any(path != cwd and cwd.is_relative_to(path) for path in roots):
+        raise ValueError("autoformalize shared write access cannot include the source checkout")
+    return tuple(dict.fromkeys(roots))
+
+
+def _worktree_prompt(cwd: Path) -> str:
+    return (
+        f"\n\nWORKTREE WRITE POLICY: Your source workspace is exactly {Path(cwd).resolve()}. "
+        "Use this directory as workdir/cwd for every shell command and Lean tool. "
+        "Keep all source edits and scratch proofs here. Main and other agents' worktrees "
+        "are read-only to you, including through absolute paths, ../ paths, and symlinks. "
+        "Shared runtime/build directories exist for Unity tools, not as alternate source "
+        "workspaces. Use the Forum tools for shared state, candidate submission, and sync; "
+        "Unity alone integrates candidates into main. If a write is denied, correct its "
+        "destination or report the blocker; do not disable or bypass the restriction."
+    )
+
+
 # ── env (per-agent, never global) ──────────────────────────────────────────────
 
 _AUTOFORMALIZE_MCP_ENV_KEYS = (
@@ -289,6 +339,13 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
     import shutil
 
+    isolation = {}
+    roots = _worktree_write_roots(cwd)
+    if roots:
+        from .autoformalize_permissions import claude_worktree_options
+        isolation = claude_worktree_options(cwd, roots)
+        system_prompt += _worktree_prompt(cwd)
+
     cli_path = None
     pid_file = None
     if own_process_group and os.name == "posix":
@@ -308,11 +365,12 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         mcp_servers=mcp_servers,
         agents=agents_def,
         cwd=str(cwd),
-        permission_mode=permission,
+        permission_mode=isolation.pop("permission_mode", permission),
         model=agent.model,
         max_budget_usd=agent.budget,
         env=_agent_env(agent, env_overrides=env_overrides),
         cli_path=cli_path,
+        **isolation,
     )
     attempt = 0
     while True:
@@ -351,7 +409,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
-                        writable_root: Path | None = None) -> str | None:
+                        writable_roots: tuple[Path, ...] = ()) -> str | None:
     """Seed CODEX_HOME/config.toml with a custom provider (if base_url), MCP servers,
     and workspace-write sandbox tuning. Returns the provider id to pass as
     model_provider, or None for the default openai provider."""
@@ -364,11 +422,11 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
             import shutil
             shutil.copy2(user_auth, home / "auth.json")
     lines: list[str] = []
-    # Unity agents run under workspace_write: they need network (lake, arXiv, MCP)
-    # and, from a worktree cwd, write access to the main project (.unity/dag.json).
+    # Keep network access for tools, without granting the main source checkout.
     lines += ["[sandbox_workspace_write]", "network_access = true"]
-    if writable_root is not None:
-        lines.append(f'writable_roots = ["{writable_root}"]')
+    if writable_roots:
+        lines.append("writable_roots = " + json.dumps([str(path) for path in writable_roots]))
+        lines += ["exclude_slash_tmp = true", "exclude_tmpdir_env_var = true"]
     lines.append("")
     provider = None
     if agent.base_url:
@@ -500,14 +558,15 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    # from a worktree cwd, the agent still needs write access to the main project (.unity/)
-    from .config import find_unity_dir
-    unity_dir = find_unity_dir(Path(cwd))
+    roots = _worktree_write_roots(cwd)
+    if roots:
+        system_prompt += _worktree_prompt(cwd)
     provider = _write_codex_config(home, agent, mcp_servers,
-                                   writable_root=unity_dir.parent if unity_dir else None)
+                                   writable_roots=roots)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
-    sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
+    sandbox = (Sandbox.workspace_write if roots or permission != "bypassPermissions"
+               else Sandbox.full_access)
 
     # Prefer the user's installed codex CLI (kept current by its own updater) over the
     # SDK's pinned bundled binary — newest models often require a newer runtime.
@@ -529,10 +588,21 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
         attempt += 1
         agent_env = _agent_env(agent, home, env_overrides)
         config_kwargs = {}
+        if roots:
+            # CLI overrides outrank project configuration; workers cannot inherit
+            # an extra writable checkout or a full-access project profile.
+            config_kwargs["config_overrides"] = (
+                'sandbox_mode="workspace-write"',
+                'approval_policy="never"',
+                "sandbox_workspace_write.writable_roots=" + json.dumps([str(path) for path in roots]),
+                "sandbox_workspace_write.network_access=true",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            )
         if mcp_profile == "autoformalize" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
             # Login startup and cached shell state can move elan ahead of autoformalize's
             # Lake shim even when the app-server process receives the right PATH.
-            config_kwargs["config_overrides"] = (
+            config_kwargs["config_overrides"] = config_kwargs.get("config_overrides", ()) + (
                 "allow_login_shell=false",
                 "features.shell_snapshot=false",
                 "shell_environment_policy.set.PATH=" + json.dumps(agent_env["PATH"]),
@@ -550,12 +620,17 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
             if agent.api_key and not agent.base_url:
                 await codex.login_api_key(agent.api_key)
+            thread_options = {}
+            if roots:
+                from openai_codex import ApprovalMode
+                thread_options["approval_mode"] = ApprovalMode.deny_all
             thread = await codex.thread_start(
                 model=agent.model,
                 model_provider=provider,
                 sandbox=sandbox,
                 base_instructions=system_prompt,
                 cwd=str(cwd),
+                **thread_options,
             )
             handle = await thread.turn(prompt)
 
@@ -660,13 +735,22 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
     if agy is None:
         raise RuntimeError("antigravity backend needs the `agy` CLI installed and logged in "
                            "(https://antigravity.google)")
-    from .config import find_unity_dir
-    unity_dir = find_unity_dir(Path(cwd))
+    roots = _worktree_write_roots(cwd)
+    if roots:
+        system_prompt += _worktree_prompt(cwd)
     full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
-    if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
-        cmd += ["--add-dir", str(unity_dir.parent)]
+    if roots:
+        # AG has no per-session editor/path hook. Its native terminal sandbox is
+        # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
+        cmd += ["--sandbox"]
+        for root in roots[1:]:
+            cmd += ["--add-dir", str(root)]
+        _console.print(
+            f"[yellow]{agent.name}: Antigravity worktree isolation is best effort; "
+            "terminal sandbox enabled, editor writes rely on the worktree policy.[/yellow]"
+        )
 
     attempt = 0
     while True:

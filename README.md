@@ -77,6 +77,8 @@ From the CLI, add files or folders with `unity source add <path>`, put the scope
 
 Autoformalize has its own runtime, agent launcher, verifier, prompts, and Forum interface. Its discussions and structured state live under `.unity/forum/autoformalize/`, separate from solve and prove. It does not run the English-solving phase or generate or rewrite a source paper. The existing project setup, roster, dependency cache, and generic worktree utilities are unchanged.
 
+Autoformalize workers use Codex's workspace-write sandbox or Claude's required Bash sandbox plus editor path checks. Source edits are confined to the assigned worktree; shared Git metadata, `.unity`, dependency packages, and the existing uv cache remain accessible to Unity tools. These are source-write restrictions, not isolation from trusted MCP servers or shared runtime state. Claude requires native sandbox support (including its platform prerequisites) and refuses unsandboxed fallback; arbitrary research URLs should use WebFetch rather than shell networking. Antigravity enables its terminal sandbox and receives the same worktree policy, but editor isolation is best effort. These settings do not change solve or prove.
+
 ### Formalize
 
 First, go to the sources tab and add the documents you want formalized.
