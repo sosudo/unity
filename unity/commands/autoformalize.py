@@ -316,7 +316,7 @@ async def _chunk_source(
 
 
 def _prepare_critic_snapshot(paths) -> bool:
-    """Controller-only mechanical gate, cached for unchanged critic retries."""
+    """Cache exact mechanical evidence for final or diagnostic critic retries."""
     with _merge_lock(paths.project_root):
         state = autoformalize_state.load_state(paths.forum)
         if not state["formalization"].get("contract"):
@@ -324,7 +324,7 @@ def _prepare_critic_snapshot(paths) -> bool:
                 "this autoformalization run has no protected formal specification; request_rechunk before resuming review"
             )
         snapshot = state["formalization"].get("review_snapshot") or {}
-        if not snapshot.get("passed") or not autoformalize_contract.snapshot_is_current(paths, state, snapshot):
+        if not autoformalize_contract.snapshot_is_current(paths, state, snapshot, require_complete=False):
             try:
                 report = autoformalize_contract.verify_final_project(paths, state)
             except (OSError, ValueError) as exc:
@@ -334,12 +334,9 @@ def _prepare_critic_snapshot(paths) -> bool:
                     "main changed outside candidate integration; request_rechunk to establish a new reviewed specification"
                 )
             autoformalize_state.record_review_snapshot(paths.forum, report)
-            if not report["passed"]:
-                autoformalize_state.reopen_after_machine_failure(paths.forum, report)
-                click.echo("mechanical critic gate reopened formalization: " + "; ".join(report["issues"]))
-                return False
+            snapshot = report
         if state["phase"] != "critic":
-            autoformalize_state.begin_critic(paths.forum)
+            autoformalize_state.begin_critic(paths.forum, diagnostic=not snapshot["passed"])
     return True
 
 
@@ -363,8 +360,6 @@ def _accept_current_critic(paths) -> bool:
                     "main changed during critic review; request_rechunk before acceptance"
                 )
             autoformalize_state.record_review_snapshot(paths.forum, report)
-            if not report["passed"]:
-                autoformalize_state.reopen_after_machine_failure(paths.forum, report)
             click.echo("critic approval became stale; the changed revision needs a new review")
             return False
         autoformalize_state.complete_critic_review(
@@ -380,6 +375,7 @@ async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
     if _accept_current_critic(paths):
         return
     state = autoformalize_state.load_state(paths.forum)
+    diagnostic = not state["formalization"]["review_snapshot"]["passed"]
     before = len(autoformalize_state.load_state(paths.forum).get("critic_verdicts", []))
     retry_context = (
         f"This is critic attempt {attempt}. The gate is still open. Reading files or ending a turn "
@@ -392,7 +388,13 @@ async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
         roster,
         load_prompt(f"{PIPELINE}/CRITIC"),
         retry_context
-        + "Audit the complete Lean project against the supplied source documents and UNITY.md scope. "
+        + ("DIAGNOSTIC REVIEW: this formalization round ended without passing final checks. "
+           "Review completed and pending tasks, yielded attempts, last-round launch blockers, "
+           "and preserved work. Give exact task IDs and concrete next steps in a lean_reopen verdict, "
+           "or request a justified replan/source repair. Mark unchecked requirements not_checked. "
+           "Do not approve incomplete proofs or reopen unaffected work. "
+           if diagnostic else
+           "Audit the complete Lean project against the supplied source documents and UNITY.md scope. ")
         + "Use the exact recorded "
         "machine snapshot for build, contract, and axiom status. Independently check requirement "
         "completeness and the mathematical meaning of statements and definitions against the source. "
@@ -563,7 +565,8 @@ async def autoformalize(continue_):
                     load_prompt("autoformalize/FORMALIZING"),
                 )
                 attempts += 1
-                if (state.get("phase") == "formalizing" and autoformalize_state.all_formal_tasks_complete(state)
+                if (not stop_requested(root) and state.get("phase") == "formalizing"
+                        and not autoformalize_state.pending_replan(state)
                         and not autoformalize_state.open_source_issues(state)):
                     _prepare_critic_snapshot(paths)
             elif phase == "critic":

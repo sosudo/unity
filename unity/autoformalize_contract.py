@@ -787,7 +787,7 @@ def _external_evidence(contract: dict) -> dict:
             for name, row in contract.get("external_declarations", {}).items()}
 
 
-def snapshot_is_current(paths, state: dict, snapshot: dict) -> bool:
+def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete: bool = True) -> bool:
     from .autoformalize_input import source_matches
     from .autoformalize_state import repair_digest
 
@@ -803,11 +803,14 @@ def snapshot_is_current(paths, state: dict, snapshot: dict) -> bool:
         and current["environment"] == snapshot.get("environment")
         and contract.get("sha256") == snapshot.get("contract_sha256")
         and contract.get("version") in {2, 3}
+        and (not require_complete or (bool(state["formal_tasks"])
+             and all(task.get("status") == "complete" for task in state["formal_tasks"].values())))
+        and snapshot.get("task_statuses") == {
+            key: task.get("status") for key, task in state["formal_tasks"].items()}
         and (contract.get("version") != 3
              or (contract.get("sha256") == _seal_contract(contract)["sha256"]
                  and {row["lean_decl"]: row["task_id"] for row in _binding_tasks(contract)}
-                 == snapshot.get("declarations")
-                 and all(task.get("status") == "complete" for task in state["formal_tasks"].values())))
+                 == snapshot.get("declarations")))
         and contract.get("spec_sha256") == snapshot.get("spec_sha256")
         == digest(formal.get("spec")) == digest(contract.get("spec"))
         and snapshot.get("repairs_sha256") == repair_digest(state)
@@ -905,6 +908,7 @@ def verify_final_project(paths, state: dict) -> dict:
         "repairs_sha256": repair_digest(state),
         "external_declarations": _external_evidence(review_contract),
         "accepted_candidates": {task["task_id"]: task.get("accepted_candidate") for task in tasks},
+        "task_statuses": {task["task_id"]: task.get("status") for task in tasks},
         "declarations": {task["lean_decl"]: task["task_id"] for task in
                          (_binding_tasks(contract) if contract.get("version") == 3 else tasks)},
         "build": build,

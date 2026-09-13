@@ -584,6 +584,27 @@ def _rejection_recovery_prompt(state: dict, author: str, task_id: str) -> str:
     )
 
 
+def _formal_launch_retry_key(state: dict, author: str, task_id: str, previous_task: str) -> str:
+    """Retry preserved work only when its task, assignment, or accepted base changes."""
+    identity = autoformalize_state.author_key(author)
+    previous = state.get("worker_tasks", {}).get(identity, previous_task)
+    return autoformalize_state.digest({
+        "accepted_main": state["formalization"].get("main_sha"),
+        "formalization_revision": state["formalization"].get("revision"),
+        "intended_previous": previous_task,
+        "actual_previous": previous,
+        "tasks": {key: {
+            "status": state["formal_tasks"][key].get("status"),
+            "attempt": autoformalize_state.snapshot_attempt(state, author, key),
+        } for key in {previous, task_id} if key in state["formal_tasks"]},
+        "previous_lineage": state.get("retired_tasks", {}).get(previous, {}).get("replaced_by"),
+        "previous_yielded": autoformalize_state.has_yielded(state, author, previous),
+        "unresolved": autoformalize_server.unresolved_formal_tasks(state, author),
+        "checkpoints": {key: state.get("worktree_checkpoints", {}).get(identity, {}).get(key)
+                        for key in {previous, task_id} if key},
+    })
+
+
 def recover_interrupted_formal_merges(paths) -> None:
     """Reopen clean interrupted merges; never discard ambiguous main changes."""
     with _merge_lock(paths.project_root):
@@ -644,6 +665,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     worker_attempts: dict[str, dict] = {}
     interrupted_workers: set[str] = set()
     blocked_launches: dict[str, str] = {}
+    blocked_launch_keys: dict[tuple[str, str], str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     state = autoformalize_state.load_state(paths.forum)
     # Target notifications may arrive while verification runs in another thread.
@@ -725,10 +747,15 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         diff = _git(worktrees[name], "diff", "HEAD", "--binary").stdout
         return status, hashlib.sha256((status + "\n" + diff).encode()).hexdigest()
 
+    def forget_blocked_launches(name: str) -> None:
+        for pair in list(blocked_launch_keys):
+            if pair[0] == name:
+                blocked_launch_keys.pop(pair)
+
     def launch(name: str, task_id: str, followup: str = "") -> None:
         if integration is not None or name in stopping:
             return  # Worktree preparation takes merge.lock; never block this event loop on a review.
-        if name in tasks and not tasks[name].done():
+        if name in tasks:
             return
         current = autoformalize_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
@@ -736,14 +763,24 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 or autoformalize_server.has_pending_formal_candidate(current, name)
                 or autoformalize_state.source_issues_blocking_task(current, task_id)):
             return
+        pair = (name, task_id)
+        retry_key = _formal_launch_retry_key(current, name, task_id, worker_targets.get(name, ""))
+        if blocked_launch_keys.get(pair) == retry_key:
+            return
         prepared = autoformalize_server.prepare_formal_worktree(
             name, previous_task=worker_targets.get(name, ""), next_task=task_id,
             expected_revision=current["formalization"]["revision"],
         )
         if not prepared["ok"]:
+            # Preparation can publish a checkpoint before reporting a block;
+            # do not mistake its own bookkeeping for a fresh retry trigger.
+            blocked_launch_keys[pair] = _formal_launch_retry_key(
+                autoformalize_state.load_state(paths.forum), name, task_id, worker_targets.get(name, ""),
+            )
             blocked_launches[name] = prepared.get("error", prepared.get("reason", "worktree unavailable"))
             _console.print(f"[yellow]preserving {name}'s worktree: {prepared.get('reason', '')}[/yellow]")
             return
+        forget_blocked_launches(name)
         blocked_launches.pop(name, None)
         # Preparation may synchronize source while Forum events arrive. Capture
         # the actual attempt, not the mutable target inferred from later claims.
@@ -809,6 +846,14 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "Do not change the source or silently formalize a different result. "
             "Use refine_chunks for explicit graph/interpretation revisions; use source repair for source defects."
         ))
+        checkpoint = prepared.get("checkpoint") or prepared.get("parked_checkpoint")
+        if checkpoint:
+            task_prompt += (
+                f"\nPreserved work for task `{checkpoint['task_id']}` is checkpointed at "
+                f"`{checkpoint['ref']}` ({checkpoint['commit_sha']}). Read artifact "
+                f"`{checkpoint['manifest_artifact']}` before reusing its source or ignored files. "
+                "Reuse only work relevant to the current task."
+            )
         event = asyncio.Event()
         interrupts[name] = event
         roles[name] = "formalizing"
@@ -950,6 +995,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 if stopper.done():
                     stopper.result()
                     stopping.pop(name)
+                    forget_blocked_launches(name)
                     if name in tasks and not tasks[name].done():
                         raise ValueError(f"Worker {name} did not stop; source and pending candidates were preserved")
 
@@ -966,6 +1012,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 except Exception as exc:
                     _console.print(f"[red]worker {name} failed: {exc!r}[/red]")
                 tasks.pop(name, None)
+                # A consumed worker/stop job may have changed private source.
+                # Manual filesystem repairs require resuming the runtime or a
+                # relevant state change; this is not a worktree watcher.
+                forget_blocked_launches(name)
                 interrupts.pop(name, None)
                 role = roles.pop(name, "")
                 attempt = worker_attempts.pop(name, None)
@@ -1096,17 +1146,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 return state
             if (integration is None and not tasks and not stopping
                     and not autoformalize_server.has_pending_formal_candidate(state)):
-                if blocked_launches:
-                    details = "; ".join(f"{name}: {reason}" for name, reason in blocked_launches.items())
-                    raise ValueError("Autoformalize cannot launch workers without discarding preserved work. "
-                                     "Reconcile these worktrees before resuming: " + details)
-                if state.get("task_yields"):
-                    raise ValueError(
-                        "Autoformalize has no runnable local attempts: remaining work is deferred or "
-                        "waiting on prerequisites. Read autoformalize_brief for reasons; resolve a "
-                        "dependency or register a distinct strategy before resuming. Worktrees are preserved."
-                    )
-                return state
+                autoformalize_state.record_round_end(paths.forum, blocked_launches=blocked_launches)
+                return autoformalize_state.load_state(paths.forum)
         return autoformalize_state.load_state(paths.forum)
     finally:
         for name in list(tasks):

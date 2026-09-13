@@ -13,6 +13,9 @@ with the task target and evidence. Reuse others' findings; routine reads and unc
 
 For your assigned task:
 
+- read the latest critic feedback and any saved checkpoint for your assigned task. Continue from preserved
+  work and address the stated blocker before repeating earlier searches. A checkpoint is private unfinished
+  work, not an accepted proof; when its task revision changed, reuse it selectively against the current task;
 - refresh `autoformalize_brief` frequently. Claim a suitable existing strategy when available; register a new
   strategy only when materially different. Investigation/editing before registration is allowed, but
   claim a strategy before finalizing. Assist, transfer ownership or mark an incorrect strategy as appropriate;

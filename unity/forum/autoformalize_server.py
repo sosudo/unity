@@ -7,13 +7,16 @@ own forum directory. Neither solve nor prove imports this interface.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import json
 import os
 import re
 import subprocess
+import stat
 import tempfile
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
@@ -353,6 +356,10 @@ def autoformalize_task(task_id: str) -> str:
             for author, records in state.get("task_yields", {}).items()
             if task_id in records
         ],
+        "checkpoints": [
+            record for records in state.get("worktree_checkpoints", {}).values()
+            if (record := records.get(task_id))
+        ],
         "source_issues": [
             item for item in state.get("source_issues", {}).values()
             if not item.get("task_ids") or task_id in item["task_ids"]
@@ -395,6 +402,20 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
             lines.append(f"- {target} [{task.get('status')}]: {task.get('title') or task.get('lean_decl')} "
                          f"{task.get('description', '')[:220]}")
         lines.append("Exact requirements, source citations and evidence: autoformalize_task(task_id).")
+    if review_phase and (last_round := formal.get("last_round")):
+        lines.extend(["", "LAST FORMALIZATION ATTEMPT"])
+        for owner, reason in list(last_round.get("blocked_launches", {}).items())[:5]:
+            lines.append(f"- {owner}: {reason[:240]}")
+    checkpoints = [record
+                   for owner, records in state.get("worktree_checkpoints", {}).items()
+                   for target, record in records.items()
+                   if (review_phase or owner == autoformalize_state.author_key(author))
+                   and (not related or target in related)]
+    if checkpoints:
+        lines.extend(["", "SAVED PRIVATE WORK (not accepted candidates)"])
+        for record in checkpoints[-5:]:
+            lines.append(f"- {record['author']} / {record['task_id']} revision {record['task_revision']}: "
+                         f"{record['ref']}; artifact {record['manifest_artifact']}")
     candidates = [
         item for item in state.get("formal_candidates", {}).values()
         if autoformalize_state.candidate_is_current(state, item)
@@ -488,7 +509,7 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         for owner, records in state.get("task_yields", {}).items()
         for target, record in records.items()
         if tasks.get(target, {}).get("status") == "pending"
-        and (owner == autoformalize_state.author_key(author) or target in related)
+        and (review_phase or owner == autoformalize_state.author_key(author) or target in related)
     ]
     if yielded:
         yielded.sort(key=lambda row: (row[0] != autoformalize_state.author_key(author), row[1], row[0]))
@@ -899,6 +920,175 @@ def ready_statement_prerequisites(state: dict, task_id: str) -> list[dict]:
     return sorted(ready, key=lambda item: item["task_id"])
 
 
+def _checkpoint_manifest_path(author: str, task_id: str, run_id: str) -> Path:
+    key = autoformalize_state.digest([run_id, autoformalize_state.author_key(author), task_id])
+    return FORUM_DIR / "worktree-checkpoints" / f"{key}.json"
+
+
+def _worktree_assignment_path(author: str, state: dict) -> Path:
+    key = autoformalize_state.digest([state.get("run_id", ""), autoformalize_state.author_key(author)])
+    return FORUM_DIR / "worktree-checkpoints" / f"{key}.assignment.json"
+
+
+def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
+                               state: dict, *, pending: bool = False) -> dict:
+    assignment = {"task_id": task_id, "task_revision": revision, "pending": pending}
+    path = _worktree_assignment_path(author, state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    artifacts._atomic_write(path, (json.dumps(assignment) + "\n").encode())
+    if not pending:
+        state.setdefault("worker_tasks", {})[autoformalize_state.author_key(author)] = task_id
+    return assignment
+
+
+def _saved_task_checkpoint(author: str, task_id: str, state: dict) -> dict | None:
+    identity = autoformalize_state.author_key(author)
+    checkpoint = state.get("worktree_checkpoints", {}).get(identity, {}).get(task_id)
+    path = _checkpoint_manifest_path(author, task_id, state.get("run_id", ""))
+    if path.is_file():
+        checkpoint = json.loads(path.read_text())
+    if not checkpoint:
+        return None
+    if (autoformalize_state.author_key(checkpoint["author"]) != identity
+            or checkpoint["task_id"] != task_id or checkpoint.get("run_id") != state.get("run_id", "")):
+        raise ValueError("Checkpoint assignment identity changed; work preserved")
+    manifest = json.loads(artifacts.artifact_bytes(_artifacts_dir(), checkpoint["manifest_artifact"]))
+    if manifest != {key: value for key, value in checkpoint.items() if key != "manifest_artifact"}:
+        raise ValueError("Checkpoint manifest changed; refusing restore")
+    return checkpoint
+
+
+def _checkpoint_task_worktree(tree: Path, author: str, task_id: str, task_revision: int | None) -> dict:
+    """Checkpoint a stopped, locked tree before reassignment; never accept it.
+
+    The immutable ref/artifacts and small recovery manifest precede any reset.
+    Ignored private files are not added to Git or mixed into future candidates.
+    """
+    files = []
+    ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+                   "--", ".", ":(exclude).unity", ":(exclude).lake").stdout
+    for relative in ignored.split("\0"):
+        if not relative:
+            continue
+        path = tree / relative
+        info = path.lstat()
+        entry = {"path": relative, "mode": stat.S_IMODE(info.st_mode)}
+        if stat.S_ISLNK(info.st_mode):
+            entry["symlink"] = os.readlink(path)
+        elif stat.S_ISREG(info.st_mode):
+            entry["data"] = base64.b64encode(path.read_bytes()).decode("ascii")
+        else:
+            raise ValueError(f"Cannot checkpoint private special file {relative}; work preserved")
+        files.append(entry)
+    state = autoformalize_state.load_state(FORUM_DIR)
+    archived = artifacts.store_text(
+        _artifacts_dir(), json.dumps({"files": files}), kind="autoformalize_private_files",
+        producer=author, metadata={"task_id": task_id, "task_revision": task_revision},
+    ) if files else None
+    # Enumerate before staging: explicit ignored exclusion pathspecs make
+    # `git add` fail, and forcing them would accidentally track shared state.
+    names = _git(tree, "ls-files", "--cached", "--others", "--exclude-standard", "-z",
+                 "--", ".", ":(exclude).unity", ":(exclude).lake").stdout.split("\0")
+    names = sorted({name for name in names if name})
+    for start in range(0, len(names), 256):
+        _git(tree, "--literal-pathspecs", "add", "-A", "--", *names[start:start + 256])
+    staged = _git(tree, "diff", "--cached", "--quiet", check=False)
+    if staged.returncode not in {0, 1}:
+        raise ValueError("Cannot inspect checkpoint index; work preserved")
+    if staged.returncode or _git(tree, "rev-parse", "-q", "--verify", "MERGE_HEAD", check=False).returncode == 0:
+        _git(tree, "commit", "-m", "UNITY: checkpoint private autoformalize attempt")
+    head = _git(tree, "rev-parse", "HEAD").stdout.strip()
+    reference = f"refs/unity/autoformalize-checkpoints/{uuid.uuid4().hex}"
+    _git(tree, "update-ref", reference, head)
+    run_id = state.get("run_id", "")
+    checkpoint = {"author": author, "task_id": task_id, "task_revision": task_revision,
+                  "run_id": run_id, "ref": reference, "commit_sha": head,
+                  "ignored_artifact": archived["artifact_id"] if archived else None}
+    manifest = artifacts.store_text(
+        _artifacts_dir(), json.dumps(checkpoint), kind="autoformalize_task_checkpoint",
+        producer=author, metadata={"task_id": task_id, "run_id": run_id},
+    )
+    checkpoint["manifest_artifact"] = manifest["artifact_id"]
+    path = _checkpoint_manifest_path(author, task_id, run_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # This small durable pointer recovers the checkpoint if the process exits
+    # after reset but before its Forum transaction is committed.
+    artifacts._atomic_write(path, (json.dumps(checkpoint) + "\n").encode())
+    return checkpoint
+
+
+def _restore_private_files(tree: Path, artifact_id: str) -> list[str]:
+    """Restore only private paths; never follow a parent symlink out of the tree."""
+    record = artifacts.artifact_info(_artifacts_dir(), artifact_id)
+    payload = artifacts.artifact_bytes(_artifacts_dir(), artifact_id)
+    if hashlib.sha256(payload).hexdigest() != record["sha256"]:
+        raise ValueError("Private checkpoint artifact changed; refusing restore")
+    entries = json.loads(payload)["files"]
+    conflicts = []
+    for entry in entries:
+        relative = Path(entry["path"])
+        if (relative.is_absolute() or not relative.parts or ".." in relative.parts
+                or relative.parts[0] in {".git", ".unity", ".lake"}):
+            raise ValueError("Private checkpoint contains an unsafe path")
+        path = tree / relative
+        if (not path.parent.resolve().is_relative_to(tree.resolve())
+                or path.exists() or path.is_symlink()):
+            conflicts.append(str(relative))
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if "symlink" in entry:
+            path.symlink_to(entry["symlink"])
+        else:
+            # Exclusive creation also protects newly appeared files.
+            with path.open("xb") as handle:
+                handle.write(base64.b64decode(entry["data"], validate=True))
+            path.chmod(entry["mode"] & 0o777)
+    return conflicts
+
+
+def _restore_task_checkpoint_if_current(
+    tree: Path, author: str, task_id: str, task_revision: int | None, state: dict, main_sha: str,
+) -> dict:
+    identity = autoformalize_state.author_key(author)
+    checkpoint = _saved_task_checkpoint(author, task_id, state)
+    if not checkpoint:
+        return {}
+    state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[task_id] = checkpoint
+    if (task_revision is None or checkpoint["task_revision"] != task_revision
+            or state.get("formal_tasks", {}).get(task_id, {}).get("revision") != task_revision):
+        return {"checkpoint": checkpoint, "sync_warning":
+                "Saved checkpoint is not bound to the current task revision; reuse it selectively, not as the current specification."}
+    if _git(tree, "rev-parse", checkpoint["ref"]).stdout.strip() != checkpoint["commit_sha"]:
+        raise ValueError("Checkpoint ref changed; refusing restore")
+    _git(tree, "reset", "--hard", checkpoint["commit_sha"])
+    merged = _git(tree, "merge", "--no-edit", "--no-autostash", "--no-overwrite-ignore", main_sha, check=False)
+    conflicts = (_restore_private_files(tree, checkpoint["ignored_artifact"])
+                 if checkpoint.get("ignored_artifact") else [])
+    result = {"checkpoint": checkpoint, "checkpoint_restored": True}
+    if merged.returncode or conflicts:
+        result["sync_warning"] = (
+            "Saved work was restored; resolve preserved merge conflicts or private-file collisions "
+            "before finalizing. Unrestored private files remain in checkpoint artifact "
+            f"{checkpoint.get('ignored_artifact') or checkpoint['manifest_artifact']}."
+        )
+    return result
+
+
+def _reset_formal_assignment(tree: Path, author: str, task_id: str, revision: int | None,
+                             state: dict, main_sha: str) -> dict:
+    # The previous task is already checkpointed (or complete/clean). Persist
+    # the intended assignment BEFORE changing Git, so an interrupted restore
+    # cannot subsequently checkpoint the target bytes under the previous task.
+    _record_worktree_assignment(author, task_id, revision, state, pending=True)
+    result = worktree.force_sync_from_main(_root(), author)
+    if result.get("ok"):
+        result.update(_restore_task_checkpoint_if_current(
+            tree, author, task_id, revision, state, main_sha,
+        ))
+        _record_worktree_assignment(author, task_id, revision, state)
+    return result
+
+
 def prepare_formal_worktree(
     author: str,
     previous_task: str = "",
@@ -908,8 +1098,8 @@ def prepare_formal_worktree(
 ) -> dict:
     """Prepare a stopped worker for another task without erasing unresolved work.
 
-    Only a completed previous assignment authorizes discarding obsolete work.
-    A yielded assignment may move only if its private tree is clean. This is
+    Completed work may be refreshed; yielded/prerequisite work is checkpointed
+    before reassignment, including ignored private files. This is
     controller-only, not an agent tool. The state lock
     serializes the final guard with new claims; the author lock protects both
     candidate submission APIs and their immutable commit ancestry.
@@ -936,26 +1126,46 @@ def prepare_formal_worktree(
         tree = worktree.agent_worktree(_root(), author)
         if not tree.is_dir():
             return _sync_blocked("missing_worktree", "The agent has no active worktree.")
+        assignment_path = _worktree_assignment_path(author, state)
+        assignment = json.loads(assignment_path.read_text()) if assignment_path.is_file() else {}
+        recovered = {}
+        if assignment.get("pending"):
+            main_sha = _accepted_formal_main(state)
+            if not main_sha:
+                return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
+            recovered = _reset_formal_assignment(
+                tree, author, assignment["task_id"], assignment["task_revision"], state, main_sha,
+            )
+            if not recovered.get("ok"):
+                return recovered
+            assignment["pending"] = False
+        if assignment:
+            previous_task = assignment["task_id"]
+            assignments[identity] = previous_task
+        # A legacy assignment has no reliable revision binding; save it for
+        # selective reuse, never relabel its bytes with today's task revision.
+        previous_revision = assignment.get("task_revision")
         retired = state.get("retired_tasks", {}).get(previous_task, {})
         continuing_refinement = next_task in retired.get("replaced_by", [])
         if previous_task == next_task or continuing_refinement:
-            result = {"ok": True, "preserved": True, "worktree": str(tree)}
+            result = {"ok": True, "preserved": True, "worktree": str(tree), **recovered}
             # Representation-only adoption keeps this task alive. Bring a clean
             # stopped tree onto accepted main so later candidates do not submit
             # its already-integrated representation again. Never erase edits.
             main_sha = _accepted_formal_main(state)
-            if ((formal.get("contract") or {}).get("version") == 3 and main_sha
+            if (not result.get("checkpoint_restored")
+                    and (formal.get("contract") or {}).get("version") == 3 and main_sha
                     and not _git(tree, "status", "--porcelain", "--untracked-files=no").stdout.strip()):
                 merged = _git(tree, "merge", "--no-edit", "--no-autostash", "--no-overwrite-ignore",
                               main_sha, check=False)
                 if merged.returncode:
                     result["sync_warning"] = "Resolve the preserved worktree merge conflict before finalizing."
-            assignments[identity] = next_task
+            _record_worktree_assignment(author, next_task, target_task.get("revision"), state)
             return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
         # A refinement can introduce a missing interface and block every former
-        # assignment. Only an unclaimed clean ancestor tree may move upstream;
-        # this exception never resets or parks private work.
+        # assignment. An unclaimed attempt can help that prerequisite after its
+        # private work has been saved.
         prerequisite_reassignment = next_task in {
             item["task_id"] for item in ready_statement_prerequisites(state, previous_task)
         }
@@ -972,28 +1182,45 @@ def prepare_formal_worktree(
         if not main_sha:
             return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
         if previous.get("status") == "complete":
-            result = worktree.force_sync_from_main(_root(), author)
+            return _reset_formal_assignment(
+                tree, author, next_task, target_task.get("revision"), state, main_sha,
+            )
+
+        private_status = _git(tree, "status", "--porcelain", "--", ".",
+                              ":(exclude).unity", ":(exclude).lake").stdout.strip()
+        ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+                       "--", ".", ":(exclude).unity", ":(exclude).lake").stdout
+        private_commits = _git(tree, "merge-base", "--is-ancestor", "HEAD", main_sha, check=False).returncode != 0
+        if (prerequisite_reassignment or yielded_reassignment) and (private_status or ignored or private_commits):
+            checkpoint = _checkpoint_task_worktree(
+                tree, author, previous_task, previous_revision,
+            )
+            state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[previous_task] = checkpoint
+            result = _reset_formal_assignment(
+                tree, author, next_task, target_task.get("revision"), state, main_sha,
+            )
             if result.get("ok"):
-                assignments[identity] = next_task
+                result["parked_checkpoint"] = checkpoint
             return result
 
         # A fresh/unassigned tree has no known obsolete task. Never reset it:
         # accept a clean ancestor of main, but preserve unexplained local work.
-        if _git(tree, "status", "--porcelain").stdout.strip():
+        if private_status:
             return _sync_blocked("dirty_worktree", "Local edits are preserved; reconcile them before changing tasks.")
-        if prerequisite_reassignment or yielded_reassignment:
-            ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").stdout
-            if any(path.split("/", 1)[0] not in {".unity", ".lake"}
-                   for path in ignored.split("\0") if path):
-                return _sync_blocked("ignored_work", "Ignored private files are preserved; reconcile them before changing tasks.")
-        if _git(tree, "merge-base", "--is-ancestor", "HEAD", main_sha, check=False).returncode:
+        if ignored:
+            return _sync_blocked("ignored_work", "Ignored private files are preserved; reconcile them before changing tasks.")
+        if private_commits:
             return _sync_blocked("local_commits", "Private commits are preserved; reconcile them before changing tasks.")
         merged = _git(tree, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", main_sha, check=False)
         if merged.returncode:
             return _sync_blocked("local_commits", merged.stderr.strip() or "Unassigned commits are preserved.")
         worktree.link_runtime_state(tree, _root())
         worktree.symlink_lake_cache(tree, _root())
-        assignments[identity] = next_task
+        if _saved_task_checkpoint(author, next_task, state):
+            return _reset_formal_assignment(
+                tree, author, next_task, target_task.get("revision"), state, main_sha,
+            )
+        _record_worktree_assignment(author, next_task, target_task.get("revision"), state)
         return {"ok": True, "main_sha": main_sha, "worktree": str(tree)}
 
 

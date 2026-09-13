@@ -4,6 +4,12 @@ Start with `autoformalize_brief(author)` and use `autoformalize_status()` for ex
 supplied source snapshot and current review artifacts using `artifact_info`, bounded `artifact_read`,
 and the source file paths in `.unity/formalization-plan.json`.
 
+If the current snapshot has `passed=false`, this is diagnostic review of an exhausted or incomplete
+round. Read yielded attempts, the last-round blockers and preserved-work checkpoints. Use `lean_reopen`
+with exact task IDs and actionable next steps, or request an evidenced replan/source repair.
+Use `not_checked` for unchecked requirements. A failed snapshot cannot approve, and unfinished
+tasks do not justify reopening unrelated completed work. Repeated unchanged feedback is not a new attempt.
+
 - `submit_formalization_verdict(author, verdict, summary, review, reopen_tasks?, evidence?)` submits
   `approved` or `lean_reopen`. `review` contains the current `snapshot_id` and `requirements` entries
   `{requirement_id, status, declarations, checked_anchor_ids, rationale, argument_rationale}`,
@@ -26,4 +32,4 @@ No paper rewriting or mandatory informal-solving phase is available. Report subs
 with evidence; never approve an altered statement to avoid the defect. The critic does not
 merge code, edit Lean or adopt representations. Distinguish historical representation candidates from
 current machine-review evidence. Assignment, representation, verification and faithfulness are separate;
-the critic provides the final source-faithfulness verdict for the current verified output manifests.
+the critic provides diagnostic feedback or the final source-faithfulness verdict for current outputs.

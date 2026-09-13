@@ -68,6 +68,7 @@ def _default_state() -> dict:
             "requirements": [],
             "review_snapshot": None,
             "pending_verdict_id": None,
+            "last_round": None,
         },
         "strategies": {},
         "findings": {},
@@ -77,6 +78,7 @@ def _default_state() -> dict:
         "formal_tasks": {},
         "task_yields": {},
         "worker_tasks": {},
+        "worktree_checkpoints": {},
         "retired_tasks": {},
         "refinements": [],
         "formal_candidates": {},
@@ -106,13 +108,19 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "solution_candidates", "formal_tasks", "formal_candidates",
         "review_snapshots",
         "source_issues", "source_repairs", "replan_requests",
-        "retired_tasks", "task_yields", "worker_tasks",
+        "retired_tasks", "task_yields", "worker_tasks", "worktree_checkpoints",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
     base["task_yields"] = {
         author: {task_id: record for task_id, record in rows.items() if isinstance(record, dict)}
         for author, rows in base["task_yields"].items() if isinstance(rows, dict)
+    }
+    base["worktree_checkpoints"] = {
+        author_key(author): {task_id: manifest for task_id, manifest in rows.items()
+                             if isinstance(manifest, dict)}
+        for author, rows in base["worktree_checkpoints"].items()
+        if author_key(author) and isinstance(rows, dict)
     }
     if not isinstance(base.get("events"), list):
         base["events"] = []
@@ -1460,6 +1468,7 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
             "representation": tasks.get(key, {}).get("representation"),
             "accepted_candidate": tasks.get(key, {}).get("accepted_candidate"),
             "complete": tasks.get(key, {}).get("status") == "complete",
+            "critic_feedback": tasks.get(key, {}).get("faithfulness", {}).get("feedback_sha256"),
         } for key in sorted(relevant)},
     })
 
@@ -1888,6 +1897,26 @@ def all_formal_tasks_complete(state: dict) -> bool:
     return bool(tasks) and all(task.get("status") == "complete" for task in tasks.values())
 
 
+def record_round_end(forum_dir: Path, *, blocked_launches: dict) -> dict:
+    """Controller-only record after workers and candidate integration have drained."""
+    with transaction(forum_dir) as state:
+        if state["phase"] != "formalizing":
+            raise ValueError("a formalization round can only end during formalizing")
+        tasks = state["formal_tasks"]
+        summary = {
+            "round_id": _id("round"), "timestamp": time.time(),
+            "main_sha": state["formalization"].get("main_sha"),
+            "formalization_revision": state["formalization"].get("revision"),
+            "complete_tasks": sum(task.get("status") == "complete" for task in tasks.values()),
+            "total_tasks": len(tasks),
+            "blocked_launches": {str(name)[:100]: str(reason)[:1000]
+                                 for name, reason in list(blocked_launches.items())[:64]},
+        }
+        state["formalization"]["last_round"] = summary
+        _event(state, "formalization_round_ended", **summary)
+    return load_state(forum_dir)
+
+
 def _invalidate_review(state: dict) -> None:
     """Keep old snapshots and verdicts as history, never as live approval evidence."""
     formal = state["formalization"]
@@ -1947,6 +1976,8 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
             or contract.get("solution_sha256") != source["sha256"]):
         raise ValueError("review contract does not match the bound supplied source")
     tasks = state["formal_tasks"]
+    if report.get("task_statuses") != {key: task.get("status") for key, task in tasks.items()}:
+        raise ValueError("review snapshot has stale or missing formal task statuses")
     accepted = {task_id: task.get("accepted_candidate") for task_id, task in tasks.items()}
     if report.get("accepted_candidates") != accepted:
         raise ValueError("review snapshot has stale accepted candidates")
@@ -2065,29 +2096,30 @@ def reopen_after_machine_failure(forum_dir: Path, report: dict) -> dict:
     return load_state(forum_dir)
 
 
-def _current_snapshot(state: dict, snapshot_id: str) -> dict:
+def _current_snapshot(state: dict, snapshot_id: str, *, require_passed: bool = True) -> dict:
     report = state["formalization"].get("review_snapshot")
     if not isinstance(report, dict) or report.get("snapshot_id") != snapshot_id:
         raise ValueError("semantic review refers to a stale or unknown snapshot")
     if state.get("review_snapshots", {}).get(snapshot_id) != report:
         raise ValueError("review snapshot differs from its immutable controller report")
-    _validate_snapshot_binding(state, report, require_passed=True)
+    _validate_snapshot_binding(state, report, require_passed=require_passed)
     return report
 
 
-def begin_critic(forum_dir: Path) -> dict:
+def begin_critic(forum_dir: Path, *, diagnostic: bool = False) -> dict:
     with transaction(forum_dir) as state:
         if state["phase"] not in {"formalizing", "critic"}:
             raise ValueError("critic can only start for an active formalization")
-        if not all_formal_tasks_complete(state):
+        if not diagnostic and not all_formal_tasks_complete(state):
             raise ValueError("critic cannot start before all formal tasks are complete")
         report = state["formalization"].get("review_snapshot") or {}
-        _current_snapshot(state, report.get("snapshot_id", ""))
+        _current_snapshot(state, report.get("snapshot_id", ""), require_passed=not diagnostic)
         if state["formalization"].get("status") == "approval_pending":
             raise ValueError("critic approval is awaiting controller finalization")
         state["formalization"]["status"] = "review"
         state["phase"] = "critic"
-        _event(state, "critic_started", main_sha=state["formalization"].get("main_sha", ""))
+        _event(state, "critic_started", main_sha=state["formalization"].get("main_sha", ""),
+               diagnostic=diagnostic)
     return load_state(forum_dir)
 
 
@@ -2108,7 +2140,7 @@ def submit_critic_verdict(
     with transaction(forum_dir) as state:
         if state["phase"] != "critic" or state["formalization"].get("status") != "review":
             raise ValueError("critic verdicts are only accepted during critic")
-        report = _current_snapshot(state, review["snapshot_id"])
+        report = _current_snapshot(state, review["snapshot_id"], require_passed=verdict == "approved")
         _validate_semantic_review(state, review, approved=verdict == "approved", author=author)
         task_ids = list(dict.fromkeys(reopen_tasks or []))
         if verdict == "approved" and task_ids:
@@ -2155,6 +2187,14 @@ def submit_critic_verdict(
                     break
                 reopened |= dependents
             item["reopened_tasks"] = sorted(reopened)
+            # Identical feedback on a new snapshot is not a fresh approach.
+            # Bind only substantive review content, never verdict IDs or time.
+            feedback_sha256 = digest({
+                "summary": item["summary"], "evidence": item["evidence"],
+                "reopen_tasks": sorted(task_ids), "scope_rationale": review["scope_rationale"],
+                "requirements": sorted(review["requirements"], key=lambda row: row["requirement_id"]),
+                "repair_reviews": sorted(review["repair_reviews"], key=lambda row: row["repair_id"]),
+            })
             for task_id in reopened:
                 task = state["formal_tasks"][task_id]
                 accepted = task.get("accepted_candidate")
@@ -2164,7 +2204,8 @@ def submit_critic_verdict(
                 task["status"] = "pending"
                 if not incremental:
                     task["accepted_candidate"] = None
-                task["faithfulness"] = {"status": "changes_requested", "verdict_id": item["verdict_id"]}
+                task["faithfulness"] = {"status": "changes_requested", "verdict_id": item["verdict_id"],
+                                        "feedback_sha256": feedback_sha256}
             for strategy in state["strategies"].values():
                 if (strategy.get("phase") == "formalizing" and strategy.get("target") in reopened
                         and strategy.get("status") in _ACTIVE_STRATEGIES):
