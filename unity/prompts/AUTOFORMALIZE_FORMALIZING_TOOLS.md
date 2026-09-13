@@ -6,6 +6,13 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `register_strategy(author, description, target?, strategy_family?)` registers a materially distinct
   approach for the formal task ID. Prefer a suitable existing strategy. Use `claim_strategy`,
   `assist_strategy`, `unclaim_strategy` or `mark_strategy_incorrect`; own one claimed strategy at a time.
+- `yield_task(author, task_id, reason, waiting_for?)` ends your blocked attempt. `waiting_for` is an
+  optional list of existing dependency task IDs. It releases your claims and assistance for that task,
+  and defers that task for you only; other workers can continue. End the turn after a `yielded` response;
+  if helpers are already ready, refresh and continue; if a candidate is pending, follow its review
+  interrupt. Unity handles reassignment and preserves private work. Use `unclaim_strategy` for ownership transfer or a
+  new approach while continuing, not for ending a blocked attempt. Do not repeat unchanged blocker
+  posts. There is no per-turn call limit.
 - `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
   shares reusable checked APIs, proof patterns and concrete failures. Publish before substantial
   follow-on work, with the formal task ID and check/artifact evidence; reuse existing findings.
@@ -33,6 +40,9 @@ findings and candidate events. These tools belong to the autoformalization runti
   in `changes`, or use the existing task-resolution shape for a supporting node. This changes only
   its implementation resolution, not the cited statement/anchors. Inspect the exact API and update
   corresponding node dependency edges as needed; unresolved choices never count as final evidence.
+  Before yielding for a missing helper, actually add its node and the consumer's typed dependency edge
+  through `refine_chunks`, then pass the helper task ID to `yield_task`. A finding or help request alone
+  does not create a task or its dependency.
 - `request_rechunk(author, reason, task_ids?)` queues a revised informal plan and argument/prerequisite
   mapping, without rewriting original source obligations. Give precise source locations/evidence; ordinary formal drafts use refinement or a new
   candidate, not mandatory rechunking. The supplied source is unchanged.

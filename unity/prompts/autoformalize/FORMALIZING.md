@@ -15,7 +15,7 @@ For your assigned task:
 
 - refresh `autoformalize_brief` frequently. Claim a suitable existing strategy when available; register a new
   strategy only when materially different. Investigation/editing before registration is allowed, but
-  claim a strategy before finalizing. Assist, release or mark an incorrect strategy as appropriate;
+  claim a strategy before finalizing. Assist, transfer ownership or mark an incorrect strategy as appropriate;
 - work only in your assigned Git worktree and preserve separately claimed work;
 - read the task's `source_components` and source locations. Preserve the source statement's domains,
   hypotheses, quantifiers, definitions and conclusion, and follow its mathematical proof argument;
@@ -27,8 +27,10 @@ For your assigned task:
   distinguish `statement_dependencies` from `proof_dependencies`. `predicted_kind`,
   `proposed_formal_statement` and `proposed_formal_strategy` are revisable hints, not frozen Lean types;
 - choose the actual Lean representation, declaration names and files, and implement meaning-bearing
-  definitions as well as proofs. Routine helpers belong inside the task's module, not automatically in
-  separate DAG nodes. Do not submit unfinished meaning-bearing definition bodies;
+  definitions as well as proofs. Routine local helpers need not be separate DAG nodes. If a missing
+  helper needs independent work, add it and the consuming node's dependency edge with `refine_chunks`
+  before waiting for it; a Forum request alone does not create runnable work. Do not submit unfinished
+  meaning-bearing definition bodies;
 - use `refine_chunks(author, expected_revision, changes)` for source-faithful interpretation, kind,
   hint and dependency corrections or explicit node splits/merges. Read the current revision first;
   stale updates fail atomically. Keep stable node IDs for the same mathematics. Original source
@@ -47,6 +49,21 @@ For your assigned task:
 - when an unrelated task merges, refresh the brief and keep working without resetting your worktree.
   Unity synchronizes obsolete worktrees before assigning another task. If your current work needs a
   newly merged result, use `sync_from_main`, preserving and resolving local edits/conflicts.
+
+When you are concretely blocked and ending this task attempt, call
+`yield_task(author, task_id, reason, waiting_for?)`. After a `yielded` response, end the turn. If the tool
+reports that helpers are already ready, refresh and continue; if a candidate is pending, follow its
+review interrupt instead. Give a specific reason and, when
+applicable, existing dependency task IDs in `waiting_for`. If the needed helper has no task, first use
+`refine_chunks` to create it and add the appropriate `statement_dependencies` or `proof_dependencies`
+edge. Do not merely repeat a missing-helper obstacle and wait for an unregistered task.
+Yielding releases your claims/assistance for that task and defers it for you, not for other workers;
+Unity handles reassignment while preserving private work. Do not reset or discard unfinished edits.
+An unchanged ended attempt is not automatically relaunched; relevant task/dependency progress or a
+distinct strategy can make it useful again. Reposting a blocker or reclaiming the same strategy cannot.
+Use `unclaim_strategy` for an ownership transfer or a change of approach while continuing useful work,
+not as a substitute for yielding an attempt that is ending blocked. Publish new evidence when useful,
+but do not repeat unchanged blockers or findings at each turn boundary. There is no per-turn call limit.
 
 Candidate submission interrupts work for that task. A model's local build claim is not authoritative.
 Do not manually merge into main or submit passive endorsements in place of candidate finalization.
@@ -121,8 +138,8 @@ failure with `|| true` or pipe the check through `head`/`tail`. Other necessary 
 enable `set -o pipefail`. Keep checks in the foreground, never `nohup` or `&`; poll the same returned tool
 session until completion. Session IDs are not shell PIDs, and empty output does not mean success. Do not
 launch duplicate checks while one is running or impose short timeouts on ordinary Lean checks; Unity
-handles cancellation. At turn end, publish the last check, outcome and source state as one compact
-finding so the next turn can reuse it.
+handles cancellation. If a check, outcome or source state adds new evidence, publish one compact
+finding so the next turn can reuse it; do not republish unchanged evidence merely because a turn ends.
 
 For the shell MCP bridge with multiline Lean, serialize arguments using JSON and pass a file/stdin via
 `--args-file`; do not manually embed Lean in shell-quoted JSON. A diagnostics artifact alone does not

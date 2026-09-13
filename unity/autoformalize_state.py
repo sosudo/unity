@@ -27,7 +27,7 @@ from .autoformalize_spec import (
 )
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 PHASES = {"chunking", "formalizing", "critic", "complete"}
 STRATEGY_PHASES = {"formalizing"}
 STRATEGY_STATUSES = {"registered", "claimed", "paused", "incorrect", "succeeded", "cancelled"}
@@ -75,6 +75,8 @@ def _default_state() -> dict:
         "questions": {},
         "solution_candidates": {},
         "formal_tasks": {},
+        "task_yields": {},
+        "worker_tasks": {},
         "retired_tasks": {},
         "refinements": [],
         "formal_candidates": {},
@@ -104,10 +106,14 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "solution_candidates", "formal_tasks", "formal_candidates",
         "review_snapshots",
         "source_issues", "source_repairs", "replan_requests",
-        "retired_tasks",
+        "retired_tasks", "task_yields", "worker_tasks",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
+    base["task_yields"] = {
+        author: {task_id: record for task_id, record in rows.items() if isinstance(record, dict)}
+        for author, rows in base["task_yields"].items() if isinstance(rows, dict)
+    }
     if not isinstance(base.get("events"), list):
         base["events"] = []
     if not isinstance(base.get("chunking_attempts"), list):
@@ -576,6 +582,7 @@ def claim_strategy(forum_dir: Path, strategy_id: str, author: str) -> dict:
             raise ValueError(f"strategy is {strategy['status']}, not claimable")
         strategy["status"] = "claimed"
         strategy["owner"] = _text(author, "author", 100)
+        strategy["attempted_by"] = sorted(set(strategy.get("attempted_by", [])) | {author_key(author)})
         strategy["updated_at"] = time.time()
         _event(state, "strategy_claimed", strategy_id=strategy_id, author=author,
                phase=strategy["phase"], target=strategy["target"])
@@ -590,6 +597,7 @@ def assist_strategy(forum_dir: Path, strategy_id: str, author: str, contribution
             raise ValueError("strategy is not actively claimed")
         if not participates(strategy, author):
             strategy["assistants"].append(_text(author, "author", 100))
+        strategy["attempted_by"] = sorted(set(strategy.get("attempted_by", [])) | {author_key(author)})
         strategy["updated_at"] = time.time()
         _event(state, "strategy_assisted", strategy_id=strategy_id, author=author,
                phase=strategy["phase"], target=strategy["target"],
@@ -611,6 +619,7 @@ def release_strategy(
             raise ValueError(f"unknown strategy '{strategy_id}'")
         if author_key(strategy.get("owner")) != author_key(author):
             raise ValueError("only the strategy owner can release it")
+        strategy["attempted_by"] = sorted(set(strategy.get("attempted_by", [])) | {author_key(author)})
         strategy["status"] = "incorrect" if incorrect else "registered"
         strategy["owner"] = None
         strategy["updated_at"] = time.time()
@@ -1405,6 +1414,201 @@ def task_ready(state: dict, task: dict | str) -> bool:
         return all(interface_available(state, dep) for dep in task["statement_dependencies"])
     return all(state["formal_tasks"].get(dep, {}).get("status") == "complete"
                for dep in task.get("dependencies", []))
+
+
+def _task_dependencies(state: dict, task_id: str) -> set[str]:
+    """Statement and proof prerequisites, including transitive helpers."""
+    tasks, pending, seen = state.get("formal_tasks", {}), [task_id], set()
+    while pending:
+        key = pending.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        row = tasks.get(key, {})
+        pending.extend(set(row.get("dependencies", []))
+                       | set(row.get("statement_dependencies", []))
+                       | set(row.get("proof_dependencies", [])))
+    return seen - {task_id}
+
+
+def _rejection_identity(state: dict, author: str, task_id: str) -> str | None:
+    # Retain a participant's observed rejection after yielding releases its claim.
+    # Otherwise detaching an assistant would itself appear to be new progress.
+    remembered = _yield_record(state, author, task_id).get("rejection_candidate_id")
+    relevant = [row for row in state.get("formal_candidates", {}).values()
+        if row.get("task_id") == task_id and candidate_is_current(state, row)
+        and (row.get("status") == "merged" or (row.get("status") == "failed" and (
+            author_key(row.get("author")) == author_key(author)
+            or participates(state.get("strategies", {}).get(row.get("strategy_id"), {}), author)
+            or row.get("candidate_id") == remembered)))]
+    latest = max(relevant, key=lambda row: row.get("updated_at", row.get("created_at", 0)), default={})
+    return latest.get("candidate_id") if latest.get("status") == "failed" else None
+
+
+def _attempt_progress(state: dict, author: str, task_id: str) -> str:
+    tasks = state.get("formal_tasks", {})
+    relevant = _task_dependencies(state, task_id) | {task_id}
+    source = formal_source(state)
+    return digest({
+        "source": [source.get("candidate_id"), source.get("sha256")],
+        "rejection": _rejection_identity(state, author, task_id),
+        "tasks": {key: {
+            "revision": tasks.get(key, {}).get("revision"),
+            "interpretation": informal_interpretation_hash(tasks.get(key, {})),
+            "dependencies": sorted(set(tasks.get(key, {}).get("dependencies", []))),
+            "outputs": tasks.get(key, {}).get("outputs", []),
+            "representation": tasks.get(key, {}).get("representation"),
+            "accepted_candidate": tasks.get(key, {}).get("accepted_candidate"),
+            "complete": tasks.get(key, {}).get("status") == "complete",
+        } for key in sorted(relevant)},
+    })
+
+
+def _task_strategies(state: dict, task_id: str) -> list[dict]:
+    return [row for row in state.get("strategies", {}).values()
+            if row.get("target") == task_id and strategy_is_current(state, row)]
+
+
+def _strategy_keys(strategy: dict) -> set[str]:
+    return {f"{field}:{strategy[field]}" for field in
+            ("family_key", "central_claim_key", "description_key") if strategy.get(field)}
+
+
+def _attempted(strategy: dict, author: str) -> bool:
+    return participates(strategy, author) or author_key(author) in strategy.get("attempted_by", [])
+
+
+def _yield_record(state: dict, author: str, task_id: str) -> dict:
+    return state.get("task_yields", {}).get(author_key(author), {}).get(task_id, {})
+
+
+def has_yielded(state: dict, author: str, task_id: str) -> bool:
+    """Retain explicit relinquishment even after new progress makes work eligible."""
+    return bool(_yield_record(state, author, task_id))
+
+
+def snapshot_attempt(state: dict, author: str, task_id: str) -> dict:
+    """Serializable launch identity; telemetry and global revisions are not memory."""
+    task = state.get("formal_tasks", {}).get(task_id)
+    if not task:
+        raise ValueError(f"unknown formal task '{task_id}'")
+    strategies = _task_strategies(state, task_id)
+    previous = _yield_record(state, author, task_id)
+    source = formal_source(state)
+    return {
+        "task_id": task_id, "author_key": author_key(author),
+        "task_revision": task.get("revision"),
+        "source_id": source.get("candidate_id"), "source_sha256": source.get("sha256"),
+        "progress_key": _attempt_progress(state, author, task_id),
+        "seen_strategy_keys": sorted({key for row in strategies for key in _strategy_keys(row)}),
+        "attempted_strategy_keys": sorted(set(previous.get("attempted_strategy_keys", []))
+            | {key for row in strategies if _attempted(row, author) for key in _strategy_keys(row)}),
+        "prior_yield_id": previous.get("yield_id"),
+    }
+
+
+def task_available_to(state: dict, author: str, task_id: str) -> bool:
+    """A globally ready task is not automatically a fresh attempt for every agent."""
+    if not task_ready(state, task_id):
+        return False
+    record = _yield_record(state, author, task_id)
+    if not record or record.get("progress_key") != _attempt_progress(state, author, task_id):
+        return True
+    seen = set(record.get("seen_strategy_keys", []))
+    attempted = set(record.get("attempted_strategy_keys", []))
+    for strategy in _task_strategies(state, task_id):
+        if strategy.get("status") not in {"registered", "claimed"}:
+            continue
+        keys = _strategy_keys(strategy)
+        if keys and not keys & seen:
+            return True
+        if participates(strategy, author) and keys and not keys & attempted:
+            return True
+    return False
+
+
+def _record_yield(state: dict, author: str, task_id: str, reason: str,
+                  waiting_for: list[str], snapshot: dict) -> dict:
+    strategies = _task_strategies(state, task_id)
+    own = [row for row in strategies if participates(row, author)
+           and row.get("status") in _ACTIVE_STRATEGIES]
+    # An approach the worker just created/tried is not a new opportunity merely
+    # because it was absent at launch. Other workers' newly proposed routes are.
+    own_keys = {key for row in strategies
+                if _attempted(row, author) or author_key(row.get("creator")) == author_key(author)
+                for key in _strategy_keys(row)}
+    record = {**{key: value for key, value in snapshot.items() if key != "candidate_ids"},
+              "yield_id": _id("yield"), "reason": reason,
+              "waiting_for": waiting_for, "timestamp": time.time(),
+              "rejection_candidate_id": _rejection_identity(state, author, task_id),
+              "seen_strategy_keys": sorted(set(snapshot.get("seen_strategy_keys", [])) | own_keys),
+              "attempted_strategy_keys": sorted(set(snapshot.get("attempted_strategy_keys", []))
+                  | {key for row in strategies if _attempted(row, author) for key in _strategy_keys(row)})}
+    for strategy in own:
+        assistants = [name for name in strategy.get("assistants", [])
+                      if author_key(name) and author_key(name) != author_key(author)]
+        if author_key(strategy.get("owner")) == author_key(author):
+            # An owner's blocked attempt must not invalidate peers still working
+            # on this strategy, including their ability to submit its candidate.
+            successor = assistants.pop(0) if assistants else None
+            strategy.update(owner=successor, status="claimed" if successor else "registered",
+                            updated_at=time.time())
+            strategy.pop("paused_from", None)
+        strategy["assistants"] = assistants
+    state.setdefault("task_yields", {}).setdefault(author_key(author), {})[task_id] = record
+    _event(state, "task_yielded", author=author, task_id=task_id,
+           reason=reason, waiting_for=waiting_for, yield_id=record["yield_id"])
+    return {"status": "yielded", "yield": deepcopy(record)}
+
+
+def yield_task(forum_dir: Path, author: str, task_id: str, reason: str,
+               waiting_for: list[str] | None = None) -> dict:
+    """Atomically defer this agent's attempt, without blocking peers or deleting work."""
+    author, reason = _text(author, "author", 100), _text(reason, "reason", 2000)
+    if waiting_for is not None and (not isinstance(waiting_for, list)
+            or any(not isinstance(key, str) or not key.strip() for key in waiting_for)
+            or len(waiting_for) != len(set(waiting_for))):
+        raise ValueError("waiting_for requires distinct task IDs")
+    waiting_for = list(waiting_for or [])
+    with transaction(forum_dir) as state:
+        task = state["formal_tasks"].get(task_id)
+        if state["phase"] != "formalizing" or not task:
+            raise ValueError("yield_task requires a current formalizing task")
+        if (set(waiting_for) - state["formal_tasks"].keys()
+                or set(waiting_for) - _task_dependencies(state, task_id)):
+            raise ValueError("waiting_for must name task prerequisites; refine the dependency edges first")
+        if any(row.get("task_id") == task_id and row.get("status") in {"submitted", "merging"}
+               and candidate_is_current(state, row) for row in state["formal_candidates"].values()):
+            return {"status": "candidate_pending", "task_id": task_id}
+        if task.get("status") != "pending":
+            return {"status": "stale", "task_id": task_id}
+        if waiting_for and all(state["formal_tasks"].get(key, {}).get("status") == "complete"
+                               for key in waiting_for):
+            return {"status": "ready", "task_id": task_id,
+                    "next_action": "The requested helpers are already complete; refresh the task and continue."}
+        return _record_yield(state, author, task_id, reason, waiting_for,
+                             snapshot_attempt(state, author, task_id))
+
+
+def record_worker_yield(forum_dir: Path, author: str, task_id: str, reason: str,
+                        *, snapshot: dict) -> dict:
+    """Normal worker exit fallback; never overwrite a newer explicit yield."""
+    author, reason = _text(author, "author", 100), _text(reason, "reason", 2000)
+    with transaction(forum_dir) as state:
+        task = state["formal_tasks"].get(task_id, {})
+        source = formal_source(state)
+        if any(row.get("task_id") == task_id and row.get("status") in {"submitted", "merging"}
+               and candidate_is_current(state, row) for row in state["formal_candidates"].values()):
+            return {"status": "candidate_pending", "task_id": task_id}
+        if (state["phase"] != "formalizing" or task.get("status") != "pending"
+                or snapshot.get("author_key") != author_key(author)
+                or snapshot.get("task_id") != task_id
+                or snapshot.get("task_revision") != task.get("revision")
+                or snapshot.get("source_id") != source.get("candidate_id")
+                or snapshot.get("source_sha256") != source.get("sha256")
+                or snapshot.get("prior_yield_id") != _yield_record(state, author, task_id).get("yield_id")):
+            return {"status": "stale", "task_id": task_id}
+        return _record_yield(state, author, task_id, reason, [], snapshot)
 
 
 def assignment_view(state: dict, task_id: str) -> dict:

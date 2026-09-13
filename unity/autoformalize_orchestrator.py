@@ -75,8 +75,10 @@ def _preamble(agent, roster, ranking=None, *, icrl_enabled=False) -> str:
         f"(backend: {agent.backend}).\n"
         f"You are collaborating with this team via the forum:\n{team}\n"
         f"The primary agent is '{roster.primary.name}'.\n"
-        "Continue until your current proof-search work is complete or concretely blocked. "
-        "Publish the blocker and release your strategy before ending a blocked turn.\n\n"
+        "Follow the current role's completion instructions. When formalizing, continue until your "
+        "current task work is complete or concretely blocked. Before ending a blocked formalizing "
+        "attempt, call yield_task with your task ID and reason; do not merely unclaim and repeat "
+        "the same blocker. Other roles follow their own reporting tools.\n\n"
     )
 
 

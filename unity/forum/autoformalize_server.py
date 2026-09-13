@@ -348,6 +348,11 @@ def autoformalize_task(task_id: str) -> str:
             item for item in state.get("formal_candidates", {}).values()
             if item.get("task_id") == task_id
         ],
+        "yielded_attempts": [
+            {"author": author, **records[task_id]}
+            for author, records in state.get("task_yields", {}).items()
+            if task_id in records
+        ],
         "source_issues": [
             item for item in state.get("source_issues", {}).values()
             if not item.get("task_ids") or task_id in item["task_ids"]
@@ -478,6 +483,20 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         for item in owned[:6]:
             lines.append(f"- {item['strategy_id']} [{item['status']}] task={item.get('target')}: "
                          f"{item.get('description', '')[:200]}")
+    yielded = [
+        (owner, target, record)
+        for owner, records in state.get("task_yields", {}).items()
+        for target, record in records.items()
+        if tasks.get(target, {}).get("status") == "pending"
+        and (owner == autoformalize_state.author_key(author) or target in related)
+    ]
+    if yielded:
+        yielded.sort(key=lambda row: (row[0] != autoformalize_state.author_key(author), row[1], row[0]))
+        lines.extend(["", "YIELDED ATTEMPTS (agent-local; independent approaches may continue)"])
+        for owner, target, record in yielded[:8]:
+            availability = "ready to reconsider" if autoformalize_state.task_available_to(state, owner, target) else "deferred"
+            lines.append(f"- {owner} / {target} [{availability}]: {record.get('reason', '')[:250]}; "
+                         f"waiting for={','.join(record.get('waiting_for', [])) or 'new relevant work'}")
     visible_tasks = [tasks[target] for target in sorted(related)] if related else list(tasks.values())
     if visible_tasks:
         lines.extend(["", "RELEVANT TASK STATUS" if related else "TASK PREVIEW"])
@@ -592,6 +611,14 @@ def unclaim_strategy(strategy_id: str, author: str, reason: str = "") -> dict:
     """Release an owned strategy that may remain viable."""
     return autoformalize_state.release_strategy(
         FORUM_DIR, strategy_id, _author(author), reason=reason, incorrect=False,
+    )
+
+
+def yield_task(author: str, task_id: str, reason: str,
+               waiting_for: list[str] | None = None) -> dict:
+    """End this agent's attempt, preserving work and other agents' approaches."""
+    return autoformalize_state.yield_task(
+        FORUM_DIR, _author(author), task_id, reason, waiting_for=waiting_for,
     )
 
 
@@ -881,13 +908,19 @@ def prepare_formal_worktree(
 ) -> dict:
     """Prepare a stopped worker for another task without erasing unresolved work.
 
-    Only an explicitly completed previous assignment authorizes discarding its
-    obsolete attempt. This is controller-only, not an agent tool. The state lock
+    Only a completed previous assignment authorizes discarding obsolete work.
+    A yielded assignment may move only if its private tree is clean. This is
+    controller-only, not an agent tool. The state lock
     serializes the final guard with new claims; the author lock protects both
     candidate submission APIs and their immutable commit ancestry.
     """
     author = _author(author)
     with _merge_lock(), _finalization_lock(author), autoformalize_state.transaction(FORUM_DIR) as state:
+        assignments = state.setdefault("worker_tasks", {})
+        identity = autoformalize_state.author_key(author)
+        # Forum registration can change an intended target, but cannot change
+        # which task's private source this worktree actually contains.
+        previous_task = assignments.get(identity, previous_task)
         formal = state["formalization"]
         if state.get("phase") != "formalizing" or (
             expected_revision is not None and formal.get("revision") != expected_revision
@@ -917,6 +950,7 @@ def prepare_formal_worktree(
                               main_sha, check=False)
                 if merged.returncode:
                     result["sync_warning"] = "Resolve the preserved worktree merge conflict before finalizing."
+            assignments[identity] = next_task
             return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
         # A refinement can introduce a missing interface and block every former
@@ -925,21 +959,29 @@ def prepare_formal_worktree(
         prerequisite_reassignment = next_task in {
             item["task_id"] for item in ready_statement_prerequisites(state, previous_task)
         }
-        if unresolved_formal_tasks(state, author) or (
-            previous_task and previous.get("status") != "complete" and not prerequisite_reassignment
+        yielded_reassignment = autoformalize_state.has_yielded(state, author, previous_task)
+        unresolved = set(unresolved_formal_tasks(state, author))
+        if yielded_reassignment:
+            unresolved.discard(next_task)  # The agent may already have claimed its chosen next task.
+        if unresolved or (
+            previous_task and previous.get("status") != "complete"
+            and not prerequisite_reassignment and not yielded_reassignment
         ):
             return _sync_blocked("unresolved_work", "Unfinished task work is preserved; resume it first.")
         main_sha = _accepted_formal_main(state)
         if not main_sha:
             return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
         if previous.get("status") == "complete":
-            return worktree.force_sync_from_main(_root(), author)
+            result = worktree.force_sync_from_main(_root(), author)
+            if result.get("ok"):
+                assignments[identity] = next_task
+            return result
 
         # A fresh/unassigned tree has no known obsolete task. Never reset it:
         # accept a clean ancestor of main, but preserve unexplained local work.
         if _git(tree, "status", "--porcelain").stdout.strip():
             return _sync_blocked("dirty_worktree", "Local edits are preserved; reconcile them before changing tasks.")
-        if prerequisite_reassignment:
+        if prerequisite_reassignment or yielded_reassignment:
             ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z").stdout
             if any(path.split("/", 1)[0] not in {".unity", ".lake"}
                    for path in ignored.split("\0") if path):
@@ -951,6 +993,7 @@ def prepare_formal_worktree(
             return _sync_blocked("local_commits", merged.stderr.strip() or "Unassigned commits are preserved.")
         worktree.link_runtime_state(tree, _root())
         worktree.symlink_lake_cache(tree, _root())
+        assignments[identity] = next_task
         return {"ok": True, "main_sha": main_sha, "worktree": str(tree)}
 
 
@@ -1105,7 +1148,7 @@ COMMON = (
 )
 COORDINATION = (
     register_strategy, claim_strategy, assist_strategy, unclaim_strategy,
-    mark_strategy_incorrect, publish_finding, report_obstacle,
+    mark_strategy_incorrect, yield_task, publish_finding, report_obstacle,
     ask_question, answer_question,
 )
 SOURCE_FEEDBACK = (publish_finding, report_obstacle, ask_question, answer_question,

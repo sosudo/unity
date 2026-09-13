@@ -8,6 +8,9 @@ the current state; `forum_post` and `forum_read` provide necessary clarification
 Write only `.unity/dag.json`: an informal, source-linked DAG with stable node IDs, titles,
 `predicted_kind`, `informal_statement`, nullable `informal_proof`, `statement_dependencies`,
 `proof_dependencies`, source/anchor/requirement references, and optional proposed formal hints.
+Initially use one node per in-scope source definition, theorem, lemma, corollary or construction,
+keeping its statement and proof together. Do not pre-decompose routine proof steps or prospective
+Lean helpers; formalizers can add needed helpers and edges later with `refine_chunks`.
 Retain anchored `requirements` and `spec` (scope, arguments and prerequisites). Unresolved library
 matches are allowed in the plan. Do not generate Lean files or a compilable scaffold, run builds,
 or perform proof search/import minimization for chunking.

@@ -132,6 +132,8 @@ def _formal_task_assignments(
     ready: list[dict],
     idle_workers: list[str],
     active_targets: list[str],
+    *,
+    available_to=None,
 ) -> list[tuple[str, str]]:
     """Cover independent ready tasks before assigning redundant formalizers."""
     if not ready:
@@ -146,7 +148,10 @@ def _formal_task_assignments(
     }
     assignments = []
     for name in idle_workers:
-        task_id = min(load, key=lambda target: (load[target], order[target]))
+        eligible = [target for target in load if available_to is None or available_to(name, target)]
+        if not eligible:
+            continue
+        task_id = min(eligible, key=lambda target: (load[target], order[target]))
         assignments.append((name, task_id))
         load[task_id] += 1
     return assignments
@@ -636,12 +641,18 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     interrupts: dict[str, asyncio.Event] = {}
     worker_targets: dict[str, str] = {}
     worker_revisions: dict[str, tuple[str, int]] = {}
+    worker_attempts: dict[str, dict] = {}
+    interrupted_workers: set[str] = set()
     blocked_launches: dict[str, str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     state = autoformalize_state.load_state(paths.forum)
     # Target notifications may arrive while verification runs in another thread.
     # Consume them separately: refreshing assignments must not consume candidates.
     target_events_seen = {event["event_id"] for event in state.get("events", [])}
+    worker_targets.update({
+        agent_names[key]: target for key, target in state.get("worker_tasks", {}).items()
+        if key in agent_names
+    })
 
     for agent in roster.agents:
         tree = _formal_worktree(paths.project_root, agent.name)
@@ -661,6 +672,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         return next((strategy for strategy in matches
                      if autoformalize_state.author_key(strategy.get("owner")) == autoformalize_state.author_key(name)),
                     matches[0] if matches else None)
+
+    def active_target(name: str) -> str:
+        # Keep the actual launch target through stop-job cleanup, even after
+        # completion consumes the attempt snapshot or registration changes hints.
+        return worker_revisions.get(name, (worker_targets.get(name, ""), 0))[0]
 
     def refresh_worker_targets(current: dict) -> None:
         for event in autoformalize_state.events_after(current, target_events_seen):
@@ -683,6 +699,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     def request_stop(name: str, reason: str) -> None:
         running = tasks.get(name)
         if running is not None and not running.done() and name not in stopping:
+            interrupted_workers.add(name)
             stopping[name] = asyncio.create_task(
                 _cancel(agents[name], running, interrupts[name], reason, paths.project_root),
                 name=f"autoformalize:stop:{name}",
@@ -715,7 +732,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             return
         current = autoformalize_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
-        if (not formal_task or not autoformalize_state.task_ready(current, formal_task)
+        if (not formal_task or not autoformalize_state.task_available_to(current, name, task_id)
                 or autoformalize_server.has_pending_formal_candidate(current, name)
                 or autoformalize_state.source_issues_blocking_task(current, task_id)):
             return
@@ -728,8 +745,17 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             _console.print(f"[yellow]preserving {name}'s worktree: {prepared.get('reason', '')}[/yellow]")
             return
         blocked_launches.pop(name, None)
+        # Preparation may synchronize source while Forum events arrive. Capture
+        # the actual attempt, not the mutable target inferred from later claims.
+        current = autoformalize_state.load_state(paths.forum)
+        if not autoformalize_state.task_available_to(current, name, task_id):
+            return
+        formal_task = current["formal_tasks"][task_id]
         worker_targets[name] = task_id
         worker_revisions[name] = (task_id, formal_task.get("revision", 0))
+        worker_attempts[name] = autoformalize_state.snapshot_attempt(current, name, task_id)
+        worker_attempts[name]["candidate_ids"] = list(current.get("formal_candidates", {}))
+        interrupted_workers.discard(name)
         agent = agents[name]
         brief = forum_brief(paths, "formalizing", name, task_id=task_id)
         system = _preamble(agent, roster, icrl_enabled=False)
@@ -748,8 +774,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             )
         if dirty:
             resume += (
-                "Your worktree already has source changes. Inspect the current diff before any new "
-                "search or edit. If the target is complete, call `finalize_formalization` immediately. "
+                "Your worktree contains uncommitted or untracked files. Inspect the source diff "
+                "and any new Lean files before new research; scratch notes alone are not a candidate. "
+                "If the target is complete, call `finalize_formalization` immediately. "
             )
         if prepared.get("sync_warning"):
             resume += prepared["sync_warning"] + " "
@@ -846,13 +873,22 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             # Unregistered edits are work too. Keep their target rather than
             # assigning the worker to a different ready task and resetting it.
             if current["formal_tasks"].get(previous, {}).get("status") == "pending":
-                if previous in ready_ids:
+                if previous in ready_ids and autoformalize_state.task_available_to(current, name, previous):
                     launch(name, previous)
-                elif not autoformalize_server.unresolved_formal_tasks(current, name):
+                    continue
+                if not autoformalize_server.unresolved_formal_tasks(current, name):
                     prerequisites = autoformalize_server.ready_statement_prerequisites(current, previous)
-                    active = [worker_targets.get(owner, "") for owner, running in tasks.items()
+                    if autoformalize_state.has_yielded(current, name, previous):
+                        # The worker may help its declared proof prerequisites,
+                        # even though their statements were already available.
+                        dependencies = current["formal_tasks"][previous].get("dependencies", [])
+                        prerequisites = sorted(ready, key=lambda task: task["task_id"] not in dependencies)
+                    active = [active_target(owner) for owner, running in tasks.items()
                               if not running.done()]
-                    for _, prerequisite in _formal_task_assignments(prerequisites, [name], active):
+                    for _, prerequisite in _formal_task_assignments(
+                        prerequisites, [name], active,
+                        available_to=lambda owner, target: autoformalize_state.task_available_to(current, owner, target),
+                    ):
                         # prepare_formal_worktree rechecks under locks and permits
                         # this move only with no private edits/commits to discard.
                         launch(name, prerequisite)
@@ -869,18 +905,21 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 continue  # Includes assistants paused for somebody else's candidate.
             unassigned.append(name)
         active_targets = [
-            worker_targets.get(name, "")
+            active_target(name)
             for name, running in tasks.items()
             if not running.done()
         ]
-        for name, task_id in _formal_task_assignments(ready, unassigned, active_targets):
+        for name, task_id in _formal_task_assignments(
+            ready, unassigned, active_targets,
+            available_to=lambda owner, target: autoformalize_state.task_available_to(current, owner, target),
+        ):
             launch(name, task_id)
 
     def candidate_workers(candidate: dict) -> list[str]:
         return [
             name for name, running in tasks.items()
             if not running.done() and roles.get(name) == "formalizing" and (
-                worker_targets.get(name) == candidate["task_id"]
+                active_target(name) == candidate["task_id"]
                 or autoformalize_state.author_key(name) == autoformalize_state.author_key(candidate["author"])
             )
         ]
@@ -918,8 +957,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 if not running.done() or name in stopping:
                     continue
                 result = None
+                ended_normally = False
                 try:
                     result = running.result()
+                    ended_normally = True
                 except asyncio.CancelledError:
                     pass
                 except Exception as exc:
@@ -927,6 +968,23 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 tasks.pop(name, None)
                 interrupts.pop(name, None)
                 role = roles.pop(name, "")
+                attempt = worker_attempts.pop(name, None)
+                interrupted = name in interrupted_workers
+                interrupted_workers.discard(name)
+                if role == "formalizing" and ended_normally and not interrupted and attempt:
+                    current = autoformalize_state.load_state(paths.forum)
+                    submitted = any(
+                        key not in attempt["candidate_ids"]
+                        and candidate.get("task_id") == attempt["task_id"]
+                        and autoformalize_state.author_key(candidate.get("author")) == autoformalize_state.author_key(name)
+                        for key, candidate in current.get("formal_candidates", {}).items()
+                    )
+                    if not submitted and not autoformalize_server.has_pending_formal_candidate(current, name):
+                        autoformalize_state.record_worker_yield(
+                            paths.forum, name, attempt["task_id"],
+                            "Worker ended without submitting a candidate or requesting further work.",
+                            snapshot=attempt,
+                        )
                 if role == "source_repair":
                     issue_id = repair_issues.pop(name, "")
                     if isinstance(result, dict) and result.get("status") == "exhausted":
@@ -992,7 +1050,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     if candidate_workers(candidate):
                         continue
                     # An old worker's stop job can still be reaping owner jobs.
-                    if any(worker_targets.get(name) == candidate["task_id"]
+                    if any(active_target(name) == candidate["task_id"]
                            or autoformalize_state.author_key(name) == autoformalize_state.author_key(candidate["author"])
                            for name in stopping):
                         continue
@@ -1015,8 +1073,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                         continue
                     current = autoformalize_state.load_state(paths.forum)
                     task_id = worker_targets.get(name, "")
-                    formal_task = current.get("formal_tasks", {}).get(task_id, {})
-                    if formal_task.get("status") != "pending" or autoformalize_server.has_pending_formal_candidate(current, name):
+                    if (not autoformalize_state.task_available_to(current, name, task_id)
+                            or autoformalize_server.has_pending_formal_candidate(current, name)):
                         continue
                     dirty, source_digest = worktree_changes(name)
                     strategy = participating_strategy(current, name, task_id)
@@ -1042,6 +1100,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     details = "; ".join(f"{name}: {reason}" for name, reason in blocked_launches.items())
                     raise ValueError("Autoformalize cannot launch workers without discarding preserved work. "
                                      "Reconcile these worktrees before resuming: " + details)
+                if state.get("task_yields"):
+                    raise ValueError(
+                        "Autoformalize has no runnable local attempts: remaining work is deferred or "
+                        "waiting on prerequisites. Read autoformalize_brief for reasons; resolve a "
+                        "dependency or register a distinct strategy before resuming. Worktrees are preserved."
+                    )
                 return state
         return autoformalize_state.load_state(paths.forum)
     finally:

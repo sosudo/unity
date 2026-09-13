@@ -21,18 +21,22 @@ statement. Record cited results used without proof as external prerequisites, no
 project axioms or leave proof holes in the final project. A possible library match is a proposal, not
 a checked declaration identity; formalizers will investigate exact Lean APIs.
 
-Use the smallest set of useful mathematical work units, not a declaration inventory. Include source
-definitions, structures, instances, constructions, theorems and lemmas when independently meaningful
-or needed by another node. Keep short direct proofs and tightly coupled steps together; do not make
-every paragraph or routine helper a separate task. Each node has a stable `id`, a human-readable `title`,
-and a revisable `predicted_kind` such as `def`, `structure`, `instance`, `theorem`, or `lemma`.
+Initially create one node per in-scope source definition, theorem, lemma, corollary or construction,
+including source structures and instances when present. Keep each statement and its proof or construction
+together in that node; do not split statement work from proof work or combine distinct source results
+merely because their proofs are short. This is a source-item DAG, not a declaration inventory of future
+Lean helpers. Do not pre-decompose proof paragraphs, tactic steps or speculative bridge lemmas.
+Formalizers can add genuine missing helpers and dependency edges later with `refine_chunks`.
+Each node has a stable `id`, a human-readable `title`, and a revisable `predicted_kind` such as `def`,
+`structure`, `instance`, `theorem`, or `lemma`.
 Write the actual informal statement/definition in `informal_statement`, and the source's proof or
 construction in `informal_proof`. Formalizers, not chunkers, choose and implement Lean representations.
 
-Coverage must remain complete despite grouping. Identify every in-scope mathematical requirement from
+Coverage must remain complete. Identify every in-scope mathematical requirement from
 the source and requested scope, including converse directions, uniqueness and relevant boundary cases.
 Record its precise statement, source references/locations, and implementing task IDs in `requirements`.
-Multiple requirements may share one node only when its informal content covers them completely.
+Multiple requirements of the same source item may share its node when its informal content covers them
+completely; distinct source items start as distinct nodes.
 In each node describe domains, hypotheses, quantifiers and conclusion or defined object precisely.
 Use `anchor_ids` for exact locations and `requirement_ids` for its source obligations. Optional
 `proposed_formal_statement` and `proposed_formal_strategy` are nullable, nonbinding hints; they need
