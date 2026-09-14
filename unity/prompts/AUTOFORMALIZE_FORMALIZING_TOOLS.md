@@ -68,6 +68,11 @@ A complete implementation can adopt the representation and verify its proof in o
 `stage="representation"` shares a locally checked representation before proof completion; it may
 contain theorem proof holes, never unfinished meaning-bearing definitions. Representation adoption
 does not mean proof completion or faithfulness. Candidate versions retain exact commits/manifests.
+After adoption, work on the remaining proof/construction and prerequisites; do not resubmit the
+unchanged representation. Use `stage="complete"` when ready, or `refine_chunks` with
+`reopen_representations` if the adopted encoding needs correction. An `already_adopted` response
+queues no new candidate or review interrupt. Follow its `next_action`: continue useful proof work,
+or call `yield_task` with a concrete blocker before ending the attempt; do not repeat the submission.
 Task details distinguish assignment (claims/assistants), representation, verification and faithfulness,
 all with current revision-bound evidence; proof-only prerequisites need not delay statement work.
 
@@ -92,4 +97,5 @@ Use the supplied non-login shell environment. Only fall back to `unity capture -
 Project/File.lean` when MCP cannot provide the needed check, or targeted `unity capture -- lake build
 Project.Module` when compiled artifacts are needed. Preserve exit status, poll a running check's same
 session, and do not start duplicate checks for empty output. Finalize promptly after a successful targeted
-local check of the exact current source; do not repeat checks against unchanged bytes.
+local check of a new representation or completed implementation; do not repeat checks or representation
+submissions against already adopted, unchanged bytes.

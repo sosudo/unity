@@ -45,8 +45,10 @@ For your assigned task:
 - use MCP for normal proof development: prefer enabled, compatible Axle tools over equivalent Lean LSP
   tools; use Lean LSP for local goals, project-aware search, and checks without a suitable Axle equivalent.
   Consider Aristotle for a stubborn proof when useful; its availability does not make it mandatory;
-- after a successful targeted local check of the exact implementation/import bytes, immediately call
-  `finalize_formalization` unless a concrete error or unresolved candidate rejection remains.
+- after a successful targeted local check of a new representation or completed implementation's exact
+  source/import bytes, immediately call `finalize_formalization` unless a concrete error or unresolved
+  candidate rejection remains. Rechecking an already adopted, unchanged representation is not new work
+  to submit; continue its proof/construction or yield a concretely blocked attempt.
   Unity commits the candidate, applies it to
   current main, and performs the sole authoritative full build and mechanical declaration review;
 - when an unrelated task merges, refresh the brief and keep working without resetting your worktree.
@@ -84,6 +86,12 @@ Use `stage="complete"` (the default) when the representation and proof/construct
 complete implementation can adopt its representation and verify its proof in one call.
 Use `stage="representation"` only when a useful representation is ready before its proof. Temporary
 theorem proof holes are allowed in that stage, never unfinished meaning-bearing definition bodies.
+Once that representation is adopted, work on the remaining proof/construction and prerequisites;
+do not resubmit the unchanged representation. Submit `stage="complete"` when that work is ready.
+An `already_adopted` response is a no-op, not a new candidate: no review or interrupt is pending from
+that call. Follow its `next_action`: continue useful proof work or call `yield_task` with the precise
+blocker when ending the attempt. Correct an adopted encoding through `refine_chunks` with
+`reopen_representations`, not repeated unchanged representation submissions.
 A representation candidate is not a completed proof or a faithfulness approval. Check source fidelity
 before sharing an interface: downstream statements may depend on it, and changing it invalidates
 dependent evidence. Proof-only dependencies need not delay statement work, but final verification

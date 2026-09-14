@@ -1508,6 +1508,7 @@ def _rejection_identity(state: dict, author: str, task_id: str) -> str | None:
 
 def _attempt_progress(state: dict, author: str, task_id: str) -> str:
     tasks = state.get("formal_tasks", {})
+    targets = (state.get("formalization", {}).get("contract") or {}).get("targets", {})
     relevant = _task_dependencies(state, task_id) | {task_id}
     source = formal_source(state)
     return digest({
@@ -1518,7 +1519,15 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
             "interpretation": informal_interpretation_hash(tasks.get(key, {})),
             "dependencies": sorted(set(tasks.get(key, {}).get("dependencies", []))),
             "outputs": tasks.get(key, {}).get("outputs", []),
-            "representation": tasks.get(key, {}).get("representation"),
+            # A new receipt ID is not new mathematics or source. Use the
+            # adopted task-local semantic identities, not candidate metadata.
+            "representation": {
+                "status": tasks.get(key, {}).get("representation", {}).get("status"),
+                "targets": {
+                    output["declaration"]: targets.get(output["declaration"], {}).get("fingerprint")
+                    for output in tasks.get(key, {}).get("outputs", [])
+                },
+            },
             "accepted_candidate": tasks.get(key, {}).get("accepted_candidate"),
             "complete": tasks.get(key, {}).get("status") == "complete",
             "critic_feedback": tasks.get(key, {}).get("faithfulness", {}).get("feedback_sha256"),
@@ -1683,6 +1692,21 @@ def assignment_view(state: dict, task_id: str) -> dict:
             "strategy_ids": [row["strategy_id"] for row in strategies]}
 
 
+def _representation_submission_context(state: dict, task_id: str) -> dict:
+    """Identity of accepted state observed by the server's immutable Git check."""
+    task = state.get("formal_tasks", {}).get(task_id, {})
+    formal = state.get("formalization", {})
+    source = formal_source(state)
+    return {
+        "main_sha": formal.get("main_sha"),
+        "source": [source.get("candidate_id"), source.get("sha256")],
+        "task_revision": task.get("revision"),
+        "representation": deepcopy(task.get("representation")),
+        "outputs": deepcopy(task.get("outputs", [])),
+        "contract_sha256": (formal.get("contract") or {}).get("sha256"),
+    }
+
+
 def submit_formal_candidate(
     forum_dir: Path,
     strategy_id: str,
@@ -1696,6 +1720,7 @@ def submit_formal_candidate(
     supersedes: str = "",
     stage: str = "complete",
     outputs: list[dict] | None = None,
+    representation_observation: dict | None = None,
 ) -> dict:
     if stage not in {"representation", "complete"}:
         raise ValueError("candidate stage must be representation or complete")
@@ -1756,6 +1781,32 @@ def submit_formal_candidate(
             raise ValueError("formal strategy/task is not accepting a new candidate")
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
+        # This observation is computed by the server from immutable Git trees,
+        # never supplied by an MCP caller. Recheck it under the existing state
+        # lock before suppressing a submission; do not acquire the merge lock
+        # here (finalization already owns the author lock).
+        if stage == "representation" and representation_observation is not None:
+            if representation_observation != _representation_submission_context(state, task_id):
+                return {
+                    "status": "retry", "task_id": task_id,
+                    "next_action": "Accepted state changed during submission; refresh the brief and retry.",
+                }
+            representation = task.get("representation", {})
+            adopted = state["formal_candidates"].get(representation.get("candidate_id"), {})
+            if (representation.get("status") == "adopted"
+                    and bindings == task.get("outputs", [])
+                    and adopted.get("task_id") == task_id
+                    and adopted.get("status") == "merged"
+                    and candidate_is_current(state, adopted)):
+                return {
+                    "status": "already_adopted", "task_id": task_id,
+                    "candidate_id": adopted["candidate_id"],
+                    "next_action": (
+                        "This representation is already adopted. Continue the proof and submit "
+                        "stage='complete', or yield_task if blocked. Do not resubmit unchanged "
+                        "statements; explicitly refine the node if its representation is incorrect."
+                    ),
+                }
         for existing in state["formal_candidates"].values():
             if (
                 existing.get("status") == "failed"

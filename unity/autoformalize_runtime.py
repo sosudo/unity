@@ -973,6 +973,24 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         recovery = _rejection_recovery_prompt(current, name, task_id)
         if recovery and prepared.get("sync_warning"):
             recovery += prepared["sync_warning"] + " "
+        if formal_task.get("representation", {}).get("status") == "adopted":
+            representation_instruction = (
+                "This task's Lean representation is already adopted. Work on its remaining "
+                "proof/construction and unfinished prerequisites; do not resubmit the unchanged "
+                "representation. Submit `stage='complete'` when the implementation and required "
+                "proofs are ready. If the adopted encoding is incorrect, use `refine_chunks` with "
+                "`reopen_representations` before revising it. If concretely blocked and ending "
+                "the attempt, call `yield_task` with the precise blocker. An `already_adopted` "
+                "response queues no candidate or review interrupt: continue useful proof work "
+                "or yield, rather than submitting the same representation again. "
+            )
+        else:
+            representation_instruction = (
+                "Choose Lean representations as needed. Submit explicit outputs with "
+                "`finalize_formalization`; stage='representation' shares checked statements/definitions "
+                "before proofs, while stage='complete' implements the whole node "
+                "(and can adopt its outputs directly). "
+            )
         task_prompt = (recovery or resume) + ((followup if not recovery else "") or (
             f"Your current formalization target is task `{task_id}`: "
             f"{formal_task.get('description', '')}. Current adopted outputs: "
@@ -983,15 +1001,14 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "Edit in your worktree using MCP tools while iterating: prefer compatible Axle tools "
             "when enabled over equivalent Lean LSP tools, and Lean LSP for local goals and diagnostics. "
             "Use direct shell checks only as a fallback or when compiled artifacts are needed. "
-            "Choose Lean representations as needed. Submit explicit outputs with `finalize_formalization`; "
-            "stage='representation' shares checked statements/definitions before proofs, while "
-            "stage='complete' implements the whole node (and can adopt its outputs directly). Unity will commit the "
+            "Unity will commit the "
             "exact source and perform the sole authoritative full build in main. Publish useful Lean/API findings "
             "as you work. Supplied documents are read-only. Use report_source_issue for source defects, "
             "and submit_source_repair with evidence when you can repair the issue directly. "
             "Do not change the source or silently formalize a different result. "
             "Use refine_chunks for explicit graph/interpretation revisions; use source repair for source defects."
         ))
+        task_prompt += "\n" + representation_instruction
         checkpoint = prepared.get("checkpoint") or prepared.get("parked_checkpoint")
         if checkpoint:
             task_prompt += (

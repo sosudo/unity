@@ -143,9 +143,24 @@ def _submit_formal_commit(
         "--binary", "--full-index", base, resolved,
     ).stdout
     diff_sha = hashlib.sha256(diff.encode()).hexdigest()
+    representation_observation = None
+    if stage == "representation":
+        state = autoformalize_state.load_state(FORUM_DIR)
+        task = state.get("formal_tasks", {}).get(task_id, {})
+        if task.get("representation", {}).get("status") == "adopted":
+            observed = autoformalize_state._representation_submission_context(state, task_id)
+            accepted_main = observed["main_sha"]
+            if accepted_main and re.fullmatch(r"[0-9a-f]{40}", accepted_main):
+                # Compare all tracked files, not only outputs: an unchanged
+                # target file may import a helper that the candidate changed.
+                candidate_tree = _git(_root(), "rev-parse", "--verify", f"{resolved}^{{tree}}").stdout.strip()
+                accepted_tree = _git(_root(), "rev-parse", "--verify", f"{accepted_main}^{{tree}}").stdout.strip()
+                if candidate_tree == accepted_tree:
+                    representation_observation = observed
     result = autoformalize_state.submit_formal_candidate(
         FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
         notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
+        representation_observation=representation_observation,
     )
     if result["status"] == "submitted":
         candidate = result["candidate"]
@@ -756,7 +771,8 @@ def finalize_formalization(
 ) -> dict:
     """Commit current worktree bytes and submit one immutable formal candidate.
 
-    Unchanged work submits the existing commit for authoritative re-verification.
+    Unchanged complete work submits the existing commit for re-verification.
+    An unchanged, already-adopted representation returns its existing acceptance.
 
     This is deliberately not a build assertion.  The autoformalize controller applies
     the exact resulting commit to main and performs the sole authoritative full
