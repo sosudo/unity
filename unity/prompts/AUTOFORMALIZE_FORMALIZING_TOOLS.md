@@ -13,11 +13,24 @@ findings and candidate events. These tools belong to the autoformalization runti
   interrupt. Unity handles reassignment and preserves private work. Use `unclaim_strategy` for ownership transfer or a
   new approach while continuing, not for ending a blocked attempt. Do not repeat unchanged blocker
   posts. There is no per-turn call limit.
-- `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
+- `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?, declarations?, files?)`
   shares reusable checked APIs, proof patterns and concrete failures. Publish before substantial
   follow-on work, with the formal task ID and check/artifact evidence; reuse existing findings.
   `confidence` is an integer from 0 to 100: use `95`, not `0.95`. `kind` is an agent-chosen string,
   not a fixed enum. Use `supersedes` when new evidence replaces an active finding.
+  For reusable Lean code, pass exact fully-qualified names in `declarations=["Project.helper"]` and
+  explicit worktree-relative `.lean` paths in `files=["Project/Helper.lean", "Project/PrivateSupport.lean"]`.
+  Include private imported files needed to integrate the helper; only explicitly named files in your
+  existing worktree are captured, not an automatically discovered import closure. The saved bytes are
+  immutable code artifacts. Names, confidence and reported local checks are agent-reported evidence,
+  not Unity acceptance; publishing neither merges code nor verifies a task.
+- `read_finding(finding_id)` retrieves the exact finding, including declarations, code artifact paths
+  and capture context; legacy and superseded findings remain readable by ID. A `potentially stale`
+  context warning does not discard the preserved bytes. Use `artifact_read` on each code attachment,
+  consume its returned `content`, and follow `next_offset` until null to retrieve complete source.
+  Inspect the exact names and imports, then integrate suitable code into your own assigned worktree
+  and check it there, preserving existing edits. Never edit another worker's tree or assume that
+  unpublished-on-main helper code is already present in your tree.
 - `report_obstacle(author, goal_state, target?, tried?, hypothesis?)` records a concrete blocker.
 - `ask_question(author, body, to?, target?)` asks for help; `answer_question(question_id, author, body)`
   answers an existing question.
@@ -54,7 +67,10 @@ findings and candidate events. These tools belong to the autoformalization runti
   candidate, not mandatory rechunking. The supplied source is unchanged.
 - `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
-  for a task. The normal brief prioritizes your task, its candidates and blockers.
+  for a task, including relevant dependency findings and current machine-verified dependency outputs.
+  Those verified outputs do not require a finding; representation adoption alone is not verification.
+  The normal brief prioritizes your task, its candidates and blockers, then reusable findings before
+  the coverage summaries. Machine verification is not a source-faithfulness approval.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` records a source defect.
   `submit_source_repair(author, issue_id, explanation, evidence, replacement?)` proposes an explicit
   evidence-backed spot repair. Unity routes it through chunking and independent review.

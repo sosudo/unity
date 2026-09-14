@@ -17,7 +17,7 @@ import subprocess
 import stat
 import tempfile
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Annotated, Literal
 
@@ -255,16 +255,99 @@ def _task_focus(state: dict, author: str, task_id: str = "") -> tuple[set[str], 
         and autoformalize_state.participates(item, author)
         and autoformalize_state.strategy_is_current(state, item)
     }
-    related = set(focus)
+    return focus, _related_tasks(state, focus)
+
+
+def _related_tasks(state: dict, task_ids: set[str]) -> set[str]:
+    """Include the prerequisite closure without broadening a focused view."""
+    tasks = {**state.get("retired_tasks", {}), **state.get("formal_tasks", {})}
+    related = set(task_ids)
     while True:
         dependencies = {
             dependency for target in related
-            for dependency in tasks[target].get("dependencies", [])
+            for dependency in tasks.get(target, {}).get("dependencies", [])
             if dependency in tasks
         }
         if dependencies <= related:
-            return focus, related
+            return related
         related |= dependencies
+
+
+def _finding_view(state: dict, finding: dict) -> dict:
+    """Annotate capture-context drift without modifying the durable evidence."""
+    view = dict(finding)
+    context = finding.get("code_context")
+    if not isinstance(context, dict) or not context:
+        return view  # Legacy findings have no observed code context to compare.
+    source = state.get("input_source") or {}
+    task_id = context.get("task_id")
+    task = state.get("formal_tasks", {}).get(task_id)
+    current = {
+        "run_id": state.get("run_id"), "source_candidate": source.get("candidate_id"),
+        "source_sha256": source.get("sha256"), "task_id": finding.get("target") or "",
+        "task_revision": task.get("revision") if task else None,
+    }
+    if ((task_id and not task)
+            or any(value != current[key] for key, value in context.items() if key in current)):
+        view["context_status"] = "potentially stale"
+    return view
+
+
+def _relevant_findings(state: dict, related: set[str]) -> list[dict]:
+    findings = [
+        _finding_view(state, item) for item in state.get("findings", {}).values()
+        if item.get("status") == "active"
+        and (not related or item.get("target") in related | {"", None})
+    ]
+    findings.sort(key=lambda item: (
+        bool(item.get("code_artifacts")), item.get("target") in related,
+        item.get("context_status") != "potentially stale", bool(item.get("declarations")),
+        item.get("confidence") or 0, item.get("created_at") or 0,
+    ), reverse=True)
+    return findings
+
+
+def _verified_dependency_outputs(state: dict, task_ids: set[str]) -> list[dict]:
+    """Advertise only current controller-verified outputs, never local claims."""
+    contract = state.get("formalization", {}).get("contract") or {}
+    results = []
+    for task_id in sorted(task_ids):
+        task = state.get("formal_tasks", {}).get(task_id, {})
+        verification = task.get("verification") or {}
+        candidate_id = task.get("accepted_candidate")
+        candidate = state.get("formal_candidates", {}).get(candidate_id, {})
+        receipt = candidate.get("verification") or {}
+        outputs = task.get("outputs") or ([
+            {"declaration": task["lean_decl"], "file": task["lean_file"]}
+        ] if task.get("lean_decl") and task.get("lean_file") else [])
+        if (task.get("status") != "complete" or verification.get("status") != "verified"
+                or not candidate_id or verification.get("candidate_id") != candidate_id
+                or candidate.get("status") != "merged" or candidate.get("task_id") != task_id
+                or candidate.get("stage", "complete") != "complete"
+                or not autoformalize_state.candidate_is_current(state, candidate)
+                or receipt.get("status") != "passed" or not outputs or not contract):
+            continue
+        if contract.get("version") == 3:
+            targets = contract.get("targets", {})
+            if (contract.get("bindings", {}).get(task_id) != outputs
+                    or candidate.get("outputs") != outputs
+                    or any(not targets.get(row["declaration"], {}).get("fingerprint")
+                           or receipt.get("verified_targets", {}).get(row["declaration"])
+                           != targets[row["declaration"]]["fingerprint"] for row in outputs)):
+                continue
+        elif receipt.get("contract_sha256") != contract.get("sha256"):
+            revalidation = task.get("revalidation") or {}
+            if (revalidation.get("status") != "passed"
+                    or revalidation.get("contract_sha256") != contract.get("sha256")
+                    or task_id not in revalidation.get("task_ids", [])):
+                continue
+        results.append({
+            "task_id": task_id, "candidate_id": candidate_id, "outputs": outputs,
+            "main_sha": candidate.get("main_sha"),
+            "verification_artifact": receipt.get("artifact_id"),
+            "build_artifact": (candidate.get("build") or {}).get("artifact_id"),
+        })
+    return results
 
 
 def _spec(state: dict) -> dict:
@@ -351,6 +434,7 @@ def autoformalize_task(task_id: str) -> str:
     } | set(task.get("source_components", []))
     spec = _requirement_spec(state, requirements)
     source_ids.update(item["source_ref"] for item in spec["anchors"])
+    related = _related_tasks(state, {task_id})
     return _detail({
         "run_id": state.get("run_id"), "revision": state.get("revision"),
         "contract_sha256": (state["formalization"].get("contract") or {}).get("sha256"),
@@ -380,10 +464,8 @@ def autoformalize_task(task_id: str) -> str:
             item for item in state.get("source_issues", {}).values()
             if not item.get("task_ids") or task_id in item["task_ids"]
         ],
-        "findings": [
-            item for item in state.get("findings", {}).values()
-            if item.get("status") == "active" and item.get("target") in {"", task_id}
-        ],
+        "findings": _relevant_findings(state, related),
+        "verified_dependency_outputs": _verified_dependency_outputs(state, related - {task_id}),
     }, task_id)
 
 
@@ -494,6 +576,41 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         for item in obstacles[-5:]:
             lines.append(f"- {item['obstacle_id']} task={item.get('target') or 'global'}: "
                          f"{item.get('goal_state', '')[:250]}")
+    findings = _relevant_findings(state, related)
+    if findings:
+        lines.extend(["", "LIVE FINDINGS — agent-reported, not Unity acceptance"])
+        for item in findings[:6]:
+            lines.append(f"- {item['finding_id']} by {item.get('author') or 'unknown'} "
+                         f"task={item.get('target') or 'global'} "
+                         f"(agent-reported confidence {item.get('confidence')}/100): "
+                         f"{str(item.get('title') or '')[:160]}; read_finding('{item['finding_id']}')")
+            if item.get("context_status"):
+                lines.append(f"  capture context: {item['context_status']}; retained bytes are historical evidence.")
+            if item.get("declarations"):
+                declarations = item["declarations"]
+                lines.append(f"  agent-reported declarations: {', '.join(declarations[:6])}"
+                             + (f" (+{len(declarations) - 6} more)" if len(declarations) > 6 else ""))
+            code = item.get("code_artifacts") or []
+            for attachment in code[:3]:
+                lines.append(f"  code {attachment['path']}: artifact {attachment['artifact_id']}")
+            if len(code) > 3:
+                lines.append(f"  {len(code) - 3} more code files via read_finding.")
+            lines.append(f"  {item.get('content', '')[:220]}")
+            if item.get("evidence"):
+                lines.append(f"  agent-reported evidence: {item['evidence'][:180]}")
+        lines.append("Read attached bytes with artifact_read; consume content and follow next_offset to null.")
+    verified_dependencies = _verified_dependency_outputs(state, related - focus)
+    if verified_dependencies:
+        lines.extend(["", "MACHINE-VERIFIED DEPENDENCY OUTPUTS — not source-faithfulness approval"])
+        for record in verified_dependencies[:6]:
+            lines.append(f"- {record['task_id']}: current merged candidate {record['candidate_id']}; "
+                         f"autoformalize_task('{record['task_id']}')")
+            for output in record["outputs"][:6]:
+                lines.append(f"  {output['declaration']} — {output['file']}")
+            if len(record["outputs"]) > 6:
+                lines.append(f"  {len(record['outputs']) - 6} more outputs via autoformalize_task.")
+            if record.get("verification_artifact"):
+                lines.append(f"  verification artifact {record['verification_artifact']}")
     if snapshot and not review_phase:
         lines.extend(snapshot_lines)
     requirements = formal.get("requirements", [])
@@ -548,7 +665,7 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
             availability = "ready to reconsider" if autoformalize_state.task_available_to(state, owner, target) else "deferred"
             lines.append(f"- {owner} / {target} [{availability}]: {record.get('reason', '')[:250]}; "
                          f"waiting for={','.join(record.get('waiting_for', [])) or 'new relevant work'}")
-    visible_tasks = [tasks[target] for target in sorted(related)] if related else list(tasks.values())
+    visible_tasks = [tasks[target] for target in sorted(related) if target in tasks] if related else list(tasks.values())
     if visible_tasks:
         lines.extend(["", "RELEVANT TASK STATUS" if related else "TASK PREVIEW"])
         for task in visible_tasks[:10]:
@@ -560,18 +677,6 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
                          f"owners={','.join(assignment['owners'])}; "
                          f"statement deps={','.join(task.get('statement_dependencies', []))}; "
                          f"proof deps={','.join(task.get('proof_dependencies', task.get('dependencies', [])))}")
-    findings = [
-        item for item in state.get("findings", {}).values()
-        if item.get("status") == "active" and (not related or item.get("target") in related | {"", None})
-    ]
-    findings.sort(key=lambda item: (item.get("confidence", 0), item.get("created_at", 0)), reverse=True)
-    if findings:
-        lines.extend(["", "LIVE FINDINGS"])
-        for item in findings[:6]:
-            lines.append(f"- {item['finding_id']} ({item.get('confidence')}/100) "
-                         f"{item.get('title')}: {item.get('content', '')[:300]}")
-            if item.get("evidence"):
-                lines.append(f"  evidence: {item['evidence'][:180]}")
     questions = [
         item for item in state.get("questions", {}).values()
         if item.get("status") == "open" and (
@@ -630,7 +735,35 @@ def artifact_info(artifact_id: str) -> dict:
 
 def artifact_read(artifact_id: str, offset: int = 0, limit: int = 12000) -> dict:
     """Read one bounded page of an immutable artifact."""
-    return artifacts.read_artifact(_artifacts_dir(), artifact_id, offset=offset, limit=limit)
+    page = artifacts.read_artifact(_artifacts_dir(), artifact_id, offset=offset, limit=limit)
+    if page["kind"] != "autoformalize_finding_code":
+        return page
+    # Shared byte previews may split a UTF-8 character. Code must roundtrip
+    # exactly; retain byte offsets, but return only whole characters.
+    payload = artifacts.artifact_bytes(_artifacts_dir(), artifact_id)
+    if hashlib.sha256(payload).hexdigest() != page["sha256"]:
+        raise ValueError("Finding code artifact changed; refusing retrieval")
+    start, end = page["offset"], page["offset"] + page["returned_bytes"]
+    if start < len(payload) and payload[start] & 0xC0 == 0x80:
+        raise ValueError("offset must be a UTF-8 boundary; follow next_offset")
+    while end > start and end < len(payload) and payload[end] & 0xC0 == 0x80:
+        end -= 1
+    if end == start and start < len(payload):
+        # A limit smaller than one character returns that character (<=4 bytes).
+        end += 1
+        while end < len(payload) and payload[end] & 0xC0 == 0x80:
+            end += 1
+    return {**page, "content": payload[start:end].decode("utf-8"),
+            "returned_bytes": end - start, "next_offset": end if end < len(payload) else None}
+
+
+def read_finding(finding_id: str) -> str:
+    """Read an exact finding and its immutable code references, including superseded work."""
+    state = autoformalize_state.load_state(FORUM_DIR)
+    finding = state.get("findings", {}).get(finding_id)
+    if finding is None:
+        raise ValueError(f"unknown finding '{finding_id}'")
+    return _detail({"finding": _finding_view(state, finding)}, finding_id)
 
 
 def register_strategy(
@@ -684,6 +817,107 @@ def mark_strategy_incorrect(strategy_id: str, author: str, reason: str) -> dict:
     )
 
 
+MAX_FINDING_FILES = 8
+MAX_FINDING_FILE_BYTES = 256 * 1024
+MAX_FINDING_TOTAL_BYTES = 1024 * 1024
+
+
+def _read_finding_file(tree_fd: int, relative: Path) -> bytes:
+    """Read a stable bounded source file, without following any path-component symlink."""
+    directory = os.dup(tree_fd)
+    fd = None
+    try:
+        for part in relative.parts[:-1]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        fd = os.open(relative.name, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW, dir_fd=directory)
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise ValueError("finding code must be a regular file, not a hardlink or special file")
+        if before.st_size > MAX_FINDING_FILE_BYTES:
+            raise ValueError(f"finding code exceeds {MAX_FINDING_FILE_BYTES} bytes per file")
+        chunks, size = [], 0
+        while size <= MAX_FINDING_FILE_BYTES:
+            chunk = os.read(fd, min(65536, MAX_FINDING_FILE_BYTES + 1 - size))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        after = os.fstat(fd)
+        current = os.stat(relative.name, dir_fd=directory, follow_symlinks=False)
+        identity = lambda row: (row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns, row.st_nlink)
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise ValueError("finding code changed during capture; finish editing and retry")
+        if size > MAX_FINDING_FILE_BYTES:
+            raise ValueError(f"finding code exceeds {MAX_FINDING_FILE_BYTES} bytes per file")
+        return b"".join(chunks)
+    except OSError as exc:
+        raise ValueError(f"cannot snapshot {relative}: use an existing private file without symlinks") from exc
+    finally:
+        if fd is not None:
+            os.close(fd)
+        os.close(directory)
+
+
+def _snapshot_finding_files(author: str, files: list[str], target: str) -> tuple[list[dict], dict]:
+    """Save explicitly shared source; never create/commit/reset an agent's worktree."""
+    if not isinstance(files, list) or len(files) > MAX_FINDING_FILES:
+        raise ValueError(f"files must be a list of at most {MAX_FINDING_FILES} private Lean paths")
+    names = []
+    for name in files:
+        if not isinstance(name, str):
+            raise ValueError("finding file paths must be strings")
+        path = Path(name)
+        if (path.is_absolute() or ".." in path.parts or path.suffix != ".lean"
+                or any(part in {".git", ".unity", ".lake", ".worktrees"} for part in path.parts)):
+            raise ValueError("finding files must be relative .lean paths outside runtime/build directories")
+        if path not in names:
+            names.append(path)
+    state = autoformalize_state.load_state(FORUM_DIR)
+    if PROFILE != "formalizing" or state.get("phase") != "formalizing":
+        raise ValueError("private code attachments are only available during formalizing")
+    if target and target not in state.get("formal_tasks", {}):
+        raise ValueError(f"unknown finding task '{target}'")
+    source = autoformalize_state.formal_source(state)
+    context = {"run_id": state.get("run_id"), "source_candidate": source.get("candidate_id"),
+               "source_sha256": source.get("sha256"), "task_id": target,
+               "task_revision": state.get("formal_tasks", {}).get(target, {}).get("revision")}
+    tree = worktree.agent_worktree(_root(), author)
+    expected = f"worktree {tree}\0"
+    registered = _git(_root(), "worktree", "list", "--porcelain", "-z").stdout
+    if not any(record.startswith(expected)
+               and f"branch refs/heads/{worktree.agent_branch(author)}" in record.split("\0")
+               for record in registered.split("\0\0")):
+        raise ValueError(f"no registered private worktree for '{author}'")
+    # Anchor traversal at the trusted main root. Even swapping a parent for a
+    # symlink cannot redirect a file read to another worker or outside the repo.
+    directory = os.open(_root(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    contents, total = [], 0
+    try:
+        for part in (".worktrees", tree.name):
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+            os.close(directory)
+            directory = child
+        for path in names:
+            data = _read_finding_file(directory, path)
+            total += len(data)
+            if total > MAX_FINDING_TOTAL_BYTES:
+                raise ValueError(f"finding files exceed {MAX_FINDING_TOTAL_BYTES} combined bytes")
+            contents.append((path.as_posix(), data.decode("utf-8")))
+    except (OSError, UnicodeError) as exc:
+        raise ValueError("finding files must be private UTF-8 Lean source without symlinks") from exc
+    finally:
+        os.close(directory)
+    # Validate every file before storing anything. No source bytes go in state.
+    records = []
+    for name, content in contents:
+        record = artifacts.store_text(_artifacts_dir(), content, kind="autoformalize_finding_code",
+                                      producer=author, source=name, metadata=context)
+        records.append({"path": name, **{key: record[key] for key in ("artifact_id", "sha256", "bytes")}})
+    return records, context
+
+
 def publish_finding(
     author: str,
     kind: str,
@@ -697,19 +931,31 @@ def publish_finding(
     strategy_id: str = "",
     evidence: str = "",
     supersedes: str = "",
+    declarations: list[str] | None = None,
+    files: list[str] | None = None,
 ) -> dict:
-    """Publish concise live knowledge with a free-form kind and integer confidence (0–100)."""
+    """Publish live knowledge; optionally snapshot named private Lean files during formalizing.
+
+    Declarations and checks are agent-reported, not verified by publication.
+    Include any private imports needed for reuse; files are never auto-imported or merged.
+    Attach up to eight files, 256 KiB per file and 1 MiB combined.
+    """
     author = _author(author)
+    if files is not None and not isinstance(files, list):
+        raise ValueError("files must be a list of private Lean paths")
     if len(evidence) > 4000:
         record = artifacts.store_text(
             _artifacts_dir(), evidence, kind="autoformalize_finding_evidence",
             producer=author, source=title,
         )
         evidence = f"artifact {record['artifact_id']} SHA-256 {record['sha256']}"
-    result = autoformalize_state.publish_finding(
-        FORUM_DIR, author, kind, title, content, confidence,
-        target=target, strategy_id=strategy_id, evidence=evidence, supersedes=supersedes,
-    )
+    with _finalization_lock(author) if files else nullcontext():
+        code_artifacts, code_context = _snapshot_finding_files(author, files, target) if files else ([], None)
+        result = autoformalize_state.publish_finding(
+            FORUM_DIR, author, kind, title, content, confidence,
+            target=target, strategy_id=strategy_id, evidence=evidence, supersedes=supersedes,
+            declarations=declarations, code_artifacts=code_artifacts, code_context=code_context,
+        )
     _mirror(author, f"FINDING {result['finding_id']}: {title}", content, target)
     return result
 
@@ -1408,7 +1654,7 @@ def submit_formalization_verdict(
 
 COMMON = (
     autoformalize_status, autoformalize_metrics, autoformalize_brief,
-    autoformalize_task, autoformalize_requirements,
+    autoformalize_task, autoformalize_requirements, read_finding,
     forum_post, forum_read, artifact_info, artifact_read,
 )
 COORDINATION = (

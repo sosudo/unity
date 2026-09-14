@@ -667,9 +667,17 @@ def publish_finding(
     strategy_id: str = "",
     evidence: str = "",
     supersedes: str = "",
+    declarations: list[str] | None = None,
+    code_artifacts: list[dict] | None = None,
+    code_context: dict | None = None,
 ) -> dict:
-    if not isinstance(confidence, int) or not 0 <= confidence <= 100:
+    if type(confidence) is not int or not 0 <= confidence <= 100:
         raise ValueError("confidence must be an integer from 0 through 100")
+    if declarations is not None and (not isinstance(declarations, list)
+                                    or len(declarations) > 64
+                                    or any(not isinstance(name, str) for name in declarations)):
+        raise ValueError("declarations must be a list of at most 64 exact names")
+    declarations = list(dict.fromkeys(_text(name, "declaration", 300) for name in declarations or []))
     with transaction(forum_dir) as state:
         if strategy_id and strategy_id not in state["strategies"]:
             raise ValueError(f"unknown strategy '{strategy_id}'")
@@ -692,6 +700,11 @@ def publish_finding(
             "content": _text(content, "content"),
             "confidence": confidence,
             "evidence": _text(evidence, "evidence", 4000, required=False),
+            # Names/check evidence are reported knowledge, never verification.
+            # Code descriptors/context are supplied only by the file-snapshot server.
+            "declarations": declarations,
+            "code_artifacts": deepcopy(code_artifacts or []),
+            "code_context": deepcopy(code_context),
             "supersedes": supersedes or None,
             "status": "active",
             "created_at": time.time(),

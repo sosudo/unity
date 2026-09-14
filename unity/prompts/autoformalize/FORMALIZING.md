@@ -11,6 +11,22 @@ APIs, test scratch declarations, derive bridge lemmas, debug tactics and ask tea
 Before substantial follow-on work, publish reusable checked APIs, working patterns and concrete failures
 with the task target and evidence. Reuse others' findings; routine reads and unchanged checks need no posts.
 
+For a reusable Lean helper, publish its exact fully-qualified names with
+`declarations=["Project.helper"]` and explicitly name its source files with
+`files=["Project/Helper.lean", "Project/PrivateSupport.lean"]` in `publish_finding`.
+Include private imported `.lean` files needed to understand or integrate it; only explicitly named
+files in your existing worktree are captured, not an automatically discovered import closure.
+These immutable code attachments preserve the published bytes even if your private files later change.
+Describe what was checked and any limitations: a reported local check is agent-reported evidence,
+not Unity acceptance or a source-faithfulness approval. A finding does not merge code or verify a task.
+Before reusing another worker's helper, call `read_finding(finding_id)`, then `artifact_read` for its
+code attachments. Read the returned `content` and follow `next_offset` until null for complete bytes.
+Check declarations, imports and the recorded source/task context; `potentially stale` means the
+capture context changed, not that the preserved bytes disappeared. Integrate suitable code into your
+own assigned worktree, preserve existing edits, and check it there. Do not edit another worker's tree
+or assume a finding's files are already on main. The brief also lists current machine-verified
+dependency outputs without requiring a finding; use `autoformalize_task` for their exact evidence.
+
 For your assigned task:
 
 - read the latest critic feedback and any saved checkpoint for your assigned task. Continue from preserved
