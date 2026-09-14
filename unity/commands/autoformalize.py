@@ -19,7 +19,7 @@ from ..autoformalize_orchestrator import (
 from ..roster import load_roster
 from ..autoformalize_runtime import (
     configure_forum, forum_brief, recover_interrupted_formal_merges,
-    run_formalizing_runtime, validate_formalization_dag, write_formalization_plan, _merge_lock,
+    run_formalizing_runtime, write_formalization_plan, _merge_lock,
     refresh_replanned_worktrees,
 )
 from ..autoformalize_repairs import run_source_repairs
@@ -170,149 +170,228 @@ def _prepare_autoformalize_environment(
         lake.build(root)
 
 
-async def _chunk_source(
-    roster, paths, max_attempts: int | float,
-) -> None:
-    """Create a valid semantic DAG, rotating chunkers after bounded failures."""
+async def _chunk_source(roster, paths, max_attempts: int | float) -> None:
+    """Rotate failed executions; correct proposals inside their existing session."""
+    from .. import artifacts
+    from ..autoformalize_chunking import chunking_workspace
+    from ..autoformalize_input import store_bytes
+    from ..autoformalize_runtime import (
+        read_chunking_draft, prepare_chunking_draft, seed_chunking_draft, chunking_diagnostic,
+    )
+
     state = autoformalize_state.load_state(paths.forum)
     candidate = autoformalize_state.formal_source(state)
     if not candidate:
         raise click.ClickException("chunking requires a bound formalization source")
-    candidate_id = candidate["candidate_id"]
     require_source_matches(paths, state)
-    source_instruction = "Read UNITY.md for scope and the exact supplied documents listed in "
-    chunkers = [roster.primary] + [
-        agent for agent in roster.agents if agent.name != roster.primary.name
-    ]
-    limit_label = "infinity" if max_attempts == float("inf") else str(int(max_attempts))
-    failures: list[str] = []
+    chunkers = [roster.primary] + [a for a in roster.agents if a.name != roster.primary.name]
+    failures = []
+    # The last submitted bytes survive genuine session failures without requiring
+    # another agent to recreate the proposal. Interrupted runs also retain this artifact.
+    resume_draft = None
+    for row in reversed(state["chunking_attempts"]):
+        if not row.get("obsolete") and row.get("draft_artifact"):
+            try:
+                resume_draft = artifacts.artifact_bytes(paths.artifacts, row["draft_artifact"])
+            except (OSError, ValueError):
+                continue
+            break
 
     for chunker in chunkers:
         while not stop_requested(paths.project_root):
             current = autoformalize_state.load_state(paths.forum)
-            used = autoformalize_state.chunking_attempt_count(current, candidate_id, chunker.name)
-            if used >= max_attempts:
+            if autoformalize_state.chunking_attempt_count(current, candidate["candidate_id"], chunker.name) >= max_attempts:
                 break
-
-            attempt = autoformalize_state.begin_chunking_attempt(
-                paths.forum, candidate_id, chunker.name,
-            )
-            attempt_number = int(attempt["attempt"])
-            plan = write_formalization_plan(paths, candidate)
-            prior = failures[-3:]
-            prior_context = (
-                " Previous failed attempts: " + " | ".join(prior)
-                if prior else ""
-            )
-            results = await dispatch(
-                [chunker],
-                roster,
-                load_prompt(f"{PIPELINE}/CHUNKING"),
-                f"This is chunking attempt {attempt_number} of {limit_label} for `{chunker.name}`. "
-                + source_instruction
-                + f"the mechanical coverage scaffold at `{plan.relative_to(paths.project_root)}`. Its input SHA-256 is "
-                f"`{candidate['sha256']}`. Produce `.unity/dag.json` bound to that candidate and hash, with "
-                "explicit mathematical requirements, anchored scope/argument/prerequisite spec, and an acyclic graph. "
-                "Extract informal nodes for definitions, structures, instances and results; include "
-                "source citations, statements, supplied proofs (null when absent), predicted kinds, "
-                "and separate statement/proof dependencies. Lean predictions are optional hints. "
-                "Do not write Lean declarations or build a scaffold during chunking. "
-                "Use meaningful proof units, keeping tightly coupled steps together and splitting "
-                "substantial independently useful work. Record genuine proof prerequisites, not "
-                "paper order; shared definitions belong in statement dependencies. Reuse and correct "
-                "any existing dag.json draft. Read repair proposals and replan context in the plan; "
-                "preserve unchanged task IDs and source obligations. Report source gaps with "
-                "report_source_issue; propose justified local repairs without editing original source files."
-                + prior_context,
-                paths.project_root,
-                build_autoformalize_mcp(paths, "chunking"),
-                tools_prompt=f"{PIPELINE.upper()}_CHUNKING_TOOLS",
-                icrl_enabled=False,
-                brief_provider=_brief_provider(paths, "chunking"),
-                mcp_profile="autoformalize",
-                log_context={
-                    "command": PIPELINE,
-                    "run_id": state.get("run_id"),
-                    "phase": "chunking",
-                    "role": "chunker",
-                    "candidate_id": candidate_id,
-                    "attempt": attempt_number,
-                },
-            )
-            dispatch_failure = next(
-                (result for result in results if isinstance(result, Exception)), None,
-            )
-            if stop_requested(paths.project_root):
-                return
-            require_source_matches(paths, autoformalize_state.load_state(paths.forum))
-            repaired = await run_source_repairs(roster, paths, max_attempts)
-            if stop_requested(paths.project_root):
-                return
-            if any(issue.get("status") == "unresolved" for issue in autoformalize_state.open_source_issues(repaired)):
-                autoformalize_state.finish_chunking_attempt(
-                    paths.forum, attempt["attempt_id"], succeeded=False,
-                    reason="source-repair attempts exhausted; original input and evidence preserved",
-                )
-                raise click.ClickException("Source-repair attempts exhausted; see source issues and repair evidence")
+            attempt = autoformalize_state.begin_chunking_attempt(paths.forum, candidate["candidate_id"], chunker.name)
+            plan_path = write_formalization_plan(paths, candidate)
+            installed = None
+            assignments = {}
+            last_feedback = None
+            execution_started = False
             try:
-                dag = validate_formalization_dag(paths, candidate["sha256"])
-                with _merge_lock(paths.project_root):
-                    current = autoformalize_state.load_state(paths.forum)
-                    if (current["phase"] != "chunking"
-                            or autoformalize_state.formal_source(current).get("candidate_id") != candidate_id):
-                        return
-                    contract = autoformalize_contract.initialize_source_contract(paths, dag)
-                    require_source_matches(paths, current)
-                    initialized = autoformalize_state.initialize_informal_plan(
-                        paths.forum, dag,
-                        main_sha=worktree.main_commit(paths.project_root),
-                        contract=contract,
-                    )
-            except autoformalize_contract.ContractEnvironmentError as exc:
-                autoformalize_state.finish_chunking_attempt(
-                    paths.forum, attempt["attempt_id"], succeeded=False,
-                    reason=f"environment failure: {exc}",
-                )
-                raise click.ClickException(
-                    f"Contract environment check failed; not retrying chunking: {exc}"
-                ) from exc
-            except (OSError, ValueError) as exc:
-                reason = str(exc)
-                if dispatch_failure is not None:
-                    reason = f"agent failure: {dispatch_failure!r}; {reason}"
-                reason = reason[:2000]
-                failures.append(f"{chunker.name} attempt {attempt_number}: {reason}")
-                autoformalize_state.finish_chunking_attempt(
-                    paths.forum, attempt["attempt_id"], succeeded=False, reason=reason,
-                )
-                click.echo(
-                    f"chunker {chunker.name} attempt {attempt_number}/{limit_label} failed: "
-                    f"{reason[:500]}"
-                )
-                continue
+                async with chunking_workspace(paths, chunker.name, attempt) as workspace:
+                    seed = seed_chunking_draft(current)
+                    if resume_draft is not None:
+                        workspace.draft_path.write_bytes(resume_draft)
+                    elif seed is not None:
+                        workspace.draft_path.write_text(json.dumps(seed, indent=2) + "\n")
 
-            assignments = (current.get("replan") or {}).get("assignments", {})
+                    async def complete_draft(_final):
+                        nonlocal installed, assignments, resume_draft, last_feedback
+                        if stop_requested(paths.project_root):
+                            return None
+                        current = autoformalize_state.load_state(paths.forum)
+                        try:
+                            require_source_matches(paths, current)
+                        except ValueError as exc:
+                            raise click.ClickException(str(exc)) from exc
+                        repaired = await run_source_repairs(roster, paths, max_attempts)
+                        if stop_requested(paths.project_root):
+                            return None
+                        if any(row.get("status") == "unresolved"
+                               for row in autoformalize_state.open_source_issues(repaired)):
+                            raise click.ClickException("Source-repair attempts exhausted; original input and evidence preserved")
+                        write_formalization_plan(paths, candidate)
+                        current = autoformalize_state.load_state(paths.forum)
+                        payload = None
+                        try:
+                            payload = read_chunking_draft(workspace.draft_path)
+                            resume_draft = payload
+                            dag, _ = prepare_chunking_draft(paths, current, payload)
+                        except (ValueError, RecursionError) as exc:
+                            diagnostic = chunking_diagnostic(exc)
+                            signature = (hashlib.sha256(payload).hexdigest() if payload is not None else None,
+                                         json.dumps(diagnostic, sort_keys=True))
+                            artifact_id = None
+                            if payload is not None and signature != last_feedback:
+                                record = store_bytes(paths.artifacts, payload, kind="autoformalize_chunking_draft",
+                                                     producer=chunker.name, source=attempt["attempt_id"])
+                                artifact_id = record["artifact_id"]
+                            autoformalize_state.record_chunking_feedback(
+                                paths.forum, attempt["attempt_id"], diagnostic, artifact_id=artifact_id,
+                            )
+                            last_feedback = signature
+                            return ("Unity rejected this draft, not this execution. Correct the fields below in "
+                                    "the same draft; call validate_chunks() before finishing. Do not rewrite frozen "
+                                    "source obligations or call Unity internals.\n"
+                                    + json.dumps(diagnostic, ensure_ascii=False)
+                                    + "\nRead updated source-repair context at " + str(plan_path))
+
+                        # A plan preflight never approves itself. Refresh live environment
+                        # once here, outside the model/API retry machinery.
+                        try:
+                            contract = autoformalize_contract.prepare_source_contract(paths, dag, state=current)
+                        except (OSError, ValueError) as exc:
+                            raise click.ClickException("Contract environment check failed: " + str(exc)) from exc
+                        old_environment = (current["formalization"].get("contract") or {}).get("environment")
+                        if old_environment is not None and old_environment != contract["environment"]:
+                            raise click.ClickException("Protected Lean environment changed; not retrying chunking")
+                        with _merge_lock(paths.project_root):
+                            latest = autoformalize_state.load_state(paths.forum)
+                            try:
+                                unchanged = read_chunking_draft(workspace.draft_path) == payload
+                            except ValueError as exc:
+                                return json.dumps(chunking_diagnostic(exc), ensure_ascii=False)
+                            if latest["revision"] != current["revision"] or not unchanged:
+                                return "The draft or shared state changed during acceptance. Refresh validate_chunks() and finish again."
+                            require_source_matches(paths, latest)
+                            main_sha = worktree.main_commit(paths.project_root)
+                            if main_sha != contract["source_main_sha"]:
+                                return "Accepted main changed during validation. Refresh validate_chunks() and finish again."
+                            record = artifacts.store_text(
+                                paths.artifacts, json.dumps(dag, sort_keys=True, ensure_ascii=False),
+                                kind="autoformalize_accepted_plan", producer="Unity", source=attempt["attempt_id"],
+                            )
+                            try:
+                                installed = autoformalize_state.initialize_informal_plan(
+                                    paths.forum, dag, main_sha=main_sha, contract=contract,
+                                    attempt_id=attempt["attempt_id"], expected_revision=latest["revision"],
+                                    plan_artifact=record["artifact_id"],
+                                )
+                            except ValueError as exc:
+                                return ("Publication did not change state. Refresh validate_chunks() and correct: "
+                                        + json.dumps(chunking_diagnostic(exc), ensure_ascii=False))
+                            assignments = (latest.get("replan") or {}).get("assignments", {})
+                            # State and its immutable artifact are authoritative if the process
+                            # exits before this convenience JSON mirror is replaced.
+                            artifacts._atomic_write(paths.unity / "dag.json",
+                                                    (json.dumps(dag, indent=2) + "\n").encode())
+                        return None
+
+                    async def completed(final):
+                        try:
+                            return await complete_draft(final)
+                        except click.ClickException:
+                            raise
+                        except Exception as exc:
+                            # Unexpected controller/IO failures are not agent/API
+                            # failures: stop rather than spending the whole roster.
+                            raise click.ClickException("Chunking controller failed: " + str(exc)) from exc
+
+                    try:
+                        execution_started = True
+                        results = await dispatch(
+                            [chunker], roster, load_prompt(f"{PIPELINE}/CHUNKING"),
+                            f"You are the chunker for execution {attempt['attempt']} ({chunker.name}). "
+                            f"Read scope at {paths.unity_md} and the source/repair plan at {plan_path}. "
+                            f"Write only the draft at {workspace.draft_path}. "
+                            + ("This is a replan: edit the seeded mutable-only draft; Unity supplies frozen obligations. "
+                               if seed is not None else
+                               "This is initial chunking: use the full informal DAG schema in your instructions. ")
+                            + "Keep one initial node per source definition/result, with its statement and supplied proof. "
+                              "Use separate statement/proof dependencies. Do not write Lean or build anything. "
+                              "Correct validation feedback in this session; ordinary corrections do not consume attempts. "
+                            + ("Previous execution failures: " + " | ".join(failures[-3:]) if failures else ""),
+                            workspace.cwd, workspace.mcp,
+                            tools_prompt=f"{PIPELINE.upper()}_CHUNKING_TOOLS", icrl_enabled=False,
+                            brief_provider=_brief_provider(paths, "chunking"),
+                            log_context={"command": PIPELINE, "run_id": state["run_id"], "phase": "chunking",
+                                         "role": "chunker", "candidate_id": candidate["candidate_id"],
+                                         "attempt": attempt["attempt"], "attempt_id": attempt["attempt_id"]},
+                            on_normal_completion=completed, writable_roots=(workspace.cwd,),
+                            control_root=paths.project_root, env_overrides=workspace.env,
+                        )
+                    finally:
+                        # Archive before the scratch workspace is removed, including
+                        # a transport failure/cancellation before a completed turn.
+                        if installed is None:
+                            try:
+                                resume_draft = read_chunking_draft(workspace.draft_path)
+                            except ValueError:
+                                pass
+                            except OSError as exc:
+                                workspace.preserve = True
+                                raise click.ClickException(
+                                    f"Cannot read chunking draft; retained at {workspace.draft_path}: {exc}"
+                                ) from exc
+                            else:
+                                try:
+                                    record = store_bytes(paths.artifacts, resume_draft,
+                                        kind="autoformalize_chunking_draft", producer=chunker.name,
+                                        source=attempt["attempt_id"])
+                                    autoformalize_state.save_chunking_draft(
+                                        paths.forum, attempt["attempt_id"], record["artifact_id"],
+                                    )
+                                except Exception as exc:
+                                    workspace.preserve = True
+                                    raise click.ClickException(
+                                        f"Cannot archive chunking draft; retained at {workspace.draft_path}: {exc}"
+                                    ) from exc
+                    if stop_requested(paths.project_root):
+                        return
+                    error = next((result for result in results if isinstance(result, Exception)), None)
+                    if error is not None:
+                        raise error
+                    if installed is None:
+                        raise RuntimeError("chunker execution ended without controller plan publication")
+            except click.ClickException:
+                if installed is None:
+                    autoformalize_state.finish_chunking_attempt(paths.forum, attempt["attempt_id"],
+                        succeeded=False, reason="controller/source/environment failure; see terminal diagnostic")
+                raise
+            except Exception as exc:
+                if installed is not None:
+                    raise click.ClickException("Plan accepted but chunker cleanup failed: " + str(exc)) from exc
+                if not execution_started:
+                    raise click.ClickException("Cannot start chunker workspace: " + str(exc)) from exc
+                # Only genuinely failed executions reach here, never schema corrections.
+                reason = f"{type(exc).__name__}: {exc}"[:2000]
+                autoformalize_state.finish_chunking_attempt(paths.forum, attempt["attempt_id"],
+                                                            succeeded=False, reason=reason)
+                failures.append(f"{chunker.name} attempt {attempt['attempt']}: {reason}")
+                click.echo(f"chunker {failures[-1]}")
+                continue
             if assignments:
-                refresh_replanned_worktrees(paths, assignments, initialized)
-            autoformalize_state.finish_chunking_attempt(
-                paths.forum,
-                attempt["attempt_id"],
-                succeeded=True,
-                chunk_count=len(dag["chunks"]),
-            )
-            click.echo(
-                f"created {len(dag['chunks'])} formalization task(s) from bound source "
-                f"using {chunker.name} on attempt {attempt_number}"
-            )
+                refresh_replanned_worktrees(paths, assignments, installed)
+            click.echo(f"created {len(installed['formal_tasks'])} formalization task(s) "
+                       f"using {chunker.name} on execution {attempt['attempt']}")
             return
 
     if stop_requested(paths.project_root):
         return
     summary = " | ".join(failures[-10:]) or "attempt limits were already exhausted"
-    raise click.ClickException(
-        "every configured agent exhausted its chunking attempts without a valid DAG: "
-        + summary
-    )
+    autoformalize_state.record_chunking_exhausted(paths.forum, summary)
+    raise click.ClickException("every configured agent exhausted its chunking executions: " + summary)
 
 
 def _prepare_critic_snapshot(paths) -> bool:

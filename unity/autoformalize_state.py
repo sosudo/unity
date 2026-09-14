@@ -843,34 +843,64 @@ def finish_chunking_attempt(
     reason: str = "",
     chunk_count: int = 0,
 ) -> dict:
-    """Record the deterministic outcome of a previously allocated attempt."""
+    """Record an execution failure; success belongs to atomic plan publication."""
+    if succeeded:
+        raise ValueError("chunking success is recorded only by plan publication")
     with transaction(forum_dir) as state:
-        attempt = next((
-            item for item in state.get("chunking_attempts", [])
-            if item.get("attempt_id") == attempt_id
-        ), None)
-        if attempt is None:
-            raise ValueError("unknown chunking attempt")
-        if attempt.get("status") != "active":
+        return _record_chunking_outcome(state, attempt_id, succeeded=False,
+                                        reason=reason, chunk_count=chunk_count)
+
+
+def _record_chunking_outcome(state: dict, attempt_id: str, *, succeeded: bool,
+                             reason: str = "", chunk_count: int = 0) -> dict:
+    attempt = next((row for row in state["chunking_attempts"]
+                    if row["attempt_id"] == attempt_id), None)
+    if attempt is None:
+        raise ValueError("unknown chunking attempt")
+    if attempt.get("status") != "active":
+        if not succeeded and attempt.get("status") == "failed":
             return dict(attempt)
-        failure = _text(reason, "reason", required=not succeeded)
-        attempt.update({
-            "status": "succeeded" if succeeded else "failed",
-            "reason": failure,
-            "chunk_count": max(0, int(chunk_count)),
-            "completed_at": time.time(),
-        })
-        _event(
-            state,
-            "chunking_attempt_succeeded" if succeeded else "chunking_attempt_failed",
-            attempt_id=attempt_id,
-            candidate_id=attempt["candidate_id"],
-            author=attempt["author"],
-            attempt=attempt["attempt"],
-            reason=failure,
-            chunk_count=attempt["chunk_count"],
-        )
+        raise ValueError("chunking attempt already finished; cannot replace its outcome")
+    if attempt["candidate_id"] != formal_source(state).get("candidate_id"):
+        raise ValueError("chunking attempt targets a stale source")
+    failure = _text(reason, "reason", required=not succeeded)
+    attempt.update(status="succeeded" if succeeded else "failed", reason=failure,
+                   chunk_count=max(0, int(chunk_count)), completed_at=time.time())
+    _event(state, "chunking_attempt_succeeded" if succeeded else "chunking_attempt_failed",
+           attempt_id=attempt_id, candidate_id=attempt["candidate_id"], author=attempt["author"],
+           attempt=attempt["attempt"], reason=failure, chunk_count=attempt["chunk_count"])
     return dict(attempt)
+
+
+def record_chunking_feedback(forum_dir: Path, attempt_id: str, diagnostic: dict,
+                             *, artifact_id: str | None = None) -> None:
+    """Telemetry for an editable proposal, not a failed execution or model memory."""
+    with transaction(forum_dir) as state:
+        attempt = next(row for row in state["chunking_attempts"] if row["attempt_id"] == attempt_id)
+        if attempt["status"] != "active":
+            raise ValueError("cannot revise a finished chunking attempt")
+        attempt["corrections"] = attempt.get("corrections", 0) + 1
+        attempt["last_validation"] = deepcopy(diagnostic)
+        if artifact_id is not None:
+            attempt["draft_artifact"] = artifact_id
+        _event(state, "chunking_draft_rejected", attempt_id=attempt_id,
+               diagnostic=diagnostic, artifact_id=artifact_id)
+
+
+def record_chunking_exhausted(forum_dir: Path, reason: str) -> None:
+    with transaction(forum_dir) as state:
+        state["chunking_failure"] = {"reason": reason, "timestamp": time.time()}
+        if state.get("replan"):
+            state["replan"].update(status="failed", reason=reason)
+        _event(state, "chunking_exhausted", reason=reason)
+
+
+def save_chunking_draft(forum_dir: Path, attempt_id: str, artifact_id: str) -> None:
+    """Preserve interrupted execution input without changing its outcome or correction count."""
+    with transaction(forum_dir) as state:
+        attempt = next(row for row in state["chunking_attempts"] if row["attempt_id"] == attempt_id)
+        if attempt["status"] == "active":
+            attempt["draft_artifact"] = artifact_id
 
 
 def pending_replan(state: dict) -> dict | None:
@@ -999,77 +1029,100 @@ def _adopt_repairs(state, spec) -> None:
         issue.update(status="resolved", owner=None, adopted_repairs=sorted(adopted.intersection(issue["repair_ids"])))
 
 
-def initialize_informal_plan(forum_dir: Path, dag: dict, *, main_sha: str, contract: dict) -> dict:
-    """Controller-only initial plan/replan publication; no Lean scaffold required."""
-    with transaction(forum_dir) as state:
-        if state["phase"] != "chunking":
-            raise ValueError("informal plans can only be initialized during chunking")
-        source = formal_source(state)
-        if not _FULL_SHA_RE.fullmatch(main_sha):
-            raise ValueError("formalization requires a full main commit")
-        requirements = normalize_requirements(dag["requirements"], dag["chunks"], source_refs(state))
-        spec = normalize_spec(dag["spec"], source=source, requirements=requirements,
-                              tasks=dag["chunks"], allow_unresolved=True)
-        nodes = normalize_informal_nodes(dag["chunks"], requirements, spec, source)
-        if (contract.get("version") != 3 or contract.get("sha256") != _contract_digest(contract)
-                or contract.get("solution_candidate") != source.get("candidate_id")
-                or contract.get("solution_sha256") != source.get("sha256")
-                or contract.get("spec_sha256") != digest(spec)
-                or contract.get("requirements") != requirements
-                or not isinstance(contract.get("environment"), dict)):
-            raise ValueError("informal plan requires a current controller-built source contract")
-        previous = state["formalization"]
-        obligations = _source_obligations(requirements, spec)
-        if previous.get("source_obligations") and previous["source_obligations"] != obligations:
-            raise ValueError("replanning cannot rewrite original source obligations")
-        old = state["formal_tasks"]
-        if old.keys() - nodes.keys():
-            raise ValueError("removing chunks requires explicit refine_chunks replacement history")
-        _adopt_repairs(state, spec)
-        tasks, affected = {}, set()
-        for key, node in nodes.items():
-            prior = old.get(key)
-            tasks[key] = {**deepcopy(prior or {}), **node,
-                "description": node["informal_statement"],
-                "revision": (prior or {}).get("revision", 1),
-                "interpretation_sha256": informal_interpretation_hash(node)}
-            if prior and informal_interpretation_hash(prior) != informal_interpretation_hash(node):
-                tasks[key].setdefault("interpretation_history", []).append({
-                    "timestamp": time.time(), "interpretation": {field: deepcopy(prior.get(field)) for field in node}})
-                affected.add(key)
-            if not prior:
-                tasks[key].update(status="pending", accepted_candidate=None, outputs=[], lean_decl="", lean_file="",
-                    representation={"status": "missing", "candidate_id": None},
-                    verification={"status": "pending", "candidate_id": None},
-                    faithfulness={"status": "unreviewed", "verdict_id": None})
-        # Carry existing exact target protections across unrelated metadata edits;
-        # newly generated source contracts must not silently drop adopted targets.
-        if (previous.get("contract") or {}).get("version") == 3:
-            if contract.get("environment") != previous["contract"].get("environment"):
-                raise ValueError("replanning cannot silently replace the protected Lean environment")
-            contract = deepcopy(contract)
-            for field in ("targets", "bindings", "external_declarations"):
-                contract[field] = deepcopy(previous["contract"].get(field, {}))
+def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: dict,
+                          attempt_id: str | None = None) -> dict:
+    """Compute publication on a private copy; no state, artifacts or source writes."""
+    state = deepcopy(state)
+    if state["phase"] != "chunking":
+        raise ValueError("informal plans can only be initialized during chunking")
+    source = formal_source(state)
+    if not _FULL_SHA_RE.fullmatch(main_sha):
+        raise ValueError("formalization requires a full main commit")
+    requirements = normalize_requirements(dag["requirements"], dag["chunks"], source_refs(state))
+    spec = normalize_spec(dag["spec"], source=source, requirements=requirements,
+                          tasks=dag["chunks"], allow_unresolved=True)
+    nodes = normalize_informal_nodes(dag["chunks"], requirements, spec, source)
+    if (contract.get("version") != 3 or contract.get("sha256") != _contract_digest(contract)
+            or contract.get("solution_candidate") != source.get("candidate_id")
+            or contract.get("solution_sha256") != source.get("sha256")
+            or contract.get("spec_sha256") != digest(spec)
+            or contract.get("requirements") != requirements
+            or not isinstance(contract.get("environment"), dict)):
+        raise ValueError("informal plan requires a current controller-built source contract")
+    previous = state["formalization"]
+    obligations = _source_obligations(requirements, spec)
+    if previous.get("source_obligations") and previous["source_obligations"] != obligations:
+        raise ValueError("replanning cannot rewrite original source obligations")
+    old = state["formal_tasks"]
+    if old.keys() - nodes.keys():
+        raise ValueError("removing chunks requires explicit refine_chunks replacement history")
+    _adopt_repairs(state, spec)
+    tasks, affected = {}, set()
+    for key, node in nodes.items():
+        prior = old.get(key)
+        tasks[key] = {**deepcopy(prior or {}), **node,
+            "description": node["informal_statement"],
+            "revision": (prior or {}).get("revision", 1),
+            "interpretation_sha256": informal_interpretation_hash(node)}
+        if prior and informal_interpretation_hash(prior) != informal_interpretation_hash(node):
+            tasks[key].setdefault("interpretation_history", []).append({
+                "timestamp": time.time(), "interpretation": {field: deepcopy(prior.get(field)) for field in node}})
+            affected.add(key)
+        if not prior:
+            tasks[key].update(status="pending", accepted_candidate=None, outputs=[], lean_decl="", lean_file="",
+                representation={"status": "missing", "candidate_id": None},
+                verification={"status": "pending", "candidate_id": None},
+                faithfulness={"status": "unreviewed", "verdict_id": None})
+    # Carry existing exact target protections across unrelated metadata edits;
+    # newly generated source contracts must not silently drop adopted targets.
+    if (previous.get("contract") or {}).get("version") == 3:
+        if contract.get("environment") != previous["contract"].get("environment"):
+            raise ValueError("replanning cannot silently replace the protected Lean environment")
         contract = deepcopy(contract)
-        contract["obligation_ids"] = sorted(tasks)
-        contract["sha256"] = _contract_digest(contract)
-        state["formal_tasks"] = tasks
-        revision = previous.get("revision", 0) + 1
-        state["formalization"] = {"revision": revision, "status": "active",
-            "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
-            "main_sha": main_sha, "requirements": requirements, "spec": spec, "contract": contract,
-            "source_obligations": obligations, "review_snapshot": None, "pending_verdict_id": None}
-        if affected:
-            affected = _invalidate_informal_tasks(state, affected, reason="informal interpretation changed")
-        carried = [key for key, task in tasks.items() if task["status"] == "complete"]
-        state["phase"] = "formalizing"
-        replan = state.get("replan") or {}
-        if replan:
-            replan.update(status="complete", affected_tasks=sorted(affected), carried_tasks=carried)
-            state["replan_requests"][replan["request_id"]]["status"] = "complete"
-        _event(state, "formalization_initialized", formalization_revision=revision,
-               tasks=list(tasks), solution_candidate=source["candidate_id"],
-               affected_tasks=sorted(affected), carried_tasks=carried)
+        for field in ("targets", "bindings", "external_declarations"):
+            contract[field] = deepcopy(previous["contract"].get(field, {}))
+    contract = deepcopy(contract)
+    contract["obligation_ids"] = sorted(tasks)
+    contract["sha256"] = _contract_digest(contract)
+    state["formal_tasks"] = tasks
+    revision = previous.get("revision", 0) + 1
+    state["formalization"] = {"revision": revision, "status": "active",
+        "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
+        "main_sha": main_sha, "requirements": requirements, "spec": spec, "contract": contract,
+        "source_obligations": obligations, "review_snapshot": None, "pending_verdict_id": None}
+    if affected:
+        affected = _invalidate_informal_tasks(state, affected, reason="informal interpretation changed")
+    carried = [key for key, task in tasks.items() if task["status"] == "complete"]
+    state["phase"] = "formalizing"
+    replan = state.get("replan") or {}
+    if replan:
+        replan.update(status="complete", affected_tasks=sorted(affected), carried_tasks=carried)
+        state["replan_requests"][replan["request_id"]]["status"] = "complete"
+    _event(state, "formalization_initialized", formalization_revision=revision,
+           tasks=list(tasks), solution_candidate=source["candidate_id"],
+           affected_tasks=sorted(affected), carried_tasks=carried)
+    if attempt_id is not None:
+        _record_chunking_outcome(state, attempt_id, succeeded=True, chunk_count=len(tasks))
+        state["formalization"]["chunking_attempt_id"] = attempt_id
+    return state
+
+
+def initialize_informal_plan(forum_dir: Path, dag: dict, *, main_sha: str, contract: dict,
+                             attempt_id: str | None = None,
+                             expected_revision: int | None = None,
+                             plan_artifact: str | None = None) -> dict:
+    """Publish a checked plan and its attempt outcome in one transaction."""
+    with transaction(forum_dir) as state:
+        if expected_revision is not None and state["revision"] != expected_revision:
+            raise ValueError("chunking state changed; refresh the draft against the current plan")
+        prepared = prepare_informal_plan(
+            state, dag, main_sha=main_sha, contract=contract, attempt_id=attempt_id,
+        )
+        if plan_artifact is not None:
+            prepared["formalization"]["plan_artifact"] = plan_artifact
+        prepared.pop("chunking_failure", None)
+        state.clear()
+        state.update(prepared)
     return load_state(forum_dir)
 
 

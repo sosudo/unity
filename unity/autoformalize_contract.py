@@ -496,7 +496,8 @@ def _seal_contract(contract: dict) -> dict:
     return {**body, "sha256": digest(body)}
 
 
-def initialize_source_contract(paths, dag: dict) -> dict:
+def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
+                            environment: dict | None = None, main_sha: str | None = None) -> dict:
     """Pin an informal plan without generating, building, or inspecting Lean.
 
     A plan records obligations, not trusted declarations. Only successful exact
@@ -504,7 +505,8 @@ def initialize_source_contract(paths, dag: dict) -> dict:
     """
     from . import autoformalize_state
 
-    source = autoformalize_state.formal_source(autoformalize_state.load_state(paths.forum))
+    source = autoformalize_state.formal_source(
+        autoformalize_state.load_state(paths.forum) if state is None else state)
     if (not source or dag.get("solution_candidate") != source["candidate_id"]
             or dag.get("solution_sha256") != source["sha256"]):
         raise ValueError("informal plan must target the current supplied-source snapshot")
@@ -517,11 +519,17 @@ def initialize_source_contract(paths, dag: dict) -> dict:
         "version": 3,
         "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
         "requirements": requirements, "spec": spec, "spec_sha256": digest(spec),
-        "environment": environment_identity(paths.project_root),
-        "source_main_sha": _git(paths.project_root, "rev-parse", "HEAD"),
+        "environment": environment_identity(paths.project_root) if environment is None else environment,
+        "source_main_sha": _git(paths.project_root, "rev-parse", "HEAD") if main_sha is None else main_sha,
         "obligation_ids": sorted(row.get("task_id", row.get("id")) for row in chunks),
         "bindings": {}, "targets": {}, "external_declarations": {},
     })
+    return contract
+
+
+def initialize_source_contract(paths, dag: dict) -> dict:
+    """Publish a contract artifact, separate from read-only plan preparation."""
+    contract = prepare_source_contract(paths, dag)
     record = artifacts.store_text(paths.artifacts, json.dumps({"contract": contract}, sort_keys=True) + "\n",
                                   kind="autoformalize_source_contract", producer="Unity")
     return {**contract, "artifact_id": record["artifact_id"]}

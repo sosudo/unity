@@ -21,8 +21,10 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
 - `autoformalize_requirements(offset?, limit?)` pages the complete requirement manifest. Keep one revision
   and continue until `next_offset` is null; the task-filtered brief is not the entire checklist.
   `autoformalize_task(task_id)` retrieves exact task evidence/anchors/prerequisites.
-- `request_rechunk(author, reason, task_ids?)` queues a corrected source-obligation/scope mapping for the
-  same supplied source. Ordinary mutable interpretation/implementation defects use `lean_reopen`;
+- `request_rechunk(author, reason, task_ids?)` queues corrected task organization, dependencies or
+  requirement-to-task/prerequisite/argument mappings under the same frozen source obligations.
+  It cannot revise the original requirement statements, anchors or scope; report such defects explicitly
+  in the Forum and verdict instead. Ordinary mutable interpretation/implementation defects use `lean_reopen`;
   formalizers can refine nodes and submit new candidate versions. Original source is preserved.
 - `forum_post` and `forum_read` provide necessary clarification and evidence-backed source defect reports.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` routes source defects to optional

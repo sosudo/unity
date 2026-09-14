@@ -12,7 +12,7 @@ import os
 import signal
 import sys
 import tempfile
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 
 from rich.console import Console
@@ -20,6 +20,68 @@ from rich.console import Console
 from .roster import Agent
 
 _console = Console()
+
+CompletionCallback = Callable[[str | None], Awaitable[str | None]]
+
+
+class _UnsuccessfulTurnError(RuntimeError):
+    """A terminal session failure, not a transient transport exception to retry."""
+
+
+class _CompletionCallbackError(Exception):
+    """Keep controller failures out of the backend's transient API retry loop."""
+
+    def __init__(self, error: Exception):
+        self.error = error
+        super().__init__(str(error))
+
+
+async def _completion_feedback(callback: CompletionCallback, final: str | None,
+                               control_root: Path) -> str | None:
+    if _stop_requested(control_root):
+        return None
+    try:
+        feedback = await callback(final)
+        if feedback is not None and not isinstance(feedback, str):
+            raise TypeError("completion feedback must be a string or None")
+    except Exception as exc:
+        raise _CompletionCallbackError(exc) from exc
+    return None if _stop_requested(control_root) else feedback
+
+
+def _writable_roots(cwd: Path, override: tuple[Path, ...] | None) -> tuple[Path, ...]:
+    if override is None:
+        return _worktree_write_roots(cwd)
+    roots = tuple(dict.fromkeys(Path(path).resolve() for path in override))
+    source = Path(cwd).resolve()
+    if source not in roots:
+        raise ValueError("explicit writable_roots must include the agent workspace")
+    if any(path != source and source.is_relative_to(path) for path in roots):
+        raise ValueError("explicit writable_roots cannot include an ancestor of the workspace")
+    return roots
+
+
+def _broker_host(env_overrides: dict[str, str] | None) -> str | None:
+    """Only the controller's loopback broker may widen isolated shell networking."""
+    from urllib.parse import urlsplit
+    endpoint = (env_overrides or {}).get("UNITY_AUTOFORMALIZE_CHUNKER_ENDPOINT")
+    if not endpoint:
+        return None
+    parsed = urlsplit(endpoint)
+    if (parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or parsed.username is not None or parsed.password is not None):
+        raise ValueError("chunker broker must be an HTTP loopback endpoint")
+    return parsed.hostname
+
+
+def _isolated_prompt(cwd: Path) -> str:
+    return (
+        f"\n\nCHUNKER WRITE POLICY: Your isolated draft workspace is {Path(cwd).resolve()}. "
+        "Only controller-granted scratch paths are writable. Original sources, the real project, "
+        "and controller state are read-only. Use the phase's Unity MCP tools for shared state; "
+        "never import/call internal state helpers or edit attempt records. The controller alone "
+        "validates, installs, and records success. Do not bypass denied writes."
+    )
 
 
 def _worktree_write_roots(cwd: Path) -> tuple[Path, ...]:
@@ -335,16 +397,23 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                          mcp_servers: dict, *, permission: str = "bypassPermissions",
                          idle_timeout: float = 600.0, subagents=(),
                          env_overrides: dict[str, str] | None = None,
-                         own_process_group: bool = False) -> str | None:
+                         own_process_group: bool = False,
+                         on_normal_completion: CompletionCallback | None = None,
+                         writable_roots: tuple[Path, ...] | None = None,
+                         control_root: Path | None = None) -> str | None:
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
     import shutil
 
     isolation = {}
-    roots = _worktree_write_roots(cwd)
+    control_root = control_root or cwd
+    roots = _writable_roots(cwd, writable_roots)
     if roots:
         from .autoformalize_permissions import claude_worktree_options
-        isolation = claude_worktree_options(cwd, roots)
-        system_prompt += _worktree_prompt(cwd)
+        isolation = claude_worktree_options(
+            cwd, roots, isolated=writable_roots is not None,
+            broker_host=_broker_host(env_overrides),
+        )
+        system_prompt += _isolated_prompt(cwd) if writable_roots is not None else _worktree_prompt(cwd)
 
     cli_path = None
     pid_file = None
@@ -362,7 +431,8 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
     }
     options = ClaudeAgentOptions(
         system_prompt=system_prompt,
-        mcp_servers=mcp_servers,
+        mcp_servers={name: ({"type": "http", **cfg} if cfg.get("url") else cfg)
+                     for name, cfg in mcp_servers.items()},
         agents=agents_def,
         cwd=str(cwd),
         permission_mode=isolation.pop("permission_mode", permission),
@@ -376,18 +446,23 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
     while True:
         attempt += 1
         try:
+            if on_normal_completion is not None:
+                return await _claude_continuation(
+                    agent, options, prompt, cwd, control_root,
+                    on_normal_completion, idle_timeout,
+                )
             final = None
             stream = query(prompt=prompt, options=options)
             try:
                 async for msg in _idle_guard(stream, idle_timeout):
-                    _log(agent.name, msg, cwd)
+                    _log(agent.name, msg, control_root)
                     if type(msg).__name__ == "ResultMessage":
                         final = getattr(msg, "result", None)
                         _last_run_stats[agent.name] = {
                             "cost_usd": getattr(msg, "total_cost_usd", None),
                             "num_turns": getattr(msg, "num_turns", None),
                         }
-                    if _stop_requested(cwd):
+                    if _stop_requested(control_root):
                         # Safe stop: wind down at the next stream item instead of being killed
                         # mid-write; abandoning the iterator disconnects the SDK client cleanly.
                         _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
@@ -397,6 +472,10 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                 if close is not None:
                     await close()
             return final
+        except _CompletionCallbackError as exc:
+            raise exc.error
+        except _UnsuccessfulTurnError:
+            raise
         except Exception as e:
             if _give_up(e, attempt):
                 raise
@@ -408,8 +487,48 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
             await _terminate_process_group(pid_file)
 
 
+async def _claude_continuation(agent, options, prompt, cwd, control_root,
+                               callback, idle_timeout):
+    """One connected SDK session; validation corrections are ordinary user turns."""
+    from claude_agent_sdk import ClaudeSDKClient
+
+    client = ClaudeSDKClient(options=options)
+    await client.connect()
+    total_turns = 0
+    try:
+        while not _stop_requested(control_root):
+            await client.query(prompt)
+            result = None
+            stream = client.receive_response()
+            try:
+                async for msg in _idle_guard(stream, idle_timeout):
+                    _log(agent.name, msg, control_root)
+                    if type(msg).__name__ == "ResultMessage":
+                        result = msg
+                        total_turns += getattr(msg, "num_turns", 0) or 0
+                        # The SDK reports cumulative session cost, not a per-turn delta.
+                        _last_run_stats[agent.name] = {
+                            "cost_usd": getattr(msg, "total_cost_usd", None),
+                            "num_turns": total_turns,
+                        }
+                    if _stop_requested(control_root):
+                        return getattr(result, "result", None)
+            finally:
+                await stream.aclose()
+            if result is None or getattr(result, "is_error", True):
+                detail = getattr(result, "subtype", "missing successful result")
+                raise _UnsuccessfulTurnError(f"Claude turn did not complete successfully: {detail}")
+            final = getattr(result, "result", None)
+            prompt = await _completion_feedback(callback, final, control_root)
+            if not prompt:
+                return final
+    finally:
+        await client.disconnect()
+
+
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
-                        writable_roots: tuple[Path, ...] = ()) -> str | None:
+                        writable_roots: tuple[Path, ...] = (), *,
+                        network_access: bool = True) -> str | None:
     """Seed CODEX_HOME/config.toml with a custom provider (if base_url), MCP servers,
     and workspace-write sandbox tuning. Returns the provider id to pass as
     model_provider, or None for the default openai provider."""
@@ -423,7 +542,7 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
             shutil.copy2(user_auth, home / "auth.json")
     lines: list[str] = []
     # Keep network access for tools, without granting the main source checkout.
-    lines += ["[sandbox_workspace_write]", "network_access = true"]
+    lines += ["[sandbox_workspace_write]", f"network_access = {str(network_access).lower()}"]
     if writable_roots:
         lines.append("writable_roots = " + json.dumps([str(path) for path in writable_roots]))
         lines += ["exclude_slash_tmp = true", "exclude_tmpdir_env_var = true"]
@@ -449,7 +568,12 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
                 args = ", ".join(f'"{a}"' for a in cfg["args"])
                 lines.append(f"args = [{args}]")
         elif cfg.get("url"):
-            lines.append(f'url = "{cfg["url"]}"')
+            lines.append("url = " + json.dumps(cfg["url"]))
+            headers = cfg.get("http_headers") or cfg.get("headers")
+            if headers:
+                lines.append("http_headers = { " + ", ".join(
+                    f"{json.dumps(key)} = {json.dumps(value)}" for key, value in headers.items()
+                ) + " }")
         lines.append("")
         if cfg.get("env"):
             lines.append(f"[mcp_servers.{name}.env]")
@@ -496,7 +620,18 @@ _AUTOFORMALIZE_CODEX_MCP_NOTE = (
 )
 
 
-def _codex_mcp_note(profile: str) -> str:
+def _codex_mcp_note(profile: str, phase: str | None = None) -> str:
+    if phase == "chunking":
+        return (
+            "\n\nCHUNKING MCP TOOLS: Use only the chunking tools described in your role prompt. "
+            "If native MCP tools are unavailable, call the authenticated controller bridge:\n"
+            "    unity mcp unity-forum <tool> '<json-args>'\n"
+            "For example: unity mcp unity-forum autoformalize_brief "
+            "'{\"author\": \"<your agent name>\"}'\n"
+            "Do not start another Forum server, import internal Unity state helpers, or modify "
+            "controller state. The bridge enforces the current phase. Edit only your draft; "
+            "the controller validates and installs it after your turn."
+        )
     return _AUTOFORMALIZE_CODEX_MCP_NOTE
 
 
@@ -552,17 +687,26 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         interrupt_event: asyncio.Event | None = None,
                         env_overrides: dict[str, str] | None = None,
                         own_process_group: bool = False,
-                        mcp_profile: str = "autoformalize") -> str | None:
+                        mcp_profile: str = "autoformalize",
+                        on_normal_completion: CompletionCallback | None = None,
+                        writable_roots: tuple[Path, ...] | None = None,
+                        control_root: Path | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
-    system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
+    control_root = control_root or cwd
+    system_prompt = system_prompt + _codex_mcp_note(
+        mcp_profile, (env_overrides or {}).get("UNITY_AUTOFORMALIZE_PROFILE"),
+    )
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    roots = _worktree_write_roots(cwd)
+    roots = _writable_roots(cwd, writable_roots)
+    # The verified Codex API exposes a boolean network grant, not a host ACL.
+    # A loopback broker requires that grant; it does not exclude other peers.
+    network_access = writable_roots is None or _broker_host(env_overrides) is not None
     if roots:
-        system_prompt += _worktree_prompt(cwd)
+        system_prompt += _isolated_prompt(cwd) if writable_roots is not None else _worktree_prompt(cwd)
     provider = _write_codex_config(home, agent, mcp_servers,
-                                   writable_roots=roots)
+                                   writable_roots=roots, network_access=network_access)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
     sandbox = (Sandbox.workspace_write if roots or permission != "bypassPermissions"
@@ -595,7 +739,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 'sandbox_mode="workspace-write"',
                 'approval_policy="never"',
                 "sandbox_workspace_write.writable_roots=" + json.dumps([str(path) for path in roots]),
-                "sandbox_workspace_write.network_access=true",
+                "sandbox_workspace_write.network_access=" + str(network_access).lower(),
                 "sandbox_workspace_write.exclude_slash_tmp=true",
                 "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             )
@@ -632,72 +776,100 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 cwd=str(cwd),
                 **thread_options,
             )
-            handle = await thread.turn(prompt)
+            next_prompt = prompt
+            thread_usage = None
+            while True:
+                if (_stop_requested(control_root)
+                        or (interrupt_event is not None and interrupt_event.is_set())):
+                    return final
+                turn_finished = asyncio.Event()
+                stream_started = asyncio.Event()
+                final = None
+                handle = await thread.turn(next_prompt)
 
-            async def interrupt_turn() -> None:
-                """Stop a Codex turn without cancelling its thread-backed queue wait.
+                async def interrupt_turn() -> None:
+                    """Stop a Codex turn without cancelling its thread-backed queue wait.
 
-                openai-codex implements next_turn_notification with asyncio.to_thread
-                around a blocking Queue.get(). Cancelling that await abandons the worker
-                thread. Ask the app server to interrupt instead, then leave the stream
-                registered until it completes or transport shutdown wakes the waiter.
-                """
-                assert interrupt_event is not None
-                await interrupt_event.wait()
-                await stream_started.wait()
-                try:
-                    await asyncio.wait_for(
-                        handle.interrupt(), timeout=_CODEX_INTERRUPT_REQUEST_TIMEOUT
+                    openai-codex implements next_turn_notification with asyncio.to_thread
+                    around a blocking Queue.get(). Cancelling that await abandons the worker
+                    thread. Ask the app server to interrupt instead, then leave the stream
+                    registered until it completes or transport shutdown wakes the waiter.
+                    """
+                    assert interrupt_event is not None
+                    await interrupt_event.wait()
+                    await stream_started.wait()
+                    try:
+                        await asyncio.wait_for(
+                            handle.interrupt(), timeout=_CODEX_INTERRUPT_REQUEST_TIMEOUT
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+                        return
+
+                    try:
+                        await asyncio.wait_for(
+                            turn_finished.wait(), timeout=_CODEX_INTERRUPT_DRAIN_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        # Interrupt was acknowledged but no terminal event arrived. Close
+                        # while the stream queue is still registered so fail_all() wakes its
+                        # blocking notification waiter before the generator unregisters it.
+                        await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+
+                if interrupt_event is not None:
+                    interrupt_task = asyncio.create_task(
+                        interrupt_turn(), name=f"codex-interrupt:{agent.name}"
                     )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-                    return
 
-                try:
-                    await asyncio.wait_for(
-                        turn_finished.wait(), timeout=_CODEX_INTERRUPT_DRAIN_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    # Interrupt was acknowledged but no terminal event arrived. Close
-                    # while the stream queue is still registered so fail_all() wakes its
-                    # blocking notification waiter before the generator unregisters it.
-                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-
-            if interrupt_event is not None:
-                interrupt_task = asyncio.create_task(
-                    interrupt_turn(), name=f"codex-interrupt:{agent.name}"
-                )
-
-            # handle.run() and handle.stream() are competing consumers of one notification
-            # queue — using both (in any order) starves one and hangs. Consume ONLY the
-            # stream and assemble the final response from agentMessage items ourselves.
-            usage = None
-            async for note in _codex_notifications(
-                handle, codex, idle_timeout, stream_started
-            ):
-                _log(agent.name, note, cwd)
-                if _stop_requested(cwd):
-                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                    break
-                method = getattr(note, "method", "") or ""
-                payload = getattr(note, "payload", None)
-                if method == "turn/completed":
-                    turn_finished.set()
-                if method == "item/completed":
-                    root = getattr(getattr(payload, "item", None), "root", None)
-                    if getattr(root, "type", "") == "agentMessage":
-                        final = getattr(root, "text", None) or final
-                elif method == "thread/tokenUsage/updated":
-                    total = getattr(getattr(payload, "token_usage", None), "total", None)
-                    if total is not None:
-                        usage = {k: getattr(total, k) for k in
-                                 ("input_tokens", "cached_input_tokens", "output_tokens",
-                                  "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
-            _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
-            return final
+                # handle.run() and handle.stream() are competing consumers of one notification
+                # queue — using both (in any order) starves one and hangs. Consume ONLY the
+                # stream and assemble the final response from agentMessage items ourselves.
+                usage = None
+                successful = False
+                async for note in _codex_notifications(
+                    handle, codex, idle_timeout, stream_started
+                ):
+                    _log(agent.name, note, control_root)
+                    if _stop_requested(control_root):
+                        _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                        break
+                    method = getattr(note, "method", "") or ""
+                    payload = getattr(note, "payload", None)
+                    if method == "turn/completed":
+                        turn_finished.set()
+                        status = getattr(getattr(payload, "turn", None), "status", None)
+                        successful = getattr(status, "value", status) == "completed"
+                    if method == "item/completed":
+                        root = getattr(getattr(payload, "item", None), "root", None)
+                        if getattr(root, "type", "") == "agentMessage":
+                            final = getattr(root, "text", None) or final
+                    elif method == "thread/tokenUsage/updated":
+                        total = getattr(getattr(payload, "token_usage", None), "total", None)
+                        if total is not None:
+                            usage = {k: getattr(total, k) for k in
+                                     ("input_tokens", "cached_input_tokens", "output_tokens",
+                                      "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
+                thread_usage = usage if usage is not None else thread_usage
+                _last_run_stats[agent.name] = {"cost_usd": None, "usage": thread_usage}
+                if interrupt_task is not None:
+                    interrupt_task.cancel()
+                    await asyncio.gather(interrupt_task, return_exceptions=True)
+                    interrupt_task = None
+                if (on_normal_completion is None or _stop_requested(control_root)
+                        or (interrupt_event is not None and interrupt_event.is_set())):
+                    return final
+                if not successful:
+                    raise _UnsuccessfulTurnError("Codex turn did not complete successfully")
+                next_prompt = await _completion_feedback(on_normal_completion, final, control_root)
+                if not next_prompt:
+                    return final
         except asyncio.CancelledError:
+            raise
+        except _CompletionCallbackError as exc:
+            raise exc.error
+        except _UnsuccessfulTurnError:
             raise
         except Exception as e:
             if interrupt_event is not None and interrupt_event.is_set():
@@ -725,7 +897,10 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                               idle_timeout: float = 600.0, subagents=(),
                               env_overrides: dict[str, str] | None = None,
                               own_process_group: bool = False,
-                              mcp_profile: str = "autoformalize") -> str | None:
+                              mcp_profile: str = "autoformalize",
+                              on_normal_completion: CompletionCallback | None = None,
+                              writable_roots: tuple[Path, ...] | None = None,
+                              control_root: Path | None = None) -> str | None:
     """Google Antigravity backend: drives the user's installed `agy` CLI in print mode
     (subscription auth; serves both the Gemini pool and the Claude/GPT pool). MCP tools
     reach the model through the `unity mcp` shell bridge, like codex."""
@@ -735,17 +910,22 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
     if agy is None:
         raise RuntimeError("antigravity backend needs the `agy` CLI installed and logged in "
                            "(https://antigravity.google)")
-    roots = _worktree_write_roots(cwd)
+    control_root = control_root or cwd
+    roots = _writable_roots(cwd, writable_roots)
     if roots:
-        system_prompt += _worktree_prompt(cwd)
-    full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
+        system_prompt += _isolated_prompt(cwd) if writable_roots is not None else _worktree_prompt(cwd)
+    full = system_prompt + _codex_mcp_note(
+        mcp_profile, (env_overrides or {}).get("UNITY_AUTOFORMALIZE_PROFILE"),
+    ) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
     if roots:
         # AG has no per-session editor/path hook. Its native terminal sandbox is
         # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
         cmd += ["--sandbox"]
-        for root in roots[1:]:
+        for root in roots:
+            if root == Path(cwd).resolve():
+                continue
             cmd += ["--add-dir", str(root)]
         _console.print(
             f"[yellow]{agent.name}: Antigravity worktree isolation is best effort; "
@@ -753,7 +933,11 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         )
 
     attempt = 0
+    total_usage = None
+    continuation_warned = False
     while True:
+        if _stop_requested(control_root):
+            return None
         attempt += 1
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
@@ -772,6 +956,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
             final = None
             usage = None
             failed = None
+            successful = False
             async for raw in _idle_guard(_lines(), idle_timeout):
                 try:
                     e = _json.loads(raw)
@@ -786,15 +971,16 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                     elif (su.get("state") == "DONE"
                           and st not in ("agent_response", "checkpoint", "user_input", "unknown", "")):
                         _console.print(f"[dim]{_ts()} \\[{agent.name}][/dim] [cyan]⚙ {st[:80]}[/cyan]")
-                        _tool_log(cwd, agent.name, st)
+                        _tool_log(control_root, agent.name, st)
                 elif ev == "result":
                     r = e.get("result", {})
+                    successful = r.get("status") == "SUCCESS"
                     final = r.get("response") or final
                     usage = r.get("usage")
                     if r.get("status") not in (None, "SUCCESS"):
                         failed = r.get("status")
                         _console.print(f"[red]{_ts()} \\[{agent.name}] ✗ agy result: {failed}[/red]")
-                if _stop_requested(cwd):
+                if _stop_requested(control_root):
                     _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
                     if own_process_group and os.name == "posix":
                         os.killpg(proc.pid, signal.SIGTERM)
@@ -803,13 +989,32 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                     break
             rc = await proc.wait()
             if failed:
-                raise RuntimeError(f"agy turn failed: {failed}")
+                failure_type = _UnsuccessfulTurnError if on_normal_completion is not None else RuntimeError
+                raise failure_type(f"agy turn failed: {failed}")
             if final is None and rc not in (0, -15):
-                raise RuntimeError(f"agy exited with code {rc} and no response")
+                failure_type = _UnsuccessfulTurnError if on_normal_completion is not None else RuntimeError
+                raise failure_type(f"agy exited with code {rc} and no response")
             _flush_delta(agent.name)
             _console.print(f"[green]{_ts()} \\[{agent.name}] ✓ turn complete[/green]")
-            _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
+            total_usage = _sum_usage(total_usage, usage)
+            _last_run_stats[agent.name] = {"cost_usd": None, "usage": total_usage}
+            if on_normal_completion is not None and not _stop_requested(control_root):
+                if not successful or rc != 0:
+                    raise _UnsuccessfulTurnError("Antigravity turn did not complete successfully")
+                feedback = await _completion_feedback(on_normal_completion, final, control_root)
+                if feedback:
+                    if not continuation_warned:
+                        _log(agent.name, "Antigravity continuation: retaining this logical attempt and draft; "
+                             "conversation resume is unavailable, so feedback starts a new CLI session.")
+                        continuation_warned = True
+                    cmd[2] = full + "\n\nCONTROLLER VALIDATION FEEDBACK:\n" + feedback
+                    attempt -= 1  # A draft correction is not a backend failure.
+                    continue
             return final
+        except _CompletionCallbackError as exc:
+            raise exc.error
+        except _UnsuccessfulTurnError:
+            raise
         except Exception as e:
             if proc.returncode is None:
                 proc.kill()
@@ -828,6 +1033,19 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                 else:
                     proc.kill()
                 await proc.wait()
+
+
+def _sum_usage(previous, current):
+    """Accumulate independent CLI-turn usage without assuming a provider schema."""
+    if current is None:
+        return previous
+    if isinstance(previous, dict) and isinstance(current, dict):
+        return {key: _sum_usage(previous.get(key), current.get(key))
+                for key in previous.keys() | current.keys()}
+    if (isinstance(previous, (int, float)) and not isinstance(previous, bool)
+            and isinstance(current, (int, float)) and not isinstance(current, bool)):
+        return previous + current
+    return current
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -891,12 +1109,20 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 log_context: dict | None = None,
                 env_overrides: dict[str, str] | None = None,
                 own_process_group: bool = False,
-                mcp_profile: str = "autoformalize") -> str | None:
+                mcp_profile: str = "autoformalize",
+                on_normal_completion: CompletionCallback | None = None,
+                writable_roots: tuple[Path, ...] | None = None,
+                control_root: Path | None = None) -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
     t0 = time.monotonic()
     try:
+        if _stop_requested(control_root or cwd):
+            return None
+        phase = (log_context or {}).get("phase")
+        if phase and "UNITY_AUTOFORMALIZE_PROFILE" not in (env_overrides or {}):
+            env_overrides = {**(env_overrides or {}), "UNITY_AUTOFORMALIZE_PROFILE": phase}
         # Other autoformalize phases keep their own prompts, without proof-development catalogs.
         if mcp_profile == "autoformalize" and (log_context or {}).get("phase") == "formalizing":
             system_prompt += "\n\n" + _autoformalize_external_tools_prompt(mcp_servers)
@@ -910,6 +1136,9 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             "subagents": subagents,
             "env_overrides": env_overrides,
             "own_process_group": own_process_group,
+            "on_normal_completion": on_normal_completion,
+            "writable_roots": writable_roots,
+            "control_root": control_root,
         }
         if agent.backend == "codex":
             kwargs["interrupt_event"] = interrupt_event
@@ -918,4 +1147,4 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             kwargs["mcp_profile"] = mcp_profile
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
     finally:
-        _write_run_log(agent, cwd, time.monotonic() - t0, log_context)
+        _write_run_log(agent, control_root or cwd, time.monotonic() - t0, log_context)

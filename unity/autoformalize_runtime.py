@@ -13,9 +13,11 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import time
+from copy import deepcopy
 from contextlib import contextmanager
 from pathlib import Path
 from threading import Event
@@ -194,6 +196,20 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
         dag = json.loads(dag_path.read_text())
     except (OSError, json.JSONDecodeError) as exc:
         raise ValueError("chunking did not produce a readable .unity/dag.json") from exc
+    return normalize_chunking_dag(dag, plan=_read_chunking_plan(paths),
+                                  expected_solution_sha=expected_solution_sha)
+
+
+def _read_chunking_plan(paths) -> dict:
+    try:
+        return json.loads((paths.unity / "formalization-plan.json").read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("chunking requires a readable formalization-plan.json") from exc
+
+
+def normalize_chunking_dag(dag: dict, *, plan: dict, expected_solution_sha: str) -> dict:
+    """Normalize an in-memory snapshot; never reread an agent's editable draft."""
+    dag = deepcopy(dag)
     if not isinstance(dag, dict):
         raise ValueError("formalization DAG must be a JSON object")
     recorded = str(dag.get("solution_sha256") or dag.get("source_sha256") or "")
@@ -207,10 +223,6 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
     ids = [str(item.get("id") or "").strip() for item in chunks]
     if any(not item for item in ids) or len(ids) != len(set(ids)):
         raise ValueError("formalization chunks require unique nonempty ids")
-    try:
-        plan = json.loads((paths.unity / "formalization-plan.json").read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("chunking requires a readable formalization-plan.json") from exc
     if not isinstance(plan, dict):
         raise ValueError("formalization plan must be a JSON object")
     required_refs: set[str] = set()
@@ -233,6 +245,140 @@ def validate_formalization_dag(paths, expected_solution_sha: str) -> dict:
     dag["chunks"] = list(nodes.values())
     dag["solution_sha256"] = expected_solution_sha
     return dag
+
+
+def seed_chunking_draft(state: dict) -> dict | None:
+    """Replans contain only mutable fields; source obligations stay controller-owned."""
+    previous = state["formalization"]
+    if not previous.get("source_obligations"):
+        return None
+    source = autoformalize_state.formal_source(state)
+    return {"solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
+            "base_revision": previous["revision"],
+            "requirement_tasks": {row["id"]: deepcopy(row["tasks"]) for row in previous["requirements"]},
+            "prerequisites": deepcopy(previous["spec"]["prerequisites"]),
+            "arguments": deepcopy(previous["spec"]["arguments"]),
+            "chunks": [{key: deepcopy(value) for key, value in row.items() if key in {
+                "id", "title", "predicted_kind", "informal_statement", "informal_proof",
+                "statement_dependencies", "proof_dependencies", "proposed_formal_statement",
+                "proposed_formal_strategy", "source_components", "anchor_ids", "requirement_ids",
+            }} for row in state["formal_tasks"].values()]}
+
+
+def assemble_chunking_draft(state: dict, draft: dict) -> dict:
+    from .autoformalize_spec import PlanValidationError, _object
+    if not isinstance(draft, dict):
+        raise PlanValidationError("draft", "must be a JSON object")
+    previous = state["formalization"]
+    frozen = previous.get("source_obligations")
+    if not frozen:
+        return deepcopy(draft)
+    _object(draft, {"solution_candidate", "solution_sha256", "base_revision", "requirement_tasks",
+                    "prerequisites", "arguments", "chunks"}, "replan")
+    if type(draft["base_revision"]) is not int or draft["base_revision"] != previous["revision"]:
+        raise PlanValidationError("base_revision", "draft targets an obsolete plan",
+                                  code="stale_base", expected=previous["revision"], actual=draft["base_revision"])
+    ids = {row["id"] for row in frozen["requirements"]}
+    _object(draft["requirement_tasks"], ids, "requirement_tasks")
+    return {"solution_candidate": draft["solution_candidate"], "solution_sha256": draft["solution_sha256"],
+            "requirements": [{**deepcopy(row), "tasks": deepcopy(draft["requirement_tasks"][row["id"]])}
+                             for row in frozen["requirements"]],
+            "spec": {"version": 1, "anchors": deepcopy(frozen["anchors"]), "scope": deepcopy(frozen["scope"]),
+                     "prerequisites": deepcopy(draft["prerequisites"]), "arguments": deepcopy(draft["arguments"])},
+            "chunks": deepcopy(draft["chunks"])}
+
+
+MAX_CHUNKING_DRAFT_BYTES = 4 * 1024 * 1024
+
+
+def read_chunking_draft(path: Path) -> bytes:
+    """Read one bounded regular-file snapshot, never follow draft/parent symlinks."""
+    from .autoformalize_spec import PlanValidationError
+    path = Path(path).absolute()
+    if path.parent.resolve() != path.parent:
+        raise PlanValidationError("draft", "draft directory must not redirect through symlinks")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise PlanValidationError("draft", "write the assigned draft file before validation") from exc
+    except OSError as exc:
+        if path.is_symlink():
+            raise PlanValidationError("draft", "draft must not be a symlink") from exc
+        raise
+    with os.fdopen(fd, "rb") as handle:
+        before = os.fstat(handle.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise PlanValidationError("draft", "draft must be a private regular file, not a hardlink/device")
+        data = handle.read(MAX_CHUNKING_DRAFT_BYTES + 1)
+        after = os.fstat(handle.fileno())
+        try:
+            current = path.lstat()
+        except FileNotFoundError as exc:
+            raise PlanValidationError("draft", "draft was removed during validation; finish editing and retry") from exc
+    if len(data) > MAX_CHUNKING_DRAFT_BYTES:
+        raise PlanValidationError("draft", "draft exceeds the 4 MiB JSON limit")
+    identity = lambda row: (row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns)
+    if identity(before) != identity(after) or identity(after) != identity(current):
+        raise PlanValidationError("draft", "draft changed during validation; retry after finishing the edit")
+    return data
+
+
+def prepare_chunking_draft(paths, state: dict, payload: bytes) -> tuple[dict, dict]:
+    """All editable-plan checks, using the bound environment as read-only context.
+
+    Live environment validation remains a controller infrastructure check, not
+    an instruction for the model to rewrite its DAG or run Lean builds.
+    """
+    from .autoformalize_spec import PlanValidationError
+    try:
+        draft = json.loads(payload)
+    except (UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise PlanValidationError("draft", str(exc), code="invalid_json") from exc
+    source = autoformalize_state.formal_source(state)
+    plan = {**source, "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"]}
+    dag = normalize_chunking_dag(assemble_chunking_draft(state, draft), plan=plan,
+                                 expected_solution_sha=source["sha256"])
+    main_sha = state["formalization"]["main_sha"]
+    environment = (state["formalization"].get("contract") or {}).get("environment", {})
+    contract = autoformalize_contract.prepare_source_contract(
+        paths, dag, state=state, environment=environment, main_sha=main_sha)
+    autoformalize_state.prepare_informal_plan(state, dag, main_sha=main_sha, contract=contract)
+    return dag, contract
+
+
+def chunking_diagnostic(exc: ValueError) -> dict:
+    from .autoformalize_spec import PlanValidationError
+    row = (exc.diagnostic if isinstance(exc, PlanValidationError)
+           else {"path": "dag", "code": "invalid_plan", "message": str(exc)})
+    # The exact draft is an artifact; feedback must remain bounded even if a
+    # malformed draft has thousands of IDs or deeply nested unexpected values.
+    def compact(value, depth=0):
+        if isinstance(value, str):
+            return value[:800]
+        if depth >= 3:
+            return str(value)[:200]
+        if isinstance(value, dict):
+            return {str(key)[:100]: compact(item, depth + 1)
+                    for key, item in list(value.items())[:12]}
+        if isinstance(value, (list, tuple)):
+            return [compact(item, depth + 1) for item in value[:12]]
+        return value
+    return compact(row)
+
+
+def validate_chunking_draft(paths, draft_path: Path) -> dict:
+    """Read-only preflight; neither acceptance nor attempt bookkeeping."""
+    state = autoformalize_state.load_state(paths.forum)
+    payload = None
+    try:
+        require_source_matches(paths, state)
+        payload = read_chunking_draft(draft_path)
+        dag, _ = prepare_chunking_draft(paths, state, payload)
+    except (ValueError, RecursionError) as exc:
+        return {"ok": False, "error": str(exc)[:2000], "errors": [chunking_diagnostic(exc)],
+                "draft_sha256": hashlib.sha256(payload).hexdigest() if payload is not None else None}
+    return {"ok": True, "chunk_count": len(dag["chunks"]), "draft_sha256": hashlib.sha256(payload).hexdigest(),
+            "base_revision": state["formalization"]["revision"]}
 
 
 def _git(project: Path, *args: str) -> subprocess.CompletedProcess:

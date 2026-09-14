@@ -87,8 +87,11 @@ For adopted source repairs, include exactly one `{repair_id, status, rationale}`
 whether the correction is justified, what changed, and whether it still satisfies the requested scope.
 An altered claim outside the requested scope cannot pass merely because its Lean proof builds.
 
-If the original source obligation ledger or scope mapping is wrong, call `request_rechunk` with exact
-source locations/evidence; this revisits the specification without changing the supplied source.
+If the original source obligation ledger or scope mapping is wrong, record exact source locations and
+evidence in the Forum and your failing verdict. The current replan path does not revise frozen
+obligations; do not request repeated rechunking to rewrite them. `request_rechunk` is for changes to
+task organization, dependencies, prerequisite/argument mappings or requirement-to-task assignments
+under the existing obligations, without changing the supplied source.
 For a mutable node interpretation or Lean representation defect, use `lean_reopen` with exact task
 IDs so formalizers can correct it with `refine_chunks` and a new candidate. Do not edit the DAG during
 independent review. If the

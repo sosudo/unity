@@ -10,6 +10,14 @@ import hashlib
 import json
 
 
+class PlanValidationError(ValueError):
+    """A bounded, machine-readable correction; never an acceptance receipt."""
+
+    def __init__(self, path: str, message: str, *, code: str = "invalid_value", **details):
+        super().__init__(f"{path}: {message}")
+        self.diagnostic = {"path": path, "code": code, "message": message, **details}
+
+
 def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False).encode()).hexdigest()
@@ -23,7 +31,8 @@ def _text(value, field: str) -> str:
 
 def _refs(value, field: str, *, nonempty: bool = True) -> list[str]:
     if not isinstance(value, list) or (nonempty and not value):
-        raise ValueError(f"{field} requires {'a nonempty' if nonempty else 'a'} list")
+        raise PlanValidationError(field, f"requires {'a nonempty' if nonempty else 'a'} list",
+                                  expected="nonempty list" if nonempty else "list", actual=value)
     if any(not isinstance(item, str) or not item.strip() or item != item.strip() for item in value):
         raise ValueError(f"{field} has invalid references")
     if len(value) != len(set(value)):
@@ -33,7 +42,12 @@ def _refs(value, field: str, *, nonempty: bool = True) -> list[str]:
 
 def _object(value, fields: set[str], name: str) -> dict:
     if not isinstance(value, dict) or set(value) != fields:
-        raise ValueError(f"{name} requires exactly: {', '.join(sorted(fields))}")
+        actual = set(value) if isinstance(value, dict) else set()
+        details = {"missing": sorted(fields - actual), "unexpected": sorted(actual - fields)}
+        if "prerequisites[" in name and "issue_id" in actual - fields:
+            details["hint"] = "Place issue_id inside resolution: {kind: unresolved, issue_id: ...}."
+        raise PlanValidationError(name, f"requires exactly: {', '.join(sorted(fields))}",
+                                  code="invalid_fields", **details)
     return value
 
 
@@ -71,7 +85,8 @@ def normalize_requirements(requirements, tasks, source_refs) -> list[dict]:
         raise ValueError("formalization requires a nonempty requirements ledger")
     result, seen = [], set()
     for row in requirements:
-        _object(row, {"id", "statement", "source_components", "tasks", "anchor_ids"}, "requirement")
+        path = f"requirements[{row.get('id', '?')}]" if isinstance(row, dict) else "requirements"
+        _object(row, {"id", "statement", "source_components", "tasks", "anchor_ids"}, path)
         identifier = _text(row["id"], "requirement id")
         if identifier in seen:
             raise ValueError("requirements have duplicate ids")
@@ -81,7 +96,8 @@ def normalize_requirements(requirements, tasks, source_refs) -> list[dict]:
         anchors = _refs(row["anchor_ids"], "requirement anchor_ids")
         _known(sources, source_refs, "requirement source_components")
         _known(task_ids, tasks, "requirement tasks")
-        covered = {ref for task_id in task_ids for ref in tasks[task_id].get("source_components", [])}
+        covered = {ref for task_id in task_ids for ref in _refs(
+            tasks[task_id].get("source_components"), f"chunks[{task_id}].source_components")}
         if set(sources) - covered:
             raise ValueError(f"requirement {identifier} sources are not covered by its tasks")
         result.append({"id": identifier, "statement": _text(row["statement"], "requirement statement"),
@@ -102,7 +118,8 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
     ledger = {row["id"]: row for row in requirements}
     anchors = {}
     for row in _rows(value["anchors"], "anchors"):
-        _object(row, {"id", "source_ref", "location", "excerpt"}, "anchor")
+        _object(row, {"id", "source_ref", "location", "excerpt"},
+                f"spec.anchors[{row.get('id', '?')}]" if isinstance(row, dict) else "spec.anchors")
         item = {key: _text(row[key], f"anchor {key}") for key in row}
         if item["id"] in anchors:
             raise ValueError("anchors have duplicate ids")
@@ -112,7 +129,10 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
     for row in requirements:
         _known(row["anchor_ids"], anchors, "requirement anchor_ids")
         if {anchors[key]["source_ref"] for key in row["anchor_ids"]} != set(row["source_components"]):
-            raise ValueError(f"requirement {row['id']} anchors do not match its source components")
+            raise PlanValidationError(f"requirements[{row['id']}].anchor_ids",
+                f"requirement {row['id']} anchors do not match its source components; "
+                f"anchor sources={sorted({anchors[key]['source_ref'] for key in row['anchor_ids']})}; "
+                f"source_components={sorted(row['source_components'])}")
         requirement_anchors.update(row["anchor_ids"])
     scope = _object(value["scope"], {"targets", "references", "excluded"}, "scope")
     targets = _refs(scope["targets"], "scope targets")
@@ -142,7 +162,8 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
         raise ValueError("scope anchors must account for every supplied document")
     prerequisites = {}
     for row in _rows(value["prerequisites"], "prerequisites"):
-        _object(row, {"id", "statement", "anchor_ids", "needed_by", "resolution"}, "prerequisite")
+        path = f"spec.prerequisites[{row.get('id', '?')}]" if isinstance(row, dict) else "spec.prerequisites"
+        _object(row, {"id", "statement", "anchor_ids", "needed_by", "resolution"}, path)
         identifier = _text(row["id"], "prerequisite id")
         if identifier in prerequisites:
             raise ValueError("prerequisites have duplicate ids")
@@ -153,21 +174,23 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
         _known(needed, tasks, "prerequisite needed_by")
         resolution = row["resolution"]
         kind = resolution.get("kind") if isinstance(resolution, dict) else None
-        field = {"library": "declaration", "task": "task_id", "unresolved": "issue_id"}.get(kind)
+        field = ({"library": "declaration", "task": "task_id", "unresolved": "issue_id"}.get(kind)
+                 if isinstance(kind, str) else None)
         if field is None:
             raise ValueError("prerequisite resolution must be library, task, or unresolved")
         if kind == "unresolved" and allow_unresolved and set(resolution) == {"kind"}:
             resolution = {"kind": kind}
         else:
-            _object(resolution, {"kind", field}, "prerequisite resolution")
+            _object(resolution, {"kind", field}, path + ".resolution")
             resolution = {"kind": kind, field: _text(resolution[field], f"prerequisite {field}")}
         if kind == "task":
             _known([resolution[field]], tasks, "prerequisite task")
             for task_id in needed:
                 task = tasks[task_id]
-                dependencies = (set(task.get("statement_dependencies", [])) | set(task.get("proof_dependencies", []))
-                                if "statement_dependencies" in task or "proof_dependencies" in task else
-                                set(task.get("dependencies", [])))
+                dependencies = (set(_refs(task.get("statement_dependencies", []),
+                                          f"chunks[{task_id}].statement_dependencies", nonempty=False))
+                                | set(_refs(task.get("proof_dependencies", task.get("dependencies", [])),
+                                            f"chunks[{task_id}].proof_dependencies", nonempty=False)))
                 if resolution[field] == task_id or resolution[field] not in dependencies:
                     raise ValueError("task prerequisite requires a direct consumer dependency edge")
         if kind == "unresolved" and not allow_unresolved:
@@ -241,15 +264,21 @@ def normalize_informal_nodes(chunks, requirements, spec, source) -> dict[str, di
         sources = _refs(row.get("source_components"), "node source_components")
         _known(sources, refs, "node source_components")
         reqs = _refs(row.get("requirement_ids", [key for key, req in ledger.items()
-                                               if identifier in req["tasks"]]), "node requirement_ids")
+                                               if identifier in req["tasks"]]),
+                     f"chunks[{identifier}].requirement_ids")
         _known(reqs, ledger, "node requirement_ids")
         if set(reqs) != {key for key, req in ledger.items() if identifier in req["tasks"]}:
-            raise ValueError("node requirement_ids must match the requirements ledger")
+            raise PlanValidationError(f"chunks[{identifier}].requirement_ids",
+                "node requirement_ids must match the requirements ledger",
+                expected=sorted(key for key, req in ledger.items() if identifier in req["tasks"]),
+                actual=reqs)
         ids = _refs(row.get("anchor_ids", sorted({key for req in reqs for key in ledger[req]["anchor_ids"]
                                                   if anchors[key]["source_ref"] in sources})), "node anchor_ids")
         _known(ids, anchors, "node anchor_ids")
         if {anchors[key]["source_ref"] for key in ids} != set(sources):
-            raise ValueError("node anchors do not match its source components")
+            raise PlanValidationError(f"chunks[{identifier}].anchor_ids",
+                f"node anchors do not match its source components for {identifier}",
+                expected=sorted(sources), actual=sorted({anchors[key]["source_ref"] for key in ids}))
         statement_deps = _refs(row.get("statement_dependencies", []), "statement_dependencies", nonempty=False)
         proof_deps = _refs(row.get("proof_dependencies", row.get("dependencies", [])), "proof_dependencies", nonempty=False)
         dependencies = sorted(set(statement_deps) | set(proof_deps))

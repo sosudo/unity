@@ -86,13 +86,15 @@ async def dispatch(
     agents, roster, base_prompt, task, cwd, mcp, *,
     tools_prompt="AUTOFORMALIZE_FORMALIZING_TOOLS", icrl_enabled=False,
     brief_provider=None, log_context=None, mcp_profile="autoformalize",
+    on_normal_completion=None, writable_roots=None, control_root=None,
+    env_overrides=None,
 ):
     """Launch autoformalize agents with its own backend and compact Forum state."""
     def agent_cwd(agent):
         return cwd[agent.name] if isinstance(cwd, dict) else cwd
 
     any_cwd = next(iter(cwd.values())) if isinstance(cwd, dict) else cwd
-    if stop_requested(any_cwd):
+    if stop_requested(control_root or any_cwd):
         _console.print("[yellow]stop requested — skipping phase[/yellow]")
         return []
 
@@ -130,7 +132,10 @@ async def dispatch(
         return await spawn(
             agent, _preamble(agent, roster) + brief(agent) + full, task,
             agent_cwd(agent), mcp, subagents=subagents,
-            log_context=log_context, mcp_profile="autoformalize",
+            log_context=log_context, mcp_profile=mcp_profile,
+            on_normal_completion=on_normal_completion,
+            writable_roots=writable_roots, control_root=control_root,
+            env_overrides=env_overrides,
         )
 
     results = await asyncio.gather(*(spawn_one(agent) for agent in agents), return_exceptions=True)
