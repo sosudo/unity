@@ -19,9 +19,10 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastmcp import FastMCP
+from pydantic import Field
 
 from .. import artifacts, autoformalize_state, worktree
 from ..autoformalize_review import SemanticReview
@@ -395,6 +396,26 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         f"Global source issues not resolved: {len(issues)}; "
         f"pending replan requests: {len(queued)}",
     ]
+    snapshot = formal.get("review_snapshot")
+    snapshot_lines = ([
+        f"Machine snapshot: {snapshot.get('snapshot_id')} "
+        f"({'passed' if snapshot.get('passed') else 'failed'}); main {snapshot.get('main_sha')}",
+        f"Machine evidence artifact: {snapshot.get('artifact_id')}; "
+        "scaffold axiom lists are historical, not current verification.",
+    ] if snapshot else [])
+    if review_phase and snapshot:
+        lines.extend(["", "CURRENT MACHINE SNAPSHOT", *snapshot_lines])
+        snapshot_tasks = snapshot.get("task_statuses", {})
+        accepted = snapshot.get("accepted_candidates", {})
+        lines.append(f"SNAPSHOT TASK EVIDENCE (showing {min(10, len(snapshot_tasks))} of {len(snapshot_tasks)})")
+        for target, status in list(snapshot_tasks.items())[:10]:
+            lines.append(f"- {target}: status={status}; accepted_candidate={accepted.get(target) or 'none'}")
+        snapshot_issues = snapshot.get("issues", [])
+        lines.append(f"SNAPSHOT ISSUES (showing {min(5, len(snapshot_issues))} of {len(snapshot_issues)})")
+        for issue in snapshot_issues[:5]:
+            lines.append(f"- {issue[:240]}")
+        lines.append("Global snapshot failure does not mean every task failed. "
+                     "Read the snapshot artifact and autoformalize_task(task_id) for exact detail.")
     if focus:
         lines.extend(["", "YOUR ASSIGNED/CLAIMED TASKS"])
         for target in sorted(focus):
@@ -458,14 +479,8 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         for item in obstacles[-5:]:
             lines.append(f"- {item['obstacle_id']} task={item.get('target') or 'global'}: "
                          f"{item.get('goal_state', '')[:250]}")
-    snapshot = formal.get("review_snapshot")
-    if snapshot:
-        lines.extend([
-            f"Machine snapshot: {snapshot.get('snapshot_id')} "
-            f"({'passed' if snapshot.get('passed') else 'failed'}); main {snapshot.get('main_sha')}",
-            f"Machine evidence artifact: {snapshot.get('artifact_id')}; "
-            "scaffold axiom lists are historical, not current verification.",
-        ])
+    if snapshot and not review_phase:
+        lines.extend(snapshot_lines)
     requirements = formal.get("requirements", [])
     lines.extend([
         "", f"GLOBAL COVERAGE LEDGER: {len(requirements)} requirements",
@@ -563,9 +578,13 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
     verdicts = state.get("critic_verdicts", [])
     if verdicts:
         verdict = verdicts[-1]
-        lines.extend(["", "LATEST FORMALIZATION VERDICT",
-                      f"- {verdict.get('verdict')} by {verdict.get('author')}: "
-                      f"{verdict.get('summary', '')[:350]}"])
+        if review_phase:
+            lines.extend(["", "PRIOR CRITIC FEEDBACK — historical, not current task verification",
+                          f"- snapshot={verdict.get('snapshot_id')}; main={verdict.get('main_sha')}"])
+        else:
+            lines.extend(["", "LATEST FORMALIZATION VERDICT"])
+        lines.append(f"- {verdict.get('verdict')} by {verdict.get('author')}: "
+                     f"{verdict.get('summary', '')[:350]}")
     if state.get("final_report"):
         lines.append(f"Run report: artifact {state['final_report'].get('artifact_id')}")
     text = "\n".join(lines)
@@ -655,13 +674,16 @@ def publish_finding(
     kind: str,
     title: str,
     content: str,
-    confidence: int,
+    confidence: Annotated[int, Field(
+        ge=0, le=100, strict=True,
+        description="Integer confidence from 0 to 100; 95 means 95%, not 0.95.",
+    )],
     target: str = "",
     strategy_id: str = "",
     evidence: str = "",
     supersedes: str = "",
 ) -> dict:
-    """Publish or correct concise live knowledge with agent-chosen kind/confidence."""
+    """Publish concise live knowledge with a free-form kind and integer confidence (0–100)."""
     author = _author(author)
     if len(evidence) > 4000:
         record = artifacts.store_text(

@@ -2287,7 +2287,10 @@ def _validate_semantic_review(state: dict, review: dict, *, approved: bool, auth
         anchors = entry["checked_anchor_ids"]
         expected_anchors = set(ledger[requirement_id]["anchor_ids"])
         if len(anchors) != len(set(anchors)) or set(anchors) - expected_anchors:
-            raise ValueError("requirement review has unknown or duplicate anchors")
+            raise ValueError(
+                f"requirement {requirement_id}: checked_anchor_ids must be unique "
+                f"and drawn from {sorted(expected_anchors)}; received {anchors}"
+            )
         if approved and set(anchors) != expected_anchors:
             raise ValueError("approval requires checking every requirement source anchor")
         refs = entry["declarations"]

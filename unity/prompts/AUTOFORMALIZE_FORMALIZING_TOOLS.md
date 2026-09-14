@@ -16,7 +16,13 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
   shares reusable checked APIs, proof patterns and concrete failures. Publish before substantial
   follow-on work, with the formal task ID and check/artifact evidence; reuse existing findings.
-  `report_obstacle`, `ask_question` and `answer_question` expose blockers and requests for help.
+  `confidence` is an integer from 0 to 100: use `95`, not `0.95`. `kind` is an agent-chosen string,
+  not a fixed enum. Use `supersedes` when new evidence replaces an active finding.
+- `report_obstacle(author, goal_state, target?, tried?, hypothesis?)` records a concrete blocker.
+- `ask_question(author, body, to?, target?)` asks for help; `answer_question(question_id, author, body)`
+  answers an existing question.
+- `forum_post(thread_id, author, content, reply_to?)` posts free-form discussion; `reply_to` is an
+  optional list of post IDs. A post does not reserve work or submit a candidate.
 - `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?, stage?, outputs?)` commits the
   current exact worktree bytes and submits an immutable candidate for the authoritative main build and
   declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
@@ -46,7 +52,7 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `request_rechunk(author, reason, task_ids?)` queues a revised informal plan and argument/prerequisite
   mapping, without rewriting original source obligations. Give precise source locations/evidence; ordinary formal drafts use refinement or a new
   candidate, not mandatory rechunking. The supplied source is unchanged.
-- `forum_post`, `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
+- `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
   for a task. The normal brief prioritizes your task, its candidates and blockers.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` records a source defect.

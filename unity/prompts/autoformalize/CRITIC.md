@@ -21,6 +21,13 @@ theorem proofs. Those historical entries alone do not justify repeating checks o
 reopening. Do not rerun `lake build` or query every already-verified declaration unless current evidence
 is missing, stale, inconsistent with main or exposes a concrete concern.
 
+Before claiming a task is incomplete or lacks verification, compare its current snapshot
+`task_statuses` and `accepted_candidates` with `autoformalize_task(task_id)`. Omission from a bounded
+preview is not absence. Prior verdicts, findings and checkpoint status claims do not override that evidence.
+A verified task may still need reopening
+for a specific current source-faithfulness defect; state that defect rather than calling its machine
+verification missing.
+
 Check semantic and structural faithfulness against the actual source, not merely names or successful builds:
 
 - every in-scope mathematical requirement is covered by the DAG and actual Lean statements; do not

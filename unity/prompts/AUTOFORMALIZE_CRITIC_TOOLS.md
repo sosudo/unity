@@ -18,6 +18,9 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
   exactly once, all passing, with all adopted outputs of its implementing nodes listed in
   `declarations` (definitions/structures/instances as well as theorems) and concrete reasoning. Rejections can be partial;
   a Lean reopen requires exact affected task IDs. Free-text `evidence` alone cannot approve.
+  Each entry's `checked_anchor_ids` must contain only IDs from that requirement's own `anchor_ids`,
+  without duplicates; approval requires all of them. Put ancillary source/argument context in
+  `rationale` or `argument_rationale`, not in `checked_anchor_ids`.
 - `autoformalize_requirements(offset?, limit?)` pages the complete requirement manifest. Keep one revision
   and continue until `next_offset` is null; the task-filtered brief is not the entire checklist.
   `autoformalize_task(task_id)` retrieves exact task evidence/anchors/prerequisites.
@@ -26,9 +29,29 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
   It cannot revise the original requirement statements, anchors or scope; report such defects explicitly
   in the Forum and verdict instead. Ordinary mutable interpretation/implementation defects use `lean_reopen`;
   formalizers can refine nodes and submit new candidate versions. Original source is preserved.
-- `forum_post` and `forum_read` provide necessary clarification and evidence-backed source defect reports.
+- `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
+  shares reusable review facts and concrete failures with evidence. `confidence` is an integer from
+  0 to 100: use `95`, not `0.95`. `kind` is an agent-chosen string, not a fixed enum. Reuse existing
+  findings; use `supersedes` when new evidence replaces an active finding.
+- `report_obstacle(author, goal_state, target?, tried?, hypothesis?)` records a concrete blocker.
+- `ask_question(author, body, to?, target?)` asks for help; `answer_question(question_id, author, body)`
+  answers an existing question.
+- `forum_post(thread_id, author, content, reply_to?)` posts free-form discussion; `reply_to` is an
+  optional list of post IDs. A post is not a verdict. `forum_read` provides discussion detail.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` routes source defects to optional
   exploration/repair work. End the current review after reporting; it cannot approve unresolved issues.
+
+For shell access, serialize the full JSON argument object, including `author`, `verdict`, `summary`
+and the nested `review`, to a file; do not save only the `review` object. Use a JSON serializer to
+escape multiline rationales and quotes, rather than hand-quoting the payload in the shell:
+
+```sh
+unity mcp unity-forum submit_formalization_verdict --args-file /path/to/review.json
+```
+
+Native MCP accepts the same structured arguments directly, not a JSON string. The critic instructions
+show the nested `review` shape; wrap it with the tool arguments above, including `reopen_tasks` for
+`lean_reopen`. Replace example IDs and rationales with current reviewed evidence.
 
 No paper rewriting or mandatory informal-solving phase is available. Report substantive source defects
 with evidence; never approve an altered statement to avoid the defect. The critic does not

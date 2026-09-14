@@ -3,7 +3,17 @@
 Start with `autoformalize_brief(author)` and the absolute formalization-plan path in your task for the immutable supplied-source
 snapshot, file paths/artifacts and exact source-reference IDs. Read source files directly as appropriate
 to their format; use `artifact_info` and bounded `artifact_read` for stored text. `autoformalize_status()` exposes
-the current state; `forum_post` and `forum_read` provide necessary clarification.
+the current state; `forum_read` provides discussion detail.
+
+- `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
+  shares reusable source facts and concrete failures with evidence. `confidence` is an integer from
+  0 to 100: use `95`, not `0.95`. `kind` is an agent-chosen string, not a fixed enum. Reuse existing
+  findings; use `supersedes` when new evidence replaces an active finding.
+- `report_obstacle(author, goal_state, target?, tried?, hypothesis?)` records a concrete blocker.
+- `ask_question(author, body, to?, target?)` asks for help; `answer_question(question_id, author, body)`
+  answers an existing question.
+- `forum_post(thread_id, author, content, reply_to?)` posts free-form discussion; `reply_to` is an
+  optional list of post IDs. A post does not publish or accept your draft.
 
 Write only the assigned draft: an informal, source-linked DAG with stable node IDs, titles,
 `predicted_kind`, `informal_statement`, nullable `informal_proof`, `statement_dependencies`,
