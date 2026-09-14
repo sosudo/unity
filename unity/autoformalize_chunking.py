@@ -118,7 +118,10 @@ async def chunking_workspace(paths, author: str, attempt: dict):
             )
             # Connect before dispatch: a broker failure must never silently launch
             # an unrestricted worker or fall back to an in-process Forum client.
+            last_error = ""
+
             async def ready():
+                nonlocal last_error
                 while True:
                     if process.returncode is not None:
                         raise RuntimeError("chunker Forum service exited during startup")
@@ -127,16 +130,24 @@ async def chunking_workspace(paths, author: str, attempt: dict):
                             endpoint, headers={"Authorization": f"Bearer {token}"},
                         )
                         async with Client(transport, timeout=1, init_timeout=1) as client:
-                            await client.ping()
+                            # Tool discovery works across MCP versions without ping.
+                            await client.list_tools()
                         return
-                    except Exception:
+                    except Exception as exc:
+                        last_error = repr(exc).replace(token, "[token]")[:2000]
                         await asyncio.sleep(0.05)
 
             try:
                 await asyncio.wait_for(ready(), timeout=20)
             except (TimeoutError, RuntimeError) as exc:
                 diagnostics.seek(0)
-                detail = diagnostics.read(8000).decode("utf-8", errors="replace").replace(token, "[token]")
+                detail = repr(exc)
+                if last_error:
+                    detail += f"; last connection error: {last_error}"
+                output = diagnostics.read(8000).decode("utf-8", errors="replace")
+                if output:
+                    detail += "\n" + output
+                detail = detail.replace(token, "[token]")
                 raise RuntimeError(f"chunker Forum service failed to start: {detail}") from exc
             workspace.env = worker_env
             workspace.mcp = {"unity-forum": {
