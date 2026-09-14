@@ -9,8 +9,7 @@ import json
 from pathlib import Path
 
 
-def claude_worktree_options(cwd: Path, writable_roots: tuple[Path, ...], *,
-                            isolated: bool = False, broker_host: str | None = None) -> dict:
+def claude_worktree_options(cwd: Path, writable_roots: tuple[Path, ...]) -> dict:
     """Return SDK options without changing user settings or launching a model."""
     from claude_agent_sdk import HookMatcher
 
@@ -65,7 +64,7 @@ def claude_worktree_options(cwd: Path, writable_roots: tuple[Path, ...], *,
             "filesystem": {"allowWrite": [str(path) for path in shared]},
             # Claude 2.1.105 rejects '*'. Keep package downloads available;
             # other research URLs use WebFetch, and MCP networking is separate.
-            "network": {"allowedDomains": ([broker_host] if broker_host else []) if isolated else [
+            "network": {"allowedDomains": [
                 "github.com", "*.github.com", "*.githubusercontent.com",
                 "pypi.org", "files.pythonhosted.org", "releases.lean-lang.org",
                 "lakecache.blob.core.windows.net", "mathlib4.lean-cache.cloud", "cache.mathlib.org",

@@ -162,21 +162,6 @@ async def mcp(server, tool, args, args_file):
     if not isinstance(kwargs, dict):
         raise click.ClickException("args must be a JSON object")
 
-    # A sandboxed chunker must never construct a local, privileged Forum server.
-    # Handle this before project discovery: its cwd intentionally has no .unity.
-    endpoint = os.getenv("UNITY_AUTOFORMALIZE_CHUNKER_ENDPOINT", "")
-    token = os.getenv("UNITY_AUTOFORMALIZE_CHUNKER_TOKEN", "")
-    if endpoint or token:
-        from ..autoformalize_chunking import call_chunker_tool
-        try:
-            result = await call_chunker_tool(endpoint, token, server, tool, kwargs)
-        except Exception as exc:
-            raise click.ClickException(f"chunker Forum call failed: {exc}") from exc
-        for block in getattr(result, "content", None) or []:
-            value = getattr(block, "text", None)
-            print(value if value is not None else str(block))
-        return
-
     from ..config import load_paths
     from ..orchestrator import build_mcp, build_solve_mcp
     from fastmcp import Client

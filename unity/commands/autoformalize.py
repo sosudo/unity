@@ -328,8 +328,7 @@ async def _chunk_source(roster, paths, max_attempts: int | float) -> None:
                             log_context={"command": PIPELINE, "run_id": state["run_id"], "phase": "chunking",
                                          "role": "chunker", "candidate_id": candidate["candidate_id"],
                                          "attempt": attempt["attempt"], "attempt_id": attempt["attempt_id"]},
-                            on_normal_completion=completed, writable_roots=(workspace.cwd,),
-                            control_root=paths.project_root, env_overrides=workspace.env,
+                            on_normal_completion=completed, env_overrides=workspace.env,
                         )
                     finally:
                         # Archive before the scratch workspace is removed, including

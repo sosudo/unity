@@ -10,7 +10,6 @@ import argparse
 import base64
 import fcntl
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -19,7 +18,6 @@ import stat
 import tempfile
 import uuid
 from contextlib import contextmanager
-from functools import wraps
 from pathlib import Path
 from typing import Literal
 
@@ -35,22 +33,15 @@ FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
 PROFILE = "chunking"
 PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair"}
-CHUNKING_CONTEXT: dict | None = None
 
 
-def configure(
-    forum_dir: Path, project_root: Path, profile: str = "chunking", *,
-    chunking_context: dict | None = None,
-) -> None:
-    global FORUM_DIR, PROJECT_ROOT, PROFILE, CHUNKING_CONTEXT
+def configure(forum_dir: Path, project_root: Path, profile: str = "chunking") -> None:
+    global FORUM_DIR, PROJECT_ROOT, PROFILE
     if profile not in PROFILES:
         raise ValueError(f"unknown autoformalize Forum profile '{profile}'")
     FORUM_DIR = Path(forum_dir)
     PROJECT_ROOT = Path(project_root).resolve()
     PROFILE = profile
-    if chunking_context is not None and profile != "chunking":
-        raise ValueError("a bound chunker cannot expose another tool profile")
-    CHUNKING_CONTEXT = dict(chunking_context) if chunking_context is not None else None
     FORUM_DIR.mkdir(parents=True, exist_ok=True)
     discussion.FORUM_DIR = FORUM_DIR
     discussion.PROJECT_ROOT = PROJECT_ROOT
@@ -71,7 +62,7 @@ def _author(author: str) -> str:
     value = str(author or "").strip()
     if not value:
         raise ValueError("author is required")
-    bound = (CHUNKING_CONTEXT or {}).get("author") or os.getenv("UNITY_AGENT_NAME", "").strip()
+    bound = os.getenv("UNITY_AGENT_NAME", "").strip()
     if bound and value.casefold() != bound.casefold():
         raise ValueError(f"this worker is bound to author '{bound}'")
     return bound or value
@@ -1391,34 +1382,17 @@ SOURCE_FEEDBACK = (publish_finding, report_obstacle, ask_question, answer_questi
                    report_source_issue, submit_source_repair)
 
 
-def _require_current_chunker() -> None:
-    """A temporary broker grants access only for its original active attempt."""
-    if CHUNKING_CONTEXT is None:
-        return
-    current = autoformalize_state.load_state(FORUM_DIR)
-    attempt = next((item for item in current.get("chunking_attempts", [])
-                    if item.get("attempt_id") == CHUNKING_CONTEXT["attempt_id"]), None)
-    if (current.get("run_id") != CHUNKING_CONTEXT["run_id"]
-            or current.get("phase") != "chunking"
-            or not attempt or attempt.get("status") != "active"
-            or attempt.get("author") != CHUNKING_CONTEXT["author"]
-            or attempt.get("candidate_id") != CHUNKING_CONTEXT["candidate_id"]
-            or autoformalize_state.formal_source(current).get("candidate_id")
-            != CHUNKING_CONTEXT["candidate_id"]):
-        raise ValueError("this chunking attempt is no longer active; its tool access has ended")
-
-
 def validate_chunks() -> dict:
     """Read and validate this attempt's draft DAG; do not accept it or change state."""
-    if CHUNKING_CONTEXT is None:
-        raise ValueError("validate_chunks requires a controller-bound chunking workspace")
-    _require_current_chunker()
+    draft_path = os.getenv("UNITY_AUTOFORMALIZE_DRAFT_PATH", "")
+    if not draft_path:
+        raise ValueError("validate_chunks requires an assigned chunking draft path")
     from ..autoformalize_input import autoformalize_paths
     from ..autoformalize_runtime import validate_chunking_draft
     from ..config import Paths
 
     paths = autoformalize_paths(Paths.from_unity_dir(_root() / ".unity"))
-    return validate_chunking_draft(paths, Path(CHUNKING_CONTEXT["draft_path"]))
+    return validate_chunking_draft(paths, Path(draft_path))
 
 
 PROFILE_TOOLS = {
@@ -1433,48 +1407,13 @@ PROFILE_TOOLS = {
 }
 
 
-def build_server(profile: str, *, auth=None) -> FastMCP:
+def build_server(profile: str) -> FastMCP:
     """Expose only the independent autoformalize tools required by this phase."""
     if profile not in PROFILES:
         raise ValueError(f"Unknown autoformalize MCP profile: {profile}")
-    if CHUNKING_CONTEXT is not None and profile != "chunking":
-        raise ValueError("a bound chunker cannot expose another tool profile")
-    server = FastMCP(f"unity-autoformalize-forum-{profile}", auth=auth)
+    server = FastMCP(f"unity-autoformalize-forum-{profile}")
     for tool in PROFILE_TOOLS[profile]:
-        if CHUNKING_CONTEXT is None:
-            server.tool(tool)
-        else:
-            # Keep the original typed signature in MCP; neither the client nor
-            # its environment can select a different author or tool profile.
-            def guarded(function):
-                signature = inspect.signature(function)
-
-                @wraps(function)
-                def call(*args, **kwargs):
-                    _require_current_chunker()
-                    arguments = signature.bind(*args, **kwargs).arguments
-                    if "author" in arguments:
-                        _author(arguments["author"])
-                    result = function(*args, **kwargs)
-                    if function.__name__ in {"validate_chunks", "artifact_read"}:
-                        return result
-                    # Preserve bounded tool memory without granting the shell
-                    # client write access to shared artifacts. Validation stays
-                    # entirely read-only; artifact pages are already bounded.
-                    rendered = result if isinstance(result, str) else json.dumps(result)
-                    compacted = artifacts.compact_text(
-                        _artifacts_dir(), rendered, kind="mcp_output",
-                        producer=CHUNKING_CONTEXT["author"],
-                        source=f"unity-forum.{function.__name__}",
-                    )
-                    if isinstance(compacted, dict):
-                        return (artifacts.format_compacted(compacted)
-                                if isinstance(result, str) else compacted)
-                    return result
-
-                return call
-
-            server.tool(guarded(tool))
+        server.tool(tool)
     return server
 
 

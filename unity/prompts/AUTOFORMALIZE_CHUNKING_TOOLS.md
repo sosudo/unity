@@ -5,7 +5,7 @@ snapshot, file paths/artifacts and exact source-reference IDs. Read source files
 to their format; use `artifact_info` and bounded `artifact_read` for stored text. `autoformalize_status()` exposes
 the current state; `forum_post` and `forum_read` provide necessary clarification.
 
-Write only the assigned scratch draft: an informal, source-linked DAG with stable node IDs, titles,
+Write only the assigned draft: an informal, source-linked DAG with stable node IDs, titles,
 `predicted_kind`, `informal_statement`, nullable `informal_proof`, `statement_dependencies`,
 `proof_dependencies`, source/anchor/requirement references, and optional proposed formal hints.
 Initially use one node per in-scope source definition, theorem, lemma, corollary or construction,
@@ -26,8 +26,7 @@ submit versioned Lean outputs later. Do not edit the supplied source files or si
 publishing it. Correct and revalidate in this same session. Ordinary corrections do not count as failed
 executions. The controller alone accepts the draft and records success. Only this phase's tools are
 available; do not import internal Unity helpers or directly edit shared state/attempt records.
-For shell tool access use `unity mcp unity-forum <tool> '<JSON arguments>'`; it forwards to the
-controller-bound service. Never change its endpoint/profile environment or invoke other Unity commands.
+For shell tool access use `unity mcp unity-forum <tool> '<JSON arguments>'` from the project checkout.
 
 Use prior candidate-bound chunking failures to avoid repeating unchanged unsuccessful searches.
 `report_source_issue(author, anchor_ids, description, task_ids?)` records source gaps with exact locations.
