@@ -38,3 +38,25 @@ class SemanticReview(BaseModel):
     scope_rationale: str = Field(min_length=1)
     requirements: list[RequirementReview]
     repair_reviews: list[RepairReview] = Field(default_factory=list)
+
+
+class RepresentationReview(BaseModel):
+    """A scoped model judgment, not a kernel or final faithfulness receipt."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verdict: Literal["aligned", "encoding_error", "source_issue", "uncertain"]
+    checked_anchor_ids: list[str]
+    rationale: str = Field(min_length=1, max_length=4000)
+    evidence: str = Field(min_length=1, max_length=16000)
+
+
+class SourceDiagnosis(BaseModel):
+    """Distinguish source defects from encodings and false alarms before replan."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    input_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    verdict: Literal["false_alarm", "encoding_error", "source_defect", "uncertain"]
+    evidence: str = Field(min_length=1, max_length=16000)

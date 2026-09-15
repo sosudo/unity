@@ -25,6 +25,7 @@ from threading import Event
 from rich.console import Console
 
 from . import artifacts, library, autoformalize_contract, autoformalize_jobs, autoformalize_state, worktree
+from . import autoformalize_files, autoformalize_representation
 from .autoformalize_input import require_source_matches
 from .forum import autoformalize_server
 from .autoformalize_orchestrator import _preamble, load_prompt, stop_requested
@@ -472,24 +473,18 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
         "source_components": list(task.get("source_components", [])),
         "mode": "formal_contract",
         "contract_sha256": check.get("proposed_contract", contract or {}).get("sha256"),
+        "policy_sha256": autoformalize_contract.policy_hash(),
         "stage": stage,
         "verified_tasks": check.get("verified_tasks", sorted(completed)),
-        **{key: check[key] for key in ("proposed_contract", "verified_targets", "final") if key in check},
+        **{key: check[key] for key in ("proposed_contract", "verified_targets", "final", "project_declarations", "compiled_receipt") if key in check},
         "issues": issues,
         "blockers": check.get("blockers", []),
     }
 
 
 def _candidate_preflight(state: dict, candidate: dict) -> list[dict]:
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("version") != 3:
-        return []
-    tasks = state.get("formal_tasks", {})
-    completed = {key for key, row in tasks.items() if row.get("status") == "complete"}
-    if candidate.get("stage", "complete") == "complete":
-        completed.add(candidate["task_id"])
-    return autoformalize_contract.prerequisite_blockers(
-        contract, completed=completed, final=bool(tasks) and completed == set(tasks),
+    return autoformalize_state.submission_blockers(
+        state, candidate["task_id"], candidate.get("stage", "complete"),
     )
 
 
@@ -536,6 +531,10 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     exact_diff = diff_result.stdout
     if hashlib.sha256(exact_diff.encode()).hexdigest() != candidate["diff_sha256"]:
         return {"ok": False, "error": "candidate commit no longer matches its submitted diff hash"}
+    actual_paths = autoformalize_files.immutable_git_paths(root, candidate["base_main_sha"], resolved)
+    blockers = autoformalize_files.validate_candidate_files(current, candidate, **actual_paths)
+    if blockers:
+        return {"ok": False, "error": "; ".join(row["message"] for row in blockers), "blockers": blockers}
     dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
     if dirty.returncode or dirty.stdout.strip():
         return {"ok": False, "error": "main has tracked changes; refusing candidate merge"}
@@ -622,6 +621,8 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         source=f"formal task {task['task_id']}",
     )
     verification["artifact_id"] = record["artifact_id"]
+    if verification.pop("project_declarations", None):
+        verification["inventory_artifact"] = {"artifact_id": record["artifact_id"], "sha256": record["sha256"]}
     if verification["status"] != "passed":
         _rollback(root, before)
         return {
@@ -880,6 +881,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     roles: dict[str, str] = {}
     repair_issues: dict[str, str] = {}
     repair_exhausted: dict[str, set[str]] = {}
+    review_inputs: dict[str, tuple[str, str]] = {}
     integration: asyncio.Task | None = None
     integration_candidate: dict = {}
     integration_cancel: Event | None = None
@@ -892,6 +894,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     blocked_launch_keys: dict[tuple[str, str], str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     state = autoformalize_state.load_state(paths.forum)
+    autoformalize_representation.recover_representation_reviews(paths.forum)
     # Target notifications may arrive while verification runs in another thread.
     # Consume them separately: refreshing assignments must not consume candidates.
     target_events_seen = {event["event_id"] for event in state.get("events", [])}
@@ -987,14 +990,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 or autoformalize_server.has_pending_formal_candidate(current, name)
                 or autoformalize_state.source_issues_blocking_task(current, task_id)):
             return
-        repair_blockers = _candidate_preflight(current, {"task_id": task_id, "stage": "complete"})
-        if not repair_blockers:
-            # Static metadata may be filled but its exact named witness was
-            # rejected. Reuse only current contract-bound prerequisite failures.
-            repair_blockers = [row for row in autoformalize_server.verification_blockers(current, task_id)
-                               if row.get("candidate_id") and row.get("prerequisite_id")]
+        # Prospective/global accounting is not a command to stop proof search.
+        # Focus repair work only after a current candidate actually failed it.
+        repair_blockers = [row for row in autoformalize_server.verification_blockers(current, task_id)
+                           if row.get("candidate_id") and row.get("prerequisite_id")]
         if repair_blockers:
-            if any(not running.done() and active_target(owner) == task_id
+            if any(not running.done() and roles.get(owner) == "formalizing" and active_target(owner) == task_id
                    for owner, running in tasks.items()):
                 return  # One focused repair, not another full proof swarm.
             followup = (
@@ -1138,6 +1139,26 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             return
         refresh_worker_targets(current)
         from .autoformalize_repairs import repair_attempt_limit, source_repair_turn
+        # Review the newly adopted interface before its dependent proof work.
+        # Use idle configured capacity and an independent author when available.
+        for review in autoformalize_representation.pending_representation_reviews(current):
+            if review["input_sha256"] in {key for _, key in review_inputs.values()}:
+                continue
+            tried = autoformalize_representation.attempted_reviewers(review)
+            available = [name for name in agents if name not in tasks and name not in stopping
+                         and autoformalize_state.author_key(name) not in tried
+                         and not autoformalize_server.has_pending_formal_candidate(current, name)]
+            available.sort(key=lambda name: autoformalize_state.author_key(name)
+                           == autoformalize_state.author_key(review.get("representation_author")))
+            if not available:
+                continue
+            name = available[0]
+            review_inputs[name] = (review["task_id"], review["input_sha256"])
+            roles[name] = "representation_review"
+            interrupts[name] = asyncio.Event()
+            tasks[name] = asyncio.create_task(autoformalize_representation.representation_review_turn(
+                agents[name], roster, paths, review["task_id"], interrupt_event=interrupts[name],
+            ), name=f"autoformalize:representation_review:{name}:{review['task_id']}")
         issues = autoformalize_state.ready_source_issues(current)
         assigned_issues = set(repair_issues.values())
         for name in agents:
@@ -1187,7 +1208,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                         dependencies = current["formal_tasks"][previous].get("dependencies", [])
                         prerequisites = sorted(ready, key=lambda task: task["task_id"] not in dependencies)
                     active = [active_target(owner) for owner, running in tasks.items()
-                              if not running.done()]
+                              if not running.done() and roles.get(owner) == "formalizing"]
                     for _, prerequisite in _formal_task_assignments(
                         prerequisites, [name], active,
                         available_to=lambda owner, target: autoformalize_state.task_available_to(current, owner, target),
@@ -1210,7 +1231,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         active_targets = [
             active_target(name)
             for name, running in tasks.items()
-            if not running.done()
+            if not running.done() and roles.get(name) == "formalizing"
         ]
         for name, task_id in _formal_task_assignments(
             ready, unassigned, active_targets,
@@ -1235,6 +1256,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             refresh_worker_targets(state)
             require_source_matches(paths, state)
             for name in list(tasks):
+                if roles.get(name) == "representation_review":
+                    target, input_sha256 = review_inputs[name]
+                    latest = autoformalize_representation.representation_review_input(state, target)
+                    if not latest or latest["input_sha256"] != input_sha256:
+                        request_stop(name, f"representation review input for {target} changed")
+                    continue
                 if roles.get(name) != "formalizing":
                     continue
                 target, revision = worker_revisions.get(name, ("", 0))
@@ -1276,6 +1303,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 forget_blocked_launches(name)
                 interrupts.pop(name, None)
                 role = roles.pop(name, "")
+                review_inputs.pop(name, None)
                 attempt = worker_attempts.pop(name, None)
                 interrupted = name in interrupted_workers
                 interrupted_workers.discard(name)
@@ -1401,7 +1429,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 if autoformalize_state.open_source_issues(state):
                     raise ValueError("Formal declarations are complete, but source issues remain unresolved; "
                                      "critic acceptance is blocked until a repair is adopted")
-                return state
+                return autoformalize_state.record_round_end(paths.forum, blocked_launches=blocked_launches)
             if (integration is None and not tasks and not stopping
                     and not autoformalize_server.has_pending_formal_candidate(state)):
                 autoformalize_state.record_round_end(paths.forum, blocked_launches=blocked_launches)

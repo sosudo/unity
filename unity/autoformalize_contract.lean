@@ -222,9 +222,13 @@ private def extract (modules targets externals witnesses : List String) : IO (Js
   let mut projectAxioms : List String := []
   let mut projectSorries : List String := []
   let mut projectRoots : Array Name := #[]
+  let mut inventory : Array Json := #[]
   for (n, ci) in env.constants.toList do
     unless (moduleOf env n).any projects.contains do continue
     projectRoots := projectRoots.push n
+    inventory := inventory.push (Json.mkObj [
+      ("name", Json.str n.toString), ("module", Json.str (((moduleOf env n).getD .anonymous).toString)),
+      ("kind", Json.str (kindOf ci))])
     if let .axiomInfo _ := ci then projectAxioms := n.toString :: projectAxioms
     let direct := usedConstants ci.type ++
       ((ci.value? (allowOpaque := true)).map usedConstants).getD #[]
@@ -330,7 +334,11 @@ private def extract (modules targets externals witnesses : List String) : IO (Js
   issues := issues ++ projectAudit.issues
   let projectUsedAxioms := projectAudit.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
   let audited ← IO.monoMsNow
+  let compiledModules ← env.header.moduleNames.toList.mapM fun n => do
+    return (← findOLean n).toString
   return (Json.mkObj [("targets", Json.mkObj records),
+    ("project_declarations", Json.arr inventory),
+    ("compiled_modules", toJson compiledModules),
     ("external_declarations", Json.mkObj externalRecords),
     ("prerequisite_declarations", Json.mkObj witnessRecords),
     ("declaration_errors", Json.arr declarationErrors),

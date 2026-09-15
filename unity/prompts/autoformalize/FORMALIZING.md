@@ -36,6 +36,10 @@ For your assigned task:
   strategy only when materially different. Investigation/editing before registration is allowed, but
   claim a strategy before finalizing. Assist, transfer ownership or mark an incorrect strategy as appropriate;
 - work only in your assigned Git worktree and preserve separately claimed work;
+- after claiming a strategy, reserve the files you intend to edit with `reserve_files`.
+  Prefer one module per independent task; workers on the same task can share its files.
+  For a file owned by another task, request explicit sharing from its owner or use a separate module.
+  Unity rechecks actual cumulative changed paths at submission and merge; conflicts preserve your work;
 - read the task's `source_components` and source locations. Preserve the source statement's domains,
   hypotheses, quantifiers, definitions and conclusion, and follow its mathematical proof argument;
 - use `autoformalize_task(task_id)` for its exact anchors, argument mapping, prerequisites and adopted
@@ -53,8 +57,8 @@ For your assigned task:
 - use `refine_chunks(author, expected_revision, changes)` for source-faithful interpretation, kind,
   hint and dependency corrections or explicit node splits/merges. Read the current revision first;
   stale updates fail atomically. Keep stable node IDs for the same mathematics. Original source
-  obligations are read-only: publish exact evidence and use source-repair tools, then `request_rechunk`
-  when a repair must be adopted into the argument/prerequisite mapping. Record a corrected
+  obligations are read-only: publish exact evidence and use source-repair tools. Unity diagnoses
+  a report before automatically replanning for a confirmed source defect. Record a corrected
   interpretation explicitly without rewriting the original obligation. Do not silently weaken a theorem;
 - reuse matching Mathlib results for cited prerequisites. If a needed prerequisite is missing, prove the
   needed API. No `sorry`, `admit`, new axioms, `native_decide`, or equivalent bypasses in final work;
@@ -102,7 +106,10 @@ Use `stage="complete"` (the default) when the representation and proof/construct
 complete implementation can adopt its representation and verify its proof in one call.
 Use `stage="representation"` only when a useful representation is ready before its proof. Temporary
 theorem proof holes are allowed in that stage, never unfinished meaning-bearing definition bodies.
-Once that representation is adopted, work on the remaining proof/construction and prerequisites;
+Once that representation is adopted, Unity requests a fresh, targeted source-correspondence review
+before its own or dependent proof work resumes. Unrelated tasks remain runnable. An aligned review
+is reused for unchanged encodings, including proof-only edits; final critic review is still required.
+After that review, work on the remaining proof/construction and prerequisites;
 do not resubmit the unchanged representation. Submit `stage="complete"` when that work is ready.
 An `already_adopted` response is a no-op, not a new candidate: no review or interrupt is pending from
 that call. Follow its `next_action`: continue useful proof work or call `yield_task` with the precise
@@ -131,19 +138,31 @@ work. For inline discharge or a record merely citing the target itself, use
 Its consumer mappings are already recorded; do not invent a self-dependency. This explanation is
 reviewed by the critic, not treated as a model-asserted proof. Preserve source statements/anchors.
 Refresh the brief after any refinement before submitting against its new revision.
+Use `request_rechunk` only when task organization or argument mappings need a revised plan;
+ordinary implementation repairs use refinement and candidates. An unchanged completed no-op replan
+request does not launch another chunker.
 
-Read authoritative verification blockers before acting on findings. A final candidate can be blocked
-by a prerequisite belonging to another completed task; read that exact record and correct its evidence
-with `refine_chunks`, preserving the existing proofs. Adding an output does not change a prerequisite
-resolution. `blocked` or `unchanged_failed` queues no new verification: do not repeat it until the
-relevant evidence or source changes. If unable to repair the blocker, yield with its exact ID so the
-diagnostic critic can address it. A finding's confidence never overrides a checked rejection.
+Distinguish last checked candidate rejections, applicable submission preflight, declared dependencies,
+and remaining global completion requirements in the brief. Global unfinished requirements and
+agent-reported obstacles do not add dependencies or prevent independent proof development. For an
+actual rejection, correct that exact candidate's evidence with `refine_chunks` or new source bytes,
+preserving unrelated proofs. Adding an output does not change a prerequisite resolution.
+`blocked` or `unchanged_failed` queues no new verification: do not repeat it unchanged. If unable to
+repair an applicable blocker, yield with its exact ID. A finding's confidence never overrides a
+checked rejection, but a global unfinished obligation does not invalidate a useful helper.
+
+To remove a superseded scaffold, explicitly delete it in your own worktree and submit
+`obsolete_files=[{"path":"Project/Old.lean","replacement_candidate_id":"<merged candidate>"}]`.
+The replacement must already be integrated and current. Retain adopted declaration bindings and
+fix imports/dependencies; Unity's normal candidate build must still pass. No automatic draft deletion
+occurs. Ordinary refactoring of your own unbound file does not require replacement metadata.
 
 If the supplied source is false, incomplete or ambiguous, call `report_source_issue` with exact anchors,
 affected task IDs and evidence. Explore a local repair or ask teammates for help. Use
 `submit_source_repair` to record a justified correction with evidence and explicit replacement text
-when needed. Original source bytes remain unchanged. Proposed repairs return through chunking and
-independent review; a changed theorem never silently counts as the original. Unity schedules optional
+when needed. Original source bytes remain unchanged. Reports are first diagnosed as a false alarm,
+encoding error, actual source defect, or uncertain. Only diagnosed source-defect repairs automatically
+return through chunking and independent review; a changed theorem never silently counts as the original. Unity schedules optional
 repair work when useful. Do not use solve-pipeline tools or invent a replacement paper.
 
 Use specific Mathlib modules; avoid `import Mathlib` and `import Mathlib.Tactic`. Narrow broad imports

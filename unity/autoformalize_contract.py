@@ -24,7 +24,7 @@ import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import artifacts, autoformalize_jobs, autoformalize_native, autoformalize_workspace
+from . import artifacts, autoformalize_cache, autoformalize_jobs, autoformalize_native, autoformalize_workspace
 from .autoformalize_spec import library_declarations, normalize_requirements, normalize_spec, task_spec_hash
 
 
@@ -49,9 +49,11 @@ class ContractEnvironmentError(ValueError):
 class ContractInspectionError(ValueError):
     """Kernel diagnostic with exact failed witness names, not parsed prose."""
 
-    def __init__(self, message: str, declaration_errors: list[dict] | None = None):
+    def __init__(self, message: str, declaration_errors: list[dict] | None = None,
+                 project_declarations: list[dict] | None = None):
         super().__init__(message)
         self.declaration_errors = declaration_errors or []
+        self.project_declarations = project_declarations or []
 
 
 @contextmanager
@@ -70,17 +72,24 @@ def digest(value: object) -> str:
                                      ensure_ascii=False).encode()).hexdigest()
 
 
-def observe_failure_inputs(root: Path, contract: dict) -> dict:
-    """Read current retry inputs only when a known rejection needs comparison."""
-    identity = source_identity(root)
+def policy_hash() -> str:
+    """Bind reuse to the current autoformalize checking implementation."""
     directory = Path(__file__).parent
     policy = {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in (
         "autoformalize_contract.py", "autoformalize_contract.lean",
         "autoformalize_spec.py", "autoformalize_runtime.py", "autoformalize_state.py",
+        "autoformalize_workspace.py", "autoformalize_workspace.lean",
+        "autoformalize_native.py", "autoformalize_jobs.py", "autoformalize_cache.py",
     )}
+    return digest(policy)
+
+
+def observe_failure_inputs(root: Path, contract: dict) -> dict:
+    """Read current retry inputs only when a known rejection needs comparison."""
+    identity = source_identity(root)
     return {"main_sha": identity["main_sha"], "source_sha256": identity["source_sha256"],
             "contract_sha256": contract.get("sha256"),
-            "environment_sha256": digest(identity["environment"]), "policy_sha256": digest(policy)}
+            "environment_sha256": digest(identity["environment"]), "policy_sha256": policy_hash()}
 
 
 def _prerequisite_blocker(row: dict, code: str, message: str, required_action: str) -> dict:
@@ -349,7 +358,8 @@ def module_for_file(root: Path, filename: str, modules: dict | None = None) -> s
 def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = None,
                         timings: dict | None = None,
                         external_declarations: list[str] | None = None,
-                        prerequisite_declarations: list[str] | None = None) -> dict:
+                        prerequisite_declarations: list[str] | None = None,
+                        _compiled_before: dict | None = None) -> dict:
     # Import every project module: generated/private dependencies are inspected by
     # the Lean helper, not filtered through the web blueprint presentation model.
     modules = sorted(set((workspace_modules(root) if layout is None else layout["modules"]).values()))
@@ -374,14 +384,32 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
     executable = autoformalize_native.executable(
         root, Path(__file__).with_suffix(".lean"), name="contract", timings=native_timings,
     )
+    cache_key, cache_identity, cache_before, cached = None, None, None, None
+    # Real projects have Git identity. Incomplete environments and unavailable
+    # cache observations always use the normal inspector, never fail open.
+    if (root / ".git").exists():
+        try:
+            cache_identity = source_identity(root, layout=layout)
+            cache_key = digest({"version": 1, "source": cache_identity["source_sha256"],
+                "environment": cache_identity["environment"], "policy": policy_hash(),
+                "executable": hashlib.sha256(executable.read_bytes()).hexdigest(),
+                "modules": modules, "targets": sorted(names), "externals": externals, "witnesses": witnesses})
+            cached, cache_before = autoformalize_cache.lookup(root, cache_key)
+            if _compiled_before is not None:
+                cached, cache_before = None, _compiled_before
+        except (OSError, ValueError, KeyError, TypeError):
+            cache_key = None
+    if timings is not None:
+        timings["inspection_cache_hit"] = cached is not None
     with measure(timings, "inspector_seconds"):
-        result = autoformalize_jobs.run(
+        result = (subprocess.CompletedProcess([], 0, json.dumps(cached), "") if cached is not None else autoformalize_jobs.run(
             root, ["lake", "env", str(executable), *modules, "--", *names,
                    *(["--external", *externals] if externals else []),
                    *(["--prerequisite", *witnesses] if witnesses else [])],
             cwd=root, owner="Unity", task_id="contract", serialize_build=True,
             timings=job_timings,
-        )
+        ))
+    inventory = []
     def failure(message: str, declaration_errors: list[dict] | None = None) -> ValueError:
         record = artifacts.store_text(
             root / ".unity" / "artifacts",
@@ -389,7 +417,8 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
                         "stderr": result.stderr}, ensure_ascii=False),
             kind="autoformalize_inspection", producer="Unity", source="formal contract inspector",
         )
-        return ContractInspectionError(f"{message}; full output: artifact {record['artifact_id']}", declaration_errors)
+        return ContractInspectionError(f"{message}; full output: artifact {record['artifact_id']}",
+                                       declaration_errors, inventory)
 
     try:
         data = json.loads(result.stdout.strip().splitlines()[-1])
@@ -401,6 +430,17 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
         raise failure(message) from exc
     if not isinstance(data, dict):
         raise failure("formal contract inspector did not return a JSON object")
+    inventory = data.get("project_declarations", [])
+    if (not isinstance(inventory, list) or any(not isinstance(row, dict)
+            or set(row) != {"name", "module", "kind"}
+            or not isinstance(row["name"], str) or not row["name"]
+            or not isinstance(row["module"], str) or not isinstance(row["kind"], str)
+            or row["module"] not in modules
+            or row["kind"] not in {"theorem", "def", "opaque", "inductive", "constructor", "recursor", "quot", "axiom"}
+            for row in inventory)
+            or len({row["name"] for row in inventory}) != len(inventory)):
+        inventory = []
+        raise failure("formal contract inspector returned invalid declaration inventory")
     issues = data.get("issues", [])
     if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
         raise failure("formal contract inspector returned invalid issues")
@@ -451,6 +491,23 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
         raise failure("formal contract inspector omitted project-wide axiom/placeholder audit")
     if timings is not None:
         timings["kernel_ms"] = data.get("timings_ms", {})
+    compiled = cache_before if cached is not None else None
+    if cache_key is not None and cached is None:
+        try:
+            if source_identity(root) == cache_identity:
+                compiled = autoformalize_cache.publish(root, cache_key, data, cache_before)
+        except autoformalize_cache.CacheUnavailable as exc:
+            if _compiled_before is None:
+                # Cache storage is optional. Only when its path hint cannot be
+                # saved, import once more with this known closure hashed first.
+                if timings is not None:
+                    timings["cache_unavailable_reinspection"] = True
+                return inspect_environment(root, tasks, layout=layout, timings=timings,
+                    external_declarations=external_declarations,
+                    prerequisite_declarations=prerequisite_declarations, _compiled_before=exc.identity)
+        except (OSError, ValueError):
+            pass
+    data["compiled_receipt"] = autoformalize_cache.compiled_receipt(root, compiled)
     return data
 
 
@@ -458,19 +515,37 @@ def inspect_declarations(root: Path, tasks: list[dict]) -> dict:
     return inspect_environment(root, tasks)["targets"]
 
 
-def _semantic_record(record: dict) -> dict:
-    return {key: value for key, value in record.items()
-            if key not in {"axioms", "signature", "proof_dependencies"}}
+def _alpha_binders(value):
+    if isinstance(value, dict):
+        return {key: _alpha_binders(item) for key, item in value.items()}
+    if not isinstance(value, list):
+        return value
+    result = [_alpha_binders(item) for item in value]
+    if (result and isinstance(result[0], str)
+            and len(result) == {"lam": 5, "forallE": 5, "letE": 6}.get(result[0])
+            and isinstance(result[1], list) and result[1]
+            and isinstance(result[1][0], str)
+            and result[1][0] in {"anonymous", "str", "num"}):
+        result[1] = ["anonymous"]
+    return result
 
 
-def _external_records(records: dict) -> dict:
+def _semantic_record(record: dict, *, fingerprint_version: int = 1) -> dict:
+    if fingerprint_version not in {1, 2}:
+        raise ValueError("unsupported semantic fingerprint version")
+    result = {key: value for key, value in record.items()
+              if key not in {"axioms", "signature", "proof_dependencies"}}
+    return _alpha_binders(result) if fingerprint_version == 2 else result
+
+
+def _external_records(records: dict, *, fingerprint_version: int = 1) -> dict:
     """Freeze kernel identities; human-readable signatures are display evidence only."""
     result = {}
     for name, row in records.items():
         if row.get("target_kind") == "axiom" or set(row["axioms"]) - AXIOMS:
             raise ContractInspectionError(f"external prerequisite {name} depends on forbidden axioms",
                                           [{"declaration": name, "code": "forbidden_axioms"}])
-        result[name] = {**row, "fingerprint": digest(_semantic_record(row))}
+        result[name] = {**row, "fingerprint": digest(_semantic_record(row, fingerprint_version=fingerprint_version))}
     return result
 
 
@@ -612,8 +687,8 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
     """
     from . import autoformalize_state
 
-    source = autoformalize_state.formal_source(
-        autoformalize_state.load_state(paths.forum) if state is None else state)
+    state = autoformalize_state.load_state(paths.forum) if state is None else state
+    source = autoformalize_state.formal_source(state)
     if (not source or dag.get("solution_candidate") != source["candidate_id"]
             or dag.get("solution_sha256") != source["sha256"]):
         raise ValueError("informal plan must target the current supplied-source snapshot")
@@ -622,8 +697,12 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
                                          {row["ref_id"] for row in source["source_refs"]})
     spec = normalize_spec(dag.get("spec"), source=source, requirements=requirements,
                           tasks=chunks, allow_unresolved=True)
+    previous_contract = state.get("formalization", {}).get("contract") or {}
     contract = _seal_contract({
         "version": 3,
+        "fingerprint_version": previous_contract.get("fingerprint_version", 1) if previous_contract else 2,
+        **({"representation_review_policy": previous_contract.get("representation_review_policy", 1)}
+           if not previous_contract or "representation_review_policy" in previous_contract else {}),
         "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
         "requirements": requirements, "spec": spec, "spec_sha256": digest(spec),
         "environment": environment_identity(paths.project_root) if environment is None else environment,
@@ -688,6 +767,7 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
                                 proposed_outputs: list[dict] | None, task_id: str | None,
                                 stage: str, final: bool, layout: dict | None,
                                 environment: dict | None, timings: dict | None) -> dict:
+    fingerprint_version = contract.get("fingerprint_version", 1)
     checked_complete = set(completed)
     if task_id is not None:
         if stage == "complete":
@@ -773,7 +853,7 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
         inspection = inspect_environment(root, actual_tasks, layout=layout, timings=timings,
                                          external_declarations=expected,
                                          **({"prerequisite_declarations": witnesses} if witnesses else {}))
-        external_records = _external_records(inspection["external_declarations"])
+        external_records = _external_records(inspection["external_declarations"], fingerprint_version=fingerprint_version)
         witness_records = inspection.get("prerequisite_declarations", {})
         if set(witness_records) != set(witnesses):
             raise ValueError("formal contract inspection omitted prerequisite declaration evidence")
@@ -786,7 +866,7 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
                             "Finish or replace this witness with a checked proof; a declaration name is not sufficient evidence.")
                         blockers.append(blocker)
                         issues.append(blocker["message"])
-        witness_records = {name: {**row, "fingerprint": digest(_semantic_record(row))}
+        witness_records = {name: {**row, "fingerprint": digest(_semantic_record(row, fingerprint_version=fingerprint_version))}
                            for name, row in witness_records.items()}
     except autoformalize_jobs.JobCancelled:
         raise
@@ -816,7 +896,8 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
                         "was not found in the built environment." if diagnostic["code"] == "not_found" else
                         "is not owned by a project source module."), "target_" + diagnostic["code"], owners,
                         "Correct the exact project output declaration/file; do not submit an imported library declaration as a project target.")
-        return {"passed": False, "issues": list(dict.fromkeys([*issues, str(exc)])), "blockers": blockers, "targets": {}}
+        return {"passed": False, "issues": list(dict.fromkeys([*issues, str(exc)])), "blockers": blockers, "targets": {},
+                "project_declarations": getattr(exc, "project_declarations", [])}
     environment = environment_identity(root) if environment is None else environment
     if environment != contract["environment"]:
         checked_issue("toolchain or dependency environment changed from the formal contract", "contract_environment_changed",
@@ -857,7 +938,7 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
     for task in actual_tasks:
         name, owner = task["lean_decl"], task["task_id"]
         row = targets[name]
-        fingerprint = digest(_semantic_record(row))
+        fingerprint = digest(_semantic_record(row, fingerprint_version=fingerprint_version))
         if row["module"] != module_for_file(root, task["lean_file"], layout["modules"]):
             checked_issue(f"candidate declaration {name} is not in {task['lean_file']}", "target_wrong_file", {owner},
                           "Correct the output file mapping; explicitly reopen adopted representations before relocating them.")
@@ -885,6 +966,8 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
     if witnesses or "prerequisite_declarations" in contract:
         proposed["prerequisite_declarations"] = witness_records
     return {"passed": not issues, "issues": issues, "blockers": blockers, "targets": targets,
+            "project_declarations": inspection.get("project_declarations", []),
+            "compiled_receipt": inspection.get("compiled_receipt"),
             "external_declarations": external_records,
             "prerequisite_declarations": witness_records,
             "verified_tasks": sorted(checked_complete), "verified_targets": verified_targets,
@@ -901,6 +984,8 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
     body = {key: value for key, value in contract.items() if key not in {"sha256", "artifact_id"}}
     if not contract or digest(body) != contract.get("sha256"):
         return {"passed": False, "issues": ["formal contract is missing or corrupt"], "targets": {}}
+    if contract.get("fingerprint_version", 1) not in {1, 2}:
+        return {"passed": False, "issues": ["unsupported semantic fingerprint version"], "targets": {}}
     if contract.get("version") not in {2, 3} or not isinstance(contract.get("spec"), dict):
         return {"passed": False, "issues": ["formal contract lacks source-evidence metadata; re-chunk it"], "targets": {}}
     if digest(contract["spec"]) != contract.get("spec_sha256"):
@@ -952,6 +1037,8 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
             if unexpected:
                 issues.append(f"{name} depends on forbidden axioms: {', '.join(sorted(unexpected))}")
     return {"passed": not issues, "issues": issues, "targets": targets,
+            "compiled_receipt": inspection.get("compiled_receipt"),
+            "project_declarations": inspection.get("project_declarations", []),
             "external_declarations": external_records}
 
 
@@ -1012,6 +1099,7 @@ def _prerequisite_evidence(contract: dict) -> dict:
 
 def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete: bool = True) -> bool:
     from .autoformalize_input import source_matches
+    from .autoformalize_representation import snapshot as representation_snapshot
     from .autoformalize_state import repair_digest
 
     if not snapshot:
@@ -1021,7 +1109,10 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
     contract = formal.get("contract") or {}
     source = state.get("input_source") or {}
     return (
-        current["main_sha"] == snapshot.get("main_sha") == formal.get("main_sha")
+        snapshot.get("policy_sha256") == policy_hash()
+        and (snapshot.get("passed") is not True
+             or autoformalize_cache.compiled_receipt_current(paths.project_root, snapshot.get("compiled_receipt")))
+        and current["main_sha"] == snapshot.get("main_sha") == formal.get("main_sha")
         and current["source_sha256"] == snapshot.get("source_sha256")
         and current["environment"] == snapshot.get("environment")
         and contract.get("sha256") == snapshot.get("contract_sha256")
@@ -1039,6 +1130,7 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
         and snapshot.get("repairs_sha256") == repair_digest(state)
         and snapshot.get("external_declarations") == _external_evidence(contract)
         and snapshot.get("prerequisite_declarations", {}) == _prerequisite_evidence(contract)
+        and snapshot.get("representation_reviews", {}) == representation_snapshot(state)
         and formal.get("revision") == snapshot.get("formalization_revision")
         and formal.get("solution_candidate") == snapshot.get("solution_candidate")
         == contract.get("solution_candidate") == source.get("candidate_id")
@@ -1053,7 +1145,8 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
 
 def verify_final_project(paths, state: dict) -> dict:
     from .autoformalize_input import source_matches
-    from .autoformalize_state import repair_digest
+    from .autoformalize_representation import snapshot as representation_snapshot
+    from .autoformalize_state import interface_available, repair_digest
 
     root = paths.project_root
     formal = state["formalization"]
@@ -1065,9 +1158,11 @@ def verify_final_project(paths, state: dict) -> dict:
     verification = last.get("verification") or {}
     complete_ids = set(state["formal_tasks"])
     build_reusable = (verification.get("status") == "passed"
+                      and verification.get("policy_sha256") == policy_hash()
                       and verification.get("source_identity") == before
                       and last.get("build", {}).get("returncode") == 0)
     reusable = (build_reusable
+                and autoformalize_cache.compiled_receipt_current(root, verification.get("compiled_receipt"))
                 and verification.get("contract_sha256") == formal.get("contract", {}).get("sha256")
                 and set(verification.get("verified_tasks", [])) == complete_ids)
     if contract.get("version") == 3:
@@ -1078,6 +1173,7 @@ def verify_final_project(paths, state: dict) -> dict:
     if reusable:
         build = {"returncode": 0, "reused_candidate": last["candidate_id"]}
         check = {"passed": True, "issues": [], "targets": {},
+                 "compiled_receipt": verification["compiled_receipt"],
                  "reused_verification": verification.get("artifact_id")}
     else:
         # Even if a plan's evidence metadata changed, exactly unchanged checked
@@ -1101,6 +1197,10 @@ def verify_final_project(paths, state: dict) -> dict:
         issues.append("source-evidence spec is missing or inconsistent; re-chunk it")
     if any(task.get("status") != "complete" for task in tasks) or not tasks:
         issues.append("formal tasks are incomplete")
+    if contract.get("representation_review_policy") == 1:
+        unreviewed = sorted(task["task_id"] for task in tasks if not interface_available(state, task))
+        if unreviewed:
+            issues.append("representation review is not aligned for tasks: " + ", ".join(unreviewed))
     if contract.get("version") == 3:
         if contract.get("sha256") != _seal_contract(contract)["sha256"]:
             issues.append("source contract is corrupt")
@@ -1125,6 +1225,8 @@ def verify_final_project(paths, state: dict) -> dict:
                  if not issues and review_contract.get("sha256") != contract.get("sha256") else {})
     report = {
         **before,
+        "policy_sha256": policy_hash(),
+        "compiled_receipt": check.get("compiled_receipt"),
         "passed": not issues,
         "issues": issues,
         "blockers": blockers,
@@ -1136,6 +1238,7 @@ def verify_final_project(paths, state: dict) -> dict:
         "repairs_sha256": repair_digest(state),
         "external_declarations": _external_evidence(review_contract),
         "prerequisite_declarations": _prerequisite_evidence(review_contract),
+        "representation_reviews": representation_snapshot(state),
         "accepted_candidates": {task["task_id"]: task.get("accepted_candidate") for task in tasks},
         "task_statuses": {task["task_id"]: task.get("status") for task in tasks},
         "declarations": {task["lean_decl"]: task["task_id"] for task in

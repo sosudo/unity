@@ -1072,7 +1072,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
         if phase and "UNITY_AUTOFORMALIZE_PROFILE" not in (env_overrides or {}):
             env_overrides = {**(env_overrides or {}), "UNITY_AUTOFORMALIZE_PROFILE": phase}
         # Other autoformalize phases keep their own prompts, without proof-development catalogs.
-        if mcp_profile == "autoformalize" and (log_context or {}).get("phase") == "formalizing":
+        if (mcp_profile == "autoformalize"
+                and (env_overrides or {}).get("UNITY_AUTOFORMALIZE_PROFILE", phase) == "formalizing"):
             system_prompt += "\n\n" + _autoformalize_external_tools_prompt(mcp_servers)
         if mcp_profile == "autoformalize":
             worker_env = dict(os.environ)

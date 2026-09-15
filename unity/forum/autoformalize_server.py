@@ -25,7 +25,8 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from .. import artifacts, autoformalize_contract, autoformalize_state, worktree
-from ..autoformalize_review import SemanticReview
+from ..autoformalize_review import SemanticReview, RepresentationReview, SourceDiagnosis
+from .. import autoformalize_representation, autoformalize_files
 from ..autoformalize_spec import normalize_outputs
 from . import server as discussion
 
@@ -33,7 +34,7 @@ from . import server as discussion
 FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
 PROFILE = "chunking"
-PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair"}
+PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair", "representation_review"}
 
 
 def configure(forum_dir: Path, project_root: Path, profile: str = "chunking") -> None:
@@ -150,7 +151,10 @@ def _submit_formal_commit(
     supersedes: str = "",
     stage: str = "complete",
     outputs: list[dict] | None = None,
+    obsolete_files: list[dict] | None = None,
 ) -> dict:
+    from .. import autoformalize_cache, autoformalize_files
+
     resolved = worktree.verify_candidate_commit(
         _root(), author, commit_sha, allow_unchanged=True,
     )
@@ -160,6 +164,7 @@ def _submit_formal_commit(
         "--binary", "--full-index", base, resolved,
     ).stdout
     diff_sha = hashlib.sha256(diff.encode()).hexdigest()
+    actual_paths = autoformalize_files.immutable_git_paths(_root(), base, resolved)
     representation_observation = None
     if stage == "representation":
         state = autoformalize_state.load_state(FORUM_DIR)
@@ -183,14 +188,39 @@ def _submit_formal_commit(
                 and item.get("failure_context", {}).get("cacheable")
                 and autoformalize_state.candidate_is_current(state, item)
                 for item in state.get("formal_candidates", {}).values())
-    with (_try_merge_lock() if retry else nullcontext(False)) as locked:
+    bindings = normalize_outputs(outputs) if outputs is not None else state.get("formal_tasks", {}).get(task_id, {}).get("outputs", [])
+    receipt, inventory = None, []
+    policy_sha = autoformalize_contract.policy_hash()
+    for item in state.get("formal_candidates", {}).values():
+        checked = item.get("verification") or {}
+        if (checked.get("status") != "passed" or not checked.get("inventory_artifact")
+                or checked.get("policy_sha256") != policy_sha
+                or checked.get("source_identity", {}).get("main_sha")
+                != state.get("formalization", {}).get("main_sha")):
+            continue
+        names = autoformalize_files.checked_inventory(_artifacts_dir(), checked)
+        if names and autoformalize_files.inventory_blockers(bindings, names):
+            receipt, inventory = checked, names
+            break
+    with (_try_merge_lock() if retry or receipt else nullcontext(False)) as locked:
         observation = None
+        inventory_observation = None
         if locked:
             state = autoformalize_state.load_state(FORUM_DIR)
             try:
-                observation = autoformalize_contract.observe_failure_inputs(
-                    _root(), state["formalization"].get("contract") or {},
-                )
+                if retry:
+                    observation = autoformalize_contract.observe_failure_inputs(
+                        _root(), state["formalization"].get("contract") or {},
+                    )
+                if (receipt and receipt["source_identity"]["main_sha"] == state["formalization"].get("main_sha")
+                        and _git(_root(), "rev-parse", f"{resolved}^{{tree}}").stdout.strip()
+                        == _git(_root(), "rev-parse", f"{receipt['source_identity']['main_sha']}^{{tree}}").stdout.strip()
+                        and autoformalize_contract.source_identity(_root()) == receipt["source_identity"]
+                        and autoformalize_cache.compiled_receipt_current(_root(), receipt.get("compiled_receipt"))):
+                    inventory_observation = {
+                        "state_context": autoformalize_state.failure_state_context(state),
+                        "project_declarations": inventory,
+                    }
             except (OSError, ValueError):
                 pass  # An unavailable cache observation never establishes rejection.
         result = autoformalize_state.submit_formal_candidate(
@@ -198,6 +228,8 @@ def _submit_formal_commit(
             notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
             representation_observation=representation_observation,
             failure_observation=observation,
+            inventory_observation=inventory_observation,
+            obsolete_files=obsolete_files, **actual_paths,
         )
     if result["status"] == "submitted" and not result.get("idempotent"):
         candidate = result["candidate"]
@@ -423,16 +455,14 @@ def _requirement_spec(state: dict, requirements: list[dict]) -> dict:
 
 
 def verification_blockers(state: dict, task_id: str = "") -> list[dict]:
-    """Derived diagnostics, not another mutable ledger or an acceptance claim."""
+    """Last checked candidate failures, never future global completion conditions."""
     formal = state.get("formalization", {})
     contract = formal.get("contract") or {}
     if contract.get("version") != 3:
         return []
-    completed = {key for key, row in state.get("formal_tasks", {}).items()
-                 if row.get("status") == "complete"}
-    rows = autoformalize_contract.prerequisite_blockers(contract, completed=completed, final=True)
-    # Global prerequisites remain visible even in a task-filtered brief. Add
-    # precise last-checked failures only while their contract/main are current.
+    rows = []
+    # Keep exact rejection evidence only for the current task/contract/main.
+    # Its repair can concern another task, but it is not a new dependency edge.
     latest = {}
     for candidate in state.get("formal_candidates", {}).values():
         if not autoformalize_state.candidate_is_current(state, candidate):
@@ -458,6 +488,29 @@ def verification_blockers(state: dict, task_id: str = "") -> list[dict]:
             seen.add(identity)
             result.append(row)
     return result
+
+
+def global_completion_requirements(state: dict) -> list[dict]:
+    contract = state.get("formalization", {}).get("contract") or {}
+    if contract.get("version") != 3:
+        return []
+    completed = {key for key, task in state.get("formal_tasks", {}).items()
+                 if task.get("status") == "complete"}
+    return [{**row, "scope": "global_completion"} for row in
+            autoformalize_contract.prerequisite_blockers(contract, completed=completed, final=True)]
+
+
+def task_readiness(state: dict, task_id: str) -> dict:
+    """Expose the actual graph without interpreting free-text obstacle reports."""
+    task = state.get("formal_tasks", {}).get(task_id, {})
+    def dependencies(kind):
+        return [{"task_id": key,
+                 "interface_available": autoformalize_state.interface_available(state, key),
+                 "proof_complete": state.get("formal_tasks", {}).get(key, {}).get("status") == "complete"}
+                for key in task.get(kind, task.get("dependencies", []) if kind == "statement_dependencies" else [])]
+    return {"runnable": autoformalize_state.task_ready(state, task),
+            "statement_dependencies": dependencies("statement_dependencies"),
+            "proof_dependencies": dependencies("proof_dependencies")}
 
 
 def autoformalize_requirements(offset: int = 0, limit: int = 20) -> str:
@@ -489,6 +542,7 @@ def autoformalize_requirements(offset: int = 0, limit: int = 20) -> str:
         "total": len(rows), "offset": offset,
         "next_offset": end if end < len(rows) else None,
         "requirements": rows[offset:end],
+        "remaining_global_requirements": global_completion_requirements(state) if offset == 0 else [],
         **_requirement_spec(state, rows[offset:end]),
     }, "requirements")
 
@@ -516,6 +570,13 @@ def autoformalize_task(task_id: str) -> str:
         "task": task, "assignment": autoformalize_state.assignment_view(state, task_id),
         "requirements": requirements,
         "verification_blockers": verification_blockers(state, task_id),
+        "submission_blockers": autoformalize_state.submission_blockers(state, task_id)
+            if task_id in tasks else [],
+        "readiness": task_readiness(state, task_id),
+        "remaining_global_requirements": global_completion_requirements(state),
+        "representation_review": autoformalize_representation.current_representation_review(state, task_id),
+        "file_reservations": {path: row for path, row in autoformalize_files.reservations(state).items()
+                              if task_id in {row["owner_task"], *row["shared_with"]}},
         "source_refs": [
             ref for ref in (state.get("input_source") or {}).get("source_refs", [])
             if ref["ref_id"] in source_ids
@@ -569,18 +630,31 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         f"Global source issues not resolved: {len(issues)}; "
         f"pending replan requests: {len(queued)}",
     ]
-    blockers = verification_blockers(state, next(iter(focus)) if len(focus) == 1 else "")
+    focus_id = next(iter(focus)) if len(focus) == 1 else ""
+    blockers = verification_blockers(state, focus_id)
+    preflight = autoformalize_state.submission_blockers(state, focus_id) if focus_id else []
     blocker_lines = []
     if blockers:
-        blocker_lines.extend(["", f"AUTHORITATIVE VERIFICATION BLOCKERS ({len(blockers)}; showing up to 6)",
-                      "Global prerequisites may belong to other completed tasks. Repair their evidence, "
-                      "not an unrelated proof. Findings are advice, not proof that a repair passed."])
+        blocker_lines.extend(["", f"LAST CHECKED CANDIDATE REJECTIONS ({len(blockers)}; showing up to 6)",
+                      "These apply to the identified candidate, not every task. "
+                      "A provider named in a rejection is not an additional dependency for unrelated work."])
         for row in blockers[:6]:
             blocker_lines.append(f"- {row.get('code')}: {row.get('prerequisite_id') or ''} "
                          f"tasks={','.join(row.get('task_ids', []))}: {row.get('message', '')[:240]}")
             blocker_lines.append(f"  Next: {row.get('required_action', '')[:240]}")
-        blocker_lines.append("Exact global prerequisite records: autoformalize_requirements; "
-                     "task details also include global verification_blockers.")
+        blocker_lines.append("Exact rejection and source-accounting records: autoformalize_task / autoformalize_requirements.")
+    if preflight:
+        blocker_lines.extend(["", "APPLICABLE FINAL-SUBMISSION PREFLIGHT",
+                              "These conditions would block this task's complete submission, not independent proof research."])
+        for row in preflight[:6]:
+            blocker_lines.append(f"- {row.get('code')}: {row.get('prerequisite_id')}: {row.get('message', '')[:240]}")
+            blocker_lines.append(f"  Next: {row.get('required_action', '')[:240]}")
+    if focus_id:
+        readiness = task_readiness(state, focus_id)
+        blocker_lines.extend(["", "DECLARED TASK DEPENDENCIES",
+            "Statement dependencies: " + (", ".join(row["task_id"] for row in readiness["statement_dependencies"]) or "none"),
+            "Proof dependencies: " + (", ".join(row["task_id"] for row in readiness["proof_dependencies"]) or "none"),
+            "An unfinished global obligation or agent-reported obstacle does not add a dependency."])
     if not review_phase:
         lines.extend(blocker_lines)
     snapshot = formal.get("review_snapshot")
@@ -605,6 +679,14 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
                      "Read the snapshot artifact and autoformalize_task(task_id) for exact detail.")
     if review_phase:
         lines.extend(blocker_lines)  # Never truncate the critic's current snapshot behind repair prose.
+    reviews = [(key, autoformalize_representation.current_representation_review(state, key))
+               for key in tasks if not related or key in related]
+    reviews = [(key, row) for key, row in reviews if row]
+    if reviews:
+        lines.extend(["", "CURRENT REPRESENTATION REVIEWS — source correspondence, not proof completion"])
+        for key, row in reviews[:6]:
+            lines.append(f"- {key}: {row['status']}; input {row['input_sha256'][:12]}; "
+                         f"autoformalize_task('{key}') for exact evidence")
     if focus:
         lines.extend(["", "YOUR ASSIGNED/CLAIMED TASKS"])
         for target in sorted(focus):
@@ -612,6 +694,11 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
             lines.append(f"- {target} [{task.get('status')}]: {task.get('title') or task.get('lean_decl')} "
                          f"{task.get('description', '')[:220]}")
         lines.append("Exact requirements, source citations and evidence: autoformalize_task(task_id).")
+        owned_files = [(path, row) for path, row in autoformalize_files.reservations(state).items()
+                       if focus.intersection({row["owner_task"], *row["shared_with"]})]
+        if owned_files:
+            lines.append("Reserved files: " + "; ".join(
+                f"{path} (owner {row['owner_task']})" for path, row in owned_files[:6]))
     if review_phase and (last_round := formal.get("last_round")):
         lines.extend(["", "LAST FORMALIZATION ATTEMPT"])
         for owner, reason in list(last_round.get("blocked_launches", {}).items())[:5]:
@@ -656,18 +743,22 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
                 repair = state.get("source_repairs", {}).get(repair_id, {})
                 lines.append(f"  proposal {repair_id} by {repair.get('author')}: "
                              f"{repair.get('explanation', '')[:180]}; artifact {repair.get('artifact_id')}")
-        lines.append("Explore gaps and submit a source repair proposal; original documents stay unchanged.")
+        lines.append("Reports require diagnosis: false alarm, encoding error, genuine source defect, or uncertain. "
+                     "A proposed repair alone does not queue a replan; original documents stay unchanged.")
     for item in queued[:3]:
         lines.append(f"Queued replan: {item.get('reason', '')[:200]}")
-    obstacles = [
-        item for item in state.get("obstacles", {}).values()
-        if item.get("status") == "open" and (not related or item.get("target") in related | {"", None})
-    ]
-    if obstacles:
-        lines.extend(["", "OPEN OBSTACLES"])
-        for item in obstacles[-5:]:
-            lines.append(f"- {item['obstacle_id']} task={item.get('target') or 'global'}: "
-                         f"{item.get('goal_state', '')[:250]}")
+    verified_dependencies = _verified_dependency_outputs(state, related - focus)
+    if verified_dependencies:
+        lines.extend(["", "MACHINE-VERIFIED DEPENDENCY OUTPUTS — not source-faithfulness approval"])
+        for record in verified_dependencies[:6]:
+            lines.append(f"- {record['task_id']}: current merged candidate {record['candidate_id']}; "
+                         f"autoformalize_task('{record['task_id']}')")
+            for output in record["outputs"][:6]:
+                lines.append(f"  {output['declaration']} — {output['file']}")
+            if len(record["outputs"]) > 6:
+                lines.append(f"  {len(record['outputs']) - 6} more outputs via autoformalize_task.")
+            if record.get("verification_artifact"):
+                lines.append(f"  verification artifact {record['verification_artifact']}")
     findings = _relevant_findings(state, related)
     if findings:
         lines.extend(["", "LIVE FINDINGS — agent-reported, not Unity acceptance"])
@@ -691,18 +782,22 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
             if item.get("evidence"):
                 lines.append(f"  agent-reported evidence: {item['evidence'][:180]}")
         lines.append("Read attached bytes with artifact_read; consume content and follow next_offset to null.")
-    verified_dependencies = _verified_dependency_outputs(state, related - focus)
-    if verified_dependencies:
-        lines.extend(["", "MACHINE-VERIFIED DEPENDENCY OUTPUTS — not source-faithfulness approval"])
-        for record in verified_dependencies[:6]:
-            lines.append(f"- {record['task_id']}: current merged candidate {record['candidate_id']}; "
-                         f"autoformalize_task('{record['task_id']}')")
-            for output in record["outputs"][:6]:
-                lines.append(f"  {output['declaration']} — {output['file']}")
-            if len(record["outputs"]) > 6:
-                lines.append(f"  {len(record['outputs']) - 6} more outputs via autoformalize_task.")
-            if record.get("verification_artifact"):
-                lines.append(f"  verification artifact {record['verification_artifact']}")
+    obstacles = [
+        item for item in state.get("obstacles", {}).values()
+        if item.get("status") == "open" and (not related or item.get("target") in related | {"", None})
+    ]
+    if obstacles:
+        lines.extend(["", "AGENT-REPORTED OBSTACLES — not additional scheduling constraints"])
+        for item in obstacles[-5:]:
+            lines.append(f"- {item['obstacle_id']} task={item.get('target') or 'global'}: "
+                         f"{item.get('goal_state', '')[:250]}")
+    global_requirements = global_completion_requirements(state)
+    if global_requirements:
+        lines.extend(["", "REMAINING GLOBAL COMPLETION REQUIREMENTS — not local proof blockers",
+                      "Independent work may continue. Missing helper proofs are work to develop or assign."])
+        for row in global_requirements[:4]:
+            lines.append(f"- {row.get('prerequisite_id')}: {row.get('message', '')[:200]}")
+        lines.append("All source-accounting details: autoformalize_requirements(offset=0).")
     if snapshot and not review_phase:
         lines.extend(snapshot_lines)
     requirements = formal.get("requirements", [])
@@ -880,6 +975,20 @@ def register_strategy(
 def claim_strategy(strategy_id: str, author: str) -> dict:
     """Atomically reserve a registered strategy."""
     return autoformalize_state.claim_strategy(FORUM_DIR, strategy_id, _author(author))
+
+
+def reserve_files(author: str, task_id: str, paths: list[str],
+                  share_with: list[str] | None = None) -> dict:
+    """Reserve task files; only the owning task can explicitly grant other tasks sharing."""
+    from .. import autoformalize_files
+
+    author = _author(author)
+    paths = autoformalize_files.normalize_paths(paths)
+    tree = worktree.agent_worktree(_root(), author).resolve()
+    for path in paths:
+        if not (tree / path).resolve().is_relative_to(tree):
+            raise ValueError("reserved files must stay inside the agent worktree")
+    return autoformalize_files.reserve_files(FORUM_DIR, author, task_id, paths, share_with=share_with)
 
 
 def assist_strategy(strategy_id: str, author: str, contribution: str = "") -> dict:
@@ -1087,6 +1196,7 @@ def emit_formalization_candidate(
     supersedes: str = "",
     stage: Literal["representation", "complete"] = "complete",
     outputs: list[dict] | None = None,
+    obsolete_files: list[dict] | None = None,
 ) -> dict:
     """Compatibility API for submitting an already-committed implementation."""
     author = _author(author)
@@ -1094,6 +1204,7 @@ def emit_formalization_candidate(
         return _submit_formal_commit(
             strategy_id, author, task_id, commit_sha,
             notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
+            obsolete_files=obsolete_files,
         )
 
 
@@ -1106,6 +1217,7 @@ def finalize_formalization(
     supersedes: str = "",
     stage: Literal["representation", "complete"] = "complete",
     outputs: list[dict] | None = None,
+    obsolete_files: list[dict] | None = None,
 ) -> dict:
     """Commit current worktree bytes and submit one immutable formal candidate.
 
@@ -1212,6 +1324,7 @@ def finalize_formalization(
         result = _submit_formal_commit(
             strategy_id, author, task_id, head,
             notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
+            obsolete_files=obsolete_files,
         )
         return {
             **result,
@@ -1716,8 +1829,25 @@ def request_rechunk(author: str, reason: str, task_ids: list[str] | None = None)
     """
     author = _author(author)
     result = autoformalize_state.request_rechunk(FORUM_DIR, author, reason, task_ids=task_ids)
-    _mirror(author, "FORMALIZATION REPLAN REQUESTED", reason)
+    if not result.get("idempotent"):
+        _mirror(author, "FORMALIZATION REPLAN REQUESTED", reason)
     return result
+
+
+def submit_representation_review(author: str, task_id: str, review: RepresentationReview) -> dict:
+    """Submit evidence for the exact input assigned to this fresh representation reviewer."""
+    with _merge_lock():
+        return autoformalize_representation.submit_representation_review(
+            FORUM_DIR, _author(author), task_id, RepresentationReview.model_validate(review).model_dump(),
+        )
+
+
+def submit_source_diagnosis(author: str, issue_id: str, review: SourceDiagnosis) -> dict:
+    """Classify a reported source problem before repair adoption or encoding invalidation."""
+    with _merge_lock():
+        return autoformalize_representation.submit_source_diagnosis(
+            FORUM_DIR, _author(author), issue_id, SourceDiagnosis.model_validate(review).model_dump(),
+        )
 
 
 def submit_formalization_verdict(
@@ -1776,10 +1906,12 @@ PROFILE_TOOLS = {
     "formalizing": COMMON + COORDINATION + (
         finalize_formalization, emit_formalization_candidate, sync_from_main, request_rechunk,
         report_source_issue, submit_source_repair, refine_chunks,
+        reserve_files,
     ),
     "critic": COMMON + SOURCE_FEEDBACK + (request_rechunk, submit_formalization_verdict),
     "retrospective": COMMON,
-    "source_repair": COMMON + SOURCE_FEEDBACK,
+    "source_repair": COMMON + SOURCE_FEEDBACK + (submit_source_diagnosis,),
+    "representation_review": COMMON + (submit_representation_review,),
 }
 
 

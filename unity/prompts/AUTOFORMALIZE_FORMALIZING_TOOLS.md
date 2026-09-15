@@ -36,10 +36,13 @@ findings and candidate events. These tools belong to the autoformalization runti
   answers an existing question.
 - `forum_post(thread_id, author, content, reply_to?)` posts free-form discussion; `reply_to` is an
   optional list of post IDs. A post does not reserve work or submit a candidate.
-- `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?, stage?, outputs?)` commits the
+- `reserve_files(author, task_id, paths, share_with?)` reserves worktree-relative paths for a claimed
+  task. Same-task workers share them. Only the owner task can grant cross-task sharing with a list of
+  task IDs in `share_with`. Prefer separate modules for independent work; conflicts preserve private edits.
+- `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?, stage?, outputs?, obsolete_files?)` commits the
   current exact worktree bytes and submits an immutable candidate for the authoritative main build and
   declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
-- `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?)` is the
+- `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?, obsolete_files?)` is the
   compatibility route for already-committed bytes; normally use `finalize_formalization`.
 - `sync_from_main(author, reason?)` merges accepted main without discarding local work. Uncommitted
   tracked edits and pending candidates block sync; unrelated untracked files do not. Git refuses to
@@ -71,14 +74,16 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
   for a task, including relevant dependency findings and current machine-verified dependency outputs.
-  `verification_blockers` includes exact global prerequisite failures even outside that task's scope;
-  the brief puts these authoritative diagnostics before agent-reported findings.
+  `verification_blockers` records actual checked candidate failures. `submission_blockers` is current
+  prospective submission preflight. `readiness` lists declared dependencies. `remaining_global_requirements`
+  is completion accounting, not an additional task dependency. Do not stop independent work for it.
   Those verified outputs do not require a finding; representation adoption alone is not verification.
   The normal brief prioritizes your task, its candidates and blockers, then reusable findings before
   the coverage summaries. Machine verification is not a source-faithfulness approval.
-- `report_source_issue(author, anchor_ids, description, task_ids?)` records a source defect.
+- `report_source_issue(author, anchor_ids, description, task_ids?)` records a suspected source defect.
   `submit_source_repair(author, issue_id, explanation, evidence, replacement?)` proposes an explicit
-  evidence-backed spot repair. Unity routes it through chunking and independent review.
+  evidence-backed spot repair. Unity diagnoses source-vs-encoding errors first; only a confirmed
+  source-defect proposal automatically queues chunking. A false report does not require a new plan.
 
 Original source bytes must not change. Explore source defects and propose explicit corrections instead
 of modifying the input or silently formalizing a different statement.
@@ -89,7 +94,9 @@ A complete implementation can adopt the representation and verify its proof in o
 `stage="representation"` shares a locally checked representation before proof completion; it may
 contain theorem proof holes, never unfinished meaning-bearing definitions. Representation adoption
 does not mean proof completion or faithfulness. Candidate versions retain exact commits/manifests.
-After adoption, work on the remaining proof/construction and prerequisites; do not resubmit the
+After adoption, Unity schedules targeted representation review before own/dependent proof work.
+Unrelated work continues. Unchanged encodings reuse that evidence; final critic review remains.
+After alignment approval, work on the remaining proof/construction and prerequisites; do not resubmit the
 unchanged representation. Use `stage="complete"` when ready, or `refine_chunks` with
 `reopen_representations` if the adopted encoding needs correction. An `already_adopted` response
 queues no new candidate or review interrupt. Follow its `next_action`: continue useful proof work,
@@ -100,6 +107,11 @@ yield with the exact blocker IDs in the reason. Repeated receipt IDs or findings
 progress. Metadata-only corrections preserve unchanged Lean proof evidence but require semantic review.
 Task details distinguish assignment (claims/assistants), representation, verification and faithfulness,
 all with current revision-bound evidence; proof-only prerequisites need not delay statement work.
+
+For explicit superseded-scaffold cleanup, delete the file privately and pass
+`obsolete_files=[{"path":"Project/Old.lean","replacement_candidate_id":"<current merged candidate>"}]`.
+No automatic deletion occurs. The replacement must be integrated, adopted bindings preserved, and
+imports/dependencies must still build. Normal edits to your own unbound files need no cleanup metadata.
 
 For a backend without native MCP, use `unity mcp unity-forum <tool> '<json-args>'`. For multiline Lean or
 quoted content, serialize the JSON argument object and pass a file/stdin rather than hand-quoting Lean:

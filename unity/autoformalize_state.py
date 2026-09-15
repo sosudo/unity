@@ -82,6 +82,8 @@ def _default_state() -> dict:
         "retired_tasks": {},
         "refinements": [],
         "formal_candidates": {},
+        "representation_reviews": {},
+        "file_reservations": {},
         "source_issues": {},
         "source_repairs": {},
         "replan_requests": {},
@@ -106,7 +108,7 @@ def _read_unlocked(forum_dir: Path) -> dict:
     for key in (
         "strategies", "findings", "obstacles", "questions",
         "solution_candidates", "formal_tasks", "formal_candidates",
-        "review_snapshots",
+        "review_snapshots", "representation_reviews", "file_reservations",
         "source_issues", "source_repairs", "replan_requests",
         "retired_tasks", "task_yields", "worker_tasks", "worktree_checkpoints",
     ):
@@ -281,6 +283,7 @@ def candidate_failure_key(candidate: dict, observation: dict | None) -> str | No
         )},
         "stage": candidate.get("stage", "complete"),
         "outputs": sorted(candidate.get("outputs", []), key=lambda row: (row["declaration"], row["file"])),
+        "obsolete_files": sorted(candidate.get("obsolete_files", []), key=lambda row: row["path"]),
     })
 
 
@@ -360,7 +363,11 @@ def open_source_issues(state: dict) -> list[dict]:
 
 
 def ready_source_issues(state: dict) -> list[dict]:
-    return [item for item in open_source_issues(state) if item.get("status") == "open"]
+    from .autoformalize_representation import source_diagnosis_current
+
+    return [item for item in open_source_issues(state) if item.get("status") == "open"
+            or (item.get("status") == "proposed"
+                and (source_diagnosis_current(state, item["issue_id"]) or {}).get("verdict") != "source_defect")]
 
 
 def _live_repair_ids(issue: dict) -> set[str]:
@@ -380,7 +387,7 @@ def claim_source_issue(forum_dir: Path, issue_id: str, author: str,
         if not issue:
             raise ValueError("unknown source issue")
         used = sum(author_key(row["author"]) == author_key(author) for row in issue["attempts"])
-        if issue["status"] != "open":
+        if not any(row["issue_id"] == issue_id for row in ready_source_issues(state)):
             return {"status": "conflict", "issue": deepcopy(issue)}
         if used >= max_attempts:
             return {"status": "exhausted", "issue": deepcopy(issue)}
@@ -403,9 +410,10 @@ def finish_source_repair_attempt(forum_dir: Path, issue_id: str, author: str,
             raise ValueError("unknown source repair attempt/owner")
         if attempt["status"] != "active":
             return deepcopy(issue)
-        attempt.update(status="proposed" if _live_repair_ids(issue) else "failed",
+        attempt.update(status="resolved" if issue.get("status") == "resolved" else
+                       "proposed" if _live_repair_ids(issue) else "failed",
                        error=_text(error, "error", required=False), finished_at=time.time())
-        if author_key(issue.get("owner")) == author_key(author):
+        if issue.get("status") not in {"resolved", "unresolved"} and author_key(issue.get("owner")) == author_key(author):
             issue.update(status="proposed" if _live_repair_ids(issue) else "open", owner=None)
         _event(state, "source_repair_attempt_finished", issue_id=issue_id, attempt_id=attempt_id,
                status=attempt["status"])
@@ -417,7 +425,7 @@ def mark_source_issue_unresolved(forum_dir: Path, issue_id: str, reason: str) ->
         issue = state["source_issues"].get(issue_id)
         if not issue:
             raise ValueError("unknown source issue")
-        if issue["status"] == "open":
+        if issue in ready_source_issues(state):
             issue.update(status="unresolved", reason=_text(reason, "reason"), owner=None)
             _event(state, "source_issue_unresolved", issue_id=issue_id, reason=reason)
     return deepcopy(issue)
@@ -433,7 +441,8 @@ def recover_source_repairs(forum_dir: Path) -> None:
             for row in active:
                 row.update(status="interrupted", error="controller resumed after interruption",
                            finished_at=time.time())
-            issue.update(owner=None, status="proposed" if _live_repair_ids(issue) else "open")
+            if issue.get("status") not in {"resolved", "unresolved"}:
+                issue.update(owner=None, status="proposed" if _live_repair_ids(issue) else "open")
             _event(state, "source_repair_recovered", issue_id=issue["issue_id"])
 
 
@@ -465,7 +474,11 @@ def submit_source_repair(forum_dir: Path, author: str, issue_id: str,
         issue["status"] = "proposed"
         _invalidate_review(state)
         _event(state, "source_repair_proposed", issue_id=issue_id, repair_id=repair["repair_id"], author=author)
-        if state["phase"] in {"formalizing", "critic"}:
+        from .autoformalize_representation import source_diagnosis_current
+
+        diagnosis = source_diagnosis_current(state, issue_id)
+        if (diagnosis and diagnosis["verdict"] == "source_defect"
+                and state["phase"] in {"formalizing", "critic"}):
             _queue_replan(state, author, "Adopt/review source repair " + repair["repair_id"], issue["task_ids"])
     return deepcopy(repair)
 
@@ -968,6 +981,21 @@ def pending_replan(state: dict) -> dict | None:
                  if row.get("status") == "queued"), None)
 
 
+def _replan_input(state: dict) -> str:
+    """Meaningful plan inputs, excluding receipts, counters and event chatter."""
+    formal = state["formalization"]
+    contract = formal.get("contract") or {}
+    return digest({
+        "source": formal_source(state).get("sha256"),
+        "spec": formal.get("spec"), "requirements": formal.get("requirements"),
+        "tasks": {key: informal_interpretation_hash(task)
+                  for key, task in state["formal_tasks"].items()},
+        "bindings": contract.get("bindings"),
+        "targets": {key: row.get("fingerprint") for key, row in contract.get("targets", {}).items()},
+        "repairs": repair_digest(state),
+    })
+
+
 def _queue_replan(state: dict, author: str, reason: str, task_ids=None) -> dict:
     targets = list(dict.fromkeys(task_ids or []))
     if set(targets) - state["formal_tasks"].keys():
@@ -976,11 +1004,19 @@ def _queue_replan(state: dict, author: str, reason: str, task_ids=None) -> dict:
     if existing:
         # Empty scope means global. Multiple requests conservatively union scope.
         existing["task_ids"] = sorted(set(existing["task_ids"]) | set(targets)) if existing["task_ids"] and targets else []
-        existing.setdefault("additional_reasons", []).append(reason)
+        if reason != existing["reason"] and reason not in existing.setdefault("additional_reasons", []):
+            existing["additional_reasons"].append(reason)
         return existing
+    input_sha256 = _replan_input(state)
+    for previous in state["replan_requests"].values():
+        if (previous.get("status") == "complete" and previous.get("no_op")
+                and previous.get("input_sha256") == input_sha256
+                and set(previous["task_ids"]) == set(targets)
+                and " ".join(previous["reason"].split()) == " ".join(str(reason).split())):
+            return {**previous, "idempotent": True, "unchanged_plan": True}
     request = {"request_id": _id("replan"), "author": _text(author, "author", 100),
                "reason": _text(reason, "reason"), "task_ids": targets,
-               "status": "queued", "created_at": time.time()}
+               "status": "queued", "created_at": time.time(), "input_sha256": input_sha256}
     state["replan_requests"][request["request_id"]] = request
     _invalidate_review(state)
     _event(state, "rechunk_requested", **request)
@@ -1139,6 +1175,12 @@ def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: di
         if contract.get("environment") != previous["contract"].get("environment"):
             raise ValueError("replanning cannot silently replace the protected Lean environment")
         contract = deepcopy(contract)
+        # Existing protected fingerprints must retain their serialization policy.
+        contract["fingerprint_version"] = previous["contract"].get("fingerprint_version", 1)
+        if "representation_review_policy" in previous["contract"]:
+            contract["representation_review_policy"] = previous["contract"]["representation_review_policy"]
+        else:
+            contract.pop("representation_review_policy", None)
         for field in ("targets", "bindings", "external_declarations", "prerequisite_declarations"):
             if field in previous["contract"] or field != "prerequisite_declarations":
                 contract[field] = deepcopy(previous["contract"].get(field, {}))
@@ -1160,10 +1202,14 @@ def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: di
         affected = _invalidate_informal_tasks(state, affected, reason="informal interpretation changed")
     carried = [key for key, task in tasks.items() if task["status"] == "complete"]
     state["phase"] = "formalizing"
+    from .autoformalize_representation import queue_representation_review
+    for key in tasks:
+        queue_representation_review(state, key)
     replan = state.get("replan") or {}
     if replan:
         replan.update(status="complete", affected_tasks=sorted(affected), carried_tasks=carried)
-        state["replan_requests"][replan["request_id"]]["status"] = "complete"
+        request = state["replan_requests"][replan["request_id"]]
+        request.update(status="complete", no_op=request.get("input_sha256") == _replan_input(state))
     _event(state, "formalization_initialized", formalization_revision=revision,
            tasks=list(tasks), solution_candidate=source["candidate_id"],
            affected_tasks=sorted(affected), carried_tasks=carried)
@@ -1353,6 +1399,9 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
                                                     "faithfulness": deepcopy(task["faithfulness"])})
             task["faithfulness"] = {"status": "stale", "verdict_id": None}
         formal["contract"]["sha256"] = _contract_digest(formal["contract"])
+        from .autoformalize_representation import queue_representation_review
+        for key in tasks:
+            queue_representation_review(state, key)
         _invalidate_review(state)
         record = {"author": author, "timestamp": time.time(), "previous_revision": expected_revision,
                   "changes": deepcopy(changes), "affected_tasks": sorted(affected)}
@@ -1537,6 +1586,28 @@ def _validate_requirements(requirements, tasks: dict, source_refs: set[str]) -> 
     return normalize_requirements(requirements, tasks, source_refs)
 
 
+def submission_blockers(state: dict, task_id: str, stage: str = "complete") -> list[dict]:
+    """Prospective submission constraints, not general proof-search readiness.
+
+    Inline obligations belonging to the candidate itself are satisfied only
+    provisionally here; the subsequent kernel check still has to verify it.
+    Whole-project accounting gates only the candidate that would finish it.
+    """
+    from .autoformalize_contract import prerequisite_blockers
+
+    contract = state.get("formalization", {}).get("contract") or {}
+    if contract.get("version") != 3:
+        return []
+    tasks = state.get("formal_tasks", {})
+    if task_id not in tasks or stage not in {"representation", "complete"}:
+        raise ValueError("submission preflight requires a known task and candidate stage")
+    completed = {key for key, task in tasks.items() if task.get("status") == "complete"}
+    if stage == "complete":
+        completed.add(task_id)
+    return prerequisite_blockers(contract, completed=completed,
+                                 final=bool(tasks) and completed == set(tasks))
+
+
 def ready_formal_tasks(state: dict) -> list[dict]:
     tasks = state.get("formal_tasks", {})
     return [task for task in tasks.values() if task_ready(state, task)]
@@ -1544,8 +1615,12 @@ def ready_formal_tasks(state: dict) -> list[dict]:
 
 def interface_available(state: dict, task: dict | str) -> bool:
     task = state.get("formal_tasks", {}).get(task, {}) if isinstance(task, str) else task
-    return bool(task and (task.get("status") == "complete"
-                         or task.get("representation", {}).get("status") == "adopted"))
+    adopted = bool(task and (task.get("status") == "complete"
+                            or task.get("representation", {}).get("status") == "adopted"))
+    if not adopted or (state.get("formalization", {}).get("contract") or {}).get("representation_review_policy") != 1:
+        return adopted
+    from .autoformalize_representation import current_representation_review
+    return (current_representation_review(state, task["task_id"]) or {}).get("status") == "aligned"
 
 
 def task_ready(state: dict, task: dict | str) -> bool:
@@ -1553,8 +1628,14 @@ def task_ready(state: dict, task: dict | str) -> bool:
     if (not task or task.get("status") != "pending"
             or source_issues_blocking_task(state, task["task_id"])):
         return False
+    if task.get("representation", {}).get("status") == "adopted" and not interface_available(state, task):
+        return False
     if "statement_dependencies" in task:
-        return all(interface_available(state, dep) for dep in task["statement_dependencies"])
+        dependencies = set(task["statement_dependencies"])
+        if (task.get("representation", {}).get("status") == "adopted"
+                and (state.get("formalization", {}).get("contract") or {}).get("representation_review_policy") == 1):
+            dependencies.update(task.get("proof_dependencies", []))
+        return all(interface_available(state, dep) for dep in dependencies)
     return all(state["formal_tasks"].get(dep, {}).get("status") == "complete"
                for dep in task.get("dependencies", []))
 
@@ -1589,6 +1670,8 @@ def _rejection_identity(state: dict, author: str, task_id: str) -> str | None:
 
 
 def _attempt_progress(state: dict, author: str, task_id: str) -> str:
+    from .autoformalize_files import reservations
+    from .autoformalize_representation import snapshot as representation_snapshot
     tasks = state.get("formal_tasks", {})
     targets = (state.get("formalization", {}).get("contract") or {}).get("targets", {})
     relevant = _task_dependencies(state, task_id) | {task_id}
@@ -1609,6 +1692,10 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
         "source": [source.get("candidate_id"), source.get("sha256")],
         "rejection": _failure_progress(rejection),
         "prerequisites": prerequisites,
+        "writable_files": sorted(path for path, row in reservations(state).items()
+                                 if task_id in {row["owner_task"], *row["shared_with"]}),
+        "representation_reviews": {key: row for key, row in representation_snapshot(state).items()
+                                   if key in relevant},
         "tasks": {key: {
             "revision": tasks.get(key, {}).get("revision"),
             "interpretation": informal_interpretation_hash(tasks.get(key, {})),
@@ -1840,7 +1927,16 @@ def submit_formal_candidate(
     outputs: list[dict] | None = None,
     representation_observation: dict | None = None,
     failure_observation: dict | None = None,
+    changed_paths: list[str] | None = None,
+    deleted_paths: list[str] | None = None,
+    obsolete_files: list[dict] | None = None,
+    inventory_observation: dict | None = None,
 ) -> dict:
+    from . import autoformalize_files
+
+    cleanup = autoformalize_files.normalize_cleanup(obsolete_files)
+    paths = autoformalize_files.normalize_paths(changed_paths or [])
+    deletions = autoformalize_files.normalize_paths(deleted_paths or [])
     if stage not in {"representation", "complete"}:
         raise ValueError("candidate stage must be representation or complete")
     normalized_outputs = normalize_outputs(outputs) if outputs is not None else None
@@ -1893,6 +1989,7 @@ def submit_formal_candidate(
                     and existing.get("diff_sha256") == diff_sha256
                     and existing.get("stage", "complete") == stage
                     and existing.get("outputs", []) == bindings
+                    and existing.get("obsolete_files", []) == cleanup
                 ):
                     return {"status": "submitted", "candidate": existing, "idempotent": True}
                 return {"status": "conflict", "candidate": existing}
@@ -1900,14 +1997,24 @@ def submit_formal_candidate(
             raise ValueError("formal strategy/task is not accepting a new candidate")
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
+        files = {"task_id": task_id, "outputs": bindings, "changed_paths": paths, "deleted_paths": deletions,
+                 "obsolete_files": cleanup}
+        blockers = autoformalize_files.validate_candidate_files(state, files)
+        if blockers:
+            return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
+                    "blockers": blockers, "error": "; ".join(row["message"] for row in blockers)}
+        if inventory_observation is not None:
+            if inventory_observation.get("state_context") != failure_state_context(state):
+                return {"status": "retry", "task_id": task_id,
+                        "next_action": "Accepted state changed during submission; refresh and retry."}
+            blockers = autoformalize_files.inventory_blockers(bindings, inventory_observation["project_declarations"])
+            if blockers:
+                for blocker in blockers:
+                    blocker["task_ids"] = [task_id]
+                return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
+                        "blockers": blockers, "error": "; ".join(row["message"] for row in blockers)}
         if contract.get("version") == 3:
-            from .autoformalize_contract import prerequisite_blockers
-
-            completed = {key for key, row in state["formal_tasks"].items() if row.get("status") == "complete"}
-            if stage == "complete":
-                completed.add(task_id)
-            blockers = prerequisite_blockers(contract, completed=completed,
-                                             final=len(completed) == len(state["formal_tasks"]))
+            blockers = submission_blockers(state, task_id, stage)
             if blockers:
                 return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
                         "blockers": blockers, "error": "; ".join(row["message"] for row in blockers),
@@ -1916,7 +2023,7 @@ def submit_formal_candidate(
         proposal = {"task_id": task_id, "task_revision": task["revision"],
                     "solution_sha256": formal_source(state).get("sha256"),
                     "base_main_sha": base_main_sha.casefold(), "diff_sha256": diff_sha256,
-                    "stage": stage, "outputs": bindings}
+                    "stage": stage, "outputs": bindings, "obsolete_files": cleanup}
         if failure_observation is not None:
             if any(failure_observation.get(key) != value for key, value in failure_state_context(state).items()):
                 return {"status": "retry", "task_id": task_id,
@@ -1948,6 +2055,9 @@ def submit_formal_candidate(
                     "status": "already_adopted", "task_id": task_id,
                     "candidate_id": adopted["candidate_id"],
                     "next_action": (
+                        "This representation is adopted but its targeted review is not aligned yet. "
+                        "Refresh autoformalize_task; do not resubmit unchanged statements or begin dependent work."
+                        if not interface_available(state, task) else
                         "This representation is already adopted. Continue the proof and submit "
                         "stage='complete', or yield_task if blocked. Do not resubmit unchanged "
                         "statements; explicitly refine the node if its representation is incorrect."
@@ -1965,6 +2075,7 @@ def submit_formal_candidate(
                 and existing.get("diff_sha256") == diff_sha256
                 and existing.get("stage", "complete") == stage
                 and existing.get("outputs", []) == bindings
+                and existing.get("obsolete_files", []) == cleanup
             ):
                 return {
                     "status": "unchanged_failed",
@@ -1987,6 +2098,9 @@ def submit_formal_candidate(
             "task_revision": task["revision"],
             "stage": stage,
             "outputs": bindings,
+            "changed_paths": paths,
+            "deleted_paths": deletions,
+            "obsolete_files": cleanup,
             "source_components": list(task.get("source_components", [])),
             "notes": _text(notes, "notes", 2000, required=False),
             "supersedes": supersedes or None,
@@ -1994,6 +2108,7 @@ def submit_formal_candidate(
             "created_at": time.time(),
         }
         state["formal_candidates"][candidate_id] = candidate
+        autoformalize_files.record_candidate_reservations(state, candidate)
         task["status"] = "candidate_pending"
         for item in state["strategies"].values():
             if item.get("phase") == "formalizing" and item.get("target") == task_id and item.get("status") in _ACTIVE_STRATEGIES:
@@ -2057,6 +2172,9 @@ def finish_formal_merge(
             if (not verification or verification.get("status") != "passed"
                     or verification.get("contract_sha256") != contract.get("sha256") or not contract):
                 raise ValueError("successful merge requires verification against the current formal contract")
+            from .autoformalize_contract import policy_hash
+            if verification.get("policy_sha256") != policy_hash():
+                raise ValueError("successful merge requires verification under the current policy")
             incremental = current_contract.get("version") == 3
             if incremental:
                 if (contract.get("sha256") != _contract_digest(contract)
@@ -2065,6 +2183,8 @@ def finish_formal_merge(
                         or contract.get("spec_sha256") != current_contract["spec_sha256"]
                         or contract.get("requirements") != current_contract["requirements"]
                         or contract.get("environment") != current_contract["environment"]
+                        or contract.get("fingerprint_version", 1) != current_contract.get("fingerprint_version", 1)
+                        or contract.get("representation_review_policy") != current_contract.get("representation_review_policy")
                         or contract.get("obligation_ids") != current_contract.get("obligation_ids")):
                     raise ValueError("candidate contract extension changed the bound source plan or environment")
                 for name, target in current_contract.get("targets", {}).items():
@@ -2098,6 +2218,8 @@ def finish_formal_merge(
                                     "verified_targets": deepcopy(verification.get("verified_targets", {}))}
             task["faithfulness"] = {"status": "unreviewed", "verdict_id": None}
             state["formalization"]["main_sha"] = main_sha.casefold()
+            from .autoformalize_representation import queue_representation_review
+            queue_representation_review(state, task["task_id"])
             _invalidate_review(state)
             for obstacle in state["obstacles"].values():
                 if not representation_only and obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
@@ -2194,6 +2316,8 @@ def _report_digest(report: dict | list) -> str:
 
 
 def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: bool) -> None:
+    from .autoformalize_contract import policy_hash
+    from .autoformalize_representation import snapshot as representation_snapshot
     formal = state["formalization"]
     contract = formal.get("contract")
     if not isinstance(contract, dict) or not formal.get("requirements"):
@@ -2212,6 +2336,7 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
         if not isinstance(report.get(field), str) or not pattern.fullmatch(report[field]):
             raise ValueError(f"review snapshot requires a full {field}")
     expected = {"main_sha": formal.get("main_sha"),
+                "policy_sha256": policy_hash(),
                 "solution_candidate": formal.get("solution_candidate"),
                 "solution_sha256": formal.get("solution_sha256"),
                 "formalization_revision": formal.get("revision"),
@@ -2220,6 +2345,8 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
                 "repairs_sha256": repair_digest(state)}
     if any(report.get(key) != value for key, value in expected.items()):
         raise ValueError("review snapshot is stale for the current formalization")
+    if report.get("representation_reviews", {}) != representation_snapshot(state):
+        raise ValueError("review snapshot has stale representation evidence")
     if (formal.get("spec") != contract.get("spec")
             or contract.get("spec_sha256") != digest(formal.get("spec"))):
         raise ValueError("source specification differs from its frozen contract")
@@ -2230,6 +2357,8 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
             raise ValueError(f"{field} prerequisite evidence differs from the frozen contract")
     if require_passed and (pending_replan(state) or open_source_issues(state)):
         raise ValueError("review cannot approve pending replanning or unresolved source issues")
+    if require_passed and any(not interface_available(state, task) for task in state["formal_tasks"].values()):
+        raise ValueError("review cannot approve unreviewed or rejected representations")
     solution_id = formal.get("solution_candidate")
     source = formal_source(state)
     if not source or source.get("candidate_id") != solution_id:

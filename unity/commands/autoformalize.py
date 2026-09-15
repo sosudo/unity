@@ -638,11 +638,16 @@ async def autoformalize(continue_):
                     raise click.ClickException(
                         f"autoformalize exhausted MAX_ATTEMPTS={max_attempts} before formalization acceptance"
                     )
+                before_round = (state["formalization"].get("last_round") or {}).get("round_id")
                 state = await run_formalizing_runtime(
                     roster, paths, build_autoformalize_mcp(paths, "formalizing"),
                     load_prompt("autoformalize/FORMALIZING"),
                 )
-                attempts += 1
+                after_round = (state["formalization"].get("last_round") or {}).get("round_id")
+                # Replans/cancellation interrupt a round; they do not complete
+                # one. The drained runtime is the authority on round endings.
+                if after_round and after_round != before_round:
+                    attempts += 1
                 if (not stop_requested(root) and state.get("phase") == "formalizing"
                         and not autoformalize_state.pending_replan(state)
                         and not autoformalize_state.open_source_issues(state)):

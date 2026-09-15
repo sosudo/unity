@@ -28,6 +28,12 @@ A verified task may still need reopening
 for a specific current source-faithfulness defect; state that defect rather than calling its machine
 verification missing.
 
+Keep blocker scope exact: the last checked rejection concerns its candidate; submission preflight
+concerns its proposed stage; declared dependencies control readiness. Remaining global completion
+requirements are not extra dependency edges. Findings and agent-reported obstacles are evidence to
+inspect, not authoritative invalidations of other tasks. Use exact helper names and code artifacts
+from task details before recommending already completed searches again.
+
 Check semantic and structural faithfulness against the actual source, not merely names or successful builds:
 
 - every in-scope mathematical requirement is covered by the DAG and actual Lean statements; do not
@@ -64,7 +70,10 @@ the original source obligations.
 Read current candidate versions and revisions, not a superseded interpretation or earlier file name.
 
 Assignment, representation, verification and faithfulness are separate. You provide diagnostic feedback
-or the final faithfulness review, not an additional representation-adoption phase. An adopted representation alone
+or the final faithfulness review, not an additional representation-adoption phase. Current targeted
+representation reviews supply reusable evidence about encodings, not a substitute for final argument
+and coverage review. Do not reopen an unchanged aligned encoding without a concrete contrary finding.
+An adopted representation alone
 is neither a completed proof nor source approval. A verified implementation can still be unfaithful;
 reject its correspondence with precise evidence without claiming that its kernel check failed.
 

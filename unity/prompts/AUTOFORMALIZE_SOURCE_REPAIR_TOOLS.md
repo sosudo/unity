@@ -4,8 +4,13 @@ Use `autoformalize_brief(author)` for the current issue/repair state and `autofo
 for targeted source and prerequisite detail. Read the original sources listed in the plan; use
 `artifact_info` and bounded `artifact_read` for detailed stored evidence.
 
+- `submit_source_diagnosis(author, issue_id, review)` first records
+  `{"input_sha256":"<assigned hash>","verdict":"false_alarm|encoding_error|source_defect|uncertain",
+  "evidence":"exact source and Lean/API evidence"}`. Inspect the supplied input before choosing one
+  verdict. A stale diagnosis must be refreshed, not reused for changed encodings.
 - `submit_source_repair(author, issue_id, explanation, evidence, replacement?)` records an immutable,
-  source-bound proposal. State exactly what changes, if anything, and cite evidence.
+  source-bound proposal. Only a current `source_defect` diagnosis permits automatic replanning.
+  State exactly what changes, if anything, and cite evidence.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` records a newly discovered defect.
 - `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
   shares reusable source facts and concrete failures with evidence. `confidence` is an integer from

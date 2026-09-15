@@ -9,6 +9,7 @@ import os
 from . import autoformalize_state, worktree
 from .autoformalize_orchestrator import _preamble, build_autoformalize_mcp, load_prompt, load_role_prompt, stop_requested
 from .autoformalize_spawn import spawn
+from .autoformalize_representation import source_diagnosis_input
 
 
 def repair_attempt_limit() -> int | float:
@@ -31,6 +32,7 @@ async def source_repair_turn(
     error = ""
     try:
         state = autoformalize_state.load_state(paths.forum)
+        diagnosis = source_diagnosis_input(state, issue_id)
         tree = _formal_worktree(paths.project_root, agent.name)
         worktree.link_runtime_state(tree, paths.project_root)
         worktree.symlink_lake_cache(tree, paths.project_root)
@@ -44,9 +46,11 @@ async def source_repair_turn(
         )
         result = await spawn(
             agent, system,
-            "Repair this exact source issue, or report why it cannot be repaired faithfully:\n"
+            "Diagnose this exact reported issue before assuming the source is defective:\n"
             + json.dumps(claim["issue"], sort_keys=True)
-            + "\nSubmit an evidence-backed source-repair proposal through the Forum. "
+            + "\nExact diagnosis input: " + json.dumps(diagnosis, sort_keys=True)
+            + "\nSubmit source diagnosis first: false alarm, encoding error, actual source defect, or uncertain. "
+              "Only a confirmed source defect calls for an evidence-backed source-repair proposal. "
               "Never edit supplied source files or Lean project files during this repair turn. "
               "Your worktree may contain an unfinished formalization; preserve it unchanged.",
             tree, build_autoformalize_mcp(paths, "source_repair"),
