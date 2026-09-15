@@ -14,6 +14,7 @@ class RequirementReview(BaseModel):
     status: Literal["pass", "fail", "not_checked"]
     declarations: list[str]
     checked_anchor_ids: list[str]
+    checked_prerequisite_ids: list[str] = Field(default_factory=list)
     rationale: str = Field(min_length=1)
     argument_rationale: str = Field(min_length=1)
 

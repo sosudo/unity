@@ -212,7 +212,7 @@ private partial def collectMeanings (env : Environment) (projects : NameSet)
   modify fun s => { s with records := (n.toString, meaningJson env ci) :: s.records }
   for dep in meaningDeps env ci do collectMeanings env projects dep
 
-private def extract (modules targets externals : List String) : IO (Json × UInt32) := do
+private def extract (modules targets externals witnesses : List String) : IO (Json × UInt32) := do
   let started ← IO.monoMsNow
   initSearchPath (← findSysroot)
   let mods := modules.toArray.map fun a => ({ module := a.toName, importAll := true } : Import)
@@ -232,14 +232,19 @@ private def extract (modules targets externals : List String) : IO (Json × UInt
   let enumerated ← IO.monoMsNow
   let mut records : List (String × Json) := []
   let mut issues : Array String := #[]
+  let mut declarationErrors : Array Json := #[]
   let mut edges : NameMap (Array Name) := {}
   for target in targets do
     let n := target.toName
     let some ci := env.checked.get.find? n | do
       issues := issues.push s!"target declaration {target} was not found in the built kernel"
+      declarationErrors := declarationErrors.push (Json.mkObj [
+        ("declaration", Json.str target), ("code", Json.str "not_found")])
       continue
     unless (moduleOf env n).any projects.contains do
       issues := issues.push s!"target declaration {target} is not owned by a supplied project module"
+      declarationErrors := declarationErrors.push (Json.mkObj [
+        ("declaration", Json.str target), ("code", Json.str "not_project_owned")])
       continue
     let roots := match ci with
       | .thmInfo _ => usedConstants ci.type
@@ -271,9 +276,13 @@ private def extract (modules targets externals : List String) : IO (Json × UInt
     let n := target.toName
     let some ci := env.checked.get.find? n | do
       issues := issues.push s!"external declaration {target} was not found in the imported kernel"
+      declarationErrors := declarationErrors.push (Json.mkObj [
+        ("declaration", Json.str target), ("code", Json.str "not_found")])
       continue
     if (moduleOf env n).any projects.contains then
-      issues := issues.push s!"external declaration {target} is project-owned; resolve it as a task"
+      issues := issues.push s!"external declaration {target} is project-owned; use declaration evidence for this local witness"
+      declarationErrors := declarationErrors.push (Json.mkObj [
+        ("declaration", Json.str target), ("code", Json.str "project_owned")])
       continue
     let (_, auditState) := (audit env n).run { edges := edges }
     edges := auditState.edges
@@ -288,12 +297,43 @@ private def extract (modules targets externals : List String) : IO (Json × UInt
       ("type", exprJson ci.type),
       ("signature", Json.str signature.pretty),
       ("axioms", toJson axiomNames)]) :: externalRecords
+  -- Supporting witnesses are not adopted outputs. Unlike legacy external-only
+  -- citations, they may live inside any project task, including their consumer.
+  -- Include project meanings so a same-named helper cannot silently change the
+  -- definitions in its statement while retaining its old evidence fingerprint.
+  let mut witnessRecords : List (String × Json) := []
+  for target in witnesses do
+    let n := target.toName
+    let some ci := env.checked.get.find? n | do
+      issues := issues.push s!"prerequisite declaration {target} was not found in the imported kernel"
+      declarationErrors := declarationErrors.push (Json.mkObj [
+        ("declaration", Json.str target), ("code", Json.str "not_found")])
+      continue
+    let roots := match ci with
+      | .thmInfo _ => usedConstants ci.type
+      | _ => (usedConstants ci.type).push n
+    let (_, ms) := (roots.forM (collectMeanings env projects)).run {}
+    let (_, auditState) := (audit env n).run { edges := edges }
+    edges := auditState.edges
+    issues := issues ++ ms.issues ++ auditState.issues
+    let proofDeps := auditState.visited.toList.filter fun name =>
+      (moduleOf env name).any projects.contains
+    let signature ← PrettyPrinter.ppExprLegacy env {} {} {} ci.type
+    witnessRecords := (target, Json.mkObj [
+      ("name", Json.str ci.name.toString), ("target_kind", Json.str (kindOf ci)),
+      ("module", Json.str (((moduleOf env n).getD .anonymous).toString)),
+      ("level_params", namesJson ci.levelParams), ("type", exprJson ci.type),
+      ("signature", Json.str signature.pretty), ("meanings", Json.mkObj ms.records),
+      ("proof_dependencies", toJson ((proofDeps.map Name.toString).mergeSort (· ≤ ·))),
+      ("axioms", toJson ((auditState.axioms.toList.map Name.toString).mergeSort (· ≤ ·)))]) :: witnessRecords
   let (_, projectAudit) := (projectRoots.forM (audit env)).run { edges := edges }
   issues := issues ++ projectAudit.issues
   let projectUsedAxioms := projectAudit.axioms.toList.map Name.toString |>.mergeSort (· ≤ ·)
   let audited ← IO.monoMsNow
   return (Json.mkObj [("targets", Json.mkObj records),
     ("external_declarations", Json.mkObj externalRecords),
+    ("prerequisite_declarations", Json.mkObj witnessRecords),
+    ("declaration_errors", Json.arr declarationErrors),
     ("project_axioms", toJson (projectAxioms.mergeSort (· ≤ ·))),
     ("project_sorries", toJson (projectSorries.mergeSort (· ≤ ·))),
     ("project_used_axioms", toJson projectUsedAxioms),
@@ -311,14 +351,15 @@ def main (args : List String) : IO UInt32 := do
   let modules := args.takeWhile (· != "--")
   let rest := args.dropWhile (· != "--")
   let requested := rest.drop 1
-  let targets := requested.takeWhile (· != "--external")
-  let externals := (requested.dropWhile (· != "--external")).drop 1
+  let targets := requested.takeWhile fun a => a != "--external" && a != "--prerequisite"
+  let externals := ((requested.dropWhile (· != "--external")).drop 1).takeWhile (· != "--prerequisite")
+  let witnesses := (requested.dropWhile (· != "--prerequisite")).drop 1
   if modules.isEmpty || targets.isEmpty then
     IO.println (Json.mkObj [("targets", Json.mkObj []), ("issues", toJson [
-      "usage: lake env <contract-executable> Module... -- Target... [--external Declaration...]"])]).compress
+      "usage: lake env <contract-executable> Module... -- Target... [--external Declaration...] [--prerequisite Declaration...]"])]).compress
     return 1
   try
-    let (result, code) ← UnityAutoformalizeContract.extract modules targets externals
+    let (result, code) ← UnityAutoformalizeContract.extract modules targets externals witnesses
     IO.println result.compress
     return code
   catch e =>

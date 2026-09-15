@@ -123,10 +123,21 @@ combining nodes. To change an adopted Lean encoding while its informal mathemati
 use `reopen_representations=[{"task_id":"stable-node-id","reason":"encoding correction"}]` in
 `changes`; do not rewrite correct prose merely to unlock a new Lean type, name or file.
 For an existing unresolved or incorrectly matched prerequisite, use
-`prerequisite_resolutions=[{"id":"P1","resolution":{"kind":"library","declaration":"Exact.name"}}]`
-in the same refinement, or resolve it to a supporting node with the task-resolution shape. Preserve
-the prerequisite's source statement/anchors and update the node dependency edges when necessary.
+`prerequisite_resolutions=[{"id":"P1","resolution":{"kind":"declaration","declaration":"Exact.name"}}]`
+in the same refinement. Unity determines whether the witness is external or project-local; local
+helpers need not be separate task outputs or nodes. Use a task resolution only for separate provider
+work. For inline discharge or a record merely citing the target itself, use
+`{"kind":"argument","rationale":"how the consuming proof accounts for this source record"}`.
+Its consumer mappings are already recorded; do not invent a self-dependency. This explanation is
+reviewed by the critic, not treated as a model-asserted proof. Preserve source statements/anchors.
 Refresh the brief after any refinement before submitting against its new revision.
+
+Read authoritative verification blockers before acting on findings. A final candidate can be blocked
+by a prerequisite belonging to another completed task; read that exact record and correct its evidence
+with `refine_chunks`, preserving the existing proofs. Adding an output does not change a prerequisite
+resolution. `blocked` or `unchanged_failed` queues no new verification: do not repeat it until the
+relevant evidence or source changes. If unable to repair the blocker, yield with its exact ID so the
+diagnostic critic can address it. A finding's confidence never overrides a checked rejection.
 
 If the supplied source is false, incomplete or ambiguous, call `report_source_issue` with exact anchors,
 affected task IDs and evidence. Explore a local repair or ask teammates for help. Use

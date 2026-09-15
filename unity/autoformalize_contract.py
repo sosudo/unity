@@ -46,6 +46,14 @@ class ContractEnvironmentError(ValueError):
     """Dependency inspection failed; another chunking attempt cannot repair it."""
 
 
+class ContractInspectionError(ValueError):
+    """Kernel diagnostic with exact failed witness names, not parsed prose."""
+
+    def __init__(self, message: str, declaration_errors: list[dict] | None = None):
+        super().__init__(message)
+        self.declaration_errors = declaration_errors or []
+
+
 @contextmanager
 def measure(timings: dict | None, stage: str):
     """Artifact-only elapsed time, including failed checks; never contract input."""
@@ -60,6 +68,75 @@ def measure(timings: dict | None, stage: str):
 def digest(value: object) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      ensure_ascii=False).encode()).hexdigest()
+
+
+def observe_failure_inputs(root: Path, contract: dict) -> dict:
+    """Read current retry inputs only when a known rejection needs comparison."""
+    identity = source_identity(root)
+    directory = Path(__file__).parent
+    policy = {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in (
+        "autoformalize_contract.py", "autoformalize_contract.lean",
+        "autoformalize_spec.py", "autoformalize_runtime.py", "autoformalize_state.py",
+    )}
+    return {"main_sha": identity["main_sha"], "source_sha256": identity["source_sha256"],
+            "contract_sha256": contract.get("sha256"),
+            "environment_sha256": digest(identity["environment"]), "policy_sha256": digest(policy)}
+
+
+def _prerequisite_blocker(row: dict, code: str, message: str, required_action: str) -> dict:
+    return {"code": code, "prerequisite_id": row.get("id", ""),
+            "task_ids": sorted(set(row.get("needed_by", []))), "message": message,
+            "required_action": required_action, "deterministic": True}
+
+
+def prerequisite_blockers(contract: dict, *, completed: set[str], final: bool) -> list[dict]:
+    """Cheap known source-accounting failures; never invent kernel verification.
+
+    ``completed`` may include the proposed complete candidate. Declaration
+    existence and semantic correspondence are not knowable from this metadata.
+    Draft unresolved/inline evidence remains permissible before the final gate.
+    """
+    blockers = []
+    if not final:
+        return blockers
+    spec = contract.get("spec") or {}
+    for row in spec.get("prerequisites", []):
+        resolution = row.get("resolution") or {}
+        kind = resolution.get("kind")
+        identifier = row.get("id", "<unnamed>")
+        if kind == "unresolved":
+            blockers.append(_prerequisite_blocker(row, "prerequisite_unresolved",
+                f"Source prerequisite {identifier} remains unresolved (consumers: {', '.join(row['needed_by'])}).",
+                "Use refine_chunks prerequisite_resolutions with an exact declaration witness, "
+                "a separate provider task, or argument evidence explaining its discharge; retain source citations."))
+        elif kind == "argument":
+            requirements = {item["id"]: item for item in contract.get("requirements", [])}
+            implementing = set(row.get("needed_by", []))
+            for argument in spec.get("arguments", []):
+                if identifier in argument.get("prerequisites", []):
+                    implementing.update(requirements.get(argument["requirement_id"], {}).get("tasks", []))
+            missing = implementing - completed
+            if not str(resolution.get("rationale", "")).strip() or not implementing:
+                blockers.append(_prerequisite_blocker(row, "prerequisite_argument_missing",
+                    f"Source prerequisite {identifier} lacks explicit argument evidence.",
+                    "Provide a nonempty rationale and retain its consuming argument/requirement mapping."))
+            elif missing:
+                blockers.append(_prerequisite_blocker(row, "prerequisite_argument_incomplete",
+                    f"Source prerequisite {identifier} needs complete proof evidence from: {', '.join(sorted(missing))}.",
+                    "Complete the mapped consumer tasks; an inline-evidence rationale does not prove them."))
+        elif kind == "task" and resolution.get("task_id") not in completed:
+            blockers.append(_prerequisite_blocker(row, "prerequisite_task_incomplete",
+                f"Source prerequisite {identifier} provider task {resolution.get('task_id')} is not complete.",
+                "Complete the declared provider task, or correct the resolution with actual evidence."))
+        elif kind == "library" and resolution.get("declaration") in contract.get("targets", {}):
+            blockers.append(_prerequisite_blocker(row, "prerequisite_project_owned",
+                f"Source prerequisite {identifier} cites project-owned {resolution['declaration']} as a library.",
+                "Use kind=declaration for this exact project witness; do not invent a helper task or self-edge."))
+        elif kind not in {"task", "library", "declaration"}:
+            blockers.append(_prerequisite_blocker(row, "prerequisite_invalid_resolution",
+                f"Source prerequisite {identifier} has an invalid resolution.",
+                "Correct its resolution with refine_chunks; no resolution status is model-trusted evidence."))
+    return blockers
 
 
 def _git(root: Path, *args: str) -> str:
@@ -271,7 +348,8 @@ def module_for_file(root: Path, filename: str, modules: dict | None = None) -> s
 
 def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = None,
                         timings: dict | None = None,
-                        external_declarations: list[str] | None = None) -> dict:
+                        external_declarations: list[str] | None = None,
+                        prerequisite_declarations: list[str] | None = None) -> dict:
     # Import every project module: generated/private dependencies are inspected by
     # the Lean helper, not filtered through the web blueprint presentation model.
     modules = sorted(set((workspace_modules(root) if layout is None else layout["modules"]).values()))
@@ -281,6 +359,11 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
             or any(not isinstance(name, str) or not name.strip() or name.startswith("-") for name in requested_externals)):
         raise ValueError("external declarations require exact nonempty names")
     externals = sorted(set(requested_externals))
+    witnesses = prerequisite_declarations or []
+    if (not isinstance(witnesses, list)
+            or any(not isinstance(name, str) or not name.strip() or name.startswith("-") for name in witnesses)):
+        raise ValueError("prerequisite declarations require exact nonempty names")
+    witnesses = sorted(set(witnesses))
     if not names or not modules:
         raise ValueError("formal contract has no declarations/modules")
     native_timings = {} if timings is not None else None
@@ -294,18 +377,19 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
     with measure(timings, "inspector_seconds"):
         result = autoformalize_jobs.run(
             root, ["lake", "env", str(executable), *modules, "--", *names,
-                   *(["--external", *externals] if externals else [])],
+                   *(["--external", *externals] if externals else []),
+                   *(["--prerequisite", *witnesses] if witnesses else [])],
             cwd=root, owner="Unity", task_id="contract", serialize_build=True,
             timings=job_timings,
         )
-    def failure(message: str) -> ValueError:
+    def failure(message: str, declaration_errors: list[dict] | None = None) -> ValueError:
         record = artifacts.store_text(
             root / ".unity" / "artifacts",
             json.dumps({"returncode": result.returncode, "stdout": result.stdout,
                         "stderr": result.stderr}, ensure_ascii=False),
             kind="autoformalize_inspection", producer="Unity", source="formal contract inspector",
         )
-        return ValueError(f"{message}; full output: artifact {record['artifact_id']}")
+        return ContractInspectionError(f"{message}; full output: artifact {record['artifact_id']}", declaration_errors)
 
     try:
         data = json.loads(result.stdout.strip().splitlines()[-1])
@@ -320,8 +404,15 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
     issues = data.get("issues", [])
     if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
         raise failure("formal contract inspector returned invalid issues")
+    declaration_errors = data.get("declaration_errors", [])
+    if (not isinstance(declaration_errors, list) or any(
+            not isinstance(row, dict) or set(row) != {"declaration", "code"}
+            or row["declaration"] not in set(names) | set(externals) | set(witnesses)
+            or row["code"] not in {"not_found", "project_owned", "not_project_owned"} for row in declaration_errors)):
+        raise failure("formal contract inspector returned invalid prerequisite diagnostics")
     if issues:
-        raise failure("formal contract inspection failed: " + artifacts.preview_text("; ".join(issues), 2000))
+        raise failure("formal contract inspection failed: " + artifacts.preview_text("; ".join(issues), 2000),
+                      declaration_errors)
     if result.returncode:
         raise failure("formal contract inspection failed: " + artifacts.preview_text(
             result.stderr or f"inspector exited {result.returncode} without reporting issues", 2000))
@@ -340,6 +431,21 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
                 or not isinstance(row.get("axioms"), list)):
             raise failure(f"incomplete kernel evidence for external declaration {name}")
     data["external_declarations"] = external_records
+    witness_records = data.get("prerequisite_declarations", {})
+    if not isinstance(witness_records, dict) or set(witness_records) != set(witnesses):
+        raise failure("formal contract inspection omitted requested prerequisite declarations")
+    for name, row in witness_records.items():
+        if (not isinstance(row, dict) or row.get("name") != name
+                or not isinstance(row.get("module"), str) or not row["module"]
+                or not isinstance(row.get("type"), list)
+                or row.get("target_kind") not in {"theorem", "def", "opaque", "inductive", "constructor", "recursor", "quot", "axiom"}
+                or not isinstance(row.get("level_params"), list)
+                or not isinstance(row.get("signature"), str) or not row["signature"].strip()
+                or not isinstance(row.get("meanings"), dict)
+                or not isinstance(row.get("proof_dependencies"), list)
+                or not isinstance(row.get("axioms"), list)):
+            raise failure(f"incomplete kernel evidence for prerequisite declaration {name}")
+    data["prerequisite_declarations"] = witness_records
     if any(not isinstance(data.get(key), list)
            for key in ("project_axioms", "project_sorries", "project_used_axioms")):
         raise failure("formal contract inspector omitted project-wide axiom/placeholder audit")
@@ -362,7 +468,8 @@ def _external_records(records: dict) -> dict:
     result = {}
     for name, row in records.items():
         if row.get("target_kind") == "axiom" or set(row["axioms"]) - AXIOMS:
-            raise ValueError(f"external prerequisite {name} depends on forbidden axioms")
+            raise ContractInspectionError(f"external prerequisite {name} depends on forbidden axioms",
+                                          [{"declaration": name, "code": "forbidden_axioms"}])
         result[name] = {**row, "fingerprint": digest(_semantic_record(row))}
     return result
 
@@ -522,7 +629,7 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
         "environment": environment_identity(paths.project_root) if environment is None else environment,
         "source_main_sha": _git(paths.project_root, "rev-parse", "HEAD") if main_sha is None else main_sha,
         "obligation_ids": sorted(row.get("task_id", row.get("id")) for row in chunks),
-        "bindings": {}, "targets": {}, "external_declarations": {},
+        "bindings": {}, "targets": {}, "external_declarations": {}, "prerequisite_declarations": {},
     })
     return contract
 
@@ -558,6 +665,17 @@ def invalidate_bindings(contract: dict, task_ids: set[str]) -> tuple[dict, set[s
     removed_names = {output["declaration"] for key in affected for output in bindings.get(key, [])}
     result["bindings"] = {key: outputs for key, outputs in bindings.items() if key not in affected}
     result["targets"] = {name: row for name, row in targets.items() if name not in removed_names}
+    if "prerequisite_declarations" in result:
+        reopened_witnesses = {row["resolution"]["declaration"]
+                              for row in result.get("spec", {}).get("prerequisites", [])
+                              if row["resolution"]["kind"] == "declaration"
+                              and set(row.get("needed_by", [])).intersection(affected)}
+        result["prerequisite_declarations"] = {
+            name: row for name, row in result["prerequisite_declarations"].items()
+            if name not in reopened_witnesses
+            and not removed_names.intersection({name} | set(row.get("meanings", {}))
+                                                | set(row.get("proof_dependencies", [])))
+        }
     return _seal_contract(result), affected
 
 
@@ -570,7 +688,21 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
                                 proposed_outputs: list[dict] | None, task_id: str | None,
                                 stage: str, final: bool, layout: dict | None,
                                 environment: dict | None, timings: dict | None) -> dict:
-    issues = []
+    checked_complete = set(completed)
+    if task_id is not None:
+        if stage == "complete":
+            checked_complete.add(task_id)
+        else:
+            checked_complete.discard(task_id)
+    blockers = prerequisite_blockers(contract, completed=checked_complete, final=final)
+    issues = [row["message"] for row in blockers]
+    def checked_issue(message: str, code: str, affected: set[str], action: str) -> None:
+        issues.append(message)
+        blockers.append({"code": code, "prerequisite_id": "", "task_ids": sorted(affected),
+                         "message": message, "required_action": action, "deterministic": True})
+    def reject(message: str, code: str, affected: set[str], action: str) -> None:
+        checked_issue(message, code, affected, action)
+        raise ValueError(message)
     proposed = copy.deepcopy(contract)
     task_ids = {task.get("task_id", task.get("id")) for task in tasks}
     if stage not in {"representation", "complete"}:
@@ -582,96 +714,167 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
     try:
         bindings = proposed.setdefault("bindings", {})
         if not isinstance(bindings, dict) or not isinstance(proposed.get("targets"), dict):
-            raise ValueError("source contract has invalid adopted output bindings")
+            reject("source contract has invalid adopted output bindings", "contract_bindings_invalid", set(),
+                   "Restore controller-owned contract state; do not rewrite verification records manually.")
         old_names = [row["lean_decl"] for row in _binding_tasks(contract)]
         if len(set(old_names)) != len(old_names) or set(old_names) != set(contract["targets"]):
-            raise ValueError("source contract target identities do not match adopted bindings")
+            reject("source contract target identities do not match adopted bindings", "contract_bindings_invalid", set(),
+                   "Restore the consistent controller-owned contract snapshot.")
         if set(bindings) - task_ids or any(not rows for rows in bindings.values()):
-            raise ValueError("source contract contains invalid task bindings")
+            reject("source contract contains invalid task bindings", "contract_bindings_invalid", set(),
+                   "Restore the consistent controller-owned task/output snapshot.")
         if proposed_outputs is not None:
             if task_id not in task_ids or not isinstance(proposed_outputs, list) or not proposed_outputs:
-                raise ValueError("candidate outputs require a current task and nonempty declaration/file list")
+                reject("candidate outputs require a current task and nonempty declaration/file list", "output_manifest_invalid",
+                       {task_id} if task_id in task_ids else set(), "Provide exact current-task declaration/file outputs.")
             outputs = []
             for output in proposed_outputs:
                 if (not isinstance(output, dict) or set(output) != {"declaration", "file"}
                         or any(not isinstance(value, str) or not value.strip()
                                or value != value.strip() for value in output.values())
                         or output["declaration"].startswith("-")):
-                    raise ValueError("candidate outputs require exact declaration and file names")
+                    reject("candidate outputs require exact declaration and file names", "output_manifest_invalid", {task_id},
+                           "Correct each output to an exact declaration/file pair.")
                 outputs.append(dict(output))
             outputs.sort(key=lambda row: row["declaration"])
             names = {row["declaration"] for row in outputs}
             if len(names) != len(outputs):
-                raise ValueError("candidate outputs repeat declarations")
+                reject("candidate outputs repeat declarations", "output_manifest_duplicate", {task_id},
+                       "List each declaration once in the output manifest.")
             owners = {output["declaration"]: owner for owner, rows in bindings.items() for output in rows}
             if any(owners.get(name, task_id) != task_id for name in names):
-                raise ValueError("candidate output already belongs to another source obligation")
+                reject("candidate output already belongs to another source obligation", "output_ownership_conflict", {task_id},
+                       "Reference existing outputs as prerequisites; do not claim another source obligation's output.")
             if task_id in bindings and sorted(bindings[task_id], key=lambda row: row["declaration"]) != outputs:
-                raise ValueError("adopted output manifest changed; explicitly revise the node before replacing it")
+                reject("adopted output manifest changed; explicitly revise the node before replacing it", "output_manifest_changed",
+                       {task_id}, "Restore the adopted manifest or explicitly reopen its representation before replacing it.")
             bindings[task_id] = outputs
         actual_tasks = _binding_tasks(proposed)
         if not actual_tasks:
-            raise ValueError("no Lean representations have been adopted or proposed")
+            reject("no Lean representations have been adopted or proposed", "output_manifest_missing", set(),
+                   "Submit the current task's actual Lean declaration/file outputs.")
         layout = workspace_layout(root) if layout is None else layout
         for row in actual_tasks:
-            module_for_file(root, row["lean_file"], layout["modules"])
+            try:
+                module_for_file(root, row["lean_file"], layout["modules"])
+            except ValueError as exc:
+                reject(str(exc), "output_file_invalid", {row["task_id"]},
+                       "Use an existing project-owned Lean source file in the output manifest.")
         expected = sorted({row["resolution"]["declaration"] for row in contract["spec"]["prerequisites"]
                            if row["resolution"]["kind"] == "library"
                            and (final or set(row["needed_by"]).intersection(bindings))})
         # Retain already inspected prerequisite identities across unrelated node
         # additions. Future, merely predicted prerequisites need not be imported.
         expected = sorted(set(expected) | set(contract.get("external_declarations", {})))
+        witnesses = sorted({row["resolution"]["declaration"] for row in contract["spec"]["prerequisites"]
+                            if row["resolution"]["kind"] == "declaration"
+                            and (final or set(row["needed_by"]).intersection(checked_complete))}
+                           | set(contract.get("prerequisite_declarations", {})))
         inspection = inspect_environment(root, actual_tasks, layout=layout, timings=timings,
-                                         external_declarations=expected)
+                                         external_declarations=expected,
+                                         **({"prerequisite_declarations": witnesses} if witnesses else {}))
         external_records = _external_records(inspection["external_declarations"])
+        witness_records = inspection.get("prerequisite_declarations", {})
+        if set(witness_records) != set(witnesses):
+            raise ValueError("formal contract inspection omitted prerequisite declaration evidence")
+        for name, row in witness_records.items():
+            if row.get("target_kind") == "axiom" or set(row["axioms"]) - AXIOMS:
+                for prerequisite in contract["spec"]["prerequisites"]:
+                    if prerequisite["resolution"].get("declaration") == name:
+                        blocker = _prerequisite_blocker(prerequisite, "prerequisite_forbidden_axioms",
+                            f"Source prerequisite {prerequisite['id']} witness {name} depends on forbidden axioms.",
+                            "Finish or replace this witness with a checked proof; a declaration name is not sufficient evidence.")
+                        blockers.append(blocker)
+                        issues.append(blocker["message"])
+        witness_records = {name: {**row, "fingerprint": digest(_semantic_record(row))}
+                           for name, row in witness_records.items()}
     except autoformalize_jobs.JobCancelled:
         raise
     except (KeyError, TypeError, ValueError) as exc:
-        return {"passed": False, "issues": [*issues, str(exc)], "targets": {}}
+        for diagnostic in getattr(exc, "declaration_errors", []):
+            matched = False
+            for prerequisite in contract["spec"]["prerequisites"]:
+                if prerequisite["resolution"].get("declaration") == diagnostic["declaration"]:
+                    matched = True
+                    project_owned = diagnostic["code"] == "project_owned"
+                    forbidden = diagnostic["code"] == "forbidden_axioms"
+                    blocker = _prerequisite_blocker(prerequisite, "prerequisite_" + diagnostic["code"],
+                        f"Source prerequisite {prerequisite['id']}: {diagnostic['declaration']} "
+                        + ("is project-owned, not a library declaration." if project_owned else
+                           "depends on forbidden axioms." if forbidden else "was not found in the built environment."),
+                        "Use kind=declaration for this project witness; do not invent a self-edge." if project_owned else
+                        "Replace forbidden dependencies with checked proofs, or correct the witness." if forbidden else
+                        "Correct the exact witness name/import or implement it; retain the cited source obligation.")
+                    if blocker not in blockers:
+                        blockers.append(blocker)
+                        issues.append(blocker["message"])
+            if not matched and diagnostic["code"] in {"not_found", "not_project_owned"}:
+                owners = {owner for owner, outputs in proposed.get("bindings", {}).items()
+                          if any(output["declaration"] == diagnostic["declaration"] for output in outputs)}
+                if owners:
+                    checked_issue(f"Target {diagnostic['declaration']} " + (
+                        "was not found in the built environment." if diagnostic["code"] == "not_found" else
+                        "is not owned by a project source module."), "target_" + diagnostic["code"], owners,
+                        "Correct the exact project output declaration/file; do not submit an imported library declaration as a project target.")
+        return {"passed": False, "issues": list(dict.fromkeys([*issues, str(exc)])), "blockers": blockers, "targets": {}}
     environment = environment_identity(root) if environment is None else environment
     if environment != contract["environment"]:
-        issues.append("toolchain or dependency environment changed from the formal contract")
+        checked_issue("toolchain or dependency environment changed from the formal contract", "contract_environment_changed",
+                      set(), "Restore the bound toolchain/dependencies or explicitly revise the environment and recheck.")
     for name, previous in contract.get("external_declarations", {}).items():
         if external_records[name]["fingerprint"] != previous.get("fingerprint"):
-            issues.append(f"external prerequisite signature changed: {name}")
+            checked_issue(f"external prerequisite signature changed: {name}", "external_witness_changed",
+                          {owner for row in contract["spec"]["prerequisites"]
+                           if row["resolution"].get("declaration") == name for owner in row["needed_by"]},
+                          "Restore the pinned library identity or explicitly revise the prerequisite evidence and recheck.")
+    for name, previous in contract.get("prerequisite_declarations", {}).items():
+        if witness_records[name]["fingerprint"] != previous.get("fingerprint"):
+            for prerequisite in contract["spec"]["prerequisites"]:
+                if prerequisite["resolution"].get("declaration") == name:
+                    blocker = _prerequisite_blocker(prerequisite, "prerequisite_witness_changed",
+                        f"Source prerequisite {prerequisite['id']} witness {name} changed its protected meaning.",
+                        "Explicitly revise the affected representation or prerequisite resolution, then recheck its source correspondence.")
+                    blockers.append(blocker)
+                    issues.append(blocker["message"])
     native = _native_axioms(inspection["project_used_axioms"])
     if native:
-        issues.append("project uses native evaluation axioms: " + ", ".join(sorted(native)))
+        checked_issue("project uses native evaluation axioms: " + ", ".join(sorted(native)), "project_native_axioms",
+                      set(), "Replace native-evaluation dependencies with kernel-checked proofs.")
     targets = inspection["targets"]
-    checked_complete = set(completed)
-    if task_id is not None:
-        if stage == "complete":
-            checked_complete.add(task_id)
-        else:
-            checked_complete.discard(task_id)
     if checked_complete - set(bindings):
         issues.append("completed tasks have no adopted output manifest")
     if final:
         if set(bindings) != task_ids or checked_complete != task_ids:
-            issues.append("not every source obligation has a complete Lean representation")
-        if any(row["resolution"]["kind"] == "unresolved" for row in contract["spec"]["prerequisites"]):
-            issues.append("source prerequisites remain unresolved")
+            checked_issue("not every source obligation has a complete Lean representation", "formal_tasks_incomplete",
+                          task_ids - (set(bindings) & checked_complete), "Complete the missing source-obligation outputs.")
         if inspection["project_axioms"]:
-            issues.append("project retains custom axioms: " + ", ".join(inspection["project_axioms"]))
+            checked_issue("project retains custom axioms: " + ", ".join(inspection["project_axioms"]), "project_custom_axioms",
+                          set(), "Replace the named project axioms with proved declarations.")
         if inspection["project_sorries"]:
-            issues.append("project retains proof holes: " + ", ".join(inspection["project_sorries"]))
+            checked_issue("project retains proof holes: " + ", ".join(inspection["project_sorries"]), "project_proof_holes",
+                          set(), "Complete the named proof holes or remove genuinely obsolete drafts without dropping source coverage.")
     verified_targets = {}
     for task in actual_tasks:
         name, owner = task["lean_decl"], task["task_id"]
         row = targets[name]
         fingerprint = digest(_semantic_record(row))
         if row["module"] != module_for_file(root, task["lean_file"], layout["modules"]):
-            issues.append(f"candidate declaration {name} is not in {task['lean_file']}")
+            checked_issue(f"candidate declaration {name} is not in {task['lean_file']}", "target_wrong_file", {owner},
+                          "Correct the output file mapping; explicitly reopen adopted representations before relocating them.")
         if name in contract["targets"] and fingerprint != contract["targets"][name].get("fingerprint"):
-            issues.append(f"contract changed for {name}: type, definition, or declaration identity differs")
+            checked_issue(f"contract changed for {name}: type, definition, or declaration identity differs",
+                          "target_meaning_changed", {owner},
+                          "Restore the protected meaning or explicitly reopen the representation and review its source correspondence.")
         if row["target_kind"] == "axiom":
-            issues.append(f"candidate declaration {name} is an axiom")
+            checked_issue(f"candidate declaration {name} is an axiom", "target_is_axiom", {owner}, "Prove the declaration.")
         if '"sorryAx"' in json.dumps(_semantic_record(row)):
-            issues.append(f"{name} has a proof hole in its type or meaning-bearing definitions")
+            checked_issue(f"{name} has a proof hole in its type or meaning-bearing definitions", "target_meaning_hole", {owner},
+                          "Implement the type/definition completely; representation-stage proof holes are only permitted in theorem proofs.")
         allowed = AXIOMS | ({"sorryAx"} if owner not in checked_complete and row["target_kind"] == "theorem" else set())
         unexpected = set(row["axioms"]) - allowed
         if unexpected:
-            issues.append(f"{name} depends on forbidden axioms: {', '.join(sorted(unexpected))}")
+            checked_issue(f"{name} depends on forbidden axioms: {', '.join(sorted(unexpected))}", "target_forbidden_axioms", {owner},
+                          "Complete the proof and replace forbidden dependencies with kernel-checked proofs.")
         proposed["targets"][name] = {"target_kind": row["target_kind"], "module": row["module"],
                                      "fingerprint": fingerprint,
                                      "meaning_dependencies": sorted(row.get("meanings", {})),
@@ -679,8 +882,11 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
         if owner in checked_complete:
             verified_targets[name] = fingerprint
     proposed["external_declarations"] = external_records
-    return {"passed": not issues, "issues": issues, "targets": targets,
+    if witnesses or "prerequisite_declarations" in contract:
+        proposed["prerequisite_declarations"] = witness_records
+    return {"passed": not issues, "issues": issues, "blockers": blockers, "targets": targets,
             "external_declarations": external_records,
+            "prerequisite_declarations": witness_records,
             "verified_tasks": sorted(checked_complete), "verified_targets": verified_targets,
             "final": final,
             **({"proposed_contract": _seal_contract(proposed)} if not issues else {})}
@@ -705,6 +911,10 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
             task_id=task_id, stage=stage, final=final, layout=layout,
             environment=environment, timings=timings,
         )
+    if any(row["resolution"]["kind"] in {"declaration", "argument"}
+           for row in contract["spec"]["prerequisites"]):
+        return {"passed": False, "issues": ["declaration/argument evidence requires a version-3 source contract"],
+                "blockers": [], "targets": {}}
     issues = []
     environment = environment_identity(root) if environment is None else environment
     if environment != contract["environment"]:
@@ -795,6 +1005,11 @@ def _external_evidence(contract: dict) -> dict:
             for name, row in contract.get("external_declarations", {}).items()}
 
 
+def _prerequisite_evidence(contract: dict) -> dict:
+    return {name: {key: row[key] for key in ("fingerprint", "module", "signature", "axioms")}
+            for name, row in contract.get("prerequisite_declarations", {}).items()}
+
+
 def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete: bool = True) -> bool:
     from .autoformalize_input import source_matches
     from .autoformalize_state import repair_digest
@@ -823,6 +1038,7 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
         == digest(formal.get("spec")) == digest(contract.get("spec"))
         and snapshot.get("repairs_sha256") == repair_digest(state)
         and snapshot.get("external_declarations") == _external_evidence(contract)
+        and snapshot.get("prerequisite_declarations", {}) == _prerequisite_evidence(contract)
         and formal.get("revision") == snapshot.get("formalization_revision")
         and formal.get("solution_candidate") == snapshot.get("solution_candidate")
         == contract.get("solution_candidate") == source.get("candidate_id")
@@ -873,7 +1089,12 @@ def verify_final_project(paths, state: dict) -> dict:
                                        completed=complete_ids, final=True)
                  if not build["returncode"] else
                  {"passed": False, "issues": ["final project build failed"], "targets": {}})
-    issues = list(check["issues"])
+    blockers = list(check.get("blockers", []))
+    for blocker in prerequisite_blockers(contract, completed={task["task_id"] for task in tasks
+                                                               if task.get("status") == "complete"}, final=True):
+        if blocker not in blockers:
+            blockers.append(blocker)
+    issues = list(dict.fromkeys([*check["issues"], *(row["message"] for row in blockers)]))
     if (contract.get("version") not in {2, 3} or not isinstance(formal.get("spec"), dict)
             or digest(formal.get("spec")) != contract.get("spec_sha256")
             or digest(contract.get("spec")) != contract.get("spec_sha256")):
@@ -887,8 +1108,6 @@ def verify_final_project(paths, state: dict) -> dict:
                 or set(contract.get("bindings", {})) != complete_ids
                 or any(not outputs for outputs in contract.get("bindings", {}).values())):
             issues.append("source obligations lack adopted Lean outputs")
-        if any(row["resolution"]["kind"] == "unresolved" for row in contract["spec"]["prerequisites"]):
-            issues.append("source prerequisites remain unresolved")
     if source_identity(root) != before:
         issues.append("source changed during final mechanical verification")
     if before["main_sha"] != formal.get("main_sha"):
@@ -908,6 +1127,7 @@ def verify_final_project(paths, state: dict) -> dict:
         **before,
         "passed": not issues,
         "issues": issues,
+        "blockers": blockers,
         "solution_candidate": formal["solution_candidate"],
         "solution_sha256": formal["solution_sha256"],
         "formalization_revision": formal["revision"],
@@ -915,6 +1135,7 @@ def verify_final_project(paths, state: dict) -> dict:
         "spec_sha256": digest(formal.get("spec")),
         "repairs_sha256": repair_digest(state),
         "external_declarations": _external_evidence(review_contract),
+        "prerequisite_declarations": _prerequisite_evidence(review_contract),
         "accepted_candidates": {task["task_id"]: task.get("accepted_candidate") for task in tasks},
         "task_statuses": {task["task_id"]: task.get("status") for task in tasks},
         "declarations": {task["lean_decl"]: task["task_id"] for task in

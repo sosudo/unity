@@ -51,8 +51,16 @@ until `next_offset` is null, keeping the same revision; restart if it changes. R
 `autoformalize_task`. Check each source anchor against the original document, each scope exclusion
 against UNITY.md, and each argument mapping against the actual Lean proof. Inspect prerequisite evidence
 and every adopted source repair. Mechanical bookkeeping cannot prove natural-language equivalence.
-For a missing source proof, distinguish the recorded gap and any justified repair from an argument
-invented by a worker. Refinements and split/merge lineage must preserve the original source obligations.
+For every passing requirement, `checked_prerequisite_ids` must contain the union of its argument
+mapping's prerequisite IDs and prerequisites whose `needed_by` includes any of its implementing
+tasks, without extras or duplicates. Check declaration witnesses (external or
+project-local) against their source claims. For `kind="argument"`, assess the recorded rationale and
+actual consumer proof: inline discharge and citations attributing the target do not require artificial
+self-dependent tasks, but must genuinely account for the source. Explain this in `argument_rationale`.
+When the source states or cites a target without a proof, a new proof is allowed: check its statement
+and source accounting, and distinguish the newly supplied argument from source text. An omitted
+proof alone is not a source defect requiring repair. Refinements and split/merge lineage must preserve
+the original source obligations.
 Read current candidate versions and revisions, not a superseded interpretation or earlier file name.
 
 Assignment, representation, verification and faithfulness are separate. You provide diagnostic feedback
@@ -76,6 +84,7 @@ the exact `snapshot_id` from the brief and `requirements`, for example:
       "status": "pass",
       "declarations": ["Project.theoremName"],
       "checked_anchor_ids": ["A1"],
+      "checked_prerequisite_ids": [],
       "rationale": "How these actual statements/definitions cover the cited source requirement",
       "argument_rationale": "How the actual Lean proof follows the source argument and resolves its prerequisites"
     }

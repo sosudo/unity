@@ -12,7 +12,7 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
 
 - `submit_formalization_verdict(author, verdict, summary, review, reopen_tasks?, evidence?)` submits
   `approved` or `lean_reopen`. `review` contains the current `snapshot_id` and `requirements` entries
-  `{requirement_id, status, declarations, checked_anchor_ids, rationale, argument_rationale}`,
+  `{requirement_id, status, declarations, checked_anchor_ids, checked_prerequisite_ids, rationale, argument_rationale}`,
   a global `scope_rationale`, and `repair_reviews` with `{repair_id,status,rationale}` for every adopted
   correction. Approval requires every recorded requirement
   exactly once, all passing, with all adopted outputs of its implementing nodes listed in
@@ -21,6 +21,11 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
   Each entry's `checked_anchor_ids` must contain only IDs from that requirement's own `anchor_ids`,
   without duplicates; approval requires all of them. Put ancillary source/argument context in
   `rationale` or `argument_rationale`, not in `checked_anchor_ids`.
+  Every passing entry must list in `checked_prerequisite_ids` the union of its argument mapping's
+  prerequisite IDs and prerequisites whose `needed_by` includes any of its implementing tasks
+  (empty when none, no extras or duplicates). Check each witness against the English statement.
+  For `kind="argument"`, explain its inline discharge or target-citation accounting in
+  `argument_rationale`; proof completion alone does not establish that correspondence.
 - `autoformalize_requirements(offset?, limit?)` pages the complete requirement manifest. Keep one revision
   and continue until `next_offset` is null; the task-filtered brief is not the entire checklist.
   `autoformalize_task(task_id)` retrieves exact task evidence/anchors/prerequisites.

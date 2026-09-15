@@ -26,8 +26,9 @@ Unity gives the roster optional source-repair attempts. This is not a mandatory 
 Preserve both the source's mathematical meaning and its proof strategy. Make implicit types,
 quantifiers, binding, and scope explicit. Preserve case splits, inductions, and meaningful intermediate
 claims in the corresponding summaries; do not merely replace the source's argument with an easier
-statement. Record cited results used without proof as external prerequisites, not as permission to add
-project axioms or leave proof holes in the final project. A possible library match is a proposal, not
+statement. Record separate results actually used by an argument as prerequisites, not as permission to add
+project axioms or leave proof holes in the final project. A citation attributing the target itself is
+source provenance, not another assumption requiring that target to depend on itself. A possible library match is a proposal, not
 a checked declaration identity; formalizers will investigate exact Lean APIs.
 
 Initially create one node per in-scope source definition, theorem, lemma, corollary or construction,
@@ -68,10 +69,14 @@ check that the anchors and exclusions faithfully describe the actual source.
 
 For each requirement, `spec.arguments` records the actual mathematical argument, its source anchors,
 prerequisite IDs and any adopted `repair_ids`. Every prerequisite records its statement, anchors,
-consuming task IDs and resolution: `{"kind":"library","declaration":"Fully.Qualified.name"}` or
+consuming task IDs and resolution: `{"kind":"declaration","declaration":"Fully.Qualified.name"}` or
 `{"kind":"task","task_id":"other-task"}`. A task resolution requires a direct dependency edge from
-each consumer in either dependency list. A library name in this informal plan is only a proposed match;
-Unity checks actual library identities and axioms when Lean implementations are submitted.
+each consumer in either dependency list. Declaration witnesses may be external or project-local;
+Unity determines ownership and checks their actual meanings and axioms. Routine local helpers need
+not become DAG nodes. An inline discharge, or an existing record merely citing the target itself, can
+use `{"kind":"argument","rationale":"exact explanation of how the consuming argument accounts for it"}`.
+Unity derives its consumers from the existing mappings; the critic must still check correspondence.
+A declaration name in this informal plan is only a proposed match, not verified evidence.
 If the Lean/library mapping is unknown, use `{"kind":"unresolved"}` in the draft. Include an
 optional `issue_id` **inside `resolution`**, only for a genuine reported source defect, not ordinary
 missing API knowledge. For example, a complete prerequisite is:

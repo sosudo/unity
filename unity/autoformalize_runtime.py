@@ -476,7 +476,21 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
         "verified_tasks": check.get("verified_tasks", sorted(completed)),
         **{key: check[key] for key in ("proposed_contract", "verified_targets", "final") if key in check},
         "issues": issues,
+        "blockers": check.get("blockers", []),
     }
+
+
+def _candidate_preflight(state: dict, candidate: dict) -> list[dict]:
+    contract = state.get("formalization", {}).get("contract") or {}
+    if contract.get("version") != 3:
+        return []
+    tasks = state.get("formal_tasks", {})
+    completed = {key for key, row in tasks.items() if row.get("status") == "complete"}
+    if candidate.get("stage", "complete") == "complete":
+        completed.add(candidate["task_id"])
+    return autoformalize_contract.prerequisite_blockers(
+        contract, completed=completed, final=bool(tasks) and completed == set(tasks),
+    )
 
 
 def _checked_tree(root: Path, revision: str | None = None) -> str:
@@ -498,6 +512,15 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         return {"ok": False, "error": "missing formal contract; request re-chunking before proving"}
     if not autoformalize_state.candidate_is_current(current, candidate):
         return {"ok": False, "error": "candidate belongs to a superseded formal contract"}
+    # A queued candidate may become the final task after another merge. Recheck
+    # the same cheap gate used at submission before mutating main or building.
+    blockers = _candidate_preflight(current, candidate)
+    if blockers:
+        issues = [row["message"] for row in blockers]
+        return {"ok": False, "error": "; ".join(issues), "blockers": blockers,
+                "failure_context": autoformalize_state.failure_state_context(current),
+                "verification": {"status": "failed", "mode": "preflight",
+                                 "issues": issues, "blockers": blockers}}
     try:
         resolved = worktree.verify_candidate_commit(
             root, candidate["author"], candidate["commit_sha"], allow_unchanged=True,
@@ -586,6 +609,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         layout=layout, environment=checked_source["environment"], timings=timings,
         candidate=candidate,
     )
+    verification["environment_sha256"] = autoformalize_contract.digest(checked_source["environment"])
     with autoformalize_contract.measure(timings, "postcheck_identity_seconds"):
         reviewed_source = autoformalize_contract.source_identity(root)
     if (reviewed_source != checked_source
@@ -605,6 +629,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             "error": "; ".join(verification["issues"]),
             "build": build_record,
             "verification": verification,
+            "blockers": verification.get("blockers", []),
         }
     require_source_matches(paths, current)
     if not no_tree_change:
@@ -640,8 +665,40 @@ def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     started = time.monotonic()
     result = {}
     try:
+        current = autoformalize_state.load_state(paths.forum)
+        if any(row.get("status") == "failed" and row.get("task_id") == candidate["task_id"]
+               and (row.get("failure_context") or {}).get("cacheable")
+               for row in current.get("formal_candidates", {}).values()):
+            try:
+                observation = autoformalize_contract.observe_failure_inputs(
+                    root, current["formalization"].get("contract") or {},
+                )
+                previous = autoformalize_state.matching_failed_candidate(current, candidate, observation)
+            except (OSError, ValueError):
+                previous = None
+            if previous:
+                result = {"ok": False, "error": previous["error"],
+                          "blockers": previous.get("blockers", []),
+                          "failure_context": previous["failure_context"],
+                          "verification": previous.get("verification"), "unchanged_failed": True}
+                return result
         result = _apply_formal_candidate(paths, candidate, task, timings=timings)
         autoformalize_jobs.check_cancelled()
+        blockers = result.get("blockers", [])
+        if (not result.get("ok") and blockers
+                and all(row.get("deterministic") is True for row in blockers)
+                and (result.get("verification") or {}).get("mode") != "preflight"):
+            # Main has been rolled back. Observe actual source/environment, not
+            # the roster's claim or a receipt ID. A failed observation disables
+            # reuse; it must not turn an IO failure into a permanent rejection.
+            try:
+                observation = autoformalize_contract.observe_failure_inputs(
+                    root, autoformalize_state.load_state(paths.forum)["formalization"].get("contract") or {},
+                )
+                if observation["environment_sha256"] == (result.get("verification") or {}).get("environment_sha256"):
+                    result["failure_context"] = {**observation, "cacheable": True}
+            except (OSError, ValueError):
+                pass
     except (OSError, ValueError, KeyError) as exc:
         _rollback(root, before)
         result = {"ok": False, "error": f"candidate verification failed: {exc}",
@@ -682,6 +739,7 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
             build=result.get("build"), verification=result.get("verification"),
             failure_kind=result.get("failure_kind", ""),
             failure_main_sha=result.get("failure_main_sha", ""),
+            blockers=result.get("blockers"), failure_context=result.get("failure_context"),
         )
         return result
 
@@ -696,6 +754,19 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
         except autoformalize_jobs.JobCancelled as exc:
             # Cancellation before acquiring the lock made no source mutation.
             return record({"ok": False, "cancelled": True, "error": str(exc)})
+
+
+def _blocker_recovery_context(blockers: list[dict]) -> str:
+    """Bound launch memory; full diagnostics live in the task/detail artifacts."""
+    preview = [{"code": str(row.get("code", ""))[:100],
+                "prerequisite_id": str(row.get("prerequisite_id", ""))[:100],
+                "task_ids": [str(key)[:100] for key in row.get("task_ids", [])[:6]],
+                "message": str(row.get("message", ""))[:300],
+                "required_action": str(row.get("required_action", ""))[:400]}
+               for row in blockers[:6]]
+    return (f"Showing {len(preview)} of {len(blockers)} blockers. Full evidence: "
+            "autoformalize_task / autoformalize_requirements.\n"
+            + json.dumps(preview, ensure_ascii=False) + "\n")
 
 
 def _rejection_recovery_prompt(state: dict, author: str, task_id: str) -> str:
@@ -722,7 +793,14 @@ def _rejection_recovery_prompt(state: dict, author: str, task_id: str) -> str:
     return (
         f"RECOVER REJECTED CANDIDATE {latest['candidate_id']} at {latest['commit_sha']}: "
         f"{latest.get('error', '')[:2000]}\n{evidence}\n"
-        "Fix the reported rejection before finalizing again; do not resubmit the unchanged failure. "
+        + ("EXACT BLOCKERS (may belong to other already-complete tasks):\n"
+           + _blocker_recovery_context(latest["blockers"])
+           + "Follow each blocker's required_action. Prerequisite IDs need evidence-record/witness repairs; "
+           "Lean signature or proof errors need the indicated code repair. Do not rewrite an unrelated "
+           "proof or add an output merely to change the submission. Agent-reported findings do not "
+           "override this checked failure. Preserve your candidate bytes.\n"
+           if latest.get("blockers") else "")
+        + "Fix the reported rejection before finalizing again; do not resubmit the unchanged failure. "
         "For merge conflicts, commit intended private edits, call sync_from_main, and resolve conflicts "
         "without removing accepted work. Preserve adopted declarations at their exact fully-qualified "
         "names, including namespace scope. A successful private build does not resolve an integration "
@@ -909,6 +987,23 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 or autoformalize_server.has_pending_formal_candidate(current, name)
                 or autoformalize_state.source_issues_blocking_task(current, task_id)):
             return
+        repair_blockers = _candidate_preflight(current, {"task_id": task_id, "stage": "complete"})
+        if not repair_blockers:
+            # Static metadata may be filled but its exact named witness was
+            # rejected. Reuse only current contract-bound prerequisite failures.
+            repair_blockers = [row for row in autoformalize_server.verification_blockers(current, task_id)
+                               if row.get("candidate_id") and row.get("prerequisite_id")]
+        if repair_blockers:
+            if any(not running.done() and active_target(owner) == task_id
+                   for owner, running in tasks.items()):
+                return  # One focused repair, not another full proof swarm.
+            followup = (
+                "SOURCE EVIDENCE REPAIR: retain existing proof work. Resolve these exact prerequisite "
+                "records, including those belonging to other completed tasks. Use refine_chunks and "
+                "read their requirements; adding unrelated outputs or resubmitting unchanged bytes "
+                "cannot fix a prerequisite record. If you cannot repair it, yield_task with the blocker.\n"
+                + _blocker_recovery_context(repair_blockers) + followup
+            )
         pair = (name, task_id)
         retry_key = _formal_launch_retry_key(current, name, task_id, worker_targets.get(name, ""))
         if blocked_launch_keys.get(pair) == retry_key:

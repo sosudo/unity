@@ -24,8 +24,10 @@ Lean helpers; formalizers can add needed helpers and edges later with `refine_ch
 Initial plans include anchored `requirements` and `spec` (scope, arguments and prerequisites).
 Replans use the seeded mutable-only draft: `base_revision`, `requirement_tasks`, `prerequisites`,
 `arguments`, `chunks`, and unchanged source-binding fields. Unity supplies frozen obligations.
-Unresolved library
-matches are allowed in the plan. Do not generate Lean files or a compilable scaffold, run builds,
+Use `kind="declaration"` for a known proposed witness (external or project-local), `kind="argument"`
+with an explicit rationale for inline discharge/target attribution, or `kind="task"` for separate work.
+A citation of the target itself is not an additional prerequisite. Unknown matches may remain unresolved.
+Do not generate Lean files or a compilable scaffold, run builds,
 or perform proof search/import minimization for chunking.
 Copy the plan's `solution_candidate` and `solution_sha256` compatibility fields exactly: they identify
 the supplied-source snapshot and bundle hash, not a generated solution or an informal review result.

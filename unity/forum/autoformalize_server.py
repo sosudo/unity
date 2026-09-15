@@ -24,7 +24,7 @@ from typing import Annotated, Literal
 from fastmcp import FastMCP
 from pydantic import Field
 
-from .. import artifacts, autoformalize_state, worktree
+from .. import artifacts, autoformalize_contract, autoformalize_state, worktree
 from ..autoformalize_review import SemanticReview
 from ..autoformalize_spec import normalize_outputs
 from . import server as discussion
@@ -123,6 +123,23 @@ def _merge_lock():
             fcntl.flock(handle, fcntl.LOCK_UN)
 
 
+@contextmanager
+def _try_merge_lock():
+    """Never wait for main while holding a worker's finalization lock."""
+    path = _root() / ".unity" / "forum" / "merge.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 def _submit_formal_commit(
     strategy_id: str,
     author: str,
@@ -157,12 +174,32 @@ def _submit_formal_commit(
                 accepted_tree = _git(_root(), "rev-parse", "--verify", f"{accepted_main}^{{tree}}").stdout.strip()
                 if candidate_tree == accepted_tree:
                     representation_observation = observed
-    result = autoformalize_state.submit_formal_candidate(
-        FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
-        notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
-        representation_observation=representation_observation,
-    )
-    if result["status"] == "submitted":
+    # Normal submissions do not fingerprint dependencies just for a cache lookup.
+    # Only a prior deterministic rejection justifies that read. Acquire main
+    # nonblockingly: sync uses merge -> author locks, and this caller owns author.
+    state = autoformalize_state.load_state(FORUM_DIR)
+    retry = any(item.get("task_id") == task_id
+                and item.get("status") == "failed"
+                and item.get("failure_context", {}).get("cacheable")
+                and autoformalize_state.candidate_is_current(state, item)
+                for item in state.get("formal_candidates", {}).values())
+    with (_try_merge_lock() if retry else nullcontext(False)) as locked:
+        observation = None
+        if locked:
+            state = autoformalize_state.load_state(FORUM_DIR)
+            try:
+                observation = autoformalize_contract.observe_failure_inputs(
+                    _root(), state["formalization"].get("contract") or {},
+                )
+            except (OSError, ValueError):
+                pass  # An unavailable cache observation never establishes rejection.
+        result = autoformalize_state.submit_formal_candidate(
+            FORUM_DIR, strategy_id, author, task_id, resolved, base, diff_sha,
+            notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
+            representation_observation=representation_observation,
+            failure_observation=observation,
+        )
+    if result["status"] == "submitted" and not result.get("idempotent"):
         candidate = result["candidate"]
         _mirror(author, f"FORMAL CANDIDATE {candidate['candidate_id']}",
                 f"task {task_id}, commit {resolved}, diff SHA-256 {diff_sha}", task_id)
@@ -385,6 +422,44 @@ def _requirement_spec(state: dict, requirements: list[dict]) -> dict:
     }
 
 
+def verification_blockers(state: dict, task_id: str = "") -> list[dict]:
+    """Derived diagnostics, not another mutable ledger or an acceptance claim."""
+    formal = state.get("formalization", {})
+    contract = formal.get("contract") or {}
+    if contract.get("version") != 3:
+        return []
+    completed = {key for key, row in state.get("formal_tasks", {}).items()
+                 if row.get("status") == "complete"}
+    rows = autoformalize_contract.prerequisite_blockers(contract, completed=completed, final=True)
+    # Global prerequisites remain visible even in a task-filtered brief. Add
+    # precise last-checked failures only while their contract/main are current.
+    latest = {}
+    for candidate in state.get("formal_candidates", {}).values():
+        if not autoformalize_state.candidate_is_current(state, candidate):
+            continue
+        target = candidate.get("task_id")
+        if task_id and target != task_id:
+            continue
+        if candidate.get("updated_at", 0) >= latest.get(target, {}).get("updated_at", 0):
+            latest[target] = candidate
+    for candidate in latest.values():
+        context = candidate.get("failure_context") or {}
+        if (candidate.get("status") != "failed"
+                or context.get("main_sha") != formal.get("main_sha")
+                or context.get("contract_sha256") != contract.get("sha256")):
+            continue
+        rows.extend({**row, "candidate_id": candidate["candidate_id"]}
+                    for row in candidate.get("blockers", []))
+    seen, result = set(), []
+    for row in rows:
+        identity = (row.get("code"), row.get("prerequisite_id"),
+                    tuple(row.get("task_ids", [])), row.get("message"))
+        if identity not in seen:
+            seen.add(identity)
+            result.append(row)
+    return result
+
+
 def autoformalize_requirements(offset: int = 0, limit: int = 20) -> str:
     """Read the complete global coverage ledger in stable-ID-sorted pages.
 
@@ -440,6 +515,7 @@ def autoformalize_task(task_id: str) -> str:
         "contract_sha256": (state["formalization"].get("contract") or {}).get("sha256"),
         "task": task, "assignment": autoformalize_state.assignment_view(state, task_id),
         "requirements": requirements,
+        "verification_blockers": verification_blockers(state, task_id),
         "source_refs": [
             ref for ref in (state.get("input_source") or {}).get("source_refs", [])
             if ref["ref_id"] in source_ids
@@ -493,6 +569,20 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
         f"Global source issues not resolved: {len(issues)}; "
         f"pending replan requests: {len(queued)}",
     ]
+    blockers = verification_blockers(state, next(iter(focus)) if len(focus) == 1 else "")
+    blocker_lines = []
+    if blockers:
+        blocker_lines.extend(["", f"AUTHORITATIVE VERIFICATION BLOCKERS ({len(blockers)}; showing up to 6)",
+                      "Global prerequisites may belong to other completed tasks. Repair their evidence, "
+                      "not an unrelated proof. Findings are advice, not proof that a repair passed."])
+        for row in blockers[:6]:
+            blocker_lines.append(f"- {row.get('code')}: {row.get('prerequisite_id') or ''} "
+                         f"tasks={','.join(row.get('task_ids', []))}: {row.get('message', '')[:240]}")
+            blocker_lines.append(f"  Next: {row.get('required_action', '')[:240]}")
+        blocker_lines.append("Exact global prerequisite records: autoformalize_requirements; "
+                     "task details also include global verification_blockers.")
+    if not review_phase:
+        lines.extend(blocker_lines)
     snapshot = formal.get("review_snapshot")
     snapshot_lines = ([
         f"Machine snapshot: {snapshot.get('snapshot_id')} "
@@ -513,6 +603,8 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
             lines.append(f"- {issue[:240]}")
         lines.append("Global snapshot failure does not mean every task failed. "
                      "Read the snapshot artifact and autoformalize_task(task_id) for exact detail.")
+    if review_phase:
+        lines.extend(blocker_lines)  # Never truncate the critic's current snapshot behind repair prose.
     if focus:
         lines.extend(["", "YOUR ASSIGNED/CLAIMED TASKS"])
         for target in sorted(focus):
@@ -1546,7 +1638,7 @@ def refine_chunks(author: str, expected_revision: int,
     author = _author(author)
     with _merge_lock():
         result = autoformalize_state.refine_chunks(FORUM_DIR, author, expected_revision, changes)
-        if result.get("status") == "conflict":
+        if result.get("status") in {"conflict", "noop"}:
             return result
         state = autoformalize_state.load_state(FORUM_DIR)
         formal = state["formalization"]

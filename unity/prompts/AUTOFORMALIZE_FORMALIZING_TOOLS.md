@@ -49,16 +49,19 @@ findings and candidate events. These tools belong to the autoformalization runti
   predicted kinds, hints and typed dependencies, or adds/splits/combines nodes. Use `upserts`
   (complete node rows) and `replacements` (`{old_ids,new_ids,reason}` rows) in `changes`. Preserve existing
   node IDs for unchanged mathematics and all original obligations. Stale revisions fail atomically;
-  refresh the brief before retrying. Source requirements/specification are read-only through this tool.
+  refresh the brief before retrying. Original source requirements/anchors/scope are read-only;
+  the implementation resolution of an existing prerequisite is editable as described below.
   To correct an adopted Lean encoding without changing its informal mathematics, add
   `reopen_representations=[{"task_id":"stable-node-id","reason":"why the encoding must change"}]`
   to `changes`. This explicitly revises the representation and invalidates its dependent evidence;
   do not rewrite correct informal prose merely to unlock a different Lean type/name/file.
   Resolve an existing planned prerequisite with
-  `prerequisite_resolutions=[{"id":"P1","resolution":{"kind":"library","declaration":"Exact.name"}}]`
-  in `changes`, or use the existing task-resolution shape for a supporting node. This changes only
-  its implementation resolution, not the cited statement/anchors. Inspect the exact API and update
-  corresponding node dependency edges as needed; unresolved choices never count as final evidence.
+  `prerequisite_resolutions=[{"id":"P1","resolution":{"kind":"declaration","declaration":"Exact.name"}}]`
+  in `changes`. Unity checks external or project-local provenance; a local witness need not be another
+  output/task. Use the existing task-resolution shape for genuinely separate provider work. Inline
+  discharge or target-citation accounting uses `{"kind":"argument","rationale":"specific evidence"}`;
+  Unity derives the consuming requirements and the critic checks correspondence. Preserve the source
+  statement/anchors; do not invent a self-edge or mark an obligation true without evidence.
   Before yielding for a missing helper, actually add its node and the consumer's typed dependency edge
   through `refine_chunks`, then pass the helper task ID to `yield_task`. A finding or help request alone
   does not create a task or its dependency.
@@ -68,6 +71,8 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
   for a task, including relevant dependency findings and current machine-verified dependency outputs.
+  `verification_blockers` includes exact global prerequisite failures even outside that task's scope;
+  the brief puts these authoritative diagnostics before agent-reported findings.
   Those verified outputs do not require a finding; representation adoption alone is not verification.
   The normal brief prioritizes your task, its candidates and blockers, then reusable findings before
   the coverage summaries. Machine verification is not a source-faithfulness approval.
@@ -89,6 +94,10 @@ unchanged representation. Use `stage="complete"` when ready, or `refine_chunks` 
 `reopen_representations` if the adopted encoding needs correction. An `already_adopted` response
 queues no new candidate or review interrupt. Follow its `next_action`: continue useful proof work,
 or call `yield_task` with a concrete blocker before ending the attempt; do not repeat the submission.
+Likewise, `blocked` or `unchanged_failed` preserves the commit but queues no new review. Correct the
+identified prerequisite/source inputs, not unrelated outputs or commit messages. If you cannot,
+yield with the exact blocker IDs in the reason. Repeated receipt IDs or findings are not new proof
+progress. Metadata-only corrections preserve unchanged Lean proof evidence but require semantic review.
 Task details distinguish assignment (claims/assistants), representation, verification and faithfulness,
 all with current revision-bound evidence; proof-only prerequisites need not delay statement work.
 

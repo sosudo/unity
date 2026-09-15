@@ -174,10 +174,12 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
         _known(needed, tasks, "prerequisite needed_by")
         resolution = row["resolution"]
         kind = resolution.get("kind") if isinstance(resolution, dict) else None
-        field = ({"library": "declaration", "task": "task_id", "unresolved": "issue_id"}.get(kind)
+        field = ({"library": "declaration", "declaration": "declaration", "argument": "rationale",
+                  "task": "task_id", "unresolved": "issue_id"}.get(kind)
                  if isinstance(kind, str) else None)
         if field is None:
-            raise ValueError("prerequisite resolution must be library, task, or unresolved")
+            raise ValueError("prerequisite resolution must be library, task, or unresolved, "
+                             "or use declaration/argument evidence")
         if kind == "unresolved" and allow_unresolved and set(resolution) == {"kind"}:
             resolution = {"kind": kind}
         else:
@@ -229,6 +231,12 @@ def normalize_spec(value, *, source, requirements, tasks, allow_unresolved: bool
 def library_declarations(spec: dict) -> list[str]:
     return sorted({row["resolution"]["declaration"] for row in spec["prerequisites"]
                    if row["resolution"]["kind"] == "library"})
+
+
+def prerequisite_declarations(spec: dict) -> list[str]:
+    """Exact witness names; project/external ownership is determined by Lean."""
+    return sorted({row["resolution"]["declaration"] for row in spec["prerequisites"]
+                   if row["resolution"]["kind"] == "declaration"})
 
 
 def normalize_outputs(value) -> list[dict]:

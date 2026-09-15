@@ -250,6 +250,53 @@ def candidate_is_current(state: dict, candidate: dict) -> bool:
                 and candidate.get("solution_sha256") == source.get("sha256"))
 
 
+_FAILURE_OBSERVATION_FIELDS = (
+    "main_sha", "contract_sha256", "environment_sha256", "source_sha256", "policy_sha256",
+)
+
+
+def failure_state_context(state: dict) -> dict:
+    """Cheap state portion of the controller's exact failed-input observation."""
+    formal = state.get("formalization", {})
+    return {"main_sha": formal.get("main_sha"),
+            "contract_sha256": (formal.get("contract") or {}).get("sha256")}
+
+
+def candidate_failure_key(candidate: dict, observation: dict | None) -> str | None:
+    """Identify checked bytes and policy, never a submission/receipt or timestamp.
+
+    The controller observes source/environment under the merge lock. Agents do
+    not provide this observation through MCP. Missing context disables reuse.
+    """
+    if not isinstance(observation, dict) or any(
+        not isinstance(observation.get(key), str)
+        or not (_FULL_SHA_RE if key == "main_sha" else _ARTIFACT_SHA_RE).fullmatch(observation[key])
+        for key in _FAILURE_OBSERVATION_FIELDS
+    ):
+        return None
+    return digest({
+        "observation": {key: observation[key] for key in _FAILURE_OBSERVATION_FIELDS},
+        "candidate": {key: candidate.get(key) for key in (
+            "task_id", "task_revision", "solution_sha256", "base_main_sha", "diff_sha256",
+        )},
+        "stage": candidate.get("stage", "complete"),
+        "outputs": sorted(candidate.get("outputs", []), key=lambda row: (row["declaration"], row["file"])),
+    })
+
+
+def matching_failed_candidate(state: dict, candidate: dict, observation: dict | None) -> dict | None:
+    """Reuse only an exact deterministic failure with current accepted-state CAS."""
+    key = candidate_failure_key(candidate, observation)
+    if not key or any(observation.get(field) != value for field, value in failure_state_context(state).items()):
+        return None
+    matches = [row for row in state.get("formal_candidates", {}).values()
+               if row.get("status") == "failed" and candidate_is_current(state, row)
+               and row.get("blockers") and all(item.get("deterministic") is True for item in row["blockers"])
+               and row.get("failure_context", {}).get("cacheable") is True
+               and row["failure_context"].get("input_sha256") == key]
+    return max(matches, key=lambda row: row.get("updated_at", row.get("created_at", 0)), default=None)
+
+
 def strategy_is_current(state: dict, strategy: dict) -> bool:
     source = formal_source(state)
     if (strategy.get("solution_candidate") != source.get("candidate_id")
@@ -1092,8 +1139,14 @@ def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: di
         if contract.get("environment") != previous["contract"].get("environment"):
             raise ValueError("replanning cannot silently replace the protected Lean environment")
         contract = deepcopy(contract)
-        for field in ("targets", "bindings", "external_declarations"):
-            contract[field] = deepcopy(previous["contract"].get(field, {}))
+        for field in ("targets", "bindings", "external_declarations", "prerequisite_declarations"):
+            if field in previous["contract"] or field != "prerequisite_declarations":
+                contract[field] = deepcopy(previous["contract"].get(field, {}))
+        for field, kind in (("external_declarations", "library"), ("prerequisite_declarations", "declaration")):
+            if field in contract:
+                names = {row["resolution"]["declaration"] for row in spec["prerequisites"]
+                         if row["resolution"]["kind"] == kind}
+                contract[field] = {name: record for name, record in contract[field].items() if name in names}
     contract = deepcopy(contract)
     contract["obligation_ids"] = sorted(tasks)
     contract["sha256"] = _contract_digest(contract)
@@ -1252,8 +1305,21 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
         requirements = normalize_requirements(requirements, rows, source_refs(state))
         spec = normalize_spec(spec, source=formal_source(state), requirements=requirements, tasks=rows, allow_unresolved=True)
         nodes = normalize_informal_nodes(rows, requirements, spec, formal_source(state))
+        if (not removed and not reopen_ids and requirements == formal["requirements"]
+                and spec == formal["spec"] and nodes.keys() == tasks.keys()
+                and all(all(task.get(field) == value for field, value in nodes[key].items())
+                        for key, task in tasks.items())):
+            return {"status": "noop", "revision": expected_revision, "affected_tasks": []}
+        # Adding/correcting a proof-only graph edge does not change the adopted
+        # Lean statement or its kernel proof. Re-review its correspondence, but
+        # retain exact machine evidence; statement/meaning changes still reopen.
+        def representation_meaning(task):
+            return informal_interpretation_hash({**task, "proof_dependencies": []})
+        proof_edges_changed = {key for key in nodes.keys() & tasks.keys()
+                               if nodes[key].get("proof_dependencies") != tasks[key].get("proof_dependencies")}
+        correspondence_affected.update(proof_edges_changed)
         affected = removed | reopen_ids | {key for key in nodes.keys() & tasks.keys()
-                              if informal_interpretation_hash(nodes[key]) != informal_interpretation_hash(tasks[key])}
+                              if representation_meaning(nodes[key]) != representation_meaning(tasks[key])}
         affected = _invalidate_informal_tasks(state, affected, reason="informal graph refined") if affected else set()
         for key in removed:
             retired = tasks.pop(key)
@@ -1274,10 +1340,13 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
         formal.update(requirements=requirements, spec=spec)
         formal["contract"].update(requirements=deepcopy(requirements), spec=deepcopy(spec),
                                   spec_sha256=digest(spec), obligation_ids=sorted(tasks))
-        libraries = {row["resolution"]["declaration"] for row in spec["prerequisites"]
-                     if row["resolution"]["kind"] == "library"}
-        formal["contract"]["external_declarations"] = {key: row for key, row in
-            formal["contract"].get("external_declarations", {}).items() if key in libraries}
+        for evidence_field, kind in (("external_declarations", "library"),
+                                     ("prerequisite_declarations", "declaration")):
+            names = {row["resolution"]["declaration"] for row in spec["prerequisites"]
+                     if row["resolution"]["kind"] == kind}
+            if evidence_field in formal["contract"] or names:
+                formal["contract"][evidence_field] = {key: row for key, row in
+                    formal["contract"].get(evidence_field, {}).items() if key in names}
         for task_id in _dependent_closure(tasks, correspondence_affected) & tasks.keys():
             task = tasks[task_id]
             task.setdefault("history", []).append({"timestamp": time.time(), "reason": "prerequisite resolution refined",
@@ -1524,9 +1593,22 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
     targets = (state.get("formalization", {}).get("contract") or {}).get("targets", {})
     relevant = _task_dependencies(state, task_id) | {task_id}
     source = formal_source(state)
+    rejection = state.get("formal_candidates", {}).get(_rejection_identity(state, author, task_id), {})
+    blocker_prerequisites = {key for row in rejection.get("blockers", [])
+                            for key in row.get("prerequisite_ids", [])}
+    blocker_prerequisites.update(row["prerequisite_id"] for row in rejection.get("blockers", [])
+                                 if row.get("prerequisite_id"))
+    spec = state.get("formalization", {}).get("spec") or {}
+    # A final candidate can be blocked by prerequisite metadata belonging to a
+    # different completed task. Its actual correction must wake this attempt.
+    final_scope = all(key == task_id or row.get("status") == "complete" for key, row in tasks.items())
+    prerequisites = {row["id"]: row for row in spec.get("prerequisites", [])
+                     if final_scope or row["id"] in blocker_prerequisites
+                     or relevant.intersection(row.get("needed_by", []))}
     return digest({
         "source": [source.get("candidate_id"), source.get("sha256")],
-        "rejection": _rejection_identity(state, author, task_id),
+        "rejection": _failure_progress(rejection),
+        "prerequisites": prerequisites,
         "tasks": {key: {
             "revision": tasks.get(key, {}).get("revision"),
             "interpretation": informal_interpretation_hash(tasks.get(key, {})),
@@ -1541,10 +1623,33 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
                     for output in tasks.get(key, {}).get("outputs", [])
                 },
             },
-            "accepted_candidate": tasks.get(key, {}).get("accepted_candidate"),
             "complete": tasks.get(key, {}).get("status") == "complete",
             "critic_feedback": tasks.get(key, {}).get("faithfulness", {}).get("feedback_sha256"),
         } for key in sorted(relevant)},
+    })
+
+
+def _failure_progress(candidate: dict) -> str | None:
+    if not candidate:
+        return None
+    def causal(value):
+        if isinstance(value, dict):
+            return {key: causal(item) for key, item in value.items() if key not in {
+                "candidate_id", "artifact_id", "snapshot_id", "timestamp", "created_at", "updated_at",
+            }}
+        if isinstance(value, list):
+            return [causal(item) for item in value]
+        if isinstance(value, str):
+            # Artifact references are telemetry even when an older verifier
+            # embedded them in its message instead of a structured field.
+            return re.sub(r"\bartifact-[0-9a-f]{12}\b", "artifact-<reference>", value)
+        return value
+    return digest({
+        "input_sha256": candidate.get("failure_context", {}).get("input_sha256"),
+        "diff_sha256": candidate.get("diff_sha256"), "outputs": candidate.get("outputs", []),
+        "stage": candidate.get("stage", "complete"), "failure_kind": candidate.get("failure_kind"),
+        "blockers": causal(candidate.get("blockers", [])),
+        "error": causal(candidate.get("error")) if not candidate.get("blockers") else None,
     })
 
 
@@ -1734,6 +1839,7 @@ def submit_formal_candidate(
     stage: str = "complete",
     outputs: list[dict] | None = None,
     representation_observation: dict | None = None,
+    failure_observation: dict | None = None,
 ) -> dict:
     if stage not in {"representation", "complete"}:
         raise ValueError("candidate stage must be representation or complete")
@@ -1794,6 +1900,33 @@ def submit_formal_candidate(
             raise ValueError("formal strategy/task is not accepting a new candidate")
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
+        if contract.get("version") == 3:
+            from .autoformalize_contract import prerequisite_blockers
+
+            completed = {key for key, row in state["formal_tasks"].items() if row.get("status") == "complete"}
+            if stage == "complete":
+                completed.add(task_id)
+            blockers = prerequisite_blockers(contract, completed=completed,
+                                             final=len(completed) == len(state["formal_tasks"]))
+            if blockers:
+                return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
+                        "blockers": blockers, "error": "; ".join(row["message"] for row in blockers),
+                        "next_action": "Correct the listed prerequisite evidence with refine_chunks; preserve "
+                                       "the existing proof. No candidate, build, or review interrupt was queued."}
+        proposal = {"task_id": task_id, "task_revision": task["revision"],
+                    "solution_sha256": formal_source(state).get("sha256"),
+                    "base_main_sha": base_main_sha.casefold(), "diff_sha256": diff_sha256,
+                    "stage": stage, "outputs": bindings}
+        if failure_observation is not None:
+            if any(failure_observation.get(key) != value for key, value in failure_state_context(state).items()):
+                return {"status": "retry", "task_id": task_id,
+                        "next_action": "Accepted state changed during submission; refresh the brief and retry."}
+            existing = matching_failed_candidate(state, proposal, failure_observation)
+            if existing is not None:
+                return {"status": "unchanged_failed", "candidate": deepcopy(existing),
+                        "blockers": deepcopy(existing["blockers"]), "error": existing.get("error", ""),
+                        "next_action": "Resolve the listed blockers before resubmitting these unchanged inputs. "
+                                       "Publish a precise blocker and yield the attempt when no repair is available."}
         # This observation is computed by the server from immutable Git trees,
         # never supplied by an MCP caller. Recheck it under the existing state
         # lock before suppressing a submission; do not acquire the merge lock
@@ -1901,6 +2034,8 @@ def finish_formal_merge(
     proposed_contract: dict | None = None,
     failure_kind: str = "",
     failure_main_sha: str = "",
+    blockers: list[dict] | None = None,
+    failure_context: dict | None = None,
 ) -> dict:
     with transaction(forum_dir) as state:
         candidate = state["formal_candidates"].get(candidate_id)
@@ -1983,6 +2118,17 @@ def finish_formal_merge(
                     raise ValueError("merge failure context requires a full main commit")
             candidate["status"] = "failed"
             candidate["error"] = _text(error, "error", 4000, required=False)
+            candidate["blockers"] = deepcopy(blockers if blockers is not None else (verification or {}).get("blockers", []))
+            if candidate["blockers"]:
+                candidate["failure_context"] = failure_state_context(state)
+            if (failure_context and failure_context.get("cacheable") is True
+                    and candidate["blockers"] and all(row.get("deterministic") is True for row in candidate["blockers"])):
+                failure_key = candidate_failure_key(candidate, failure_context)
+                if failure_key:
+                    candidate["failure_context"] = {
+                        **{key: failure_context[key] for key in _FAILURE_OBSERVATION_FIELDS},
+                        "cacheable": True, "input_sha256": failure_key,
+                    }
             if failure_kind:
                 candidate["failure_kind"] = _text(failure_kind, "failure_kind", 100)
             if failure_main_sha:
@@ -2077,10 +2223,11 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
     if (formal.get("spec") != contract.get("spec")
             or contract.get("spec_sha256") != digest(formal.get("spec"))):
         raise ValueError("source specification differs from its frozen contract")
-    external = {name: {key: row.get(key) for key in ("fingerprint", "module", "signature", "axioms")}
-                for name, row in contract.get("external_declarations", {}).items()}
-    if report.get("external_declarations", {}) != external:
-        raise ValueError("external prerequisite evidence differs from the frozen contract")
+    for field in ("external_declarations", "prerequisite_declarations"):
+        expected_evidence = {name: {key: row.get(key) for key in ("fingerprint", "module", "signature", "axioms")}
+                             for name, row in contract.get(field, {}).items()}
+        if report.get(field, {}) != expected_evidence:
+            raise ValueError(f"{field} prerequisite evidence differs from the frozen contract")
     if require_passed and (pending_replan(state) or open_source_issues(state)):
         raise ValueError("review cannot approve pending replanning or unresolved source issues")
     solution_id = formal.get("solution_candidate")
@@ -2357,6 +2504,22 @@ def _validate_semantic_review(state: dict, review: dict, *, approved: bool, auth
             )
         if approved and set(anchors) != expected_anchors:
             raise ValueError("approval requires checking every requirement source anchor")
+        spec = state["formalization"]["spec"]
+        expected_prerequisites = {
+            key for argument in spec.get("arguments", [])
+            if argument.get("requirement_id") == requirement_id
+            for key in argument.get("prerequisites", [])
+        } | {row["id"] for row in spec.get("prerequisites", [])
+             if set(row.get("needed_by", [])) & set(ledger[requirement_id]["tasks"])}
+        checked_prerequisites = entry.get("checked_prerequisite_ids", [])
+        if (len(checked_prerequisites) != len(set(checked_prerequisites))
+                or set(checked_prerequisites) - expected_prerequisites):
+            raise ValueError(f"requirement {requirement_id}: checked_prerequisite_ids must be unique "
+                             f"and drawn from {sorted(expected_prerequisites)}")
+        if (approved or entry["status"] == "pass") and set(checked_prerequisites) != expected_prerequisites:
+            raise ValueError(f"requirement {requirement_id}: a passing review must check every source "
+                             f"prerequisite {sorted(expected_prerequisites)} and explain their use "
+                             "in argument_rationale")
         refs = entry["declarations"]
         if len(refs) != len(set(refs)):
             raise ValueError("requirement review has duplicate declaration references")
