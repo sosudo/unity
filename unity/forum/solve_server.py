@@ -25,7 +25,9 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from .. import artifacts, solve_contract, solve_state, worktree
-from ..solve_review import SemanticReview, RepresentationReview, SourceDiagnosis
+from ..solve_review import (
+    SemanticReview, RepresentationRepairRequest, RepresentationReview, SourceDiagnosis,
+)
 from .. import solve_representation, solve_files
 from ..solve_spec import normalize_outputs
 from . import server as discussion
@@ -152,9 +154,20 @@ def _submit_formal_commit(
     stage: str = "complete",
     outputs: list[dict] | None = None,
     obsolete_files: list[dict] | None = None,
+    submission_context: dict | None = None,
 ) -> dict:
     from .. import solve_cache, solve_files
 
+    if submission_context is None:
+        preflight = solve_state.preflight_formal_submission(
+            FORUM_DIR, strategy_id, author, task_id, stage=stage, outputs=outputs,
+        )
+        if preflight["status"] == "ok":
+            submission_context = preflight["context"]
+        elif preflight["status"] != "conflict":
+            return preflight
+        # A committed retry has no worktree side effects. Let the state layer
+        # identify its exact existing candidate before enforcing mutable gates.
     resolved = worktree.verify_candidate_commit(
         _root(), author, commit_sha, allow_unchanged=True,
     )
@@ -229,6 +242,7 @@ def _submit_formal_commit(
             representation_observation=representation_observation,
             failure_observation=observation,
             inventory_observation=inventory_observation,
+            submission_context=submission_context,
             obsolete_files=obsolete_files, **actual_paths,
         )
     if result["status"] == "submitted" and not result.get("idempotent"):
@@ -244,7 +258,7 @@ def solve_status() -> dict:
 
 
 def read_metrics(forum_dir: Path, project_root: Path) -> dict:
-    """Read one workspace's telemetry without changing process-global tool routing."""
+    """Read telemetry; repair latency ends at diagnostic clearance, not acceptance."""
     state = solve_state.load_state(forum_dir)
     events = state.get("events", [])
     first_by_kind: dict[str, float] = {}
@@ -291,6 +305,37 @@ def read_metrics(forum_dir: Path, project_root: Path) -> dict:
         float(event.get("timestamp") or 0) for event in events
         if event.get("kind") == "critic_review_completed"
     ), default=0)
+    repair_records = list(state.get("manifest_repairs", {}).values())
+    repair_counts: dict[str, int] = {}
+    repair_attempt_counts: dict[str, int] = {}
+    repair_timestamps = []
+    current_repairs = {row["repair_id"] for row in solve_state.current_manifest_repairs(state)}
+    for repair in repair_records:
+        status = str(repair.get("status") or "unknown")
+        repair_counts[status] = repair_counts.get(status, 0) + 1
+        attempts = repair.get("attempts", [])
+        for attempt in attempts:
+            outcome = str(attempt.get("status") or "unknown")
+            repair_attempt_counts[outcome] = repair_attempt_counts.get(outcome, 0) + 1
+        created = repair.get("created_at")
+        finished = repair.get("resolved_at")
+        if finished is None:
+            finished = repair.get("exhausted_at")
+        latency = (round(finished - created, 3)
+                   if isinstance(created, (int, float)) and isinstance(finished, (int, float))
+                   and finished >= created else None)
+        repair_timestamps.append({
+            "repair_id": repair.get("repair_id"), "task_id": repair.get("task_id"),
+            "kind": repair.get("kind"), "status": repair.get("status"),
+            "is_current": repair.get("repair_id") in current_repairs,
+            "diagnostic_latency_seconds": latency,
+            "created_at": repair.get("created_at"),
+            "resolved_at": repair.get("resolved_at"),
+            "exhausted_at": repair.get("exhausted_at"),
+            "attempts": [{key: attempt.get(key) for key in
+                          ("author", "status", "started_at", "finished_at")}
+                         for attempt in attempts],
+        })
     return {
         "run_id": state.get("run_id"),
         "phase": state.get("phase"),
@@ -304,6 +349,11 @@ def read_metrics(forum_dir: Path, project_root: Path) -> dict:
         "by_phase": by_phase,
         "by_model": by_model,
         "by_task": by_task,
+        "manifest_repairs": {
+            "total": len(repair_records), "by_status": repair_counts,
+            "attempts_by_status": repair_attempt_counts,
+            "records": repair_timestamps,
+        },
     }
 
 
@@ -577,6 +627,8 @@ def solve_task(task_id: str) -> str:
         "readiness": task_readiness(state, task_id),
         "remaining_global_requirements": global_completion_requirements(state),
         "representation_review": solve_representation.current_representation_review(state, task_id),
+        "manifest_repairs": [row for row in solve_state.current_manifest_repairs(state)
+                             if row.get("task_id") == task_id],
         "file_reservations": {path: row for path, row in solve_files.reservations(state).items()
                               if task_id in {row["owner_task"], *row["shared_with"]}},
         "source_refs": [
@@ -683,6 +735,17 @@ def _formal_brief(author: str, task_id: str = "") -> str:
                      "Read the snapshot artifact and solve_task(task_id) for exact detail.")
     if review_phase:
         lines.extend(blocker_lines)  # Never truncate the critic's current snapshot behind repair prose.
+    repairs = [row for row in solve_state.current_manifest_repairs(state)
+               if not related or row.get("task_id") in related]
+    if repairs:
+        lines.extend(["", "CURRENT MANIFEST/REPRESENTATION REPAIR REQUESTS — not acceptance evidence"])
+        for row in repairs[:6]:
+            lines.append(f"- {row['task_id']}: {row['kind']}; {row['status']}; "
+                         f"repair {row['repair_id']}; attempts={len(row.get('attempts', []))}")
+            for blocker in row.get("blockers", [])[:2]:
+                lines.append(f"  {blocker.get('code')}: {blocker.get('message', '')[:240]}")
+        lines.append("Read solve_task(task_id).manifest_repairs for exact scope and blockers; "
+                     "repair completion does not approve mathematical correspondence.")
     reviews = [(key, solve_representation.current_representation_review(state, key))
                for key in tasks if not related or key in related]
     reviews = [(key, row) for key, row in reviews if row]
@@ -1238,6 +1301,11 @@ def finalize_formalization(
         raise ValueError("candidate stage must be representation or complete")
     outputs = normalize_outputs(outputs) if outputs is not None else None
     with _finalization_lock(author):
+        preflight = solve_state.preflight_formal_submission(
+            FORUM_DIR, strategy_id, author, task_id, stage=stage, outputs=outputs,
+        )
+        if preflight["status"] != "ok":
+            return preflight
         state = solve_state.load_state(FORUM_DIR)
         task = state.get("formal_tasks", {}).get(task_id)
         if state.get("phase") != "formalizing" or not task:
@@ -1330,6 +1398,7 @@ def finalize_formalization(
             strategy_id, author, task_id, head,
             notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
             obsolete_files=obsolete_files,
+            submission_context=preflight["context"],
         )
         return {
             **result,
@@ -1902,18 +1971,25 @@ def submit_formalization_verdict(
     review: SemanticReview,
     reopen_tasks: list[str] | None = None,
     evidence: str = "",
+    representation_repairs: list[RepresentationRepairRequest] | None = None,
 ) -> dict:
     """Submit snapshot-bound semantic evidence. Approval requires every requirement to pass.
 
     Read solve_status() for the current snapshot_id and immutable requirements.
     Free-text evidence is optional context, never a substitute for structured review.
     Approval remains pending until the controller verifies that source bytes are unchanged.
+    Optional representation_repairs route focused v3 lean_reopen work; they never approve outputs.
     """
     author = _author(author)
+    if representation_repairs is not None and not isinstance(representation_repairs, list):
+        raise ValueError("representation_repairs must be a list")
+    repairs = ([RepresentationRepairRequest.model_validate(row).model_dump()
+                for row in representation_repairs] if representation_repairs is not None else None)
     result = solve_state.submit_critic_verdict(
         FORUM_DIR, author, verdict, summary,
         review=SemanticReview.model_validate(review).model_dump(),
         reopen_tasks=reopen_tasks, evidence=evidence,
+        representation_repairs=repairs,
     )
     _mirror(author, f"FORMALIZATION VERDICT: {verdict}", summary)
     return result

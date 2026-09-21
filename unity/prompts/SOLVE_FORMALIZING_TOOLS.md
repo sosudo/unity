@@ -46,6 +46,8 @@ its incorporated components and the original problem, not an unapproved draft or
 - `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?, stage?, outputs?, obsolete_files?)` commits the
   current exact worktree bytes and submits an immutable candidate for the authoritative main build and
   declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
+  Submission preflight runs before staging/committing; a blocked or stale request preserves private
+  work and does not queue verification. Refresh the exact task context and address its blocker.
 - `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?, obsolete_files?)` is the
   compatibility route for already-committed bytes; normally use `finalize_formalization`.
 - `sync_from_main(author, reason?)` merges accepted main without discarding local work. Uncommitted
@@ -82,6 +84,12 @@ its incorporated components and the original problem, not an unapproved draft or
   prospective submission preflight. `readiness` lists declared dependencies. `remaining_global_requirements`
   is completion accounting, not an additional task dependency. Do not stop independent work for it.
   Those verified outputs do not require a finding; representation adoption alone is not verification.
+  `manifest_repairs` lists current focused requests with their context, blockers and prior attempts.
+  Read these before repeating a repair. Preserve unrelated proofs and outputs. A request classified
+  `output_manifest` is not proof that the change is metadata-only; missing mathematical witnesses or
+  changed meanings need representation work and independent source-faithfulness review.
+  Correct an adopted encoding with the existing `refine_chunks`/`reopen_representations` path.
+  A `cleared` repair is a cleared diagnostic, not an accepted proof or a semantic approval.
   The normal brief prioritizes your task, its candidates and blockers, then reusable findings before
   the coverage summaries. Machine verification is not a source-faithfulness approval.
 - `report_source_issue(author, anchor_ids, description, task_ids?)` records a suspected source defect.

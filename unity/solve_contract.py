@@ -25,7 +25,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from . import artifacts, solve_cache, solve_jobs, solve_native, solve_workspace
-from .solve_spec import library_declarations, normalize_requirements, normalize_spec, task_spec_hash
+from .solve_spec import library_declarations, normalize_outputs, normalize_requirements, normalize_spec, task_spec_hash
 
 
 AXIOMS = frozenset({"propext", "Classical.choice", "Quot.sound"})
@@ -763,6 +763,62 @@ def _binding_tasks(contract: dict) -> list[dict]:
             for task_id, outputs in contract.get("bindings", {}).items() for output in outputs]
 
 
+def output_manifest_blockers(contract: dict, *, task_ids: set[str], task_id: str,
+                             proposed_outputs: list[dict]) -> list[dict]:
+    """Cheap declaration-binding checks, shared by submission and verification.
+
+    This does not establish declaration existence, mathematical coverage or proof
+    correctness. Changing adopted outputs always requires explicit refinement.
+    """
+    if contract.get("version") != 3:
+        return []
+
+    def blocked(code: str, message: str, action: str, **details) -> list[dict]:
+        return [{"code": code, "prerequisite_id": "", "task_ids": [task_id] if task_id in task_ids else [],
+                 "message": message, "required_action": action, "deterministic": True, **details}]
+
+    if task_id not in task_ids or not isinstance(proposed_outputs, list) or not proposed_outputs:
+        return blocked("output_manifest_invalid", "candidate outputs require a current task and nonempty declaration/file list",
+                       "Provide exact current-task declaration/file outputs.")
+    names = []
+    for row in proposed_outputs:
+        if (not isinstance(row, dict) or set(row) != {"declaration", "file"}
+                or any(not isinstance(value, str) or not value.strip() or value != value.strip()
+                       for value in row.values()) or row["declaration"].startswith("-")):
+            return blocked("output_manifest_invalid", "candidate outputs require exact declaration and file names",
+                           "Correct each output to an exact declaration/file pair.")
+        names.append(row["declaration"])
+    if len(set(names)) != len(names):
+        return blocked("output_manifest_duplicate", "candidate outputs repeat declarations",
+                       "List each declaration once in the output manifest.")
+    try:
+        outputs = normalize_outputs(proposed_outputs)
+    except ValueError as exc:
+        return blocked("output_manifest_invalid", str(exc), "Provide normalized project-relative Lean output files.")
+    bindings = contract.get("bindings", {})
+    try:
+        if (not isinstance(bindings, dict) or set(bindings) - task_ids
+                or not isinstance(contract.get("targets"), dict)):
+            raise ValueError("invalid binding owners")
+        adopted = {owner: normalize_outputs(rows) for owner, rows in bindings.items()}
+        all_names = [row["declaration"] for rows in adopted.values() for row in rows]
+        if (any(not rows for rows in adopted.values()) or len(set(all_names)) != len(all_names)
+                or set(all_names) != set(contract.get("targets", {}))):
+            raise ValueError("invalid binding identities")
+    except (ValueError, TypeError, KeyError):
+        return blocked("contract_bindings_invalid", "source contract has inconsistent adopted output bindings",
+                       "Restore the consistent controller-owned contract snapshot; do not rewrite verification records.")
+    owners = {row["declaration"]: owner for owner, rows in adopted.items() for row in rows}
+    if any(owners.get(name, task_id) != task_id for name in names):
+        return blocked("output_ownership_conflict", "candidate output already belongs to another source obligation",
+                       "Reference existing outputs as prerequisites; do not claim another source obligation's output.")
+    if task_id in adopted and adopted[task_id] != outputs:
+        return blocked("output_manifest_changed", "adopted output manifest changed; explicitly revise the node before replacing it",
+                       "Restore the adopted manifest or use refine_chunks with reopen_representations before replacing it.",
+                       expected_outputs=adopted[task_id], proposed_outputs=outputs)
+    return []
+
+
 def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *, completed: set[str],
                                 proposed_outputs: list[dict] | None, task_id: str | None,
                                 stage: str, final: bool, layout: dict | None,
@@ -804,31 +860,13 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
             reject("source contract contains invalid task bindings", "contract_bindings_invalid", set(),
                    "Restore the consistent controller-owned task/output snapshot.")
         if proposed_outputs is not None:
-            if task_id not in task_ids or not isinstance(proposed_outputs, list) or not proposed_outputs:
-                reject("candidate outputs require a current task and nonempty declaration/file list", "output_manifest_invalid",
-                       {task_id} if task_id in task_ids else set(), "Provide exact current-task declaration/file outputs.")
-            outputs = []
-            for output in proposed_outputs:
-                if (not isinstance(output, dict) or set(output) != {"declaration", "file"}
-                        or any(not isinstance(value, str) or not value.strip()
-                               or value != value.strip() for value in output.values())
-                        or output["declaration"].startswith("-")):
-                    reject("candidate outputs require exact declaration and file names", "output_manifest_invalid", {task_id},
-                           "Correct each output to an exact declaration/file pair.")
-                outputs.append(dict(output))
-            outputs.sort(key=lambda row: row["declaration"])
-            names = {row["declaration"] for row in outputs}
-            if len(names) != len(outputs):
-                reject("candidate outputs repeat declarations", "output_manifest_duplicate", {task_id},
-                       "List each declaration once in the output manifest.")
-            owners = {output["declaration"]: owner for owner, rows in bindings.items() for output in rows}
-            if any(owners.get(name, task_id) != task_id for name in names):
-                reject("candidate output already belongs to another source obligation", "output_ownership_conflict", {task_id},
-                       "Reference existing outputs as prerequisites; do not claim another source obligation's output.")
-            if task_id in bindings and sorted(bindings[task_id], key=lambda row: row["declaration"]) != outputs:
-                reject("adopted output manifest changed; explicitly revise the node before replacing it", "output_manifest_changed",
-                       {task_id}, "Restore the adopted manifest or explicitly reopen its representation before replacing it.")
-            bindings[task_id] = outputs
+            manifest_issues = output_manifest_blockers(contract, task_ids=task_ids, task_id=task_id,
+                                                       proposed_outputs=proposed_outputs)
+            if manifest_issues:
+                blockers.extend(manifest_issues)
+                issues.extend(row["message"] for row in manifest_issues)
+                raise ValueError(manifest_issues[0]["message"])
+            bindings[task_id] = normalize_outputs(proposed_outputs)
         actual_tasks = _binding_tasks(proposed)
         if not actual_tasks:
             reject("no Lean representations have been adopted or proposed", "output_manifest_missing", set(),

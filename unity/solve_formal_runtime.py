@@ -485,6 +485,7 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
 def _candidate_preflight(state: dict, candidate: dict) -> list[dict]:
     return solve_state.submission_blockers(
         state, candidate["task_id"], candidate.get("stage", "complete"),
+        outputs=candidate.get("outputs"),
     )
 
 
@@ -770,6 +771,62 @@ def _blocker_recovery_context(blockers: list[dict]) -> str:
             + json.dumps(preview, ensure_ascii=False) + "\n")
 
 
+def _manifest_repair_scope(state: dict, repair: dict) -> set[str]:
+    """Pause only the repaired outputs and their declared dependent work."""
+    roots = {repair["task_id"]}
+    roots.update(key for blocker in repair.get("blockers", []) for key in blocker.get("task_ids", []))
+    return _affected_tasks(state, list(roots)) & state.get("formal_tasks", {}).keys()
+
+
+def _manifest_repair_pending_candidate(state: dict, repair: dict) -> bool:
+    scope = _manifest_repair_scope(state, repair)
+    return any(candidate.get("task_id") in scope
+               and candidate.get("status") in {"submitted", "merging"}
+               and solve_state.candidate_is_current(state, candidate)
+               for candidate in state.get("formal_candidates", {}).values())
+
+
+def _select_manifest_repairs(state: dict, repairs: list[dict], active_inputs: set[tuple[str, str]]) -> list[dict]:
+    """Serialize overlapping repair scopes without cancelling their current owner."""
+    ordered = sorted(repairs, key=lambda row: (
+        (row["repair_id"], row["input_sha256"]) not in active_inputs,
+        row.get("status") != "open", -len(_manifest_repair_scope(state, row)), row["repair_id"],
+    ))
+    selected, occupied = [], set()
+    for repair in ordered:
+        scope = _manifest_repair_scope(state, repair)
+        if not scope.intersection(occupied):
+            selected.append(repair)
+            occupied.update(scope)
+    return selected
+
+
+def _manifest_repair_prompt(repair: dict) -> str:
+    return (
+        f"MANIFEST REPAIR {repair['repair_id']}: you are the focused repair worker for "
+        f"task `{repair['task_id']}`. Preserve existing Lean declarations, dependent proofs, "
+        "and private work. Read solve_task and the exact blockers below. If the adopted "
+        "output manifest must change, use refine_chunks with reopen_representations once; "
+        "do not repeatedly submit the changed manifest against the old representation. "
+        "After a refinement refresh the task and strategy generation before submitting. "
+        "Reuse existing proof bytes and submit unchanged complete work when appropriate; "
+        "Correct Lean declarations or proofs when required, but do not rewrite accepted mathematics "
+        "or bypass fresh verification and review. "
+        "If blocked, publish the precise blocker and yield_task.\n"
+        + _blocker_recovery_context(repair.get("blockers", []))
+    )
+
+
+def _compose_formal_task_prompt(*, recovery: str, resume: str, followup: str,
+                               normal: str, representation: str, repair: dict | None = None) -> str:
+    # Current rejection recovery suppresses opportunistic submission nudges.
+    # Dedicated manifest instructions survive either path, without implying success.
+    return "\n".join(part for part in (
+        _manifest_repair_prompt(repair) if repair else "",
+        recovery or resume, normal if recovery else followup or normal, representation,
+    ) if part)
+
+
 def _rejection_recovery_prompt(state: dict, author: str, task_id: str) -> str:
     """A current rejection takes priority over opportunistic submission nudges."""
     relevant = [
@@ -893,8 +950,17 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     blocked_launches: dict[str, str] = {}
     blocked_launch_keys: dict[tuple[str, str], str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
+    manifest_attempts: dict[str, dict] = {}
     state = solve_state.load_state(paths.forum)
     solve_representation.recover_representation_reviews(paths.forum)
+    # A prior controller may have stopped between starting an attempt and
+    # recording its end. Do not let restarts repeat that author/input forever.
+    for repair in solve_state.current_manifest_repairs(state):
+        for attempt in repair.get("attempts", []):
+            if attempt.get("status") == "started":
+                solve_state.finish_manifest_repair_attempt(
+                    paths.forum, repair["repair_id"], attempt["author"], "interrupted",
+                )
     # Target notifications may arrive while verification runs in another thread.
     # Consume them separately: refreshing assignments must not consume candidates.
     target_events_seen = {event["event_id"] for event in state.get("events", [])}
@@ -954,6 +1020,57 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 name=f"solve:stop:{name}",
             )
 
+    def manifest_repairs(current: dict) -> list[dict]:
+        return _select_manifest_repairs(current, solve_state.current_manifest_repairs(current),
+            {(row["repair_id"], row["input_sha256"]) for row in manifest_attempts.values()})
+
+    def reconcile_manifest_workers(current: dict) -> None:
+        repairs = manifest_repairs(current)
+        for key in list(blocked_launches):
+            if key.startswith("manifest:"):
+                blocked_launches.pop(key)
+        live = {(row["repair_id"], row["input_sha256"]) for row in repairs}
+        for name, repair in manifest_attempts.items():
+            if (repair["repair_id"], repair["input_sha256"]) not in live:
+                request_stop(name, "manifest repair input changed; refresh current task evidence")
+        for repair in repairs:
+            if _manifest_repair_pending_candidate(current, repair):
+                continue  # Exact queued work gets its normal integration first.
+            scope = _manifest_repair_scope(current, repair)
+            for name in list(tasks):
+                if roles.get(name) != "formalizing" or active_target(name) not in scope:
+                    continue
+                owned = manifest_attempts.get(name, {})
+                if (owned.get("repair_id"), owned.get("input_sha256")) != (
+                        repair["repair_id"], repair["input_sha256"]):
+                    request_stop(name, "focused manifest repair; preserving competing proof work")
+            tried = {solve_state.author_key(row["author"]) for row in repair.get("attempts", [])}
+            if (repair.get("status") == "open" and set(agent_names) <= tried
+                    and not any(row.get("status") == "started" for row in repair.get("attempts", []))):
+                solve_state.mark_manifest_repair_exhausted(paths.forum, repair["repair_id"])
+                repair["status"] = "exhausted"
+            if repair.get("status") == "exhausted":
+                blocked_launches[f"manifest:{repair['task_id']}"] = "All configured authors attempted the current manifest repair."
+
+    def launch_manifest_repair(current: dict, name: str, task_id: str) -> tuple[bool, dict | None]:
+        relevant = [row for row in manifest_repairs(current)
+                    if task_id in _manifest_repair_scope(current, row)]
+        if not relevant:
+            return True, None
+        repair = relevant[0]
+        if (repair["task_id"] != task_id or repair.get("status") != "open"
+                or _manifest_repair_pending_candidate(current, repair)
+                or any(solve_state.author_key(row["author"]) == solve_state.author_key(name)
+                       for row in repair.get("attempts", []))):
+            return False, None
+        scope = _manifest_repair_scope(current, repair)
+        if any(active_target(owner) in scope for owner in stopping):
+            return False, None
+        if any(roles.get(owner) == "formalizing" and not running.done() and active_target(owner) in scope
+               for owner, running in tasks.items()):
+            return False, None
+        return True, repair
+
     def retire_completed_task(task_id: str) -> None:
         for name, running in list(tasks.items()):
             current = solve_state.load_state(paths.forum)
@@ -989,6 +1106,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         if (not formal_task or not solve_state.task_available_to(current, name, task_id)
                 or solve_server.has_pending_formal_candidate(current, name)
                 or solve_state.source_issues_blocking_task(current, task_id)):
+            return
+        allowed, repair = launch_manifest_repair(current, name, task_id)
+        if not allowed:
             return
         # Prospective/global accounting is not a command to stop proof search.
         # Focus repair work only after a current candidate actually failed it.
@@ -1029,6 +1149,16 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         current = solve_state.load_state(paths.forum)
         if not solve_state.task_available_to(current, name, task_id):
             return
+        allowed, refreshed_repair = launch_manifest_repair(current, name, task_id)
+        if not allowed or ((repair or {}).get("input_sha256") != (refreshed_repair or {}).get("input_sha256")):
+            return  # Preparation can race with a corrected submission or refinement.
+        repair = refreshed_repair
+        if repair:
+            started = solve_state.begin_manifest_repair_attempt(paths.forum, repair["repair_id"], name)
+            if started.get("status") != "started":
+                return
+            repair = started["repair"]
+            manifest_attempts[name] = repair
         formal_task = current["formal_tasks"][task_id]
         worker_targets[name] = task_id
         worker_revisions[name] = (task_id, formal_task.get("revision", 0))
@@ -1087,7 +1217,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 "before proofs, while stage='complete' implements the whole node "
                 "(and can adopt its outputs directly). "
             )
-        task_prompt = (recovery or resume) + ((followup if not recovery else "") or (
+        normal_task_prompt = (
             f"Your current formalization target is task `{task_id}`: "
             f"{formal_task.get('description', '')}. Current adopted outputs: "
             f"{formal_task.get('outputs', [])}. Its formalization source references are "
@@ -1104,8 +1234,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "propose_source_fix and independent solution review, or reopen_solving for further "
             "informal work. submit_source_repair records evidence, not permission to change the "
             "accepted mathematics. Use refine_chunks for graph/encoding revisions."
-        ))
-        task_prompt += "\n" + representation_instruction
+        )
+        task_prompt = _compose_formal_task_prompt(
+            recovery=recovery, resume=resume, followup=followup, normal=normal_task_prompt,
+            representation=representation_instruction, repair=repair,
+        )
         checkpoint = prepared.get("checkpoint") or prepared.get("parked_checkpoint")
         if checkpoint:
             task_prompt += (
@@ -1139,6 +1272,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         if current.get("phase") != "formalizing" or solve_state.pending_replan(current):
             return
         refresh_worker_targets(current)
+        reconcile_manifest_workers(current)
         from .solve_repairs import repair_attempt_limit, source_repair_turn
         # Review the newly adopted interface before its dependent proof work.
         # Use idle configured capacity and an independent author when available.
@@ -1178,6 +1312,18 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 agents[name], roster, paths, issue_id, repair_attempt_limit(),
                 interrupt_event=interrupts[name],
             ), name=f"solve:source_repair:{name}:{issue_id}")
+        # Repair work is a focused target, not another general proof assignment.
+        # Trying it here lets a later eligible author take over after a yield;
+        # central launch/worktree guards still preserve any unresolved private work.
+        for repair in manifest_repairs(current):
+            if repair.get("status") != "open":
+                continue
+            for name in agents:
+                if name in tasks or name in stopping:
+                    continue
+                launch(name, repair["task_id"])
+                if name in tasks:
+                    break
         ready = solve_state.ready_formal_tasks(current)
         if not ready:
             return
@@ -1257,6 +1403,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             refresh_worker_targets(state)
             if state.get("phase") == "formalizing":
                 require_source_matches(paths, state)
+                reconcile_manifest_workers(state)
             for name in list(tasks):
                 if roles.get(name) == "representation_review":
                     target, input_sha256 = review_inputs[name]
@@ -1309,6 +1456,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 attempt = worker_attempts.pop(name, None)
                 interrupted = name in interrupted_workers
                 interrupted_workers.discard(name)
+                repair = manifest_attempts.pop(name, None)
+                if repair:
+                    solve_state.finish_manifest_repair_attempt(
+                        paths.forum, repair["repair_id"], name,
+                        "interrupted" if interrupted else "yielded" if ended_normally else "failed",
+                    )
                 if role == "formalizing" and ended_normally and not interrupted and attempt:
                     current = solve_state.load_state(paths.forum)
                     submitted = any(
@@ -1461,6 +1614,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 _console.print(f"[red]integration ended with an error; worktrees preserved: {exc!r}[/red]")
         if stopping:
             await asyncio.gather(*stopping.values(), return_exceptions=True)
+        for name, repair in manifest_attempts.items():
+            solve_state.finish_manifest_repair_attempt(paths.forum, repair["repair_id"], name, "interrupted")
         await asyncio.to_thread(solve_jobs.terminate, paths.project_root)
         final_state = solve_state.load_state(paths.forum)
         for agent in roster.agents:

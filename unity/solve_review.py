@@ -40,6 +40,16 @@ class SemanticReview(BaseModel):
     repair_reviews: list[RepairReview] = Field(default_factory=list)
 
 
+class RepresentationRepairRequest(BaseModel):
+    """Focused repair intent, never verification or acceptance evidence."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    task_id: str = Field(min_length=1)
+    kind: Literal["output_manifest", "representation"]
+    reason: str = Field(min_length=1, max_length=4000)
+
+
 class RepresentationReview(BaseModel):
     """A scoped model judgment, not a kernel or final faithfulness receipt."""
 
