@@ -110,6 +110,20 @@ def run(
     """Run a registered job; interactive LSP keeps live stdio and its client's group."""
     if passthrough_stdio and serialize_build:
         raise ValueError("an interactive server must not hold the build lock")
+    # Internal checks must not re-enter the worker's Lake guard while
+    # holding the same build lock.
+    args = list(args)
+    if args and args[0] == "lake":
+        real_lake = os.environ.get("UNITY_REAL_LAKE", "").strip()
+        if real_lake:
+            executable = Path(real_lake)
+            if (
+                not executable.is_absolute()
+                or not executable.is_file()
+                or not os.access(executable, os.X_OK)
+            ):
+                raise ValueError("Invalid UNITY_REAL_LAKE executable")
+            args[0] = real_lake
     project_root = Path(project_root).resolve()
     cwd = Path(cwd or project_root).resolve()
     job_id = uuid.uuid4().hex
