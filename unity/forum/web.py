@@ -120,6 +120,14 @@ def _autoformalize_command(*, active: bool = False) -> bool:
     return state.get("command") == "autoformalize" and (not active or state.get("phase") != "done")
 
 
+def _solve_command() -> bool:
+    """Keep solve's final structured DAG visible after the run has completed."""
+    try:
+        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") == "solve"
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def _autoformalize_forum() -> Path:
     return FORUM_DIR / "autoformalize"
 
@@ -169,6 +177,53 @@ def _autoformalize_dag() -> dict:
             "revision": task.get("revision"), "status": color,
         })
     return {"graph_kind": "autoformalize", "chunks": chunks}
+
+
+def _solve_formal_dag(state: dict) -> dict:
+    """Solve-owned formal graph; the informal paper graph remains separate."""
+    from ..solve_state import assignment_view, source_issues_blocking_task
+    from ..solve_representation import current_representation_review
+
+    chunks = []
+    for task in state.get("formal_tasks", {}).values():
+        if task.get("status") == "superseded":
+            continue
+        task_id = task["task_id"]
+        assignment = assignment_view(state, task_id)
+        representation = task.get("representation") or {"status": "missing"}
+        verification = task.get("verification") or {"status": "pending"}
+        faithfulness = task.get("faithfulness") or {"status": "unreviewed"}
+        review = current_representation_review(state, task_id) or {"status": "missing"}
+        blockers = source_issues_blocking_task(state, task_id)
+        if blockers or faithfulness["status"] == "changes_requested" or task.get("status") == "blocked":
+            color = "red"
+        elif faithfulness["status"] == "approved" and verification["status"] == "verified":
+            color = "green"
+        elif task.get("status") == "candidate_pending" or representation["status"] == "adopted":
+            color = "blue"
+        else:
+            color = "yellow" if assignment.get("status") == "assigned" else "grey"
+        outputs = task.get("outputs") or []
+        statement_dependencies = task.get("statement_dependencies", [])
+        proof_dependencies = task.get("proof_dependencies", [])
+        chunks.append({
+            "id": task_id, "title": task.get("title") or task_id,
+            "type": task.get("predicted_kind") or "unknown",
+            "summary": task.get("informal_statement", ""),
+            "informal_proof": task.get("informal_proof"),
+            "source_components": task.get("source_components", []),
+            "anchor_ids": task.get("anchor_ids", []),
+            "requirement_ids": task.get("requirement_ids", []),
+            "statement_dependencies": statement_dependencies,
+            "proof_dependencies": proof_dependencies,
+            "dependencies": sorted(set(statement_dependencies) | set(proof_dependencies)),
+            "outputs": outputs, "declarations": [row["declaration"] for row in outputs],
+            "assignment": assignment, "representation": representation,
+            "representation_review": review, "blockers": blockers,
+            "verification": verification, "faithfulness": faithfulness,
+            "revision": task.get("revision"), "status": color,
+        })
+    return {"graph_kind": "solve_formalization", "chunks": chunks}
 
 
 _SORRY_RE = re.compile(r'\bsorry\b')
@@ -400,7 +455,7 @@ def get_tag(name: str):
 def get_dag():
     if _autoformalize_command():
         return JSONResponse(_autoformalize_dag())
-    if _active_structured_command() == "solve":
+    if _solve_command():
         state = _load_solve_state(FORUM_DIR)
         if state.get("phase") in {"solving", "solution_review"}:
             claimed = {
@@ -428,6 +483,7 @@ def get_dag():
                     "declarations": [],
                 })
             return JSONResponse({"graph_kind": "informal_tasks", "chunks": chunks})
+        return JSONResponse(_solve_formal_dag(state))
     dag_file = ROOT_DIR / "dag.json"
     if not dag_file.exists():
         return JSONResponse({"error": "dag.json not found"}, status_code=404)
@@ -1271,7 +1327,7 @@ function updateHeaderLegend(data) {
   const el = document.getElementById('hlegend');
   const legend = data.graph_kind === 'informal_tasks'
     ? [['green','Resolved','#2e7d32'], ['yellow','Claimed','#7c5cbf'], ['grey','Open','#d97706'], ['red','Blocked','#c62828']]
-    : data.graph_kind === 'autoformalize'
+    : ['autoformalize', 'solve_formalization'].includes(data.graph_kind)
     ? [['green','Verified + faithful','#2e7d32'], ['yellow','In progress','#7c5cbf'], ['grey','Unstarted','#d97706'], ['red','Needs attention','#c62828']]
     : LEGEND;
   if (el) el.innerHTML = legend.map(([k, label, col]) =>
@@ -1357,7 +1413,7 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
-  if (graphKind === 'autoformalize') {
+  if (['autoformalize', 'solve_formalization'].includes(graphKind)) {
     const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
     const assignment = c.assignment || {};
     document.getElementById('info-content').innerHTML =
@@ -1375,7 +1431,11 @@ function showPanel(id) {
       + field('assistants', (assignment.assistants || []).join(', ') || 'none')
       + field('representation', (c.representation || {}).status || 'missing')
       + field('verification', (c.verification || {}).status || 'pending')
-      + field('faithfulness', (c.faithfulness || {}).status || 'unreviewed');
+      + field('faithfulness', (c.faithfulness || {}).status || 'unreviewed')
+      + (graphKind === 'solve_formalization'
+        ? field('representation review', (c.representation_review || {}).status || 'missing')
+          + field('source blockers', (c.blockers || []).map(x => x.description || x.issue_id).join('; ') || 'none')
+        : '');
     document.getElementById('info-panel').classList.add('visible');
     return;
   }
@@ -1408,8 +1468,8 @@ async function loadDag(forceRebuild) {
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : data.graph_kind === 'autoformalize' ? 'Informal formalization DAG' : 'Formalization chunks';
-  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>data.graph_kind === 'autoformalize' ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
+  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
+  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>['autoformalize', 'solve_formalization'].includes(data.graph_kind) ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
   if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
   updateHeaderLegend(data);
@@ -2497,6 +2557,8 @@ async function loadOverview() {
     const [af, afm] = r.command === 'autoformalize'
       ? await Promise.all([J('/api/autoformalize-state'), J('/api/autoformalize-metrics')])
       : [{}, {}];
+    const solveDag = r.command === 'solve' ? await J('/api/dag') : {};
+    const solveTaskViews = Object.fromEntries((solveDag.chunks || []).map(x => [x.id, x]));
     const mins = r.running ? Math.floor(Date.now() / 1000 - r.started) / 60 | 0 : 0;
     let h = pagehead('Overview', '');
     // top row: run status + obstacles
@@ -2545,7 +2607,7 @@ async function loadOverview() {
         itasks = Object.values(s.informal_tasks || {}),
         iresults = Object.values(s.informal_results || {}),
         issues = Object.values(s.review_issues || {}).filter(x => x.status === 'open'),
-        stasks = Object.values(s.formal_tasks || {}),
+        stasks = Object.values(s.formal_tasks || {}).filter(x => x.status !== 'superseded'),
         sstrategies = Object.values(s.strategies || {}).filter(x => ['registered','claimed','paused'].includes(x.status)),
         sfindings = Object.values(s.findings || {}).filter(x => x.status === 'active'),
         scandidates = Object.values(s.solution_candidates || {}),
@@ -2568,9 +2630,17 @@ async function loadOverview() {
         '<div>' + esc(x.summary || '').slice(0,180) + '</div><div class="who">' + esc(x.kind || 'component') + ' · task ' + esc(x.task_id) + ' · ' + esc(x.author) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
       h += '<section><h2>actionable paper issues</h2>' + (issues.length ? issues.slice(-10).reverse().map(x =>
         '<div class="item"><b>' + esc(x.kind) + '</b><span class="badge blocked">open</span><div>' + esc(x.description || '').slice(0,220) + '</div><div class="who">repair task ' + esc(x.repair_task || '') + '</div></div>').join('') : '<div class="empty">none open</div>') + '</section>';
-      h += '<section><h2>formal tasks</h2>' + (stasks.length ? stasks.map(x =>
-        '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge ' + (x.status === 'complete' ? 'ok' : 'pending') + '">' + esc(x.status) + '</span><div class="who">' + esc(x.lean_decl || '') + '</div>' +
-        ((x.source_components || []).length ? '<div class="who">source: ' + x.source_components.map(esc).join(', ') + '</div>' : '') + '</div>').join('') : '<div class="empty">not chunked yet</div>') + '</section>';
+      h += '<section><h2>formal tasks</h2>' + (stasks.length ? stasks.map(x => {
+        const view = solveTaskViews[x.task_id] || {}, assignment = view.assignment || {};
+        return '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge ' + (x.status === 'complete' ? 'ok' : 'pending') + '">' + esc(x.status) + '</span><div>' + esc(x.title || '') + '</div>' +
+          '<div class="who">owners: ' + ((assignment.owners || []).map(esc).join(', ') || 'unassigned') + '</div>' +
+          '<div class="who">outputs: ' + ((x.outputs || []).map(o => esc(o.declaration) + ' · ' + esc(o.file)).join('; ') || 'not bound yet') + '</div>' +
+          '<div class="who">statement dependencies: ' + ((x.statement_dependencies || []).map(esc).join(', ') || 'none') + ' · proof dependencies: ' + ((x.proof_dependencies || []).map(esc).join(', ') || 'none') + '</div>' +
+          '<div class="who">representation: ' + esc((x.representation || {}).status || 'missing') + ' · review: ' + esc((view.representation_review || {}).status || 'missing') + '</div>' +
+          '<div class="who">verification: ' + esc((x.verification || {}).status || 'pending') + ' · faithfulness: ' + esc((x.faithfulness || {}).status || 'unreviewed') + '</div>' +
+          ((view.blockers || []).length ? '<div class="sub">source blockers: ' + view.blockers.map(b => esc(b.description || b.issue_id)).join('; ') + '</div>' : '') +
+          ((x.source_components || []).length ? '<div class="who">source: ' + x.source_components.map(esc).join(', ') + '</div>' : '') + '</div>';
+      }).join('') : '<div class="empty">not chunked yet</div>') + '</section>';
       h += '<section><h2>formal candidates</h2>' + (fcandidates.length ? fcandidates.slice(-6).reverse().map(x => {
         const build = x.build || {}, verification = x.verification || {};
         return '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge ' + (x.status === 'merged' ? 'ok' : x.status === 'failed' ? 'blocked' : 'amber') + '">' + esc(x.status) + '</span>' +

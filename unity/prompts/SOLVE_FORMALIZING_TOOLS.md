@@ -1,67 +1,149 @@
 # Available tools for `unity solve` — Lean formalization
 
-Start with `solve_brief(author)` and refresh frequently. The brief contains the accepted solution identity,
-ready tasks, current strategies, findings, and candidate events.
+Start with `solve_brief(author)` and refresh frequently for source identity, ready tasks, strategies,
+findings and candidate events. These tools belong to solve's formalization phase and share its Forum
+with the preceding informal-solving phase. The formal source is the independently accepted paper,
+its incorporated components and the original problem, not an unapproved draft or repair proposal.
 
-- `register_strategy(author, description, target?, strategy_family?)` registers a materially distinct Lean
-  approach; `target` must be the formal task ID. Prefer claiming a suitable registered strategy. Use
-  `claim_strategy`, `assist_strategy`, `unclaim_strategy`, or `mark_strategy_incorrect` as appropriate.
-  Own only one claimed strategy at a time.
-- `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
-  shares reusable checked APIs, working proof patterns, and concrete failures. Publish before substantial
-  follow-on work, not only after completing the whole proof. Include the formal task ID as `target` and
-  concrete `evidence` (checked type/module, check outcome, or artifact reference). Reuse existing findings;
-  routine reads and unchanged checks do not need posts. `report_obstacle`, `ask_question`, and
-  `answer_question` share blockers and requests for help.
-- `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?)` stages and
-  commits the current worktree source, binds the candidate to that exact commit and diff hash, and submits
-  it for Unity's authoritative main build. Call it as soon as the target appears complete. `changed_paths`
-  is optional; omit it to include all non-ignored project changes.
-- `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?)` remains
-  available for compatibility when you already made the exact commit yourself. Prefer
-  `finalize_formalization`.
-- `sync_from_main(author, reason?)` merges accepted main without discarding local work. Dirty worktrees
-  and pending candidates block synchronization; merge conflicts remain for you to resolve. Claims are
-  retained. Do not sync merely because an unrelated task merged.
-- `propose_source_fix(author, path, reason, supersedes?)` snapshots corrected paper bytes and returns them
-  to independent review.
-- `reopen_solving(author, reason)` returns to full informal solving for a substantive paper defect.
-- `request_rechunk(author, reason)` requests a new protected specification when the chunker's Lean
-  statement or definition mapping is wrong but the accepted paper remains valid. Explain the precise
-  mismatch first; the old contract and its review evidence are invalidated.
-- `forum_post`, `forum_read`, `solve_status`, `artifact_info`, and `artifact_read` provide discussion and
-  bounded detail.
+- `register_strategy(author, description, target?, strategy_family?)` registers a materially distinct
+  approach for the formal task ID. Prefer a suitable existing strategy. Use `claim_strategy`,
+  `assist_strategy`, `unclaim_strategy` or `mark_strategy_incorrect`; own one claimed strategy at a time.
+- `yield_task(author, task_id, reason, waiting_for?)` ends your blocked attempt. `waiting_for` is an
+  optional list of existing dependency task IDs. It releases your claims and assistance for that task,
+  and defers that task for you only; other workers can continue. End the turn after a `yielded` response;
+  if helpers are already ready, refresh and continue; if a candidate is pending, follow its review
+  interrupt. Unity handles reassignment and preserves private work. Use `unclaim_strategy` for ownership transfer or a
+  new approach while continuing, not for ending a blocked attempt. Do not repeat unchanged blocker
+  posts. There is no per-turn call limit.
+- `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?, declarations?, files?)`
+  shares reusable checked APIs, proof patterns and concrete failures. Publish before substantial
+  follow-on work, with the formal task ID and check/artifact evidence; reuse existing findings.
+  Publish useful partial findings; do not wait for your entire proof.
+  Routine reads and unchanged checks need no posts.
+  `confidence` is an integer from 0 to 100: use `95`, not `0.95`. `kind` is an agent-chosen string,
+  not a fixed enum. Use `supersedes` when new evidence replaces an active finding.
+  For reusable Lean code, pass exact fully-qualified names in `declarations=["Project.helper"]` and
+  explicit worktree-relative `.lean` paths in `files=["Project/Helper.lean", "Project/PrivateSupport.lean"]`.
+  Include private imported files needed to integrate the helper; only explicitly named files in your
+  existing worktree are captured, not an automatically discovered import closure. The saved bytes are
+  immutable code artifacts. Names, confidence and reported local checks are agent-reported evidence,
+  not Unity acceptance; publishing neither merges code nor verifies a task.
+- `read_finding(finding_id)` retrieves the exact finding, including declarations, code artifact paths
+  and capture context; legacy and superseded findings remain readable by ID. A `potentially stale`
+  context warning does not discard the preserved bytes. Use `artifact_read` on each code attachment,
+  consume its returned `content`, and follow `next_offset` until null to retrieve complete source.
+  Inspect the exact names and imports, then integrate suitable code into your own assigned worktree
+  and check it there, preserving existing edits. Never edit another worker's tree or assume that
+  unpublished-on-main helper code is already present in your tree.
+- `report_obstacle(author, goal_state, target?, tried?, hypothesis?)` records a concrete blocker.
+- `ask_question(author, body, to?, target?)` asks for help; `answer_question(question_id, author, body)`
+  answers an existing question.
+- `forum_post(thread_id, author, content, reply_to?)` posts free-form discussion; `reply_to` is an
+  optional list of post IDs. A post does not reserve work or submit a candidate.
+- `reserve_files(author, task_id, paths, share_with?)` reserves worktree-relative paths for a claimed
+  task. Same-task workers share them. Only the owner task can grant cross-task sharing with a list of
+  task IDs in `share_with`. Prefer separate modules for independent work; conflicts preserve private edits.
+- `finalize_formalization(strategy_id, author, task_id, changed_paths?, notes?, supersedes?, stage?, outputs?, obsolete_files?)` commits the
+  current exact worktree bytes and submits an immutable candidate for the authoritative main build and
+  declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
+- `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?, obsolete_files?)` is the
+  compatibility route for already-committed bytes; normally use `finalize_formalization`.
+- `sync_from_main(author, reason?)` merges accepted main without discarding local work. Uncommitted
+  tracked edits and pending candidates block sync; unrelated untracked files do not. Git refuses to
+  overwrite colliding untracked files. Conflicts remain for resolution and claims are retained. Do not sync
+  just because an unrelated task merged.
+- `refine_chunks(author, expected_revision, changes)` transactionally revises informal interpretations,
+  predicted kinds, hints and typed dependencies, or adds/splits/combines nodes. Use `upserts`
+  (complete node rows) and `replacements` (`{old_ids,new_ids,reason}` rows) in `changes`. Preserve existing
+  node IDs for unchanged mathematics and all original obligations. Stale revisions fail atomically;
+  refresh the brief before retrying. Original source requirements/anchors/scope are read-only;
+  the implementation resolution of an existing prerequisite is editable as described below.
+  To correct an adopted Lean encoding without changing its informal mathematics, add
+  `reopen_representations=[{"task_id":"stable-node-id","reason":"why the encoding must change"}]`
+  to `changes`. This explicitly revises the representation and invalidates its dependent evidence;
+  do not rewrite correct informal prose merely to unlock a different Lean type/name/file.
+  Resolve an existing planned prerequisite with
+  `prerequisite_resolutions=[{"id":"P1","resolution":{"kind":"declaration","declaration":"Exact.name"}}]`
+  in `changes`. Unity checks external or project-local provenance; a local witness need not be another
+  output/task. Use the existing task-resolution shape for genuinely separate provider work. Inline
+  discharge or target-citation accounting uses `{"kind":"argument","rationale":"specific evidence"}`;
+  Unity derives the consuming requirements and the critic checks correspondence. Preserve the source
+  statement/anchors; do not invent a self-edge or mark an obligation true without evidence.
+  Before yielding for a missing helper, actually add its node and the consumer's typed dependency edge
+  through `refine_chunks`, then pass the helper task ID to `yield_task`. A finding or help request alone
+  does not create a task or its dependency.
+- `request_rechunk(author, reason, task_ids?)` queues a revised informal plan and argument/prerequisite
+  mapping, without rewriting original source obligations. Give precise source locations/evidence; ordinary formal drafts use refinement or a new
+  candidate, not mandatory rechunking. The supplied source is unchanged.
+- `forum_read`, `solve_status`, `artifact_info` and bounded `artifact_read` provide detail.
+- `solve_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
+  for a task, including relevant dependency findings and current machine-verified dependency outputs.
+  `verification_blockers` records actual checked candidate failures. `submission_blockers` is current
+  prospective submission preflight. `readiness` lists declared dependencies. `remaining_global_requirements`
+  is completion accounting, not an additional task dependency. Do not stop independent work for it.
+  Those verified outputs do not require a finding; representation adoption alone is not verification.
+  The normal brief prioritizes your task, its candidates and blockers, then reusable findings before
+  the coverage summaries. Machine verification is not a source-faithfulness approval.
+- `report_source_issue(author, anchor_ids, description, task_ids?)` records a suspected source defect.
+  `submit_source_repair(author, issue_id, explanation, evidence, replacement?)` proposes an explicit
+  evidence-backed spot repair. Unity diagnoses source-vs-encoding errors first. A proposal alone
+  cannot change the accepted paper or queue adoption of changed mathematics.
+- `propose_source_fix(author, path, reason, supersedes?)` submits a corrected full paper draft to
+  independent solution review. Never overwrite accepted `PROOF.tex` or self-approve the correction.
+- `reopen_solving(author, reason)` returns substantial unresolved mathematics to informal solving.
+  End the formalization attempt when either tool changes the phase. Encoding errors instead use
+  refinement/new Lean candidates under the same accepted source. Keep argument `repair_ids` empty.
 
-For backends without native MCP, run `unity mcp unity-forum <tool> '<json-args>'`.
+Original source bytes must not change. Explore source defects and propose explicit corrections instead
+of modifying the input or silently formalizing a different statement.
 
-For multiline Lean or other quoted content, read the source from its file and serialize the argument
-object with `json.dump`/`json.dumps` using the tool's documented fields. Write it to a private temporary
-JSON file or stdin; never manually embed Lean source in shell-quoted JSON. For example, after creating
-the serialized request:
+Both candidate tools default to `stage="complete"`. Pass the first output binding as
+`outputs=[{"declaration":"Project.name","file":"Project/File.lean"}]`; a node may have multiple outputs.
+A complete implementation can adopt the representation and verify its proof in one submission.
+`stage="representation"` shares a locally checked representation before proof completion; it may
+contain theorem proof holes, never unfinished meaning-bearing definitions. Representation adoption
+does not mean proof completion or faithfulness. Candidate versions retain exact commits/manifests.
+After adoption, Unity schedules targeted representation review before own/dependent proof work.
+Unrelated work continues. Unchanged encodings reuse that evidence; final critic review remains.
+After alignment approval, work on the remaining proof/construction and prerequisites; do not resubmit the
+unchanged representation. Use `stage="complete"` when ready, or `refine_chunks` with
+`reopen_representations` if the adopted encoding needs correction. An `already_adopted` response
+queues no new candidate or review interrupt. Follow its `next_action`: continue useful proof work,
+or call `yield_task` with a concrete blocker before ending the attempt; do not repeat the submission.
+Likewise, `blocked` or `unchanged_failed` preserves the commit but queues no new review. Correct the
+identified prerequisite/source inputs, not unrelated outputs or commit messages. If you cannot,
+yield with the exact blocker IDs in the reason. Repeated receipt IDs or findings are not new proof
+progress. Metadata-only corrections preserve unchanged Lean proof evidence but require semantic review.
+Task details distinguish assignment (claims/assistants), representation, verification and faithfulness,
+all with current revision-bound evidence; proof-only prerequisites need not delay statement work.
+
+For explicit superseded-scaffold cleanup, delete the file privately and pass
+`obsolete_files=[{"path":"Project/Old.lean","replacement_candidate_id":"<current merged candidate>"}]`.
+No automatic deletion occurs. The replacement must be integrated, adopted bindings preserved, and
+imports/dependencies must still build. Normal edits to your own unbound files need no cleanup metadata.
+
+For a backend without native MCP, use `unity mcp unity-forum <tool> '<json-args>'`. For multiline Lean or
+quoted content, serialize the JSON argument object and pass a file/stdin rather than hand-quoting Lean:
+use a real JSON serializer such as Python `json.dump` or `json.dumps`, with exactly the documented
+tool fields; do not guess extra arguments or concatenate unescaped source into shell strings.
 
 ```sh
 unity mcp axle check --args-file /path/to/request.json
 unity mcp axle check --args-file - < /path/to/request.json
 ```
 
-Use either positional JSON or `--args-file`, not both. This applies to all MCP servers, including
-`lean-lsp` and `unity-forum`; native MCP calls use structured arguments directly.
+Use positional JSON or `--args-file`, not both. This works for all MCP servers. Native MCP uses structured
+arguments directly. The bridge stores server stderr separately; a diagnostics artifact alone does not
+mean failure. Inspect actual result/exit status and retrieve diagnostics only as needed.
 
-The shell MCP bridge stores server stderr separately. A diagnostics artifact alone does not mean the
-tool failed; inspect the returned result and command exit status. Retrieve diagnostics with
-`artifact_read` when investigating a failure.
+Use enabled compatible Axle tools preferentially over equivalent Lean LSP tools. Use Lean LSP for local
+goals/project diagnostics. Consult the injected catalogs for actual tool schemas and Aristotle availability.
+The shared `.lake/packages` cache is controller-owned: do not run `lake clean`, `lake update`, `lake upgrade`,
+`lake exe cache` or bare `lake build`; do not bypass these restrictions with `lean_build`.
 
-The shared `.lake/packages` cache is controller-owned. Worker commands `lake clean`, `lake update`,
-`lake upgrade`, `lake exe cache`, and bare `lake build` are rejected. Do not bypass these restrictions
-with `lean_build`. Use MCP tools for normal proof development: prefer enabled, compatible Axle tools
-over equivalent Lean LSP tools; use Lean LSP for local goal state and project-specific diagnostics.
-The injected Lean and external-tool catalogs describe available tools and their uses.
-
-Use the supplied non-login shell environment (`login=false` where available). Do not start nested login
-shells or bypass the guarded `lake` command. Direct shell checks are a fallback when MCP cannot provide
-the needed diagnostic, or when a targeted build is needed for compiled artifacts. In that case, use
-`unity capture -- lake env lean Project/File.lean` (or the targeted `lake build`) from your worktree root;
-these shell checks are registered and serialized automatically. Do not pipe away the check's exit status.
-Poll a running check's same tool session until it exits; never start a duplicate check merely because
-output is empty. Finalize after a successful targeted local check unless a concrete error remains;
-do not repeat a check against unchanged source.
+Use the supplied non-login shell environment. Only fall back to `unity capture -- lake env lean
+Project/File.lean` when MCP cannot provide the needed check, or targeted `unity capture -- lake build
+Project.Module` when compiled artifacts are needed. Preserve exit status, poll a running check's same
+session, and do not start duplicate checks for empty output. Finalize promptly after a successful targeted
+local check of a new representation or completed implementation; do not repeat checks or representation
+submissions against already adopted, unchanged bytes.

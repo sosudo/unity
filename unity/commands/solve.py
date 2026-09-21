@@ -19,21 +19,27 @@ from ..orchestrator import (
     mark_phase,
     resume_point,
     stop_requested,
-    toposort,
 )
+from ..solve_formal_orchestrator import (
+    dispatch as formal_dispatch, build_solve_formal_mcp,
+)
+from ..solve_input import require_source_matches
+from ..solve_repairs import run_source_repairs
+from ..solve_report import persist_report
 from ..roster import load_roster
 from ..solve_runtime import (
     configure_forum,
     forum_brief,
     materialize_solution,
-    recover_interrupted_formal_merges,
     reset_solve_workspace,
-    run_formalizing_runtime,
     run_solving_runtime,
-    validate_formalization_dag,
-    write_formalization_plan,
-    _merge_lock,
 )
+from ..solve_formal_runtime import (
+    recover_interrupted_formal_merges, run_formalizing_runtime,
+    write_formalization_plan, _merge_lock, refresh_replanned_worktrees,
+)
+
+PIPELINE = "solve"
 
 
 def _retrospective_enabled() -> bool:
@@ -275,136 +281,243 @@ async def _review_current_solution(roster, paths, max_attempts: int | float) -> 
 
 
 async def _chunk_accepted_solution(roster, paths, max_attempts: int | float) -> None:
-    """Create a valid semantic DAG, rotating chunkers after bounded failures."""
+    """Rotate failed executions; correct proposals inside their existing session."""
+    from .. import artifacts
+    from ..solve_chunking import chunking_workspace
+    from ..solve_input import store_bytes
+    from ..solve_formal_runtime import (
+        read_chunking_draft, prepare_chunking_draft, seed_chunking_draft, chunking_diagnostic,
+    )
+
     state = solve_state.load_state(paths.forum)
-    candidate_id = state["solution"].get("accepted_candidate")
-    candidate = state["solution_candidates"].get(candidate_id or "")
+    candidate = solve_state.formal_source(state)
     if not candidate:
-        raise click.ClickException("chunking requires an accepted solution candidate")
-    proof = materialize_solution(paths, candidate)
-    plan = write_formalization_plan(paths, candidate)
-    chunkers = [roster.primary] + [
-        agent for agent in roster.agents if agent.name != roster.primary.name
-    ]
-    limit_label = "infinity" if max_attempts == float("inf") else str(int(max_attempts))
-    failures: list[str] = []
+        raise click.ClickException("chunking requires a bound formalization source")
+    require_source_matches(paths, state)
+    chunkers = [roster.primary] + [a for a in roster.agents if a.name != roster.primary.name]
+    failures = []
+    # The last submitted bytes survive genuine session failures without requiring
+    # another agent to recreate the proposal. Interrupted runs also retain this artifact.
+    resume_draft = None
+    for row in reversed(state["chunking_attempts"]):
+        if not row.get("obsolete") and row.get("draft_artifact"):
+            try:
+                resume_draft = artifacts.artifact_bytes(paths.artifacts, row["draft_artifact"])
+            except (OSError, ValueError):
+                continue
+            break
 
     for chunker in chunkers:
         while not stop_requested(paths.project_root):
             current = solve_state.load_state(paths.forum)
-            used = solve_state.chunking_attempt_count(current, candidate_id, chunker.name)
-            if used >= max_attempts:
+            if (current.get("phase") != "chunking"
+                    or solve_state.formal_source(current).get("candidate_id") != candidate["candidate_id"]):
+                return
+            if solve_state.chunking_attempt_count(current, candidate["candidate_id"], chunker.name) >= max_attempts:
                 break
-
-            attempt = solve_state.begin_chunking_attempt(
-                paths.forum, candidate_id, chunker.name,
-            )
-            attempt_number = int(attempt["attempt"])
-            (paths.unity / "dag.json").unlink(missing_ok=True)
-            prior = failures[-3:]
-            prior_context = (
-                " Previous failed attempts: " + " | ".join(prior)
-                if prior else ""
-            )
-            results = await dispatch(
-                [chunker],
-                roster,
-                load_prompt("solve/CHUNKING"),
-                f"This is chunking attempt {attempt_number} of {limit_label} for `{chunker.name}`. "
-                f"Read the exact accepted paper at `{proof.relative_to(paths.project_root)}` and the "
-                f"mechanical coverage scaffold at `{plan.relative_to(paths.project_root)}`. Its SHA-256 is "
-                f"`{candidate['sha256']}`. Produce `.unity/dag.json` bound to that candidate and hash, with "
-                "explicit mathematical requirements, source-component coverage, and an acyclic graph. "
-                "Create an elaboratable Lean scaffold for each chunk's exact declaration and complete "
-                "meaning-bearing definitions. Only theorem proofs may remain as scaffold sorry holes. "
-                "Use meaningful proof units, keeping tightly coupled steps together and splitting "
-                "substantial independently useful work. Record genuine proof prerequisites, not "
-                "paper order or shared-definition dependencies. Minimize scaffold imports using "
-                "the installed min_imports tools."
-                + prior_context,
-                paths.project_root,
-                build_solve_mcp(paths, "chunking"),
-                tools_prompt="SOLVE_CHUNKING_TOOLS",
-                icrl_enabled=False,
-                brief_provider=_brief_provider(paths, "chunking"),
-                mcp_profile="solve",
-                log_context={
-                    "command": "solve",
-                    "run_id": state.get("run_id"),
-                    "phase": "chunking",
-                    "role": "chunker",
-                    "candidate_id": candidate_id,
-                    "attempt": attempt_number,
-                },
-            )
-            dispatch_failure = next(
-                (result for result in results if isinstance(result, Exception)), None,
-            )
+            attempt = solve_state.begin_chunking_attempt(paths.forum, candidate["candidate_id"], chunker.name)
+            plan_path = write_formalization_plan(paths, candidate)
+            installed = None
+            assignments = {}
+            last_feedback = None
+            execution_started = False
             try:
-                dag = validate_formalization_dag(paths, candidate["sha256"])
-                toposort(paths)
-                with _merge_lock(paths.project_root):
-                    current = solve_state.load_state(paths.forum)
-                    if (current["phase"] != "chunking"
-                            or current["solution"].get("accepted_candidate") != candidate_id):
-                        return
-                    contract = solve_contract.freeze_formal_contract(paths, dag)
-                    solve_state.initialize_formal_tasks(
-                        paths.forum,
-                        dag["chunks"],
-                        solution_candidate=candidate_id,
-                        solution_sha256=candidate["sha256"],
-                        main_sha=worktree.main_commit(paths.project_root),
-                        requirements=dag["requirements"],
-                        contract=contract,
-                    )
-            except solve_contract.ContractEnvironmentError as exc:
-                solve_state.finish_chunking_attempt(
-                    paths.forum, attempt["attempt_id"], succeeded=False,
-                    reason=f"environment failure: {exc}",
-                )
-                raise click.ClickException(
-                    f"Contract environment check failed; not retrying chunking: {exc}"
-                ) from exc
-            except (OSError, ValueError) as exc:
-                reason = str(exc)
-                if dispatch_failure is not None:
-                    reason = f"agent failure: {dispatch_failure!r}; {reason}"
-                reason = reason[:2000]
-                failures.append(f"{chunker.name} attempt {attempt_number}: {reason}")
-                solve_state.finish_chunking_attempt(
-                    paths.forum, attempt["attempt_id"], succeeded=False, reason=reason,
-                )
-                (paths.unity / "dag.json").unlink(missing_ok=True)
-                click.echo(
-                    f"chunker {chunker.name} attempt {attempt_number}/{limit_label} failed: "
-                    f"{reason[:500]}"
-                )
-                continue
+                async with chunking_workspace(paths, chunker.name, attempt) as workspace:
+                    seed = seed_chunking_draft(current)
+                    if resume_draft is not None:
+                        workspace.draft_path.write_bytes(resume_draft)
+                    elif seed is not None:
+                        workspace.draft_path.write_text(json.dumps(seed, indent=2) + "\n")
 
-            solve_state.finish_chunking_attempt(
-                paths.forum,
-                attempt["attempt_id"],
-                succeeded=True,
-                chunk_count=len(dag["chunks"]),
-            )
-            click.echo(
-                f"created {len(dag['chunks'])} formalization task(s) from accepted solution "
-                f"using {chunker.name} on attempt {attempt_number}"
-            )
+                    async def complete_draft(_final):
+                        nonlocal installed, assignments, resume_draft, last_feedback
+                        if stop_requested(paths.project_root):
+                            return None
+                        current = solve_state.load_state(paths.forum)
+                        if current.get("phase") != "chunking":
+                            return None
+                        try:
+                            require_source_matches(paths, current)
+                        except ValueError as exc:
+                            raise click.ClickException(str(exc)) from exc
+                        repaired = await run_source_repairs(roster, paths, max_attempts)
+                        if repaired.get("phase") != "chunking":
+                            return None
+                        if stop_requested(paths.project_root):
+                            return None
+                        if any(row.get("status") == "unresolved"
+                               for row in solve_state.open_source_issues(repaired)):
+                            raise click.ClickException("Source-repair attempts exhausted; original input and evidence preserved")
+                        write_formalization_plan(paths, candidate)
+                        current = solve_state.load_state(paths.forum)
+                        payload = None
+                        try:
+                            payload = read_chunking_draft(workspace.draft_path)
+                            resume_draft = payload
+                            dag, _ = prepare_chunking_draft(paths, current, payload)
+                        except (ValueError, RecursionError) as exc:
+                            diagnostic = chunking_diagnostic(exc)
+                            signature = (hashlib.sha256(payload).hexdigest() if payload is not None else None,
+                                         json.dumps(diagnostic, sort_keys=True))
+                            artifact_id = None
+                            if payload is not None and signature != last_feedback:
+                                record = store_bytes(paths.artifacts, payload, kind="solve_chunking_draft",
+                                                     producer=chunker.name, source=attempt["attempt_id"])
+                                artifact_id = record["artifact_id"]
+                            solve_state.record_chunking_feedback(
+                                paths.forum, attempt["attempt_id"], diagnostic, artifact_id=artifact_id,
+                            )
+                            last_feedback = signature
+                            return ("Unity rejected this draft, not this execution. Correct the fields below in "
+                                    "the same draft; call validate_chunks() before finishing. Do not rewrite frozen "
+                                    "source obligations or call Unity internals.\n"
+                                    + json.dumps(diagnostic, ensure_ascii=False)
+                                    + "\nRead updated source-repair context at " + str(plan_path))
+
+                        # A plan preflight never approves itself. Refresh live environment
+                        # once here, outside the model/API retry machinery.
+                        try:
+                            contract = solve_contract.prepare_source_contract(paths, dag, state=current)
+                        except (OSError, ValueError) as exc:
+                            raise click.ClickException("Contract environment check failed: " + str(exc)) from exc
+                        old_environment = (current["formalization"].get("contract") or {}).get("environment")
+                        if old_environment is not None and old_environment != contract["environment"]:
+                            raise click.ClickException("Protected Lean environment changed; not retrying chunking")
+                        with _merge_lock(paths.project_root):
+                            latest = solve_state.load_state(paths.forum)
+                            if (latest.get("phase") != "chunking"
+                                    or solve_state.formal_source(latest).get("candidate_id") != candidate["candidate_id"]):
+                                return None
+                            try:
+                                unchanged = read_chunking_draft(workspace.draft_path) == payload
+                            except ValueError as exc:
+                                return json.dumps(chunking_diagnostic(exc), ensure_ascii=False)
+                            if latest["revision"] != current["revision"] or not unchanged:
+                                return "The draft or shared state changed during acceptance. Refresh validate_chunks() and finish again."
+                            require_source_matches(paths, latest)
+                            main_sha = worktree.main_commit(paths.project_root)
+                            if main_sha != contract["source_main_sha"]:
+                                return "Accepted main changed during validation. Refresh validate_chunks() and finish again."
+                            record = artifacts.store_text(
+                                paths.artifacts, json.dumps(dag, sort_keys=True, ensure_ascii=False),
+                                kind="solve_accepted_plan", producer="Unity", source=attempt["attempt_id"],
+                            )
+                            try:
+                                installed = solve_state.initialize_informal_plan(
+                                    paths.forum, dag, main_sha=main_sha, contract=contract,
+                                    attempt_id=attempt["attempt_id"], expected_revision=latest["revision"],
+                                    plan_artifact=record["artifact_id"],
+                                )
+                            except ValueError as exc:
+                                return ("Publication did not change state. Refresh validate_chunks() and correct: "
+                                        + json.dumps(chunking_diagnostic(exc), ensure_ascii=False))
+                            assignments = (latest.get("replan") or {}).get("assignments", {})
+                            # State and its immutable artifact are authoritative if the process
+                            # exits before this convenience JSON mirror is replaced.
+                            artifacts._atomic_write(paths.unity / "dag.json",
+                                                    (json.dumps(dag, indent=2) + "\n").encode())
+                        return None
+
+                    async def completed(final):
+                        try:
+                            return await complete_draft(final)
+                        except click.ClickException:
+                            raise
+                        except Exception as exc:
+                            # Unexpected controller/IO failures are not agent/API
+                            # failures: stop rather than spending the whole roster.
+                            raise click.ClickException("Chunking controller failed: " + str(exc)) from exc
+
+                    try:
+                        execution_started = True
+                        results = await formal_dispatch(
+                            [chunker], roster, load_prompt(f"{PIPELINE}/CHUNKING"),
+                            f"You are the chunker for execution {attempt['attempt']} ({chunker.name}). "
+                            f"Read scope at {paths.unity_md} and the source/repair plan at {plan_path}. "
+                            f"Write only the draft at {workspace.draft_path}. "
+                            + ("This is a replan: edit the seeded mutable-only draft; Unity supplies frozen obligations. "
+                               if seed is not None else
+                               "This is initial chunking: use the full informal DAG schema in your instructions. ")
+                            + "Keep one initial node per source definition/result, with its statement and supplied proof. "
+                              "Use separate statement/proof dependencies. Do not write Lean or build anything. "
+                              "Correct validation feedback in this session; ordinary corrections do not consume attempts. "
+                            + ("Previous execution failures: " + " | ".join(failures[-3:]) if failures else ""),
+                            workspace.cwd, workspace.mcp,
+                            tools_prompt=f"{PIPELINE.upper()}_CHUNKING_TOOLS", icrl_enabled=False,
+                            brief_provider=_brief_provider(paths, "chunking"),
+                            log_context={"command": PIPELINE, "run_id": state["run_id"], "phase": "chunking",
+                                         "role": "chunker", "candidate_id": candidate["candidate_id"],
+                                         "attempt": attempt["attempt"], "attempt_id": attempt["attempt_id"]},
+                            on_normal_completion=completed, env_overrides=workspace.env,
+                        )
+                    finally:
+                        # Archive before the scratch workspace is removed, including
+                        # a transport failure/cancellation before a completed turn.
+                        if installed is None:
+                            try:
+                                resume_draft = read_chunking_draft(workspace.draft_path)
+                            except ValueError:
+                                pass
+                            except OSError as exc:
+                                workspace.preserve = True
+                                raise click.ClickException(
+                                    f"Cannot read chunking draft; retained at {workspace.draft_path}: {exc}"
+                                ) from exc
+                            else:
+                                try:
+                                    record = store_bytes(paths.artifacts, resume_draft,
+                                        kind="solve_chunking_draft", producer=chunker.name,
+                                        source=attempt["attempt_id"])
+                                    if solve_state.load_state(paths.forum).get("phase") == "chunking":
+                                        solve_state.save_chunking_draft(
+                                            paths.forum, attempt["attempt_id"], record["artifact_id"],
+                                        )
+                                except Exception as exc:
+                                    workspace.preserve = True
+                                    raise click.ClickException(
+                                        f"Cannot archive chunking draft; retained at {workspace.draft_path}: {exc}"
+                                    ) from exc
+                    if stop_requested(paths.project_root):
+                        return
+                    if installed is None and solve_state.load_state(paths.forum).get("phase") != "chunking":
+                        return
+                    error = next((result for result in results if isinstance(result, Exception)), None)
+                    if error is not None:
+                        raise error
+                    if installed is None:
+                        raise RuntimeError("chunker execution ended without controller plan publication")
+            except click.ClickException:
+                if installed is None and solve_state.load_state(paths.forum).get("phase") == "chunking":
+                    solve_state.finish_chunking_attempt(paths.forum, attempt["attempt_id"],
+                        succeeded=False, reason="controller/source/environment failure; see terminal diagnostic")
+                raise
+            except Exception as exc:
+                if installed is not None:
+                    raise click.ClickException("Plan accepted but chunker cleanup failed: " + str(exc)) from exc
+                if not execution_started:
+                    raise click.ClickException("Cannot start chunker workspace: " + str(exc)) from exc
+                # Only genuinely failed executions reach here, never schema corrections.
+                reason = f"{type(exc).__name__}: {exc}"[:2000]
+                solve_state.finish_chunking_attempt(paths.forum, attempt["attempt_id"],
+                                                            succeeded=False, reason=reason)
+                failures.append(f"{chunker.name} attempt {attempt['attempt']}: {reason}")
+                click.echo(f"chunker {failures[-1]}")
+                continue
+            if assignments:
+                refresh_replanned_worktrees(paths, assignments, installed)
+            click.echo(f"created {len(installed['formal_tasks'])} formalization task(s) "
+                       f"using {chunker.name} on execution {attempt['attempt']}")
             return
 
     if stop_requested(paths.project_root):
         return
     summary = " | ".join(failures[-10:]) or "attempt limits were already exhausted"
-    raise click.ClickException(
-        "every configured agent exhausted its chunking attempts without a valid DAG: "
-        + summary
-    )
+    solve_state.record_chunking_exhausted(paths.forum, summary)
+    raise click.ClickException("every configured agent exhausted its chunking executions: " + summary)
 
 
 def _prepare_critic_snapshot(paths) -> bool:
-    """Controller-only mechanical gate, cached for unchanged critic retries."""
+    """Cache exact mechanical evidence for final or diagnostic critic retries."""
     with _merge_lock(paths.project_root):
         state = solve_state.load_state(paths.forum)
         if not state["formalization"].get("contract"):
@@ -412,7 +525,7 @@ def _prepare_critic_snapshot(paths) -> bool:
                 "this solve run has no protected formal specification; request_rechunk before resuming review"
             )
         snapshot = state["formalization"].get("review_snapshot") or {}
-        if not snapshot.get("passed") or not solve_contract.snapshot_is_current(paths, state, snapshot):
+        if not solve_contract.snapshot_is_current(paths, state, snapshot, require_complete=False):
             try:
                 report = solve_contract.verify_final_project(paths, state)
             except (OSError, ValueError) as exc:
@@ -422,12 +535,9 @@ def _prepare_critic_snapshot(paths) -> bool:
                     "main changed outside candidate integration; request_rechunk to establish a new reviewed specification"
                 )
             solve_state.record_review_snapshot(paths.forum, report)
-            if not report["passed"]:
-                solve_state.reopen_after_machine_failure(paths.forum, report)
-                click.echo("mechanical critic gate reopened formalization: " + "; ".join(report["issues"]))
-                return False
+            snapshot = report
         if state["phase"] != "critic":
-            solve_state.begin_critic(paths.forum)
+            solve_state.begin_critic(paths.forum, diagnostic=not snapshot["passed"])
     return True
 
 
@@ -438,7 +548,8 @@ def _accept_current_critic(paths) -> bool:
     with _merge_lock(paths.project_root):
         state = solve_state.load_state(paths.forum)
         formal = state["formalization"]
-        if formal.get("status") != "approval_pending":
+        if (formal.get("status") != "approval_pending" or solve_state.pending_replan(state)
+                or solve_state.open_source_issues(state)):
             return False
         snapshot = formal.get("review_snapshot") or {}
         if not solve_contract.snapshot_is_current(paths, state, snapshot):
@@ -450,8 +561,6 @@ def _accept_current_critic(paths) -> bool:
                     "main changed during critic review; request_rechunk before acceptance"
                 )
             solve_state.record_review_snapshot(paths.forum, report)
-            if not report["passed"]:
-                solve_state.reopen_after_machine_failure(paths.forum, report)
             click.echo("critic approval became stale; the changed revision needs a new review")
             return False
         solve_state.complete_critic_review(
@@ -467,6 +576,7 @@ async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
     if _accept_current_critic(paths):
         return
     state = solve_state.load_state(paths.forum)
+    diagnostic = not state["formalization"]["review_snapshot"]["passed"]
     before = len(solve_state.load_state(paths.forum).get("critic_verdicts", []))
     retry_context = (
         f"This is critic attempt {attempt}. The gate is still open. Reading files or ending a turn "
@@ -474,27 +584,40 @@ async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
         "check any remaining concerns, and submit the structured verdict before finishing. "
         if attempt > 1 else ""
     )
-    await dispatch(
+    await formal_dispatch(
         [critic],
         roster,
-        load_prompt("solve/CRITIC"),
+        load_prompt(f"{PIPELINE}/CRITIC"),
         retry_context
-        + "Audit the complete Lean project against the exact accepted PROOF.tex. Use the exact recorded "
+        + ("DIAGNOSTIC REVIEW: this formalization round ended without passing final checks. "
+           "Review completed and pending tasks, yielded attempts, last-round launch blockers, "
+           "and preserved work. Give exact task IDs and concrete next steps in a lean_reopen verdict, "
+           "or request a justified replan/source repair. Mark unchecked requirements not_checked. "
+           "Do not approve incomplete proofs or reopen unaffected work. "
+           if diagnostic else
+           "Audit the complete Lean project against the supplied source documents and UNITY.md scope. ")
+        + "Use the exact recorded "
         "machine snapshot for build, contract, and axiom status. Independently check requirement "
         "completeness and the mathematical meaning of statements and definitions against the source. "
         "Submit one structured verdict with submit_formalization_verdict and mandatory snapshot-bound "
         "per-requirement review evidence. Reopen only the exact Lean tasks that "
-        "need repair, or reopen informal solving if the accepted mathematics is substantively wrong.",
+        "need repair. "
+        + "Do not edit accepted PROOF.tex directly. Use lean_reopen for encoding/proof defects, "
+        "propose_source_fix for a corrected paper requiring independent paper review, or reopen_solving "
+        "when the accepted mathematics needs further informal work. UNITY.md remains the original problem; "
+        "do not approve a changed or weakened result.",
         paths.project_root,
-        build_solve_mcp(paths, "critic"),
-        tools_prompt="SOLVE_CRITIC_TOOLS",
+        build_solve_formal_mcp(paths, "critic"),
+        tools_prompt=f"{PIPELINE.upper()}_CRITIC_TOOLS",
         icrl_enabled=False,
         brief_provider=_brief_provider(paths, "critic"),
         mcp_profile="solve",
-        log_context={"command": "solve", "run_id": state.get("run_id"),
+        log_context={"command": PIPELINE, "run_id": state.get("run_id"),
                      "phase": "critic", "role": "critic", "attempt": attempt},
     )
     after_state = solve_state.load_state(paths.forum)
+    if solve_state.pending_replan(after_state) or solve_state.open_source_issues(after_state):
+        return
     if after_state["formalization"].get("status") == "approval_pending":
         _accept_current_critic(paths)
     if len(after_state.get("critic_verdicts", [])) == before and after_state["phase"] == "critic":
@@ -512,11 +635,13 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
         agent for agent in roster.agents
         if agent.name != roster.primary.name
     ]
-
     for critic in critics:
         attempt = 0
         while attempt < max_attempts:
             if stop_requested(paths.project_root):
+                return
+            current = solve_state.load_state(paths.forum)
+            if solve_state.pending_replan(current) or solve_state.open_source_issues(current):
                 return
 
             attempt += 1
@@ -526,7 +651,9 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
 
             if stop_requested(paths.project_root):
                 return
-            if solve_state.load_state(paths.forum)["phase"] != "critic":
+            after = solve_state.load_state(paths.forum)
+            if (after["phase"] != "critic" or solve_state.pending_replan(after)
+                    or solve_state.open_source_issues(after)):
                 return
 
     raise click.ClickException(
@@ -557,11 +684,20 @@ async def solve(continue_):
         solve_jobs.terminate(root)
         try:
             recover_interrupted_formal_merges(paths)
+            solve_state.recover_source_repairs(paths.forum)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
     if fresh:
         mark_phase("solve", "architect")
-    persisted_phase = solve_state.load_state(paths.forum).get("phase") if not fresh else None
+    persisted = solve_state.load_state(paths.forum) if not fresh else {}
+    persisted_phase = persisted.get("phase")
+    if (persisted_phase in {"formalizing", "critic", "complete"}
+            and (persisted.get("formalization", {}).get("contract") or {}).get("version") not in {2, 3}):
+        raise click.ClickException(
+            "This older solve formalization has no source-bound specification for the new verifier. "
+            "Its paper, proofs and state were preserved. Start a fresh solve run without --continue; "
+            "legacy verification cannot be reused as new acceptance evidence."
+        )
     _prepare_solve_environment(
         root, run_architect=fresh, validate_project=persisted_phase != "chunking",
     )
@@ -585,57 +721,82 @@ async def solve(continue_):
     # enforce their own per-agent retry budgets, so MAX_ATTEMPTS=1 still permits
     # one complete happy-path solve run.
     attempts = {"solving": 0, "formalizing": 0}
-    while not stop_requested(root):
-        state = solve_state.load_state(paths.forum)
-        phase = state.get("phase", "solving")
-        if phase == "complete":
-            break
-        if phase in attempts and attempts[phase] >= max_attempts:
-            raise click.ClickException(
-                f"solve exhausted MAX_ATTEMPTS={max_attempts} in the {phase} loop "
-                "before both gates were accepted"
-            )
+    try:
+        while not stop_requested(root):
+            state = solve_state.load_state(paths.forum)
+            phase = state.get("phase", "solving")
+            if phase == "complete":
+                break
+            if phase in {"chunking", "formalizing", "critic"}:
+                require_source_matches(paths, state)
+            if phase in attempts and attempts[phase] >= max_attempts:
+                raise click.ClickException(
+                    f"solve exhausted MAX_ATTEMPTS={max_attempts} in the {phase} loop "
+                    "before both gates were accepted"
+                )
 
-        if phase == "solving":
-            await run_solving_runtime(
-                roster,
-                paths,
-                build_solve_mcp(paths, "solving"),
-                load_prompt("solve/SOLVING"),
-            )
-            attempts["solving"] += 1
-            continue
+            if phase == "solving":
+                await run_solving_runtime(
+                    roster,
+                    paths,
+                    build_solve_mcp(paths, "solving"),
+                    load_prompt("solve/SOLVING"),
+                )
+                attempts["solving"] += 1
+                continue
 
-        if phase == "solution_review":
-            await _review_current_solution(roster, paths, max_attempts)
-            continue
+            if phase == "solution_review":
+                await _review_current_solution(roster, paths, max_attempts)
+                continue
 
-        if phase == "chunking":
-            await _chunk_accepted_solution(roster, paths, max_attempts)
-            continue
+            if phase == "chunking":
+                await _chunk_accepted_solution(roster, paths, max_attempts)
+                continue
 
-        if phase == "formalizing":
-            state = await run_formalizing_runtime(
-                roster,
-                paths,
-                build_solve_mcp(paths, "formalizing"),
-                load_prompt("solve/FORMALIZING"),
-            )
-            if state.get("phase") == "formalizing" and solve_state.all_formal_tasks_complete(state):
-                _prepare_critic_snapshot(paths)
-            attempts["formalizing"] += 1
-            continue
+            if phase == "formalizing":
+                before_round = (state["formalization"].get("last_round") or {}).get("round_id")
+                state = await run_formalizing_runtime(
+                    roster,
+                    paths,
+                    build_solve_formal_mcp(paths, "formalizing"),
+                    load_prompt("solve/FORMALIZING"),
+                )
+                after_round = (state["formalization"].get("last_round") or {}).get("round_id")
+                if after_round and after_round != before_round:
+                    attempts["formalizing"] += 1
+                if (not stop_requested(root) and state.get("phase") == "formalizing"
+                        and not solve_state.pending_replan(state)
+                        and not solve_state.open_source_issues(state)):
+                    _prepare_critic_snapshot(paths)
+                continue
 
-        if phase == "critic":
-            await _run_critics(roster, paths, max_attempts)
-            continue
+            if phase == "critic":
+                if solve_state.ready_source_issues(state):
+                    state = await run_source_repairs(roster, paths, max_attempts)
+                    if state.get("phase") != "critic":
+                        continue
+                request = solve_state.pending_replan(state)
+                if request:
+                    with _merge_lock(root):
+                        solve_state.begin_replan(paths.forum, request["request_id"])
+                    continue
+                if solve_state.open_source_issues(state):
+                    raise click.ClickException("Source issues remain unresolved; repair or reopen the accepted paper")
+                await _run_critics(roster, paths, max_attempts)
+                continue
 
-        raise click.ClickException(f"unknown solve phase '{phase}'")
+            raise click.ClickException(f"unknown solve phase '{phase}'")
+
+    except Exception:
+        _save_incomplete_report(paths)
+        raise
 
     if stop_requested(root):
+        _save_incomplete_report(paths)
         click.echo("solve stopped safely; rerun with --continue to resume")
         return
 
+    persist_report(paths, accepted=True)
     if _retrospective_enabled():
         await _run_retrospective(roster, paths)
     mark_done(paths, "solve")
@@ -643,3 +804,10 @@ async def solve(continue_):
 
 
 command = solve
+
+
+def _save_incomplete_report(paths) -> None:
+    try:
+        persist_report(paths, accepted=False)
+    except (OSError, ValueError) as exc:
+        click.echo(f"Warning: could not persist incomplete solve formalization report: {exc}")

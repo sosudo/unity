@@ -189,6 +189,13 @@ async def mcp(server, tool, args, args_file):
         "solving", "solution_review", "chunking", "formalizing", "critic", "retrospective",
     }:
         solve_profile = "solving"
+    if active_solve:
+        from ..forum import solve_server
+        override = os.getenv("UNITY_SOLVE_PROFILE", "").strip()
+        if override:
+            if override not in solve_server.PROFILES:
+                raise click.ClickException(f"unknown solve tool profile '{override}'")
+            solve_profile = override
     client = None
     diagnostic_note = ""
     if server in ("unity-forum", "forum") and active_autoformalize:
@@ -218,6 +225,15 @@ async def mcp(server, tool, args, args_file):
             from ..autoformalize_orchestrator import build_autoformalize_mcp
             shared_forum, _ = _autoformalize_shared_paths(paths)
             specs = build_autoformalize_mcp(replace(paths, forum=shared_forum), autoformalize_profile)
+        elif active_solve and solve_profile in {
+            "chunking", "formalizing", "critic", "source_repair", "representation_review",
+        }:
+            from dataclasses import replace
+            from ..solve_formal_orchestrator import build_solve_formal_mcp
+            shared_forum, shared_root = _solve_shared_paths(paths)
+            specs = build_solve_formal_mcp(
+                replace(paths, forum=shared_forum, project_root=shared_root), solve_profile,
+            )
         else:
             specs = build_solve_mcp(paths, solve_profile) if active_solve else build_mcp(paths)
         if server not in specs:

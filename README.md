@@ -77,7 +77,7 @@ From the CLI, add files or folders with `unity source add <path>`, put the scope
 
 Autoformalize has its own runtime, agent launcher, verifier, prompts, and Forum interface. Its discussions and structured state live under `.unity/forum/autoformalize/`, separate from solve and prove. It does not run the English-solving phase or generate or rewrite a source paper. The existing project setup, roster, dependency cache, and generic worktree utilities are unchanged.
 
-Autoformalize workers use Codex's workspace-write sandbox or Claude's required Bash sandbox plus editor path checks. Source edits are confined to the assigned worktree; shared Git metadata, `.unity`, dependency packages, and the existing uv cache remain accessible to Unity tools. These are source-write restrictions, not isolation from trusted MCP servers or shared runtime state. Claude requires native sandbox support (including its platform prerequisites) and refuses unsandboxed fallback; arbitrary research URLs should use WebFetch rather than shell networking. Antigravity enables its terminal sandbox and receives the same worktree policy, but editor isolation is best effort. These settings do not change solve or prove.
+Autoformalize workers use Codex's workspace-write sandbox or Claude's required Bash sandbox plus editor path checks. Source edits are confined to the assigned worktree; shared Git metadata, `.unity`, dependency packages, and the existing uv cache remain accessible to Unity tools. These are source-write restrictions, not isolation from trusted MCP servers or shared runtime state. Claude requires native sandbox support (including its platform prerequisites) and refuses unsandboxed fallback; arbitrary research URLs should use WebFetch rather than shell networking. Antigravity enables its terminal sandbox and receives the same worktree policy, but editor isolation is best effort. Solve formalization has its own copy of these restrictions; informal solving and prove keep their existing launchers.
 
 ### Formalize
 
@@ -119,8 +119,16 @@ informal solving the whole roster coordinates through a solve-specific Forum and
 argument and paper components. Dependency-aware informal tasks let agents divide lemmas, checks,
 sections, and synthesis while preserving direct full-solution attempts. Paper candidates record the
 exact component revisions they incorporate and receive independent review. The accepted paper is then
-chunked into a component-traceable formalization DAG; agents implement ready Lean tasks in worktrees,
-and a final critic can reopen either individual Lean tasks or the informal solution itself.
+chunked into a source-linked informal DAG, without writing Lean scaffolds. Chunkers correct ordinary
+validation feedback in the same session; only failed executions consume their attempt budget.
+Solve-owned formalizers refine this graph and implement ready Lean tasks in private worktrees,
+with separate statement/proof dependencies, immutable candidates, targeted representation review,
+and cached verification of exact source and dependency revisions. The same solve Forum spans both
+loops; standalone autoformalize and prove remain independent. A final critic can reopen individual
+Lean tasks or the informal solution. Paper corrections require new independent paper review and
+checkpoint old private work before reassignment. Runs finish only after both gates are accepted.
+Legacy solve runs with a version-1 formal contract cannot reuse their old verification evidence;
+their files remain preserved, but continuing requires a fresh solve run.
 
 ### Create
 
