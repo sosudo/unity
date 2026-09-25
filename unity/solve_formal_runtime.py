@@ -951,7 +951,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     blocked_launch_keys: dict[tuple[str, str], str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     manifest_attempts: dict[str, dict] = {}
-    state = solve_state.load_state(paths.forum)
+    activity = {"worker_launches": 0, "integrations": 0, "review_launches": 0, "source_repairs": 0}
+    # Persisted states can predate merge-time rejection reconciliation. Repair
+    # that bookkeeping before deciding whether any work is dispatchable.
+    state = solve_state.reconcile_rejected_representations(paths.forum)
     solve_representation.recover_representation_reviews(paths.forum)
     # A prior controller may have stopped between starting an attempt and
     # recording its end. Do not let restarts repeat that author/input forever.
@@ -1103,12 +1106,15 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             return
         current = solve_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
-        if (not formal_task or not solve_state.task_available_to(current, name, task_id)
-                or solve_server.has_pending_formal_candidate(current, name)
-                or solve_state.source_issues_blocking_task(current, task_id)):
-            return
         allowed, repair = launch_manifest_repair(current, name, task_id)
         if not allowed:
+            return
+        eligible = (solve_state.repair_available_to(
+            current, name, task_id, repair["repair_id"], repair["input_sha256"],
+        ) if repair else solve_state.task_available_to(current, name, task_id))
+        if (not formal_task or not eligible
+                or solve_server.has_pending_formal_candidate(current, name)
+                or solve_state.source_issues_blocking_task(current, task_id)):
             return
         # Prospective/global accounting is not a command to stop proof search.
         # Focus repair work only after a current candidate actually failed it.
@@ -1132,6 +1138,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         prepared = solve_server.prepare_formal_worktree(
             name, previous_task=worker_targets.get(name, ""), next_task=task_id,
             expected_revision=current["formalization"]["revision"],
+            **({"repair_id": repair["repair_id"], "repair_input_sha256": repair["input_sha256"]}
+               if repair else {}),
         )
         if not prepared["ok"]:
             # Preparation can publish a checkpoint before reporting a block;
@@ -1147,14 +1155,20 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         # Preparation may synchronize source while Forum events arrive. Capture
         # the actual attempt, not the mutable target inferred from later claims.
         current = solve_state.load_state(paths.forum)
-        if not solve_state.task_available_to(current, name, task_id):
-            return
         allowed, refreshed_repair = launch_manifest_repair(current, name, task_id)
-        if not allowed or ((repair or {}).get("input_sha256") != (refreshed_repair or {}).get("input_sha256")):
+        if not allowed or any((repair or {}).get(key) != (refreshed_repair or {}).get(key)
+                              for key in ("repair_id", "input_sha256")):
             return  # Preparation can race with a corrected submission or refinement.
         repair = refreshed_repair
+        eligible = (solve_state.repair_available_to(
+            current, name, task_id, repair["repair_id"], repair["input_sha256"],
+        ) if repair else solve_state.task_available_to(current, name, task_id))
+        if not eligible:
+            return
         if repair:
-            started = solve_state.begin_manifest_repair_attempt(paths.forum, repair["repair_id"], name)
+            started = solve_state.begin_manifest_repair_attempt(
+                paths.forum, repair["repair_id"], name, input_sha256=repair["input_sha256"],
+            )
             if started.get("status") != "started":
                 return
             repair = started["repair"]
@@ -1264,11 +1278,15 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             ),
             name=f"{PIPELINE}:formalizing:{name}:{task_id}",
         )
+        activity["worker_launches"] += 1
 
     def launch_idle() -> None:
         if integration is not None:
             return
-        current = solve_state.load_state(paths.forum)
+        # An unrelated merge changes dispatch context, not the rejected
+        # semantic input's retry budget. Refresh that context before scheduling
+        # or concluding that the round has no runnable work.
+        current = solve_state.reconcile_rejected_representations(paths.forum)
         if current.get("phase") != "formalizing" or solve_state.pending_replan(current):
             return
         refresh_worker_targets(current)
@@ -1294,6 +1312,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             tasks[name] = asyncio.create_task(solve_representation.representation_review_turn(
                 agents[name], roster, paths, review["task_id"], interrupt_event=interrupts[name],
             ), name=f"solve:representation_review:{name}:{review['task_id']}")
+            activity["review_launches"] += 1
         issues = solve_state.ready_source_issues(current)
         assigned_issues = set(repair_issues.values())
         for name in agents:
@@ -1312,13 +1331,20 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 agents[name], roster, paths, issue_id, repair_attempt_limit(),
                 interrupt_event=interrupts[name],
             ), name=f"solve:source_repair:{name}:{issue_id}")
+            activity["source_repairs"] += 1
         # Repair work is a focused target, not another general proof assignment.
         # Trying it here lets a later eligible author take over after a yield;
         # central launch/worktree guards still preserve any unresolved private work.
         for repair in manifest_repairs(current):
             if repair.get("status") != "open":
                 continue
-            for name in agents:
+            # Resume the root's private proof work before moving a dependent's
+            # checkpointed worktree back to its rejected prerequisite.
+            owners = sorted(agents, key=lambda name: (
+                worker_targets.get(name) != repair["task_id"],
+                participating_strategy(current, name, repair["task_id"]) is None,
+            ))
+            for name in owners:
                 if name in tasks or name in stopping:
                     continue
                 launch(name, repair["task_id"])
@@ -1557,6 +1583,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                         _integrate_and_record, paths, integration_candidate,
                         state["formal_tasks"][candidate["task_id"]], integration_cancel,
                     ), name=f"solve:integration:{candidate['candidate_id']}")
+                    activity["integrations"] += 1
                     break
 
             if integration is None:
@@ -1586,10 +1613,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 if solve_state.open_source_issues(state):
                     raise ValueError("Formal declarations are complete, but source issues remain unresolved; "
                                      "critic acceptance requires issue resolution or a reviewed paper correction")
-                return solve_state.record_round_end(paths.forum, blocked_launches=blocked_launches)
+                return solve_state.record_round_end(
+                    paths.forum, blocked_launches=blocked_launches, activity=activity,
+                )
             if (integration is None and not tasks and not stopping
                     and not solve_server.has_pending_formal_candidate(state)):
-                solve_state.record_round_end(paths.forum, blocked_launches=blocked_launches)
+                solve_state.record_round_end(paths.forum, blocked_launches=blocked_launches, activity=activity)
                 return solve_state.load_state(paths.forum)
         return solve_state.load_state(paths.forum)
     finally:

@@ -105,7 +105,7 @@ class ManifestRuntimeSchedulingTests(unittest.IsolatedAsyncioTestCase):
         return [deepcopy(row) for row in state["manifest_repairs"].values()
                 if row["status"] in {"open", "exhausted"} and (not task_id or row["task_id"] == task_id)]
 
-    def begin(self, _forum, repair_id, author):
+    def begin(self, _forum, repair_id, author, *, input_sha256=None):
         repair = self.state["manifest_repairs"][repair_id]
         if any(row["author"] == author.casefold() for row in repair["attempts"]):
             return {"status": "attempted", "repair": deepcopy(repair)}
@@ -120,7 +120,7 @@ class ManifestRuntimeSchedulingTests(unittest.IsolatedAsyncioTestCase):
             if row["author"] == author.casefold() and row["status"] == "started":
                 row["status"] = outcome
 
-    async def run_runtime(self, worker, *, prepare=None, real_eligibility=False):
+    async def run_runtime(self, worker, *, prepare=None, real_eligibility=False, real_repair_state=False):
         agents = [SimpleNamespace(name=name, backend="claude") for name in self.names]
         roster = SimpleNamespace(agents=agents)
         ss = runtime.solve_state
@@ -147,23 +147,30 @@ class ManifestRuntimeSchedulingTests(unittest.IsolatedAsyncioTestCase):
             mock(runtime.solve_jobs, "terminate")
             mock(runtime.solve_representation, "recover_representation_reviews")
             mock(runtime.solve_representation, "pending_representation_reviews", return_value=[])
-            mock(ss, "load_state", side_effect=lambda *_: deepcopy(self.state))
-            mock(ss, "current_manifest_repairs", side_effect=self.current_repairs)
-            mock(ss, "begin_manifest_repair_attempt", side_effect=self.begin)
-            mock(ss, "finish_manifest_repair_attempt", side_effect=self.finish)
-            mock(ss, "mark_manifest_repair_exhausted", side_effect=lambda _, key:
-                 self.state["manifest_repairs"][key].update(status="exhausted"))
+            if not real_repair_state:
+                mock(ss, "load_state", side_effect=lambda *_: deepcopy(self.state))
+                mock(ss, "reconcile_rejected_representations", side_effect=lambda *_: deepcopy(self.state))
+                mock(ss, "current_manifest_repairs", side_effect=self.current_repairs)
+                mock(ss, "begin_manifest_repair_attempt", side_effect=self.begin)
+                mock(ss, "finish_manifest_repair_attempt", side_effect=self.finish)
+                mock(ss, "mark_manifest_repair_exhausted", side_effect=lambda _, key:
+                     self.state["manifest_repairs"][key].update(status="exhausted"))
+                mock(ss, "repair_available_to", side_effect=lambda state, name, task, *_:
+                     ss.task_available_to(state, name, task))
             if not real_eligibility:
                 mock(ss, "ready_formal_tasks", side_effect=lambda state:
                      [row for row in state["formal_tasks"].values() if row["status"] == "pending"])
                 mock(ss, "task_available_to", side_effect=lambda state, name, task:
                      task in state["formal_tasks"] and state["formal_tasks"][task]["status"] == "pending"
                      and (name, task) not in self.yielded)
-            mock(ss, "source_issues_blocking_task", return_value=[])
+            if not real_repair_state:
+                mock(ss, "source_issues_blocking_task", return_value=[])
             mock(ss, "ready_source_issues", return_value=[])
             mock(ss, "open_source_issues", return_value=[])
             mock(ss, "pending_replan", return_value=None)
-            if real_eligibility:
+            if real_repair_state:
+                pass  # Real persisted attempt/yield/currentness gates in the regression below.
+            elif real_eligibility:
                 mock(ss, "record_worker_yield", side_effect=lambda _, name, task, reason, *, snapshot:
                      ss._record_yield(self.state, name, task, reason, [], snapshot))
             else:
@@ -179,6 +186,76 @@ class ManifestRuntimeSchedulingTests(unittest.IsolatedAsyncioTestCase):
             mock(fs, "verification_blockers", return_value=[])
             mock(fs, "prepare_formal_worktree", side_effect=prepare or (lambda *args, **kwargs: {"ok": True}))
             return await asyncio.wait_for(runtime.run_formalizing_runtime(roster, self.paths, {}, "formalize"), 4)
+
+    async def test_cached_rejected_interface_launches_only_root_owner_with_real_gates(self):
+        from test_solve_manifest_repair import ManifestStateFixture
+        fixture = ManifestStateFixture()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        self.paths.forum = fixture.forum
+        ss = runtime.solve_state
+        with ss.transaction(fixture.forum) as state:
+            contract = state["formalization"]["contract"]
+            contract["representation_review_policy"] = 1
+            contract["bindings"]["beta"] = [{"declaration": "Example.beta", "file": "Example/beta.lean"}]
+            contract["targets"]["Example.beta"] = {"fingerprint": ss.digest("Example.beta")}
+            contract["sha256"] = ss._contract_digest(contract)
+            state["worker_tasks"] = {"ada": "beta", "bert": "alpha"}
+            # Proof-only dependencies must stay blocked, too.
+            state["formal_tasks"]["beta"]["statement_dependencies"] = []
+            state["formal_tasks"]["beta"]["proof_dependencies"] = ["alpha"]
+            state["formal_tasks"]["beta"]["representation"] = {"status": "adopted"}
+            state["formal_tasks"]["beta"]["outputs"] = contract["bindings"]["beta"]
+            for strategy in state["strategies"].values():
+                strategy["status"] = "cancelled"
+            row = runtime.solve_representation.queue_representation_review(state, "alpha")
+            state["representation_reviews"][row["input_sha256"]]["status"] = "encoding_error"
+            dependent_review = runtime.solve_representation.queue_representation_review(state, "beta")
+            state["representation_reviews"][dependent_review["input_sha256"]]["status"] = "aligned"
+        before = ss.load_state(fixture.forum)
+        self.assertFalse(ss.task_ready(before, before["formal_tasks"]["alpha"]))
+        self.assertFalse(ss.task_ready(before, before["formal_tasks"]["beta"]))
+        aligned = deepcopy(before)
+        aligned["representation_reviews"][row["input_sha256"]]["status"] = "aligned"
+        self.assertTrue(ss.task_ready(aligned, aligned["formal_tasks"]["beta"]))
+        self.assertEqual(ss.current_manifest_repairs(before), [])
+        launched, prepared, budgets = [], [], []
+
+        def prepare(author, **kwargs):
+            current = ss.load_state(fixture.forum)
+            self.assertTrue(ss.repair_available_to(
+                current, author, kwargs["next_task"], kwargs["repair_id"], kwargs["repair_input_sha256"],
+            ))
+            prepared.append(author)
+            repair = ss.current_manifest_repairs(current, "alpha")[0]
+            budgets.append(repair["budget_sha256"])
+            if len(prepared) == 1:
+                # Simulate an unrelated accepted merge during preparation.
+                # The exact permission must fail post-prepare, then refresh
+                # without losing the rejection or resetting its retry budget.
+                with ss.transaction(fixture.forum) as state:
+                    state["formalization"]["main_sha"] = "f" * 40
+            return {"ok": True}
+
+        async def worker(agent, _system, prompt, *_args, **kwargs):
+            launched.append((agent.name, kwargs["log_context"]["task_id"]))
+            self.assertIn("MANIFEST REPAIR", prompt)
+            current = ss.load_state(fixture.forum)
+            repair = ss.current_manifest_repairs(current, "alpha")[0]
+            self.assertFalse(ss.repair_available_to(
+                current, "Ada", "alpha", repair["repair_id"], repair["input_sha256"],
+            ))
+            self.assertFalse(ss.interface_available(current, current["formal_tasks"]["alpha"]))
+            self.assertFalse(ss.task_ready(current, current["formal_tasks"]["beta"]))
+            # End the offline worker stub after observing its exclusive lease;
+            # no acceptance or proof success is synthesized.
+            with ss.transaction(fixture.forum) as state:
+                state["phase"] = "critic"
+
+        await self.run_runtime(worker, prepare=prepare, real_eligibility=True, real_repair_state=True)
+        self.assertEqual(launched, [("Bert", "alpha")])
+        self.assertEqual(prepared, ["Bert", "Bert"])
+        self.assertEqual(len(set(budgets)), 1)
 
     async def test_one_author_per_input_then_exhaustion_without_generic_relaunch(self):
         self.state["manifest_repairs"]["repair-1"] = repair_record()

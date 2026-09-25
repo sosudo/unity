@@ -37,3 +37,8 @@ changes5.md
 project/
 log
 tests/
+!/tests/
+/tests/*
+!/tests/test_solve_rejected_encoding.py
+!/tests/test_solve_critic_retry.py
+!/tests/test_solve_worktree_preservation.py

@@ -118,6 +118,10 @@ def queue_representation_review(state: dict, task_id: str) -> dict | None:
                                     source_diagnosis=diagnosis)
                 _state()._event(state, "representation_review_reopened", task_id=task_id,
                                input_sha256=key, source_diagnosis_sha256=epoch)
+    if records[key]["status"] == "encoding_error":
+        # Proof-only re-adoption must retain the cached rejection while opening
+        # a scoped correction path. It must not create a new review or budget.
+        _state()._reconcile_rejected_representation(state, task_id, records[key])
     return deepcopy(records[key])
 
 

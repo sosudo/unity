@@ -42,6 +42,25 @@ from ..solve_formal_runtime import (
 PIPELINE = "solve"
 
 
+def _formal_round_attempted(state: dict, previous_round: str | None) -> bool:
+    """An empty scheduler pass is a blocker, not a spent proof attempt."""
+    summary = state.get("formalization", {}).get("last_round") or {}
+    if not summary.get("round_id") or summary["round_id"] == previous_round:
+        return False
+    if summary.get("outcome") == "blocked":
+        pending = ", ".join(row["task_id"] for row in summary.get("pending_tasks", [])) or "unknown"
+        reasons = "; ".join(summary.get("blocked_launches", {}).values())
+        raise click.ClickException(
+            f"solve formalization blocked: no worker, review, repair or integration was dispatched; "
+            f"pending tasks: {pending}. "
+            + (reasons + ". " if reasons else "")
+            + "State and proof work were preserved. Inspect formalization.last_round in solve-state.json; "
+              "no proof attempt was charged and no unchanged critic snapshot was requested."
+        )
+    # Older recorded rounds lack activity metadata; retain their prior accounting.
+    return "activity" not in summary or any(summary["activity"].values())
+
+
 def _retrospective_enabled() -> bool:
     return os.getenv("RETROSPECTIVE", "true").strip().lower() != "false"
 
@@ -761,8 +780,8 @@ async def solve(continue_):
                     build_solve_formal_mcp(paths, "formalizing"),
                     load_prompt("solve/FORMALIZING"),
                 )
-                after_round = (state["formalization"].get("last_round") or {}).get("round_id")
-                if after_round and after_round != before_round:
+                if (not stop_requested(root) and state.get("phase") == "formalizing"
+                        and _formal_round_attempted(state, before_round)):
                     attempts["formalizing"] += 1
                 if (not stop_requested(root) and state.get("phase") == "formalizing"
                         and not solve_state.pending_replan(state)

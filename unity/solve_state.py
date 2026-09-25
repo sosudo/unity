@@ -2422,6 +2422,10 @@ def _record_manifest_repair(state: dict, task_id: str, blockers: list[dict], *,
     if not selected:
         return None
     context = _manifest_repair_context(state, task_id)
+    from .solve_representation import current_representation_review
+    rejected = current_representation_review(state, task_id)
+    if rejected and rejected.get("status") == "encoding_error":
+        return _record_encoding_repair(state, task_id, rejected, context=context)
     input_sha = digest({"context": context, "kind": kind, "blockers": selected})
     repairs = state.setdefault("manifest_repairs", {})
     for existing in repairs.values():
@@ -2448,6 +2452,84 @@ def _record_manifest_repair(state: dict, task_id: str, blockers: list[dict], *,
     return deepcopy(repair)
 
 
+def _record_encoding_repair(state: dict, task_id: str, review: dict, *, context: dict) -> dict:
+    """One semantic retry budget, with a separately refreshed dispatch identity."""
+    budget_sha = digest({"run_id": state.get("run_id"), "task_id": task_id,
+                         "representation_input_sha256": review["input_sha256"]})
+    repairs = state.setdefault("manifest_repairs", {})
+    matching = [row for row in repairs.values() if row.get("task_id") == task_id and (
+        row.get("budget_sha256") == budget_sha
+        # Migrate current pre-fix diagnostics without granting their authors
+        # another try just because the old code recorded several rationales.
+        or (not row.get("budget_sha256") and row.get("context") == context))]
+    # Preserve an already-dispatched owner's record ID when coalescing legacy
+    # diagnostics, so its normal finish call closes the retained attempt.
+    matching.sort(key=lambda row: (not any(attempt.get("status") == "started"
+                                           for attempt in row.get("attempts", [])),
+                                   row.get("created_at", 0), row["repair_id"]))
+    repair = matching[0] if matching else {
+        "repair_id": _id("manifest-repair"), "task_id": task_id,
+        "created_at": time.time(), "attempts": [], "status": "open",
+    }
+    attempts = []
+    for row in matching:
+        for attempt in row.get("attempts", []):
+            if attempt not in attempts:
+                attempts.append(deepcopy(attempt))
+    exhausted = any(row.get("status") == "exhausted" or row.get("exhausted_at") for row in matching)
+    blockers = [{"code": "critic_representation_repair", "task_ids": [task_id],
+                 "deterministic": False, "prerequisite_id": "",
+                 "message": review.get("review", {}).get("rationale", "Current representation was rejected."),
+                 "required_action": "Explicitly refine the rejected representation, preserving useful proof work; "
+                                    "resubmit for normal kernel and representation checks."}]
+    identity = digest({"context": context, "budget_sha256": budget_sha})
+    changed = repair.get("input_sha256") != identity or repair.get("status") not in {"open", "exhausted"}
+    repair.update(context=deepcopy(context), input_sha256=identity, budget_sha256=budget_sha,
+                  origin="representation_review", kind="rejected_encoding", blockers=blockers,
+                  evidence={"representation_input_sha256": review["input_sha256"]},
+                  status="exhausted" if exhausted else "open", attempts=attempts)
+    repair.pop("resolved_at", None)
+    repairs[repair["repair_id"]] = repair
+    for row in repairs.values():
+        if (row is not repair and row.get("task_id") == task_id
+                and row.get("status") in {"open", "exhausted"}):
+            row.update(status="superseded", resolved_at=time.time())
+    if changed:
+        _event(state, "manifest_repair_requested", repair_id=repair["repair_id"], task_id=task_id,
+               input_sha256=identity, budget_sha256=budget_sha, origin="representation_review")
+    return deepcopy(repair)
+
+
+def _reconcile_rejected_representation(state: dict, task_id: str, review: dict) -> None:
+    """A proof of the same rejected statement is useful work, not acceptance."""
+    task = state["formal_tasks"][task_id]
+    changed = task.get("status") != "pending" or task.get("accepted_candidate") is not None
+    task.update(status="pending", accepted_candidate=None)
+    # Keep the adopted binding and its kernel receipt as diagnostics. Making
+    # either available to dependents still requires an aligned exact review.
+    faithfulness = {**task.get("faithfulness", {}), "status": "changes_requested",
+                    "representation_input_sha256": review["input_sha256"]}
+    changed = changed or task.get("faithfulness") != faithfulness
+    task["faithfulness"] = faithfulness
+    _record_encoding_repair(state, task_id, review, context=_manifest_repair_context(state, task_id))
+    if changed:
+        _invalidate_review(state)
+        _event(state, "rejected_representation_reconciled", task_id=task_id,
+               input_sha256=review["input_sha256"])
+
+
+def reconcile_rejected_representations(forum_dir: Path) -> dict:
+    """Controller-only recovery of persisted rejection; no proof or review rerun."""
+    from .solve_representation import current_representation_review
+    with transaction(forum_dir) as state:
+        if state.get("phase") == "formalizing":
+            for task_id in state.get("formal_tasks", {}):
+                review = current_representation_review(state, task_id)
+                if review and review.get("status") == "encoding_error":
+                    _reconcile_rejected_representation(state, task_id, review)
+    return load_state(forum_dir)
+
+
 def _clear_manifest_repairs(state: dict, task_id: str, *, status: str = "cleared") -> None:
     for repair in state.get("manifest_repairs", {}).values():
         if repair.get("task_id") == task_id and repair.get("status") in {"open", "exhausted"}:
@@ -2455,13 +2537,17 @@ def _clear_manifest_repairs(state: dict, task_id: str, *, status: str = "cleared
             _event(state, "manifest_repair_" + status, repair_id=repair["repair_id"], task_id=task_id)
 
 
-def begin_manifest_repair_attempt(forum_dir: Path, repair_id: str, author: str) -> dict:
+def begin_manifest_repair_attempt(forum_dir: Path, repair_id: str, author: str, *,
+                                  input_sha256: str | None = None) -> dict:
     author = author_key(_text(author, "author", 100))
     with transaction(forum_dir) as state:
         repair = state.get("manifest_repairs", {}).get(repair_id)
         current = {row["repair_id"] for row in current_manifest_repairs(state)}
         if not repair or repair_id not in current or repair["status"] != "open":
             return {"status": "stale"}
+        if input_sha256 is not None and not repair_available_to(
+                state, author, repair["task_id"], repair_id, input_sha256):
+            return {"status": "unavailable", "repair": deepcopy(repair)}
         if any(author_key(row["author"]) == author for row in repair["attempts"]):
             return {"status": "attempted", "repair": deepcopy(repair)}
         scope = _dependent_closure(state["formal_tasks"], {repair["task_id"]})
@@ -2558,6 +2644,46 @@ def task_ready(state: dict, task: dict | str) -> bool:
         return all(interface_available(state, dep) for dep in dependencies)
     return all(state["formal_tasks"].get(dep, {}).get("status") == "complete"
                for dep in task.get("dependencies", []))
+
+
+def repair_available_to(state: dict, author: str, task_id: str,
+                        repair_id: str, input_sha256: str) -> bool:
+    """Permission to repair one current input, never permission to accept it."""
+    author = author_key(author)
+    repair = next((row for row in current_manifest_repairs(state, task_id)
+                   if row["repair_id"] == repair_id), None)
+    if (not author or not repair or repair.get("status") != "open"
+            or repair.get("input_sha256") != input_sha256 or pending_replan(state)
+            or source_issues_blocking_task(state, task_id)
+            or any(author_key(row.get("author")) == author for row in repair.get("attempts", []))):
+        return False
+    if not task_available_to(state, author, task_id):
+        from .solve_representation import current_representation_review
+        task = state["formal_tasks"][task_id]
+        review = current_representation_review(state, task_id)
+        if (repair.get("kind") != "rejected_encoding" or not review
+                or review.get("status") != "encoding_error"
+                or repair.get("evidence", {}).get("representation_input_sha256") != review["input_sha256"]):
+            return False
+        # Relax only the target's own rejected interface gate. Its upstream
+        # statement/proof interfaces and source diagnoses remain hard gates.
+        if "statement_dependencies" in task:
+            dependencies = set(task["statement_dependencies"]) | set(task.get("proof_dependencies", []))
+            if not all(interface_available(state, dependency) for dependency in dependencies):
+                return False
+        elif not all(state["formal_tasks"].get(key, {}).get("status") == "complete"
+                     for key in task.get("dependencies", [])):
+            return False
+    scope = _dependent_closure(state["formal_tasks"], {task_id})
+    if any(candidate.get("task_id") in scope and candidate_is_current(state, candidate)
+           and candidate.get("status") in {"submitted", "merging"}
+           for candidate in state.get("formal_candidates", {}).values()):
+        return False
+    for row in current_manifest_repairs(state):
+        if (scope & _dependent_closure(state["formal_tasks"], {row["task_id"]})
+                and any(attempt.get("status") == "started" for attempt in row.get("attempts", []))):
+            return False
+    return True
 
 
 def _task_dependencies(state: dict, task_id: str) -> set[str]:
@@ -3146,13 +3272,13 @@ def finish_formal_merge(
             queue_representation_review(state, task["task_id"])
             _invalidate_review(state)
             for obstacle in state["obstacles"].values():
-                if (not representation_only and obstacle.get("phase") == "formalizing"
+                if (task["status"] == "complete" and obstacle.get("phase") == "formalizing"
                         and obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]):
                     obstacle["status"] = "resolved"
                     obstacle["resolved_by"] = candidate_id
             for strategy in state["strategies"].values():
                 if strategy.get("phase") == "formalizing" and strategy.get("target") == task["task_id"] and strategy.get("status") in _ACTIVE_STRATEGIES:
-                    if representation_only:
+                    if task["status"] != "complete":
                         strategy["status"] = strategy.pop("paused_from", "registered")
                     else:
                         strategy["status"] = "succeeded" if strategy["strategy_id"] == candidate["strategy_id"] else "cancelled"
@@ -3209,7 +3335,8 @@ def all_formal_tasks_complete(state: dict) -> bool:
     return bool(tasks) and all(task.get("status") == "complete" for task in tasks.values())
 
 
-def record_round_end(forum_dir: Path, *, blocked_launches: dict) -> dict:
+def record_round_end(forum_dir: Path, *, blocked_launches: dict,
+                     activity: dict | None = None) -> dict:
     """Controller-only record after workers and candidate integration have drained."""
     with transaction(forum_dir) as state:
         if state["phase"] != "formalizing":
@@ -3224,6 +3351,26 @@ def record_round_end(forum_dir: Path, *, blocked_launches: dict) -> dict:
             "blocked_launches": {str(name)[:100]: str(reason)[:1000]
                                  for name, reason in list(blocked_launches.items())[:64]},
         }
+        if activity is not None:
+            counters = {key: max(0, int(activity.get(key, 0))) for key in (
+                "worker_launches", "integrations", "review_launches", "source_repairs")}
+            summary["activity"] = counters
+            summary["outcome"] = ("complete" if all_formal_tasks_complete(state) else
+                                  "attempted" if any(counters.values()) else "blocked")
+            # Diagnostics describe why a drained round could not dispatch; they
+            # do not make a rejected interface available or create proof evidence.
+            from .solve_representation import current_representation_review
+            repairs = current_manifest_repairs(state)
+            summary["pending_tasks"] = [{
+                "task_id": task_id,
+                "representation_status": (current_representation_review(state, task_id) or {}).get("status"),
+                "unavailable_dependencies": sorted(dep for dep in (
+                    set(task.get("statement_dependencies", []))
+                    | set(task.get("proof_dependencies", []))
+                    | set(task.get("dependencies", []))) if not interface_available(state, dep)),
+                "repairs": [{"repair_id": row["repair_id"], "status": row["status"]}
+                            for row in repairs if row["task_id"] == task_id],
+            } for task_id, task in tasks.items() if task.get("status") == "pending"]
         state["formalization"]["last_round"] = summary
         _event(state, "formalization_round_ended", **summary)
     return load_state(forum_dir)

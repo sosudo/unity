@@ -1483,6 +1483,21 @@ def ready_statement_prerequisites(state: dict, task_id: str) -> list[dict]:
     return sorted(ready, key=lambda item: item["task_id"])
 
 
+def _declared_prerequisite(state: dict, task_id: str, prerequisite_id: str) -> bool:
+    """An exact repair may revisit an existing statement or proof prerequisite."""
+    tasks, seen, pending = state.get("formal_tasks", {}), {task_id}, [task_id]
+    while pending:
+        task = tasks.get(pending.pop(), {})
+        for key in set(task.get("dependencies", [])) | set(task.get("statement_dependencies", [])) | set(
+                task.get("proof_dependencies", [])):
+            if key == prerequisite_id and key != task_id:
+                return True
+            if key not in seen:
+                seen.add(key)
+                pending.append(key)
+    return False
+
+
 def _worktree_source(state: dict) -> dict:
     source = solve_state.formal_source(state)
     return {"source_candidate": source.get("candidate_id"), "source_sha256": source.get("sha256")}
@@ -1500,9 +1515,12 @@ def _worktree_assignment_path(author: str, state: dict) -> Path:
 
 
 def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
-                               state: dict, *, pending: bool = False) -> dict:
+                               state: dict, *, pending: bool = False,
+                               repair_handoff: dict | None = None) -> dict:
     assignment = {"task_id": task_id, "task_revision": revision, "pending": pending,
                   **_worktree_source(state)}
+    if repair_handoff:
+        assignment["repair_handoff"] = repair_handoff
     path = _worktree_assignment_path(author, state)
     path.parent.mkdir(parents=True, exist_ok=True)
     artifacts._atomic_write(path, (json.dumps(assignment) + "\n").encode())
@@ -1654,18 +1672,32 @@ def _restore_task_checkpoint_if_current(
 
 
 def _reset_formal_assignment(tree: Path, author: str, task_id: str, revision: int | None,
-                             state: dict, main_sha: str) -> dict:
+                             state: dict, main_sha: str, *, repair_handoff: dict | None = None) -> dict:
     # The previous task is already checkpointed (or complete/clean). Persist
     # the intended assignment BEFORE changing Git, so an interrupted restore
     # cannot subsequently checkpoint the target bytes under the previous task.
-    _record_worktree_assignment(author, task_id, revision, state, pending=True)
+    _record_worktree_assignment(author, task_id, revision, state, pending=True,
+                               repair_handoff=repair_handoff)
     result = worktree.force_sync_from_main(_root(), author)
     if result.get("ok"):
         result.update(_restore_task_checkpoint_if_current(
             tree, author, task_id, revision, state, main_sha,
         ))
-        _record_worktree_assignment(author, task_id, revision, state)
+        _record_worktree_assignment(author, task_id, revision, state, repair_handoff=repair_handoff)
     return result
+
+
+def _finish_repair_handoff(state: dict, author: str, handoff: dict) -> None:
+    """Release only the checkpointed related claim, after successful reset."""
+    previous_task = handoff["previous_task"]
+    solve_state._record_yield(
+        state, author, previous_task,
+        "Controller checkpointed this stopped dependent to repair its rejected prerequisite.",
+        [handoff["next_task"]], solve_state.snapshot_attempt(state, author, previous_task),
+    )
+    state["task_yields"][solve_state.author_key(author)][previous_task]["repair_handoff_sha256"] = (
+        solve_state.digest(handoff)
+    )
 
 
 def prepare_formal_worktree(
@@ -1674,6 +1706,8 @@ def prepare_formal_worktree(
     next_task: str = "",
     *,
     expected_revision: int | None = None,
+    repair_id: str = "",
+    repair_input_sha256: str = "",
 ) -> dict:
     """Prepare a stopped worker for another task without erasing unresolved work.
 
@@ -1698,7 +1732,12 @@ def prepare_formal_worktree(
         target_task = state.get("formal_tasks", {}).get(next_task, {})
         if target_task.get("status") != "pending":
             return _sync_blocked("task_unavailable", "The next formal task is no longer pending.")
-        if not solve_state.task_ready(state, target_task):
+        repair_allowed = bool(repair_id and repair_input_sha256 and solve_state.repair_available_to(
+            state, author, next_task, repair_id, repair_input_sha256,
+        ))
+        if (repair_id or repair_input_sha256) and not repair_allowed:
+            return _sync_blocked("repair_changed", "The exact repair permission is no longer current; work preserved.")
+        if not repair_allowed and not solve_state.task_ready(state, target_task):
             return _sync_blocked("dependencies_pending", "The next formal task has unresolved dependencies.")
         if has_pending_formal_candidate(state, author):
             return _sync_blocked("candidate_pending", "Candidate review is pending; its branch is preserved.")
@@ -1730,6 +1769,27 @@ def prepare_formal_worktree(
             # or interrupted Forum transaction; the durable pointer is source-bound.
             result["parked_checkpoint"] = checkpoint
             return result
+        handoff = assignment.get("repair_handoff") or {}
+        handoff_finished = bool(handoff and state.get("task_yields", {}).get(identity, {}).get(
+            handoff["previous_task"], {}).get("repair_handoff_sha256") == solve_state.digest(handoff))
+        if handoff and not handoff_finished:
+            # The durable assignment may have advanced before its Forum claim
+            # release committed. Revalidate the original scoped handoff before
+            # either retrying a reset or completing that interrupted release.
+            previous = state["formal_tasks"].get(handoff["previous_task"], {})
+            checkpoint = _saved_task_checkpoint(author, handoff["previous_task"], state)
+            if (not repair_allowed or handoff.get("repair_id") != repair_id
+                    or handoff.get("repair_input_sha256") != repair_input_sha256
+                    or handoff.get("next_task") != next_task
+                    or handoff.get("next_task_revision") != target_task.get("revision")
+                    or handoff.get("previous_task_revision") != previous.get("revision")
+                    or not _declared_prerequisite(state, handoff["previous_task"], next_task)
+                    or not checkpoint
+                    or checkpoint.get("manifest_artifact") != handoff.get("checkpoint_manifest_artifact")):
+                return _sync_blocked("repair_changed", "Checkpointed repair handoff changed; claims and work preserved.")
+            if set(unresolved_formal_tasks(state, author)) - {handoff["previous_task"], next_task}:
+                return _sync_blocked("unresolved_work", "Unrelated unfinished task work is preserved.")
+            state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[handoff["previous_task"]] = checkpoint
         recovered = {}
         if assignment.get("pending"):
             main_sha = _accepted_formal_main(state)
@@ -1737,10 +1797,14 @@ def prepare_formal_worktree(
                 return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
             recovered = _reset_formal_assignment(
                 tree, author, assignment["task_id"], assignment["task_revision"], state, main_sha,
+                repair_handoff=handoff if not handoff_finished else None,
             )
             if not recovered.get("ok"):
                 return recovered
             assignment["pending"] = False
+        if handoff and not handoff_finished:
+            _finish_repair_handoff(state, author, handoff)
+            recovered["parked_checkpoint"] = checkpoint
         if assignment:
             previous_task = assignment["task_id"]
             assignments[identity] = previous_task
@@ -1762,7 +1826,11 @@ def prepare_formal_worktree(
                               main_sha, check=False)
                 if merged.returncode:
                     result["sync_warning"] = "Resolve the preserved worktree merge conflict before finalizing."
-            _record_worktree_assignment(author, next_task, target_task.get("revision"), state)
+            # Keep recovery provenance until a later transaction observes the
+            # committed yield. A crash after this durable write must not orphan
+            # the dependent claim even when the Git reset already succeeded.
+            _record_worktree_assignment(author, next_task, target_task.get("revision"), state,
+                                       repair_handoff=handoff if not handoff_finished else None)
             return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
         # A refinement can introduce a missing interface and block every former
@@ -1771,13 +1839,19 @@ def prepare_formal_worktree(
         prerequisite_reassignment = next_task in {
             item["task_id"] for item in ready_statement_prerequisites(state, previous_task)
         }
+        repair_reassignment = repair_allowed and _declared_prerequisite(state, previous_task, next_task)
         yielded_reassignment = solve_state.has_yielded(state, author, previous_task)
         unresolved = set(unresolved_formal_tasks(state, author))
-        if yielded_reassignment:
+        if yielded_reassignment or repair_reassignment:
             unresolved.discard(next_task)  # The agent may already have claimed its chosen next task.
+        if repair_reassignment:
+            # The stopped worker's related dependent claim can be parked only
+            # after its source is checkpointed below. Unrelated claims remain
+            # a hard blocker; other authors' participation is never released.
+            unresolved.discard(previous_task)
         if unresolved or (
             previous_task and previous.get("status") != "complete"
-            and not prerequisite_reassignment and not yielded_reassignment
+            and not prerequisite_reassignment and not yielded_reassignment and not repair_reassignment
         ):
             return _sync_blocked("unresolved_work", "Unfinished task work is preserved; resume it first.")
         main_sha = _accepted_formal_main(state)
@@ -1793,16 +1867,24 @@ def prepare_formal_worktree(
         ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
                        "--", ".", ":(exclude).unity", ":(exclude).lake").stdout
         private_commits = _git(tree, "merge-base", "--is-ancestor", "HEAD", main_sha, check=False).returncode != 0
-        if (prerequisite_reassignment or yielded_reassignment) and (private_status or ignored or private_commits):
+        if repair_reassignment or ((prerequisite_reassignment or yielded_reassignment) and (
+                private_status or ignored or private_commits)):
             checkpoint = _checkpoint_task_worktree(
                 tree, author, previous_task, previous_revision,
             )
             state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[previous_task] = checkpoint
+            handoff = {"previous_task": previous_task, "previous_task_revision": previous.get("revision"),
+                       "next_task": next_task, "next_task_revision": target_task.get("revision"),
+                       "repair_id": repair_id, "repair_input_sha256": repair_input_sha256,
+                       "checkpoint_manifest_artifact": checkpoint["manifest_artifact"]} if repair_reassignment else None
             result = _reset_formal_assignment(
                 tree, author, next_task, target_task.get("revision"), state, main_sha,
+                repair_handoff=handoff,
             )
             if result.get("ok"):
                 result["parked_checkpoint"] = checkpoint
+                if repair_reassignment:
+                    _finish_repair_handoff(state, author, handoff)
             return result
 
         # A fresh/unassigned tree has no known obsolete task. Never reset it:
