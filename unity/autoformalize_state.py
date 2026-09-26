@@ -20,7 +20,7 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Iterator, TypedDict
 
-from .autoformalize_review import SemanticReview
+from .autoformalize_review import RepresentationRepairRequest, SemanticReview
 from .autoformalize_spec import (
     digest, informal_interpretation_hash, normalize_informal_nodes, normalize_outputs,
     normalize_requirements, normalize_spec, task_spec_hash,
@@ -79,6 +79,7 @@ def _default_state() -> dict:
         "task_yields": {},
         "worker_tasks": {},
         "worktree_checkpoints": {},
+        "manifest_repairs": {},
         "retired_tasks": {},
         "refinements": [],
         "formal_candidates": {},
@@ -110,7 +111,7 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "solution_candidates", "formal_tasks", "formal_candidates",
         "review_snapshots", "representation_reviews", "file_reservations",
         "source_issues", "source_repairs", "replan_requests",
-        "retired_tasks", "task_yields", "worker_tasks", "worktree_checkpoints",
+        "retired_tasks", "task_yields", "worker_tasks", "worktree_checkpoints", "manifest_repairs",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
@@ -1088,6 +1089,7 @@ def _invalidate_informal_tasks(state: dict, seeds: set[str], *, reason: str) -> 
     state["formalization"]["contract"] = contract
     for task_id in affected & tasks.keys():
         task = tasks[task_id]
+        _clear_manifest_repairs(state, task_id, status="superseded")
         task.setdefault("history", []).append({"revision": task.get("revision", 1),
             "reason": reason, "timestamp": time.time(), "outputs": deepcopy(task.get("outputs", [])),
             "representation": deepcopy(task.get("representation")),
@@ -1586,14 +1588,15 @@ def _validate_requirements(requirements, tasks: dict, source_refs: set[str]) -> 
     return normalize_requirements(requirements, tasks, source_refs)
 
 
-def submission_blockers(state: dict, task_id: str, stage: str = "complete") -> list[dict]:
+def submission_blockers(state: dict, task_id: str, stage: str = "complete", *,
+                        outputs: list[dict] | None = None) -> list[dict]:
     """Prospective submission constraints, not general proof-search readiness.
 
     Inline obligations belonging to the candidate itself are satisfied only
     provisionally here; the subsequent kernel check still has to verify it.
     Whole-project accounting gates only the candidate that would finish it.
     """
-    from .autoformalize_contract import prerequisite_blockers
+    from .autoformalize_contract import output_manifest_blockers, prerequisite_blockers
 
     contract = state.get("formalization", {}).get("contract") or {}
     if contract.get("version") != 3:
@@ -1604,8 +1607,243 @@ def submission_blockers(state: dict, task_id: str, stage: str = "complete") -> l
     completed = {key for key, task in tasks.items() if task.get("status") == "complete"}
     if stage == "complete":
         completed.add(task_id)
-    return prerequisite_blockers(contract, completed=completed,
-                                 final=bool(tasks) and completed == set(tasks))
+    proposed = outputs if outputs is not None else tasks[task_id].get("outputs", [])
+    return (output_manifest_blockers(contract, task_ids=set(tasks), task_id=task_id,
+                                     proposed_outputs=proposed)
+            + prerequisite_blockers(contract, completed=completed,
+                                    final=bool(tasks) and completed == set(tasks)))
+
+
+def _manifest_repair_context(state: dict, task_id: str) -> dict:
+    """Bind coordination to supplied-source provenance, not an informal approval.
+
+    Compatibility field names match the formal contract; formal_source always
+    reads input_source here. This is not an observation of compiled proof bytes.
+    """
+    formal = state.get("formalization", {})
+    task = state.get("formal_tasks", {}).get(task_id, {})
+    source = formal_source(state)
+    return {"run_id": state.get("run_id"), "solution_candidate": source.get("candidate_id"),
+            "solution_sha256": source.get("sha256"), "task_revision": task.get("revision"),
+            "interpretation_sha256": task.get("interpretation_sha256"),
+            "main_sha": formal.get("main_sha"),
+            "contract_sha256": (formal.get("contract") or {}).get("sha256"),
+            "outputs": deepcopy(task.get("outputs", []))}
+
+
+def current_manifest_repairs(state: dict, task_id: str = "") -> list[dict]:
+    """Current scheduling diagnostics, including exhausted ones; never receipts."""
+    if state.get("phase") != "formalizing":
+        return []
+    result = []
+    for repair in state.get("manifest_repairs", {}).values():
+        target = repair.get("task_id")
+        task = state.get("formal_tasks", {}).get(target, {})
+        if (repair.get("status") in {"open", "exhausted"}
+                and (not task_id or target == task_id)
+                and task.get("status") == "pending"
+                and repair.get("context") == _manifest_repair_context(state, target)):
+            result.append(deepcopy(repair))
+    return sorted(result, key=lambda row: (row.get("created_at", 0), row["repair_id"]))
+
+
+def _record_manifest_repair(state: dict, task_id: str, blockers: list[dict], *,
+                            origin: str, kind: str = "output_manifest", evidence: dict | None = None) -> dict | None:
+    selected = [deepcopy(row) for row in blockers if row.get("code") in {
+        "output_manifest_changed", "critic_representation_repair"}]
+    if not selected:
+        return None
+    context = _manifest_repair_context(state, task_id)
+    from .autoformalize_representation import current_representation_review
+    rejected = current_representation_review(state, task_id)
+    if rejected and rejected.get("status") == "encoding_error":
+        return _record_encoding_repair(state, task_id, rejected, context=context)
+    input_sha = digest({"context": context, "kind": kind, "blockers": selected})
+    repairs = state.setdefault("manifest_repairs", {})
+    for existing in repairs.values():
+        if existing.get("input_sha256") == input_sha:
+            # Clearing a diagnostic on a valid submission is not proof success.
+            # If that candidate fails and the same mismatch returns, retain the
+            # attempt budget but make the repair visible to scheduling again.
+            if existing.get("status") == "cleared":
+                existing.update(status="open")
+                existing.pop("resolved_at", None)
+                _event(state, "manifest_repair_reopened", repair_id=existing["repair_id"], task_id=task_id)
+            return deepcopy(existing)
+    for existing in repairs.values():
+        if (existing.get("task_id") == task_id and existing.get("status") in {"open", "exhausted"}
+                and existing.get("context") != context):
+            existing.update(status="superseded", resolved_at=time.time())
+    repair = {"repair_id": _id("manifest-repair"), "input_sha256": input_sha,
+              "task_id": task_id, "origin": origin, "kind": kind, "context": context,
+              "blockers": selected, "status": "open", "attempts": [], "created_at": time.time(),
+              "evidence": deepcopy(evidence or {})}
+    repairs[repair["repair_id"]] = repair
+    _event(state, "manifest_repair_requested", repair_id=repair["repair_id"], task_id=task_id,
+           input_sha256=input_sha, origin=origin)
+    return deepcopy(repair)
+
+
+def _record_encoding_repair(state: dict, task_id: str, review: dict, *, context: dict) -> dict:
+    """One semantic retry budget, with a separately refreshed dispatch identity."""
+    budget_sha = digest({"run_id": state.get("run_id"), "task_id": task_id,
+                         "representation_input_sha256": review["input_sha256"]})
+    repairs = state.setdefault("manifest_repairs", {})
+    matching = [row for row in repairs.values() if row.get("task_id") == task_id and (
+        row.get("budget_sha256") == budget_sha
+        # Migrate current pre-fix diagnostics without granting their authors
+        # another try just because the old code recorded several rationales.
+        or (not row.get("budget_sha256") and row.get("context") == context))]
+    # Preserve an already-dispatched owner's record ID when coalescing legacy
+    # diagnostics, so its normal finish call closes the retained attempt.
+    matching.sort(key=lambda row: (not any(attempt.get("status") == "started"
+                                           for attempt in row.get("attempts", [])),
+                                   row.get("created_at", 0), row["repair_id"]))
+    repair = matching[0] if matching else {
+        "repair_id": _id("manifest-repair"), "task_id": task_id,
+        "created_at": time.time(), "attempts": [], "status": "open",
+    }
+    attempts = []
+    for row in matching:
+        for attempt in row.get("attempts", []):
+            if attempt not in attempts:
+                attempts.append(deepcopy(attempt))
+    exhausted = any(row.get("status") == "exhausted" or row.get("exhausted_at") for row in matching)
+    blockers = [{"code": "critic_representation_repair", "task_ids": [task_id],
+                 "deterministic": False, "prerequisite_id": "",
+                 "message": review.get("review", {}).get("rationale", "Current representation was rejected."),
+                 "required_action": "Explicitly refine the rejected representation, preserving useful proof work; "
+                                    "resubmit for normal kernel and representation checks."}]
+    identity = digest({"context": context, "budget_sha256": budget_sha})
+    changed = repair.get("input_sha256") != identity or repair.get("status") not in {"open", "exhausted"}
+    repair.update(context=deepcopy(context), input_sha256=identity, budget_sha256=budget_sha,
+                  origin="representation_review", kind="rejected_encoding", blockers=blockers,
+                  evidence={"representation_input_sha256": review["input_sha256"]},
+                  status="exhausted" if exhausted else "open", attempts=attempts)
+    repair.pop("resolved_at", None)
+    repairs[repair["repair_id"]] = repair
+    for row in repairs.values():
+        if (row is not repair and row.get("task_id") == task_id
+                and row.get("status") in {"open", "exhausted"}):
+            row.update(status="superseded", resolved_at=time.time())
+    if changed:
+        _event(state, "manifest_repair_requested", repair_id=repair["repair_id"], task_id=task_id,
+               input_sha256=identity, budget_sha256=budget_sha, origin="representation_review")
+    return deepcopy(repair)
+
+
+def _reconcile_rejected_representation(state: dict, task_id: str, review: dict) -> None:
+    """A proof of the same rejected statement is useful work, not acceptance."""
+    task = state["formal_tasks"][task_id]
+    changed = task.get("status") != "pending" or task.get("accepted_candidate") is not None
+    task.update(status="pending", accepted_candidate=None)
+    # Keep the adopted binding and its kernel receipt as diagnostics. Making
+    # either available to dependents still requires an aligned exact review.
+    faithfulness = {**task.get("faithfulness", {}), "status": "changes_requested",
+                    "representation_input_sha256": review["input_sha256"]}
+    changed = changed or task.get("faithfulness") != faithfulness
+    task["faithfulness"] = faithfulness
+    _record_encoding_repair(state, task_id, review, context=_manifest_repair_context(state, task_id))
+    if changed:
+        _invalidate_review(state)
+        _event(state, "rejected_representation_reconciled", task_id=task_id,
+               input_sha256=review["input_sha256"])
+
+
+def reconcile_rejected_representations(forum_dir: Path) -> dict:
+    """Controller-only recovery of persisted rejection; no proof or review rerun."""
+    from .autoformalize_representation import current_representation_review
+    with transaction(forum_dir) as state:
+        if state.get("phase") == "formalizing":
+            for task_id in state.get("formal_tasks", {}):
+                review = current_representation_review(state, task_id)
+                if review and review.get("status") == "encoding_error":
+                    _reconcile_rejected_representation(state, task_id, review)
+    return load_state(forum_dir)
+
+
+def _clear_manifest_repairs(state: dict, task_id: str, *, status: str = "cleared") -> None:
+    for repair in state.get("manifest_repairs", {}).values():
+        if repair.get("task_id") == task_id and repair.get("status") in {"open", "exhausted"}:
+            repair.update(status=status, resolved_at=time.time())
+            _event(state, "manifest_repair_" + status, repair_id=repair["repair_id"], task_id=task_id)
+
+
+def begin_manifest_repair_attempt(forum_dir: Path, repair_id: str, author: str, *,
+                                  input_sha256: str | None = None) -> dict:
+    author = author_key(_text(author, "author", 100))
+    with transaction(forum_dir) as state:
+        repair = state.get("manifest_repairs", {}).get(repair_id)
+        current = {row["repair_id"] for row in current_manifest_repairs(state)}
+        if not repair or repair_id not in current or repair["status"] != "open":
+            return {"status": "stale"}
+        if input_sha256 is not None and not repair_available_to(
+                state, author, repair["task_id"], repair_id, input_sha256):
+            return {"status": "unavailable", "repair": deepcopy(repair)}
+        if any(author_key(row["author"]) == author for row in repair["attempts"]):
+            return {"status": "attempted", "repair": deepcopy(repair)}
+        scope = _dependent_closure(state["formal_tasks"], {repair["task_id"]})
+        if any(candidate.get("task_id") in scope and candidate_is_current(state, candidate)
+               and candidate.get("status") in {"submitted", "merging"}
+               for candidate in state["formal_candidates"].values()):
+            return {"status": "conflict", "repair": deepcopy(repair)}
+        for row in current_manifest_repairs(state):
+            other_scope = _dependent_closure(state["formal_tasks"], {row["task_id"]})
+            if scope & other_scope and any(attempt["status"] == "started" for attempt in row["attempts"]):
+                return {"status": "conflict", "repair": deepcopy(repair)}
+        repair["attempts"].append({"author": author, "status": "started", "started_at": time.time()})
+        _event(state, "manifest_repair_attempt_started", repair_id=repair_id, author=author)
+        return {"status": "started", "repair": deepcopy(repair)}
+
+
+def finish_manifest_repair_attempt(forum_dir: Path, repair_id: str, author: str, outcome: str) -> None:
+    if outcome not in {"yielded", "interrupted", "failed"}:
+        raise ValueError("unknown manifest repair attempt outcome")
+    with transaction(forum_dir) as state:
+        repair = state.get("manifest_repairs", {}).get(repair_id, {})
+        for attempt in repair.get("attempts", []):
+            if author_key(attempt["author"]) == author_key(author) and attempt["status"] == "started":
+                attempt.update(status=outcome, finished_at=time.time())
+                _event(state, "manifest_repair_attempt_finished", repair_id=repair_id,
+                       author=author_key(author), outcome=outcome)
+
+
+def mark_manifest_repair_exhausted(forum_dir: Path, repair_id: str) -> None:
+    with transaction(forum_dir) as state:
+        current = {row["repair_id"] for row in current_manifest_repairs(state)}
+        repair = state.get("manifest_repairs", {}).get(repair_id, {})
+        if (repair_id in current and repair.get("status") == "open"
+                and not any(row["status"] == "started" for row in repair.get("attempts", []))):
+            repair.update(status="exhausted", exhausted_at=time.time())
+            _event(state, "manifest_repair_exhausted", repair_id=repair_id, task_id=repair["task_id"])
+
+
+def preflight_formal_submission(forum_dir: Path, strategy_id: str, author: str, task_id: str, *,
+                                stage: str = "complete", outputs: list[dict] | None = None) -> dict:
+    """Reject known metadata errors before staging, without queueing a candidate."""
+    with transaction(forum_dir) as state:
+        task = state.get("formal_tasks", {}).get(task_id)
+        strategy = state.get("strategies", {}).get(strategy_id)
+        if state.get("phase") != "formalizing" or not task or task.get("status") == "complete":
+            raise ValueError("formalization task is unavailable")
+        if (not strategy or strategy.get("phase") != "formalizing" or strategy.get("target") != task_id
+                or not strategy_is_current(state, strategy) or not participates(strategy, author)
+                or strategy.get("status") not in {"claimed", "paused"}):
+            raise ValueError("author must own or assist a current strategy for this formal task")
+        for candidate in state["formal_candidates"].values():
+            if (candidate.get("task_id") == task_id and candidate_is_current(state, candidate)
+                    and candidate.get("status") in {"submitted", "merging"}):
+                return {"status": "conflict", "candidate": deepcopy(candidate)}
+        if strategy.get("status") != "claimed" or task.get("status") != "pending":
+            raise ValueError("formal strategy/task is not accepting a new candidate")
+        blockers = submission_blockers(state, task_id, stage, outputs=outputs)
+        if blockers:
+            repair = _record_manifest_repair(state, task_id, blockers, origin="preflight")
+            return {"status": "blocked", "task_id": task_id, "blockers": blockers, "repair": repair,
+                    "error": "; ".join(row["message"] for row in blockers),
+                    "next_action": "Resolve the listed records; explicitly refine adopted representations before changing outputs. "
+                                   "Preserve existing proof work. No candidate, build or review interrupt was queued."}
+        return {"status": "ok", "context": _manifest_repair_context(state, task_id)}
 
 
 def ready_formal_tasks(state: dict) -> list[dict]:
@@ -1638,6 +1876,46 @@ def task_ready(state: dict, task: dict | str) -> bool:
         return all(interface_available(state, dep) for dep in dependencies)
     return all(state["formal_tasks"].get(dep, {}).get("status") == "complete"
                for dep in task.get("dependencies", []))
+
+
+def repair_available_to(state: dict, author: str, task_id: str,
+                        repair_id: str, input_sha256: str) -> bool:
+    """Permission to repair one current input, never permission to accept it."""
+    author = author_key(author)
+    repair = next((row for row in current_manifest_repairs(state, task_id)
+                   if row["repair_id"] == repair_id), None)
+    if (not author or not repair or repair.get("status") != "open"
+            or repair.get("input_sha256") != input_sha256 or pending_replan(state)
+            or source_issues_blocking_task(state, task_id)
+            or any(author_key(row.get("author")) == author for row in repair.get("attempts", []))):
+        return False
+    if not task_available_to(state, author, task_id):
+        from .autoformalize_representation import current_representation_review
+        task = state["formal_tasks"][task_id]
+        review = current_representation_review(state, task_id)
+        if (repair.get("kind") != "rejected_encoding" or not review
+                or review.get("status") != "encoding_error"
+                or repair.get("evidence", {}).get("representation_input_sha256") != review["input_sha256"]):
+            return False
+        # Relax only the target's own rejected interface gate. Its upstream
+        # statement/proof interfaces and source diagnoses remain hard gates.
+        if "statement_dependencies" in task:
+            dependencies = set(task["statement_dependencies"]) | set(task.get("proof_dependencies", []))
+            if not all(interface_available(state, dependency) for dependency in dependencies):
+                return False
+        elif not all(state["formal_tasks"].get(key, {}).get("status") == "complete"
+                     for key in task.get("dependencies", [])):
+            return False
+    scope = _dependent_closure(state["formal_tasks"], {task_id})
+    if any(candidate.get("task_id") in scope and candidate_is_current(state, candidate)
+           and candidate.get("status") in {"submitted", "merging"}
+           for candidate in state.get("formal_candidates", {}).values()):
+        return False
+    for row in current_manifest_repairs(state):
+        if (scope & _dependent_closure(state["formal_tasks"], {row["task_id"]})
+                and any(attempt.get("status") == "started" for attempt in row.get("attempts", []))):
+            return False
+    return True
 
 
 def _task_dependencies(state: dict, task_id: str) -> set[str]:
@@ -1690,6 +1968,8 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
                      or relevant.intersection(row.get("needed_by", []))}
     return digest({
         "source": [source.get("candidate_id"), source.get("sha256")],
+        "manifest_repair_inputs": sorted(row["input_sha256"] for row in current_manifest_repairs(state)
+                                         if row["task_id"] in relevant),
         "rejection": _failure_progress(rejection),
         "prerequisites": prerequisites,
         "writable_files": sorted(path for path, row in reservations(state).items()
@@ -1931,6 +2211,7 @@ def submit_formal_candidate(
     deleted_paths: list[str] | None = None,
     obsolete_files: list[dict] | None = None,
     inventory_observation: dict | None = None,
+    submission_context: dict | None = None,
 ) -> dict:
     from . import autoformalize_files
 
@@ -1957,12 +2238,6 @@ def submit_formal_candidate(
         contract = state["formalization"].get("contract") or {}
         if contract.get("version") == 3 and not bindings:
             raise ValueError("a first candidate requires its declaration/file outputs")
-        owners = {output["declaration"]: owner
-                  for owner, rows in contract.get("bindings", {}).items() for output in rows}
-        for output in bindings:
-            name = output["declaration"]
-            if name in owners and owners[name] != task_id:
-                raise ValueError(f"candidate output '{name}' belongs to task '{owners[name]}', not '{task_id}'")
         strategy = state["strategies"].get(strategy_id)
         if (
             not strategy
@@ -1995,8 +2270,19 @@ def submit_formal_candidate(
                 return {"status": "conflict", "candidate": existing}
         if strategy.get("status") != "claimed" or task.get("status") != "pending":
             raise ValueError("formal strategy/task is not accepting a new candidate")
+        if submission_context is not None and submission_context != _manifest_repair_context(state, task_id):
+            return {"status": "retry", "task_id": task_id,
+                    "next_action": "Accepted state changed after preflight; refresh and retry the preserved source."}
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
+        if contract.get("version") == 3:
+            blockers = submission_blockers(state, task_id, stage, outputs=bindings)
+            if blockers:
+                repair = _record_manifest_repair(state, task_id, blockers, origin="preflight")
+                return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
+                        "blockers": blockers, "repair": repair, "error": "; ".join(row["message"] for row in blockers),
+                        "next_action": "Correct the listed evidence or explicitly refine changed representations; preserve "
+                                       "the existing proof. No candidate, build, or review interrupt was queued."}
         files = {"task_id": task_id, "outputs": bindings, "changed_paths": paths, "deleted_paths": deletions,
                  "obsolete_files": cleanup}
         blockers = autoformalize_files.validate_candidate_files(state, files)
@@ -2013,13 +2299,6 @@ def submit_formal_candidate(
                     blocker["task_ids"] = [task_id]
                 return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
                         "blockers": blockers, "error": "; ".join(row["message"] for row in blockers)}
-        if contract.get("version") == 3:
-            blockers = submission_blockers(state, task_id, stage)
-            if blockers:
-                return {"status": "blocked", "task_id": task_id, "commit_sha": commit_sha,
-                        "blockers": blockers, "error": "; ".join(row["message"] for row in blockers),
-                        "next_action": "Correct the listed prerequisite evidence with refine_chunks; preserve "
-                                       "the existing proof. No candidate, build, or review interrupt was queued."}
         proposal = {"task_id": task_id, "task_revision": task["revision"],
                     "solution_sha256": formal_source(state).get("sha256"),
                     "base_main_sha": base_main_sha.casefold(), "diff_sha256": diff_sha256,
@@ -2108,6 +2387,7 @@ def submit_formal_candidate(
             "created_at": time.time(),
         }
         state["formal_candidates"][candidate_id] = candidate
+        _clear_manifest_repairs(state, task_id)
         autoformalize_files.record_candidate_reservations(state, candidate)
         task["status"] = "candidate_pending"
         for item in state["strategies"].values():
@@ -2222,12 +2502,12 @@ def finish_formal_merge(
             queue_representation_review(state, task["task_id"])
             _invalidate_review(state)
             for obstacle in state["obstacles"].values():
-                if not representation_only and obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
+                if task["status"] == "complete" and obstacle.get("status") == "open" and obstacle.get("target") == task["task_id"]:
                     obstacle["status"] = "resolved"
                     obstacle["resolved_by"] = candidate_id
             for strategy in state["strategies"].values():
                 if strategy.get("phase") == "formalizing" and strategy.get("target") == task["task_id"] and strategy.get("status") in _ACTIVE_STRATEGIES:
-                    if representation_only:
+                    if task["status"] != "complete":
                         strategy["status"] = strategy.pop("paused_from", "registered")
                     else:
                         strategy["status"] = "succeeded" if strategy["strategy_id"] == candidate["strategy_id"] else "cancelled"
@@ -2256,6 +2536,8 @@ def finish_formal_merge(
             if failure_main_sha:
                 candidate["failure_main_sha"] = failure_main_sha.casefold()
             task["status"] = "pending"
+            _record_manifest_repair(state, task["task_id"], candidate["blockers"],
+                                    origin="candidate_check", evidence={"candidate_id": candidate_id})
             for strategy in state["strategies"].values():
                 if strategy.get("phase") == "formalizing" and strategy.get("target") == task["task_id"] and strategy.get("status") == "paused":
                     strategy["status"] = strategy.pop("paused_from", "registered")
@@ -2282,7 +2564,8 @@ def all_formal_tasks_complete(state: dict) -> bool:
     return bool(tasks) and all(task.get("status") == "complete" for task in tasks.values())
 
 
-def record_round_end(forum_dir: Path, *, blocked_launches: dict) -> dict:
+def record_round_end(forum_dir: Path, *, blocked_launches: dict,
+                     activity: dict | None = None) -> dict:
     """Controller-only record after workers and candidate integration have drained."""
     with transaction(forum_dir) as state:
         if state["phase"] != "formalizing":
@@ -2297,6 +2580,26 @@ def record_round_end(forum_dir: Path, *, blocked_launches: dict) -> dict:
             "blocked_launches": {str(name)[:100]: str(reason)[:1000]
                                  for name, reason in list(blocked_launches.items())[:64]},
         }
+        if activity is not None:
+            counters = {key: max(0, int(activity.get(key, 0))) for key in (
+                "worker_launches", "integrations", "review_launches", "source_repairs")}
+            summary["activity"] = counters
+            summary["outcome"] = ("complete" if all_formal_tasks_complete(state) else
+                                  "attempted" if any(counters.values()) else "blocked")
+            # Diagnostics describe why a drained round could not dispatch; they
+            # do not make a rejected interface available or create proof evidence.
+            from .autoformalize_representation import current_representation_review
+            repairs = current_manifest_repairs(state)
+            summary["pending_tasks"] = [{
+                "task_id": task_id,
+                "representation_status": (current_representation_review(state, task_id) or {}).get("status"),
+                "unavailable_dependencies": sorted(dep for dep in (
+                    set(task.get("statement_dependencies", []))
+                    | set(task.get("proof_dependencies", []))
+                    | set(task.get("dependencies", []))) if not interface_available(state, dep)),
+                "repairs": [{"repair_id": row["repair_id"], "status": row["status"]}
+                            for row in repairs if row["task_id"] == task_id],
+            } for task_id, task in tasks.items() if task.get("status") == "pending"]
         state["formalization"]["last_round"] = summary
         _event(state, "formalization_round_ended", **summary)
     return load_state(forum_dir)
@@ -2525,17 +2828,32 @@ def submit_critic_verdict(
     review: dict,
     reopen_tasks: list[str] | None = None,
     evidence: str = "",
+    representation_repairs: list[dict] | None = None,
 ) -> dict:
     verdict = verdict.strip().casefold()
     if verdict not in {"approved", "lean_reopen"}:
         raise ValueError("verdict must be approved or lean_reopen")
     review = SemanticReview.model_validate(review).model_dump()
+    if representation_repairs is not None and not isinstance(representation_repairs, list):
+        raise ValueError("representation_repairs must be a list")
+    repairs = [RepresentationRepairRequest.model_validate(row).model_dump()
+               for row in representation_repairs or []]
+    for repair in repairs:
+        repair["task_id"] = _text(repair["task_id"], "repair task_id")
+        repair["reason"] = _text(repair["reason"], "representation repair reason")
+    repairs.sort(key=lambda row: row["task_id"])
     with transaction(forum_dir) as state:
         if state["phase"] != "critic" or state["formalization"].get("status") != "review":
             raise ValueError("critic verdicts are only accepted during critic")
         report = _current_snapshot(state, review["snapshot_id"], require_passed=verdict == "approved")
         _validate_semantic_review(state, review, approved=verdict == "approved", author=author)
         task_ids = list(dict.fromkeys(reopen_tasks or []))
+        if repairs:
+            if verdict != "lean_reopen" or (state["formalization"].get("contract") or {}).get("version") != 3:
+                raise ValueError("representation repairs require lean_reopen with a version 3 source contract")
+            repair_tasks = [row["task_id"] for row in repairs]
+            if len(set(repair_tasks)) != len(repair_tasks) or set(repair_tasks) - set(task_ids):
+                raise ValueError("representation repairs require unique tasks explicitly listed in reopen_tasks")
         if verdict == "approved" and task_ids:
             raise ValueError("approved verdict cannot reopen formal tasks")
         if verdict == "lean_reopen":
@@ -2559,6 +2877,8 @@ def submit_critic_verdict(
             "timestamp": time.time(),
         }
         state["critic_verdicts"].append(item)
+        if repairs:
+            item["representation_repairs"] = repairs
         if verdict == "approved":
             state["formalization"]["status"] = "approval_pending"
             state["formalization"]["pending_verdict_id"] = item["verdict_id"]
@@ -2582,12 +2902,15 @@ def submit_critic_verdict(
             item["reopened_tasks"] = sorted(reopened)
             # Identical feedback on a new snapshot is not a fresh approach.
             # Bind only substantive review content, never verdict IDs or time.
-            feedback_sha256 = digest({
+            feedback = {
                 "summary": item["summary"], "evidence": item["evidence"],
                 "reopen_tasks": sorted(task_ids), "scope_rationale": review["scope_rationale"],
                 "requirements": sorted(review["requirements"], key=lambda row: row["requirement_id"]),
                 "repair_reviews": sorted(review["repair_reviews"], key=lambda row: row["repair_id"]),
-            })
+            }
+            if repairs:
+                feedback["representation_repairs"] = repairs
+            feedback_sha256 = digest(feedback)
             for task_id in reopened:
                 task = state["formal_tasks"][task_id]
                 accepted = task.get("accepted_candidate")
@@ -2606,6 +2929,16 @@ def submit_critic_verdict(
             _invalidate_review(state)
             state["formalization"]["status"] = "active"
             state["phase"] = "formalizing"
+            for repair in repairs:
+                _record_manifest_repair(state, repair["task_id"], [{
+                    "code": "critic_representation_repair", "task_ids": [repair["task_id"]],
+                    "prerequisite_id": "", "deterministic": False, "message": repair["reason"],
+                    "required_action": "Inspect the cited representation; explicitly refine it if necessary, "
+                                       "then submit retained or corrected proof code for normal verification.",
+                }], origin="critic", kind=repair["kind"], evidence={
+                    "snapshot_id": report["snapshot_id"], "snapshot_sha256": item["snapshot_sha256"],
+                    "verdict_id": item["verdict_id"],
+                })
         _event(state, "critic_verdict", verdict_id=item["verdict_id"], author=author,
                verdict=verdict, reopen_tasks=task_ids)
     return {"verdict": item, "state": load_state(forum_dir)}

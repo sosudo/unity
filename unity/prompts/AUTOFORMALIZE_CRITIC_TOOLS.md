@@ -10,7 +10,7 @@ with exact task IDs and actionable next steps, or request an evidenced replan/so
 Use `not_checked` for unchecked requirements. A failed snapshot cannot approve, and unfinished
 tasks do not justify reopening unrelated completed work. Repeated unchanged feedback is not a new attempt.
 
-- `submit_formalization_verdict(author, verdict, summary, review, reopen_tasks?, evidence?)` submits
+- `submit_formalization_verdict(author, verdict, summary, review, reopen_tasks?, evidence?, representation_repairs?)` submits
   `approved` or `lean_reopen`. `review` contains the current `snapshot_id` and `requirements` entries
   `{requirement_id, status, declarations, checked_anchor_ids, checked_prerequisite_ids, rationale, argument_rationale}`,
   a global `scope_rationale`, and `repair_reviews` with `{repair_id,status,rationale}` for every adopted
@@ -18,6 +18,13 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
   exactly once, all passing, with all adopted outputs of its implementing nodes listed in
   `declarations` (definitions/structures/instances as well as theorems) and concrete reasoning. Rejections can be partial;
   a Lean reopen requires exact affected task IDs. Free-text `evidence` alone cannot approve.
+  For a version-3 `lean_reopen`, optional `representation_repairs` contains strict
+  `{task_id, kind, reason}` entries with unique task IDs explicitly in `reopen_tasks`.
+  `kind="output_manifest"` requests investigation of existing outputs omitted or misbound;
+  `kind="representation"` requests an encoding correction or missing mathematical witness.
+  These route focused work, never certify metadata-only changes or satisfy a requirement.
+  Put unmanifested witness names in `reason`, not the current review's `declarations`.
+  Repair completion still requires normal machine checks and independent semantic review.
   Each entry's `checked_anchor_ids` must contain only IDs from that requirement's own `anchor_ids`,
   without duplicates; approval requires all of them. Put ancillary source/argument context in
   `rationale` or `argument_rationale`, not in `checked_anchor_ids`.

@@ -25,7 +25,9 @@ from fastmcp import FastMCP
 from pydantic import Field
 
 from .. import artifacts, autoformalize_contract, autoformalize_state, worktree
-from ..autoformalize_review import SemanticReview, RepresentationReview, SourceDiagnosis
+from ..autoformalize_review import (
+    SemanticReview, RepresentationRepairRequest, RepresentationReview, SourceDiagnosis,
+)
 from .. import autoformalize_representation, autoformalize_files
 from ..autoformalize_spec import normalize_outputs
 from . import server as discussion
@@ -152,9 +154,20 @@ def _submit_formal_commit(
     stage: str = "complete",
     outputs: list[dict] | None = None,
     obsolete_files: list[dict] | None = None,
+    submission_context: dict | None = None,
 ) -> dict:
     from .. import autoformalize_cache, autoformalize_files
 
+    if submission_context is None:
+        preflight = autoformalize_state.preflight_formal_submission(
+            FORUM_DIR, strategy_id, author, task_id, stage=stage, outputs=outputs,
+        )
+        if preflight["status"] == "ok":
+            submission_context = preflight["context"]
+        elif preflight["status"] != "conflict":
+            return preflight
+        # A committed retry has no worktree side effects. Let the state layer
+        # identify its exact existing candidate before enforcing mutable gates.
     resolved = worktree.verify_candidate_commit(
         _root(), author, commit_sha, allow_unchanged=True,
     )
@@ -229,6 +242,7 @@ def _submit_formal_commit(
             representation_observation=representation_observation,
             failure_observation=observation,
             inventory_observation=inventory_observation,
+            submission_context=submission_context,
             obsolete_files=obsolete_files, **actual_paths,
         )
     if result["status"] == "submitted" and not result.get("idempotent"):
@@ -244,7 +258,7 @@ def autoformalize_status() -> dict:
 
 
 def read_metrics(forum_dir: Path, project_root: Path) -> dict:
-    """Read one workspace's telemetry without changing process-global tool routing."""
+    """Read telemetry; repair latency ends at diagnostic clearance, not acceptance."""
     state = autoformalize_state.load_state(forum_dir)
     events = state.get("events", [])
     first_by_kind: dict[str, float] = {}
@@ -291,6 +305,37 @@ def read_metrics(forum_dir: Path, project_root: Path) -> dict:
         float(event.get("timestamp") or 0) for event in events
         if event.get("kind") == "critic_review_completed"
     ), default=0)
+    repair_records = list(state.get("manifest_repairs", {}).values())
+    repair_counts: dict[str, int] = {}
+    repair_attempt_counts: dict[str, int] = {}
+    repair_timestamps = []
+    current_repairs = {row["repair_id"] for row in autoformalize_state.current_manifest_repairs(state)}
+    for repair in repair_records:
+        status = str(repair.get("status") or "unknown")
+        repair_counts[status] = repair_counts.get(status, 0) + 1
+        attempts = repair.get("attempts", [])
+        for attempt in attempts:
+            outcome = str(attempt.get("status") or "unknown")
+            repair_attempt_counts[outcome] = repair_attempt_counts.get(outcome, 0) + 1
+        created = repair.get("created_at")
+        finished = repair.get("resolved_at")
+        if finished is None:
+            finished = repair.get("exhausted_at")
+        latency = (round(finished - created, 3)
+                   if isinstance(created, (int, float)) and isinstance(finished, (int, float))
+                   and finished >= created else None)
+        repair_timestamps.append({
+            "repair_id": repair.get("repair_id"), "task_id": repair.get("task_id"),
+            "kind": repair.get("kind"), "status": repair.get("status"),
+            "is_current": repair.get("repair_id") in current_repairs,
+            "diagnostic_latency_seconds": latency,
+            "created_at": repair.get("created_at"),
+            "resolved_at": repair.get("resolved_at"),
+            "exhausted_at": repair.get("exhausted_at"),
+            "attempts": [{key: attempt.get(key) for key in
+                          ("author", "status", "started_at", "finished_at")}
+                         for attempt in attempts],
+        })
     return {
         "run_id": state.get("run_id"),
         "phase": state.get("phase"),
@@ -304,6 +349,11 @@ def read_metrics(forum_dir: Path, project_root: Path) -> dict:
         "by_phase": by_phase,
         "by_model": by_model,
         "by_task": by_task,
+        "manifest_repairs": {
+            "total": len(repair_records), "by_status": repair_counts,
+            "attempts_by_status": repair_attempt_counts,
+            "records": repair_timestamps,
+        },
     }
 
 
@@ -575,6 +625,8 @@ def autoformalize_task(task_id: str) -> str:
         "readiness": task_readiness(state, task_id),
         "remaining_global_requirements": global_completion_requirements(state),
         "representation_review": autoformalize_representation.current_representation_review(state, task_id),
+        "manifest_repairs": [row for row in autoformalize_state.current_manifest_repairs(state)
+                             if row.get("task_id") == task_id],
         "file_reservations": {path: row for path, row in autoformalize_files.reservations(state).items()
                               if task_id in {row["owner_task"], *row["shared_with"]}},
         "source_refs": [
@@ -679,6 +731,17 @@ def autoformalize_brief(author: str, task_id: str = "") -> str:
                      "Read the snapshot artifact and autoformalize_task(task_id) for exact detail.")
     if review_phase:
         lines.extend(blocker_lines)  # Never truncate the critic's current snapshot behind repair prose.
+    repairs = [row for row in autoformalize_state.current_manifest_repairs(state)
+               if not related or row.get("task_id") in related]
+    if repairs:
+        lines.extend(["", "CURRENT MANIFEST/REPRESENTATION REPAIR REQUESTS — not acceptance evidence"])
+        for row in repairs[:6]:
+            lines.append(f"- {row['task_id']}: {row['kind']}; {row['status']}; "
+                         f"repair {row['repair_id']}; attempts={len(row.get('attempts', []))}")
+            for blocker in row.get("blockers", [])[:2]:
+                lines.append(f"  {blocker.get('code')}: {blocker.get('message', '')[:240]}")
+        lines.append("Read autoformalize_task(task_id).manifest_repairs for exact scope and blockers; "
+                     "repair completion does not approve mathematical correspondence.")
     reviews = [(key, autoformalize_representation.current_representation_review(state, key))
                for key in tasks if not related or key in related]
     reviews = [(key, row) for key, row in reviews if row]
@@ -1233,6 +1296,11 @@ def finalize_formalization(
         raise ValueError("candidate stage must be representation or complete")
     outputs = normalize_outputs(outputs) if outputs is not None else None
     with _finalization_lock(author):
+        preflight = autoformalize_state.preflight_formal_submission(
+            FORUM_DIR, strategy_id, author, task_id, stage=stage, outputs=outputs,
+        )
+        if preflight["status"] != "ok":
+            return preflight
         state = autoformalize_state.load_state(FORUM_DIR)
         task = state.get("formal_tasks", {}).get(task_id)
         if state.get("phase") != "formalizing" or not task:
@@ -1325,6 +1393,7 @@ def finalize_formalization(
             strategy_id, author, task_id, head,
             notes=notes, supersedes=supersedes, stage=stage, outputs=outputs,
             obsolete_files=obsolete_files,
+            submission_context=preflight["context"],
         )
         return {
             **result,
@@ -1409,6 +1478,21 @@ def ready_statement_prerequisites(state: dict, task_id: str) -> list[dict]:
     return sorted(ready, key=lambda item: item["task_id"])
 
 
+def _declared_prerequisite(state: dict, task_id: str, prerequisite_id: str) -> bool:
+    """An exact repair may revisit an existing statement or proof prerequisite."""
+    tasks, seen, pending = state.get("formal_tasks", {}), {task_id}, [task_id]
+    while pending:
+        task = tasks.get(pending.pop(), {})
+        for key in set(task.get("dependencies", [])) | set(task.get("statement_dependencies", [])) | set(
+                task.get("proof_dependencies", [])):
+            if key == prerequisite_id and key != task_id:
+                return True
+            if key not in seen:
+                seen.add(key)
+                pending.append(key)
+    return False
+
+
 def _checkpoint_manifest_path(author: str, task_id: str, run_id: str) -> Path:
     key = autoformalize_state.digest([run_id, autoformalize_state.author_key(author), task_id])
     return FORUM_DIR / "worktree-checkpoints" / f"{key}.json"
@@ -1420,8 +1504,11 @@ def _worktree_assignment_path(author: str, state: dict) -> Path:
 
 
 def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
-                               state: dict, *, pending: bool = False) -> dict:
+                               state: dict, *, pending: bool = False,
+                               repair_handoff: dict | None = None) -> dict:
     assignment = {"task_id": task_id, "task_revision": revision, "pending": pending}
+    if repair_handoff:
+        assignment["repair_handoff"] = repair_handoff
     path = _worktree_assignment_path(author, state)
     path.parent.mkdir(parents=True, exist_ok=True)
     artifacts._atomic_write(path, (json.dumps(assignment) + "\n").encode())
@@ -1564,18 +1651,32 @@ def _restore_task_checkpoint_if_current(
 
 
 def _reset_formal_assignment(tree: Path, author: str, task_id: str, revision: int | None,
-                             state: dict, main_sha: str) -> dict:
+                             state: dict, main_sha: str, *, repair_handoff: dict | None = None) -> dict:
     # The previous task is already checkpointed (or complete/clean). Persist
     # the intended assignment BEFORE changing Git, so an interrupted restore
     # cannot subsequently checkpoint the target bytes under the previous task.
-    _record_worktree_assignment(author, task_id, revision, state, pending=True)
+    _record_worktree_assignment(author, task_id, revision, state, pending=True,
+                               repair_handoff=repair_handoff)
     result = worktree.force_sync_from_main(_root(), author)
     if result.get("ok"):
         result.update(_restore_task_checkpoint_if_current(
             tree, author, task_id, revision, state, main_sha,
         ))
-        _record_worktree_assignment(author, task_id, revision, state)
+        _record_worktree_assignment(author, task_id, revision, state, repair_handoff=repair_handoff)
     return result
+
+
+def _finish_repair_handoff(state: dict, author: str, handoff: dict) -> None:
+    """Release only the checkpointed related claim, after successful reset."""
+    previous_task = handoff["previous_task"]
+    autoformalize_state._record_yield(
+        state, author, previous_task,
+        "Controller checkpointed this stopped dependent to repair its rejected prerequisite.",
+        [handoff["next_task"]], autoformalize_state.snapshot_attempt(state, author, previous_task),
+    )
+    state["task_yields"][autoformalize_state.author_key(author)][previous_task]["repair_handoff_sha256"] = (
+        autoformalize_state.digest(handoff)
+    )
 
 
 def prepare_formal_worktree(
@@ -1584,6 +1685,8 @@ def prepare_formal_worktree(
     next_task: str = "",
     *,
     expected_revision: int | None = None,
+    repair_id: str = "",
+    repair_input_sha256: str = "",
 ) -> dict:
     """Prepare a stopped worker for another task without erasing unresolved work.
 
@@ -1608,7 +1711,12 @@ def prepare_formal_worktree(
         target_task = state.get("formal_tasks", {}).get(next_task, {})
         if target_task.get("status") != "pending":
             return _sync_blocked("task_unavailable", "The next formal task is no longer pending.")
-        if not autoformalize_state.task_ready(state, target_task):
+        repair_allowed = bool(repair_id and repair_input_sha256 and autoformalize_state.repair_available_to(
+            state, author, next_task, repair_id, repair_input_sha256,
+        ))
+        if (repair_id or repair_input_sha256) and not repair_allowed:
+            return _sync_blocked("repair_changed", "The exact repair permission is no longer current; work preserved.")
+        if not repair_allowed and not autoformalize_state.task_ready(state, target_task):
             return _sync_blocked("dependencies_pending", "The next formal task has unresolved dependencies.")
         if has_pending_formal_candidate(state, author):
             return _sync_blocked("candidate_pending", "Candidate review is pending; its branch is preserved.")
@@ -1617,6 +1725,28 @@ def prepare_formal_worktree(
             return _sync_blocked("missing_worktree", "The agent has no active worktree.")
         assignment_path = _worktree_assignment_path(author, state)
         assignment = json.loads(assignment_path.read_text()) if assignment_path.is_file() else {}
+        handoff = assignment.get("repair_handoff") or {}
+        handoff_finished = bool(handoff and state.get("task_yields", {}).get(identity, {}).get(
+            handoff["previous_task"], {}).get("repair_handoff_sha256") == autoformalize_state.digest(handoff))
+        if handoff and not handoff_finished:
+            # A durable assignment can advance before the Forum claim release
+            # commits. Revalidate its exact source-bound repair before retrying
+            # the reset or completing that interrupted release.
+            previous = state["formal_tasks"].get(handoff["previous_task"], {})
+            checkpoint = _saved_task_checkpoint(author, handoff["previous_task"], state)
+            if (not repair_allowed or handoff.get("repair_id") != repair_id
+                    or handoff.get("repair_input_sha256") != repair_input_sha256
+                    or handoff.get("source_identity_sha256") != autoformalize_state.digest(state.get("input_source") or {})
+                    or handoff.get("next_task") != next_task
+                    or handoff.get("next_task_revision") != target_task.get("revision")
+                    or handoff.get("previous_task_revision") != previous.get("revision")
+                    or not _declared_prerequisite(state, handoff["previous_task"], next_task)
+                    or not checkpoint
+                    or checkpoint.get("manifest_artifact") != handoff.get("checkpoint_manifest_artifact")):
+                return _sync_blocked("repair_changed", "Checkpointed repair handoff changed; claims and work preserved.")
+            if set(unresolved_formal_tasks(state, author)) - {handoff["previous_task"], next_task}:
+                return _sync_blocked("unresolved_work", "Unrelated unfinished task work is preserved.")
+            state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[handoff["previous_task"]] = checkpoint
         recovered = {}
         if assignment.get("pending"):
             main_sha = _accepted_formal_main(state)
@@ -1624,10 +1754,14 @@ def prepare_formal_worktree(
                 return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
             recovered = _reset_formal_assignment(
                 tree, author, assignment["task_id"], assignment["task_revision"], state, main_sha,
+                repair_handoff=handoff if not handoff_finished else None,
             )
             if not recovered.get("ok"):
                 return recovered
             assignment["pending"] = False
+        if handoff and not handoff_finished:
+            _finish_repair_handoff(state, author, handoff)
+            recovered["parked_checkpoint"] = checkpoint
         if assignment:
             previous_task = assignment["task_id"]
             assignments[identity] = previous_task
@@ -1649,7 +1783,11 @@ def prepare_formal_worktree(
                               main_sha, check=False)
                 if merged.returncode:
                     result["sync_warning"] = "Resolve the preserved worktree merge conflict before finalizing."
-            _record_worktree_assignment(author, next_task, target_task.get("revision"), state)
+            # Keep recovery provenance until a later transaction observes the
+            # committed yield. A crash after this durable write must not orphan
+            # the dependent claim even when the Git reset already succeeded.
+            _record_worktree_assignment(author, next_task, target_task.get("revision"), state,
+                                       repair_handoff=handoff if not handoff_finished else None)
             return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
         # A refinement can introduce a missing interface and block every former
@@ -1658,13 +1796,19 @@ def prepare_formal_worktree(
         prerequisite_reassignment = next_task in {
             item["task_id"] for item in ready_statement_prerequisites(state, previous_task)
         }
+        repair_reassignment = repair_allowed and _declared_prerequisite(state, previous_task, next_task)
         yielded_reassignment = autoformalize_state.has_yielded(state, author, previous_task)
         unresolved = set(unresolved_formal_tasks(state, author))
-        if yielded_reassignment:
+        if yielded_reassignment or repair_reassignment:
             unresolved.discard(next_task)  # The agent may already have claimed its chosen next task.
+        if repair_reassignment:
+            # The stopped worker's related dependent claim can be parked only
+            # after its source is checkpointed below. Unrelated claims remain
+            # a hard blocker; other authors' participation is never released.
+            unresolved.discard(previous_task)
         if unresolved or (
             previous_task and previous.get("status") != "complete"
-            and not prerequisite_reassignment and not yielded_reassignment
+            and not prerequisite_reassignment and not yielded_reassignment and not repair_reassignment
         ):
             return _sync_blocked("unresolved_work", "Unfinished task work is preserved; resume it first.")
         main_sha = _accepted_formal_main(state)
@@ -1680,16 +1824,25 @@ def prepare_formal_worktree(
         ignored = _git(tree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
                        "--", ".", ":(exclude).unity", ":(exclude).lake").stdout
         private_commits = _git(tree, "merge-base", "--is-ancestor", "HEAD", main_sha, check=False).returncode != 0
-        if (prerequisite_reassignment or yielded_reassignment) and (private_status or ignored or private_commits):
+        if repair_reassignment or ((prerequisite_reassignment or yielded_reassignment) and (
+                private_status or ignored or private_commits)):
             checkpoint = _checkpoint_task_worktree(
                 tree, author, previous_task, previous_revision,
             )
             state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[previous_task] = checkpoint
+            handoff = {"previous_task": previous_task, "previous_task_revision": previous.get("revision"),
+                       "next_task": next_task, "next_task_revision": target_task.get("revision"),
+                       "repair_id": repair_id, "repair_input_sha256": repair_input_sha256,
+                       "source_identity_sha256": autoformalize_state.digest(state.get("input_source") or {}),
+                       "checkpoint_manifest_artifact": checkpoint["manifest_artifact"]} if repair_reassignment else None
             result = _reset_formal_assignment(
                 tree, author, next_task, target_task.get("revision"), state, main_sha,
+                repair_handoff=handoff,
             )
             if result.get("ok"):
                 result["parked_checkpoint"] = checkpoint
+                if repair_reassignment:
+                    _finish_repair_handoff(state, author, handoff)
             return result
 
         # A fresh/unassigned tree has no known obsolete task. Never reset it:
@@ -1857,18 +2010,25 @@ def submit_formalization_verdict(
     review: SemanticReview,
     reopen_tasks: list[str] | None = None,
     evidence: str = "",
+    representation_repairs: list[RepresentationRepairRequest] | None = None,
 ) -> dict:
     """Submit snapshot-bound semantic evidence. Approval requires every requirement to pass.
 
     Read autoformalize_status() for the current snapshot_id and immutable requirements.
     Free-text evidence is optional context, never a substitute for structured review.
     Approval remains pending until the controller verifies that source bytes are unchanged.
+    Optional representation_repairs route focused v3 lean_reopen work; they never approve outputs.
     """
     author = _author(author)
+    if representation_repairs is not None and not isinstance(representation_repairs, list):
+        raise ValueError("representation_repairs must be a list")
+    repairs = ([RepresentationRepairRequest.model_validate(row).model_dump()
+                for row in representation_repairs] if representation_repairs is not None else None)
     result = autoformalize_state.submit_critic_verdict(
         FORUM_DIR, author, verdict, summary,
         review=SemanticReview.model_validate(review).model_dump(),
         reopen_tasks=reopen_tasks, evidence=evidence,
+        representation_repairs=repairs,
     )
     _mirror(author, f"FORMALIZATION VERDICT: {verdict}", summary)
     return result

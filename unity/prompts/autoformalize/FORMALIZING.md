@@ -29,6 +29,13 @@ dependency outputs without requiring a finding; use `autoformalize_task` for the
 
 For your assigned task:
 
+- inspect current `autoformalize_task(task_id).manifest_repairs` before attempting a focused repair.
+  Its exact blockers, source/task context and prior attempts define the requested scope, not acceptance
+  evidence. Preserve unrelated declarations and proofs. An `output_manifest` request is a diagnosis
+  to check; a missing mathematical witness or changed meaning is a representation repair, not a
+  mechanical bookkeeping fix. Use existing `refine_chunks`/`reopen_representations` when its adopted
+  encoding needs revision. `cleared` means the diagnostic no longer blocks submission, not proof or
+  faithfulness acceptance. New declarations and compilation do not prove source correspondence;
 - read the latest critic feedback and any saved checkpoint for your assigned task. Continue from preserved
   work and address the stated blocker before repeating earlier searches. A checkpoint is private unfinished
   work, not an accepted proof; when its task revision changed, reuse it selectively against the current task;
@@ -150,6 +157,10 @@ preserving unrelated proofs. Adding an output does not change a prerequisite res
 `blocked` or `unchanged_failed` queues no new verification: do not repeat it unchanged. If unable to
 repair an applicable blocker, yield with its exact ID. A finding's confidence never overrides a
 checked rejection, but a global unfinished obligation does not invalidate a useful helper.
+Finalization checks current submission blockers before staging or committing. A `blocked`, `conflict`
+or `retry` response is not a submitted candidate: read its exact status and next action, preserve your
+private work, and refresh current task/repair context before retrying. A repair attempt's completion
+does not approve its outputs; corrected candidates still pass normal verification and semantic review.
 
 To remove a superseded scaffold, explicitly delete it in your own worktree and submit
 `obsolete_files=[{"path":"Project/Old.lean","replacement_candidate_id":"<merged candidate>"}]`.

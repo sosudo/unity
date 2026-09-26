@@ -119,7 +119,17 @@ task organization, dependencies, prerequisite/argument mappings or requirement-t
 under the existing obligations, without changing the supplied source.
 For a mutable node interpretation or Lean representation defect, use `lean_reopen` with exact task
 IDs so formalizers can correct it with `refine_chunks` and a new candidate. Do not edit the DAG during
-independent review. If the
+independent review. For a focused repair, optionally supply top-level
+`representation_repairs=[{"task_id":"stable-node-id","kind":"output_manifest","reason":"exact mismatch and evidence"}]`
+with the verdict. Every repair must name a unique task explicitly listed in `reopen_tasks`; this
+option is only for the version-3 informal-node plan and `lean_reopen`. Use `output_manifest` when
+correct existing declarations appear omitted or misbound; use `representation` for an incorrect
+encoding or a mathematically missing witness. These are repair requests, not machine findings or
+acceptance evidence. The controller must independently check whether a correction is metadata-only.
+Put missing witness names and source evidence in `reason`, not in a requirement's `declarations`,
+which may only cite current manifested outputs. New declarations or a successful build do not
+establish semantic coverage. A corrected implementation still needs current verification and an
+independent source-faithfulness verdict; do not approve an outstanding repair request. If the
 source itself has an error or unreadable/missing argument, use `report_source_issue` with exact anchors
 and task IDs, then end this review attempt. Unity routes the issue to exploration/spot-repair rather
 than asking you to approve it. Do not edit Lean/source during review or review a correction you just
