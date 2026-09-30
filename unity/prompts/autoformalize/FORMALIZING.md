@@ -36,9 +36,16 @@ For your assigned task:
   mechanical bookkeeping fix. Use existing `refine_chunks`/`reopen_representations` when its adopted
   encoding needs revision. `cleared` means the diagnostic no longer blocks submission, not proof or
   faithfulness acceptance. New declarations and compilation do not prove source correspondence;
-- read the latest critic feedback and any saved checkpoint for your assigned task. Continue from preserved
-  work and address the stated blocker before repeating earlier searches. A checkpoint is private unfinished
-  work, not an accepted proof; when its task revision changed, reuse it selectively against the current task;
+- read `autoformalize_task(task_id).critic_feedback`, including both `direct` feedback for the assigned
+  task and `upstream` feedback inherited from its dependencies, plus any saved checkpoint. Apply only
+  the repair checklist entries identified as relevant to your assigned task; do not silently take over
+  unrelated tasks. The recorded verdict, snapshot, reviewed main, requirement/task mappings, and
+  historical/shared/lineage flags are provenance, not current truth: revalidate historical feedback
+  against the current source, task interpretation, dependency outputs and exact Lean bytes before reusing it. Continue from preserved
+  work and address each applicable repair step before repeating earlier searches. A checkpoint is private
+  unfinished work, not an accepted proof; when its task revision changed, reuse it selectively against
+  the current task. Compilation or merely repeating a formula/declaration name does not discharge a
+  semantic construction or proof obligation;
 - refresh `autoformalize_brief` frequently. Claim a suitable existing strategy when available; register a new
   strategy only when materially different. Investigation/editing before registration is allowed, but
   claim a strategy before finalizing. Assist, transfer ownership or mark an incorrect strategy as appropriate;
@@ -73,9 +80,16 @@ For your assigned task:
   tools; use Lean LSP for local goals, project-aware search, and checks without a suitable Axle equivalent.
   Consider Aristotle for a stubborn proof when useful; its availability does not make it mandatory;
 - after a successful targeted local check of a new representation or completed implementation's exact
-  source/import bytes, immediately call `finalize_formalization` unless a concrete error or unresolved
-  candidate rejection remains. Rechecking an already adopted, unchanged representation is not new work
-  to submit; continue its proof/construction or yield a concretely blocked attempt.
+  source/import bytes, immediately call `finalize_formalization` unless a concrete error or an applicable
+  semantic repair step or candidate rejection remains unresolved. Once the actual repair steps and the
+  concrete candidate-rejection blocker are addressed, resubmit promptly;
+  do not wait indefinitely for informal approval in the Forum. In `notes`, map every applicable repair
+  step to the actual declaration(s), dependency resolution(s), and checked evidence that address it, or
+  name the precise remaining blocker. Compilation alone and reflexively listing the criticized formula or
+  declaration names are insufficient. These notes provide evidence for a new independent critic review;
+  they do not resolve the critic's semantic finding or authorize self-approval. Rechecking an already
+  adopted, unchanged representation is not new work to submit; continue its proof/construction or yield
+  a concretely blocked attempt.
   Unity commits the candidate, applies it to
   current main, and performs the sole authoritative full build and mechanical declaration review;
 - when an unrelated task merges, refresh the brief and keep working without resetting your worktree.
@@ -107,7 +121,9 @@ candidate version; previous failed/superseded attempts remain evidence, not curr
 Preserve adopted declarations at their exact fully-qualified names, including namespace scope.
 Do not wrap existing shared declarations in a new namespace. `outputs` lists only this task's
 deliverables, not dependencies or every declaration in the file. After rejection, fix the reported
-cause before resubmitting. For merge conflicts, commit intended private edits, use `sync_from_main`,
+cause before resubmitting, and use candidate `notes` to map each applicable `repair_steps` item to the
+actual declarations/dependencies changed and checked or to the exact remaining blocker. For merge
+conflicts, commit intended private edits, use `sync_from_main`,
 and resolve conflicts while preserving accepted work; a private build alone does not resolve rejection.
 Use `stage="complete"` (the default) when the representation and proof/construction are ready. A short
 complete implementation can adopt its representation and verify its proof in one call.

@@ -82,6 +82,11 @@ def _autoformalize_shared_paths(paths) -> tuple[Path, Path]:
     return shared_unity / "forum" / "autoformalize", shared_unity.parent
 
 
+def _formalize_shared_paths(paths) -> tuple[Path, Path]:
+    shared_unity = paths.unity.resolve()
+    return shared_unity / "forum" / "formalize", shared_unity.parent
+
+
 async def _call_autoformalize_stdio(paths, server, spec, tool, kwargs):
     """Keep autoformalize's one-shot server diagnostics out of the tool result."""
     import tempfile
@@ -171,6 +176,16 @@ async def mcp(server, tool, args, args_file):
         run_state = json.loads((paths.unity / "state.json").read_text())
     except (OSError, json.JSONDecodeError):
         run_state = {}
+    active_formalize = run_state.get("command") == "formalize" and run_state.get("phase") != "done"
+    formalize_profile = run_state.get("phase", "chunking")
+    if active_formalize:
+        from ..forum import formalize_server
+        override = os.getenv("UNITY_FORMALIZE_PROFILE", "").strip()
+        if override and override not in formalize_server.PROFILES:
+            raise click.ClickException(f"unknown formalize tool profile '{override}'")
+        formalize_profile = override or formalize_profile
+        if formalize_profile not in formalize_server.PROFILES:
+            formalize_profile = "chunking"
     active_autoformalize = (
         run_state.get("command") == "autoformalize" and run_state.get("phase") != "done"
     )
@@ -198,7 +213,12 @@ async def mcp(server, tool, args, args_file):
             solve_profile = override
     client = None
     diagnostic_note = ""
-    if server in ("unity-forum", "forum") and active_autoformalize:
+    if server in ("unity-forum", "forum") and active_formalize:
+        from ..forum import formalize_server
+        shared_forum, shared_root = _formalize_shared_paths(paths)
+        formalize_server.configure(shared_forum, shared_root, formalize_profile)
+        client = Client(formalize_server.build_server(formalize_profile))
+    elif server in ("unity-forum", "forum") and active_autoformalize:
         from ..forum import autoformalize_server
         shared_forum, shared_root = _autoformalize_shared_paths(paths)
         autoformalize_server.configure(shared_forum, shared_root, autoformalize_profile)
@@ -220,7 +240,13 @@ async def mcp(server, tool, args, args_file):
         )
         client = Client(fsrv.mcp)  # in-process: no subprocess, same flock-safe storage
     else:
-        if active_autoformalize:
+        if active_formalize:
+            from dataclasses import replace
+            from ..formalize_orchestrator import build_formalize_mcp
+            shared_forum, shared_root = _formalize_shared_paths(paths)
+            specs = build_formalize_mcp(
+                replace(paths, forum=shared_forum, project_root=shared_root), formalize_profile)
+        elif active_autoformalize:
             from dataclasses import replace
             from ..autoformalize_orchestrator import build_autoformalize_mcp
             shared_forum, _ = _autoformalize_shared_paths(paths)
@@ -239,7 +265,9 @@ async def mcp(server, tool, args, args_file):
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
         spec = specs[server]
-        if active_autoformalize and spec.get("command"):
+        if active_formalize and spec.get("command"):
+            res, diagnostic_note = await _call_solve_stdio(paths, server, spec, tool, kwargs)
+        elif active_autoformalize and spec.get("command"):
             res, diagnostic_note = await _call_autoformalize_stdio(
                 paths, server, spec, tool, kwargs,
             )
@@ -262,7 +290,7 @@ async def mcp(server, tool, args, args_file):
     bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
         "artifact_read", "artifact_snapshot_file",
     }
-    if (active_prove or active_solve or active_autoformalize) and output and not bounded_artifact_read:
+    if (active_prove or active_solve or active_autoformalize or active_formalize) and output and not bounded_artifact_read:
         from .. import artifacts
         compacted = artifacts.compact_text(
             paths.artifacts,

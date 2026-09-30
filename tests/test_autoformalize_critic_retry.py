@@ -49,6 +49,10 @@ class AutoformalizeCriticRetryTests(unittest.IsolatedAsyncioTestCase):
         if verdict != "approved":
             for row in evidence["requirements"]:
                 row["status"] = "fail"
+                row["repair_steps"] = [
+                    "Implement the missing source argument in the affected task's proof, "
+                    "then identify the declarations that establish it.",
+                ]
         return state.submit_critic_verdict(
             self.forum, author, verdict, "Checked the current supplied-source requirements.",
             review=evidence,

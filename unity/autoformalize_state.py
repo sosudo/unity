@@ -2819,6 +2819,18 @@ def begin_critic(forum_dir: Path, *, diagnostic: bool = False) -> dict:
     return load_state(forum_dir)
 
 
+def _validate_new_repair_steps(review: dict) -> None:
+    """Normalize new checklists without imposing new policy on stored reviews."""
+    for entry in review["requirements"]:
+        steps = entry["repair_steps"]
+        if entry["status"] == "fail":
+            if not 1 <= len(steps) <= 8 or any(not step.strip() or len(step) > 1000 for step in steps):
+                raise ValueError("failed requirement reviews require 1-8 nonblank repair_steps, each at most 1000 characters")
+            entry["repair_steps"] = [step.strip() for step in steps]
+        elif steps:
+            raise ValueError("only failed requirement reviews may supply repair_steps")
+
+
 def submit_critic_verdict(
     forum_dir: Path,
     author: str,
@@ -2834,6 +2846,7 @@ def submit_critic_verdict(
     if verdict not in {"approved", "lean_reopen"}:
         raise ValueError("verdict must be approved or lean_reopen")
     review = SemanticReview.model_validate(review).model_dump()
+    _validate_new_repair_steps(review)
     if representation_repairs is not None and not isinstance(representation_repairs, list):
         raise ValueError("representation_repairs must be a list")
     repairs = [RepresentationRepairRequest.model_validate(row).model_dump()
@@ -2942,6 +2955,127 @@ def submit_critic_verdict(
         _event(state, "critic_verdict", verdict_id=item["verdict_id"], author=author,
                verdict=verdict, reopen_tasks=task_ids)
     return {"verdict": item, "state": load_state(forum_dir)}
+
+
+def critic_feedback_for_task(state: dict, task_id: str) -> dict:
+    """Return historical repair guidance, never a live failure or acceptance gate.
+
+    A mechanical merge/refinement clears task faithfulness pointers, not the
+    critic's advice. Recover it from immutable verdict/snapshot pairs instead.
+    Source identity and the plan epoch prevent feedback leaking across rechunks;
+    ordinary proof, manifest and graph refinements remain in the same epoch.
+    """
+    result = {"direct": [], "upstream": []}
+    tasks = state.get("formal_tasks", {})
+    formal = state.get("formalization", {})
+    source = formal_source(state)
+    if (task_id not in tasks or state.get("phase") == "chunking" or pending_replan(state)
+            or (state.get("replan") or {}).get("status") == "chunking"
+            or not source or formal.get("solution_candidate") != source.get("candidate_id")
+            or formal.get("solution_sha256") != source.get("sha256")):
+        return result
+    requirements = {row["id"]: row for row in formal.get("requirements", [])}
+    spec = formal.get("spec") or {}
+    frozen = formal.get("source_obligations")
+    if frozen and _source_obligations(list(requirements.values()), spec) != frozen:
+        return result
+    retired = state.get("retired_tasks", {})
+
+    def successors(origin: str, visiting: frozenset[str] = frozenset()) -> set[str]:
+        if origin in visiting:
+            return set()
+        if origin in tasks:
+            return {origin}
+        row = retired.get(origin, {})
+        children = row.get("replaced_by", [])
+        if not isinstance(children, list) or any(not isinstance(key, str) for key in children):
+            return set()
+        return {key for child in children for key in successors(child, visiting | {origin})}
+
+    dependency_cache = {}
+
+    def dependencies_of(target: str) -> set[str]:
+        if target not in dependency_cache:
+            dependencies, pending = set(), list(tasks[target].get("dependencies", []))
+            while pending:
+                key = pending.pop()
+                if key in dependencies or key not in tasks or key == target:
+                    continue
+                dependencies.add(key)
+                pending.extend(tasks[key].get("dependencies", []))
+            dependency_cache[target] = dependencies
+        return dependency_cache[target]
+
+    latest_status, decided = {}, set()
+    for verdict in reversed(state.get("critic_verdicts", [])):
+        snapshot_id = verdict.get("snapshot_id")
+        snapshot = state.get("review_snapshots", {}).get(snapshot_id)
+        if (not isinstance(snapshot, dict) or snapshot.get("snapshot_id") != snapshot_id
+                or verdict.get("snapshot_sha256") != _report_digest(snapshot)
+                or verdict.get("main_sha") != snapshot.get("main_sha")
+                or snapshot.get("solution_candidate") != source["candidate_id"]
+                or snapshot.get("solution_sha256") != source["sha256"]
+                or snapshot.get("formalization_revision") != formal.get("revision")
+                or verdict.get("verdict") not in {"approved", "lean_reopen"}):
+            continue
+        try:
+            review = SemanticReview.model_validate(verdict.get("review")).model_dump()
+        except (TypeError, ValueError):
+            continue
+        if review["snapshot_id"] != snapshot_id:
+            continue
+        for entry in review["requirements"]:
+            requirement_id = entry["requirement_id"]
+            if requirement_id in decided or requirement_id not in requirements:
+                continue
+            latest_status.setdefault(requirement_id, entry["status"])
+            if entry["status"] == "not_checked":
+                continue  # Neither a partial review nor its omission resolves a prior failure.
+            decided.add(requirement_id)
+            if entry["status"] == "pass" or verdict["verdict"] != "lean_reopen":
+                continue
+            requirement_tasks = set(requirements[requirement_id].get("tasks", []))
+            if not requirement_tasks or requirement_tasks - tasks.keys():
+                continue
+            # A critic may explicitly reopen a provider to repair its consumer's
+            # failed requirement. Dependency reachability explains that mapping;
+            # it does not authorize assigning any non-reopened provider.
+            supporting_tasks = requirement_tasks | {
+                key for consumer in requirement_tasks for key in dependencies_of(consumer)
+            }
+            original_targets, repair_targets = set(), set()
+            for origin in verdict.get("reopen_tasks", []):
+                mapped = successors(origin) & supporting_tasks
+                if origin in snapshot.get("task_statuses", {}) and mapped:
+                    original_targets.add(origin)
+                    repair_targets.update(mapped)
+            if task_id in repair_targets:
+                scope = "direct"
+            elif dependencies_of(task_id) & repair_targets:
+                scope = "upstream"
+            else:
+                continue  # Shared requirements alone do not reassign another task's repair.
+            result[scope].append({
+                "task_ids": sorted(repair_targets), "origin_task_ids": sorted(original_targets),
+                "requirement_task_ids": sorted(requirement_tasks), "requirement_id": requirement_id,
+                "rationale": entry["rationale"], "argument_rationale": entry["argument_rationale"],
+                "declarations": list(entry["declarations"]),
+                "checked_anchor_ids": list(entry["checked_anchor_ids"]),
+                "checked_prerequisite_ids": list(entry["checked_prerequisite_ids"]),
+                "repair_steps": list(entry["repair_steps"]), "verdict_id": verdict.get("verdict_id"),
+                "snapshot_id": snapshot_id, "reviewed_main_sha": snapshot.get("main_sha"),
+                "latest_review_status": latest_status[requirement_id],
+                "summary": verdict.get("summary", ""), "evidence": verdict.get("evidence", ""),
+                "scope_rationale": review["scope_rationale"], "scope": scope, "historical": True,
+                "mapping_changed": (verdict.get("requirements_sha256") != _report_digest(formal.get("requirements", []))
+                                    or snapshot.get("spec_sha256") != digest(spec)),
+                "shared_guidance": len(requirement_tasks) > 1 or len(repair_targets) > 1,
+                "lineage_inherited": bool(repair_targets - original_targets),
+                "dependency_provider_task_ids": sorted(repair_targets - requirement_tasks),
+            })
+    for rows in result.values():
+        rows.sort(key=lambda row: row["requirement_id"])
+    return deepcopy(result)
 
 
 def _validate_semantic_review(state: dict, review: dict, *, approved: bool, author: str = "") -> None:

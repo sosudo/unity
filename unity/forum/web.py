@@ -91,7 +91,7 @@ def _load_config() -> dict:
 
 def _icrl_visible() -> bool:
     """ICRL is not part of the prove or solve coordination workspaces."""
-    if _autoformalize_command():
+    if _autoformalize_command() or _formalize_command():
         return False
     try:
         return json.loads((ROOT_DIR / "state.json").read_text()).get("command") not in {"prove", "solve"}
@@ -128,12 +128,78 @@ def _solve_command() -> bool:
         return False
 
 
+def _formalize_command(*, active: bool = False) -> bool:
+    """Keep the existing-project workflow separate from other saved workspaces."""
+    try:
+        state = json.loads((ROOT_DIR / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return state.get("command") == "formalize" and (not active or state.get("phase") != "done")
+
+
+def _formalize_forum() -> Path:
+    return FORUM_DIR / "formalize"
+
+
+def _formalize_history_exists() -> bool:
+    # Even unreadable history must not be mistaken for permission to start fresh.
+    return (_formalize_forum() / "formalize-state.json").exists()
+
+
+def _dashboard_dag_path() -> Path:
+    return _formalize_forum() / "dag.json" if _formalize_command() else ROOT_DIR / "dag.json"
+
+
 def _autoformalize_forum() -> Path:
     return FORUM_DIR / "autoformalize"
 
 
 def _discussion_forum() -> Path:
+    if _formalize_command():
+        return _formalize_forum()
     return _autoformalize_forum() if _autoformalize_command() else FORUM_DIR
+
+
+def _formalize_dag() -> dict:
+    """Source-bound gap-filling DAG, independent of any saved Autoformalize graph."""
+    from ..formalize_state import assignment_view, load_state
+    state = load_state(_formalize_forum())
+    chunks = []
+    for task in state.get("formal_tasks", {}).values():
+        if task.get("status") == "superseded":
+            continue
+        assignment = assignment_view(state, task["task_id"])
+        representation = task.get("representation") or {"status": "missing"}
+        verification = task.get("verification") or {"status": "pending"}
+        faithfulness = task.get("faithfulness") or {"status": "unreviewed"}
+        outputs = task.get("outputs") or []
+        statement_dependencies = task.get("statement_dependencies", [])
+        proof_dependencies = task.get("proof_dependencies", [])
+        if faithfulness["status"] == "approved" and verification["status"] == "verified":
+            color = "green"
+        elif faithfulness["status"] == "changes_requested" or task.get("status") == "blocked":
+            color = "red"
+        elif task.get("status") == "candidate_pending" or representation["status"] == "adopted":
+            color = "blue"
+        else:
+            color = "yellow" if assignment.get("status") == "assigned" else "grey"
+        chunks.append({
+            "id": task["task_id"], "title": task.get("title") or task["task_id"],
+            "type": task.get("predicted_kind") or "unknown",
+            "summary": task.get("informal_statement", ""),
+            "informal_proof": task.get("informal_proof"),
+            "source_components": task.get("source_components", []),
+            "anchor_ids": task.get("anchor_ids", []),
+            "requirement_ids": task.get("requirement_ids", []),
+            "statement_dependencies": statement_dependencies,
+            "proof_dependencies": proof_dependencies,
+            "dependencies": sorted(set(statement_dependencies) | set(proof_dependencies)),
+            "outputs": outputs, "declarations": [row["declaration"] for row in outputs],
+            "assignment": assignment, "representation": representation,
+            "verification": verification, "faithfulness": faithfulness,
+            "revision": task.get("revision"), "status": color,
+        })
+    return {"graph_kind": "formalize", "chunks": chunks}
 
 
 def _autoformalize_dag() -> dict:
@@ -453,6 +519,8 @@ def get_tag(name: str):
 
 @app.get("/api/dag")
 def get_dag():
+    if _formalize_command():
+        return JSONResponse(_formalize_dag())
     if _autoformalize_command():
         return JSONResponse(_autoformalize_dag())
     if _solve_command():
@@ -508,7 +576,7 @@ async def events():
                     (p.stat().st_mtime for p in _discussion_forum().glob("*.json")),
                     default=0.0,
                 )
-                dag_file = ROOT_DIR / "dag.json"
+                dag_file = _dashboard_dag_path()
                 if dag_file.exists():
                     mtime = max(mtime, dag_file.stat().st_mtime)
                 if mtime > last_mtime:
@@ -629,6 +697,24 @@ def get_autoformalize_metrics():
     return read_metrics(_autoformalize_forum(), ROOT_DIR.parent)
 
 
+@app.get("/api/formalize-state")
+def get_formalize_state():
+    """Existing-project source formalization state, isolated from other commands."""
+    if not _formalize_command():
+        return {}
+    from ..formalize_state import load_state
+    return load_state(_formalize_forum())
+
+
+@app.get("/api/formalize-metrics")
+def get_formalize_metrics():
+    """Read formalize telemetry without changing live Forum server globals."""
+    if not _formalize_command():
+        return {}
+    from .formalize_server import read_metrics
+    return read_metrics(_formalize_forum(), ROOT_DIR.parent)
+
+
 @app.get("/api/artifacts")
 def api_artifacts(limit: int = 200):
     """Recent immutable run artifacts and aggregate stored-byte telemetry."""
@@ -710,6 +796,20 @@ def _agent_statuses(chunks: dict) -> list:
     elif active_command == "solve":
         solve = _load_solve_state(FORUM_DIR)
         for strategy in solve.get("strategies", {}).values():
+            if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+                claims[strategy["owner"]] = {
+                    "chunk": strategy.get("target", ""),
+                    "strategy": strategy.get("description", ""),
+                }
+                for assistant in strategy.get("assistants", []):
+                    claims[assistant] = {
+                        "chunk": strategy.get("target", ""),
+                        "strategy": "assisting: " + strategy.get("description", ""),
+                    }
+    elif _formalize_command(active=True):
+        from ..formalize_state import load_state
+        state = load_state(_formalize_forum())
+        for strategy in state.get("strategies", {}).values():
             if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
                 claims[strategy["owner"]] = {
                     "chunk": strategy.get("target", ""),
@@ -1327,7 +1427,7 @@ function updateHeaderLegend(data) {
   const el = document.getElementById('hlegend');
   const legend = data.graph_kind === 'informal_tasks'
     ? [['green','Resolved','#2e7d32'], ['yellow','Claimed','#7c5cbf'], ['grey','Open','#d97706'], ['red','Blocked','#c62828']]
-    : ['autoformalize', 'solve_formalization'].includes(data.graph_kind)
+    : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind)
     ? [['green','Verified + faithful','#2e7d32'], ['yellow','In progress','#7c5cbf'], ['grey','Unstarted','#d97706'], ['red','Needs attention','#c62828']]
     : LEGEND;
   if (el) el.innerHTML = legend.map(([k, label, col]) =>
@@ -1413,7 +1513,7 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
-  if (['autoformalize', 'solve_formalization'].includes(graphKind)) {
+  if (['formalize', 'autoformalize', 'solve_formalization'].includes(graphKind)) {
     const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
     const assignment = c.assignment || {};
     document.getElementById('info-content').innerHTML =
@@ -1468,8 +1568,8 @@ async function loadDag(forceRebuild) {
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
-  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>['autoformalize', 'solve_formalization'].includes(data.graph_kind) ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
+  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
+  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
   if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
   updateHeaderLegend(data);
@@ -1662,6 +1762,8 @@ def _safe_unity_path(rel: str) -> Path:
 
 
 def _forum_nonempty() -> bool:
+    if _formalize_command() and _formalize_history_exists():
+        return True
     for tp in _discussion_forum().glob("*.json"):
         if tp.name.startswith("_") or tp.name in ("config.json", "balances.json"):
             continue
@@ -1711,7 +1813,7 @@ def _current_run() -> dict:
 
 @app.get("/api/project")
 def api_project():
-    dag = ROOT_DIR / "dag.json"
+    dag = _dashboard_dag_path()
     chunk_ids = []
     if dag.exists():
         try:
@@ -1720,6 +1822,7 @@ def api_project():
             pass
     return {"name": _project_root().name,
             "continue": _forum_nonempty(),
+            "formalize_continue": _formalize_history_exists(),
             "has_dag": dag.exists(), "chunks": chunk_ids,
             "active_metric": _active_metric(),
             "commands": _COMMANDS,
@@ -2076,9 +2179,18 @@ def api_blueprint(tree: str = "main"):
 def _chunk_for_decl(name: str) -> dict | None:
     """Find the chunk in dag.json that covers a declaration, if any."""
     try:
-        chunks = json.loads((ROOT_DIR / "dag.json").read_text()).get("chunks", [])
+        chunks = json.loads(_dashboard_dag_path().read_text()).get("chunks", [])
     except (OSError, json.JSONDecodeError):
         return None
+    if _formalize_command():
+        for chunk in chunks:
+            if chunk.get("status") == "superseded":
+                continue
+            outputs = chunk.get("outputs") or []
+            if name in {output.get("declaration") for output in outputs if isinstance(output, dict)}:
+                return {"id": chunk.get("id") or chunk.get("task_id"),
+                        "title": chunk.get("title", ""), "status": chunk.get("status", "")}
+        return None  # Similar titles/short names are not an output binding.
     short = name.split(".")[-1]
     for c in chunks:
         decls = c.get("declarations") or []
@@ -2212,7 +2324,7 @@ def api_run_start(payload: dict = Body(...)):
         argv += ["--targets", ", ".join(t.strip() for t in targets.splitlines() if t.strip())]
     cont = payload.get("continue")
     if cont is None:
-        cont = _forum_nonempty()
+        cont = _formalize_history_exists() if command == "formalize" else _forum_nonempty()
     if cont:
         argv.append("--continue")
 
@@ -2247,7 +2359,13 @@ def api_run_stop(payload: dict = Body(default={})):
         # Safe stop: agents end at their next stream item, remaining phases are skipped,
         # worktrees get cleaned up. Force mode (second click) kills the process group.
         (ROOT_DIR / "stop-requested").write_text(str(time.time()))
+        if st.get("command") == "formalize":
+            from ..formalize_jobs import terminate
+            terminate(_project_root())
         return {"ok": True, "stopping": True}
+    if st.get("command") == "formalize":
+        from ..formalize_jobs import terminate
+        terminate(_project_root())
     pid = st["pid"]
     try:
         pgid = os.getpgid(pid)
@@ -2556,6 +2674,8 @@ async function loadOverview() {
     const [w, r, p, s, sm, a] = await Promise.all([J('/api/workspace'), J('/api/run'), J('/api/prove-state'), J('/api/solve-state'), J('/api/solve-metrics'), J('/api/artifacts')]);
     const [af, afm] = r.command === 'autoformalize'
       ? await Promise.all([J('/api/autoformalize-state'), J('/api/autoformalize-metrics')])
+      : r.command === 'formalize'
+      ? await Promise.all([J('/api/formalize-state'), J('/api/formalize-metrics')])
       : [{}, {}];
     const solveDag = r.command === 'solve' ? await J('/api/dag') : {};
     const solveTaskViews = Object.fromEntries((solveDag.chunks || []).map(x => [x.id, x]));
@@ -2652,14 +2772,14 @@ async function loadOverview() {
         '<div class="item"><b>' + (sm.worker_turns || 0) + '</b> worker turns · ' + (sm.worker_seconds || 0) + ' agent-seconds</div>' +
         '<div class="item"><b>$' + Number(sm.cost_usd || 0).toFixed(4) + '</b> recorded cost' + (sm.time_to_first_candidate_seconds == null ? '' : ' · first candidate ' + sm.time_to_first_candidate_seconds + 's') + '</div></section></div>';
     }
-    if (af.run_id && r.command === 'autoformalize') {
+    if (af.run_id && ['formalize', 'autoformalize'].includes(r.command)) {
       const source = af.input_source || {}, formal = af.formalization || {},
         tasks = Object.values(af.formal_tasks || {}).filter(x => x.status !== 'superseded'),
         candidates = Object.values(af.formal_candidates || {}),
         strategies = Object.values(af.strategies || {}).filter(x => ['registered','claimed','paused'].includes(x.status)),
         findings = Object.values(af.findings || {}).filter(x => x.status === 'active'),
         obstacles = Object.values(af.obstacles || {}).filter(x => x.status === 'open');
-      h += '<div class="sechead">autoformalize workspace<span class="r">phase ' + esc(af.phase || 'chunking') + ' · revision ' + (af.revision || 0) + '</span></div>';
+      h += '<div class="sechead">' + esc(r.command) + ' workspace<span class="r">phase ' + esc(af.phase || 'chunking') + ' · revision ' + (af.revision || 0) + '</span></div>';
       if (af.final_report) h += '<div class="item">' + (af.final_report.status === 'accepted' ? 'accepted snapshot report' : 'incomplete run report') + artifactButton(af.final_report.artifact_id) + '</div>';
       h += '<div class="grid"><section><h2>immutable supplied source</h2><div class="item mono">' + esc(source.candidate_id || '') + '</div>' + artifactButton(source.artifact_id) +
         (source.source_refs || []).map(x => '<div class="item"><b>' + esc(x.ref_id) + '</b><div class="who">' + esc(x.path) + ' · ' + esc((x.sha256 || '').slice(0,12)) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') +
@@ -3037,8 +3157,9 @@ let RUN_CMD = null;
 function openRunModal(cmd) {
   RUN_CMD = cmd;
   $('rm-title').textContent = 'run: unity ' + cmd;
-  $('rm-continue').checked = PROJECT['continue'];
-  $('rm-continue-note').textContent = PROJECT['continue'] ? '(auto-detected: forum has prior state)' : '(fresh run: forum empty)';
+  const hasHistory = cmd === 'formalize' ? PROJECT.formalize_continue : PROJECT['continue'];
+  $('rm-continue').checked = hasHistory;
+  $('rm-continue-note').textContent = hasHistory ? '(auto-detected: saved run history)' : '(fresh run: no saved history)';
   const spec = PROJECT.commands[cmd];
   $('rm-metric-row').style.display = spec.metric ? 'flex' : 'none';
   if (spec.metric) {
@@ -3048,7 +3169,8 @@ function openRunModal(cmd) {
   $('rm-version').value = '';
   $('rm-targets-row').style.display = spec.targets ? 'block' : 'none';
   $('rm-targets').value = '';
-  $('rm-chips').innerHTML = (PROJECT.chunks || []).map(c => '<span class="chip" data-c="' + esc(c) + '">' + esc(c) + '</span>').join('');
+  // Formalize takes declaration names or a source description, not informal task IDs.
+  $('rm-chips').innerHTML = (cmd === 'formalize' ? [] : PROJECT.chunks || []).map(c => '<span class="chip" data-c="' + esc(c) + '">' + esc(c) + '</span>').join('');
   document.querySelectorAll('#rm-chips .chip').forEach(ch => ch.onclick = () => {
     ch.classList.toggle('on');
     const t = $('rm-targets'); const lines = new Set(t.value.split('\n').filter(Boolean));

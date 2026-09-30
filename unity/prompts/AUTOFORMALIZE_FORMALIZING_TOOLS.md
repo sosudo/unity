@@ -44,6 +44,17 @@ findings and candidate events. These tools belong to the autoformalization runti
   declaration review. Omit optional `changed_paths` to include all non-ignored project changes.
   Submission preflight runs before staging/committing; a blocked or stale request preserves private
   work and does not queue verification. Refresh the exact task context and address its blocker.
+  Read `autoformalize_task(task_id).critic_feedback` before repair work: `direct` feedback applies to
+  this task, while `upstream` feedback records relevant dependency defects. Its verdict, snapshot,
+  reviewed main, requirement/task mappings, and historical/shared/lineage flags are provenance;
+  revalidate historical feedback against the current task and exact bytes.
+  Apply the repair checklist only where it is relevant to the assigned task. In `notes`, map every
+  applicable `repair_steps` item to the actual declarations or dependency resolutions changed and the
+  checked evidence, or state the exact remaining blocker. Compilation and reflexively repeating formula
+  or declaration names are not semantic repair evidence. Address unresolved semantic steps and the
+  concrete candidate-rejection blocker before finalizing; once they are actually addressed and targeted checks pass, resubmit promptly instead of
+  waiting indefinitely for Forum approval. The independent critic, not the implementing formalizer,
+  decides whether the new exact candidate resolves the source-faithfulness defect.
 - `emit_formalization_candidate(strategy_id, author, task_id, commit_sha, notes?, supersedes?, stage?, outputs?, obsolete_files?)` is the
   compatibility route for already-committed bytes; normally use `finalize_formalization`.
 - `sync_from_main(author, reason?)` merges accepted main without discarding local work. Uncommitted
@@ -76,6 +87,10 @@ findings and candidate events. These tools belong to the autoformalization runti
 - `forum_read`, `autoformalize_status`, `artifact_info` and bounded `artifact_read` provide detail.
 - `autoformalize_task(task_id)` retrieves source anchors, requirements, argument mapping and prerequisites
   for a task, including relevant dependency findings and current machine-verified dependency outputs.
+  Its `critic_feedback.direct` and `critic_feedback.upstream` sections preserve critic repair checklists
+  with verdict/snapshot/reviewed-main provenance, requirement/task mappings, and historical/shared/
+  lineage flags. Historical feedback is context to revalidate,
+  not an instruction to weaken current source or proof obligations and not current approval.
   `verification_blockers` records actual checked candidate failures. `submission_blockers` is current
   prospective submission preflight. `readiness` lists declared dependencies. `remaining_global_requirements`
   is completion accounting, not an additional task dependency. Do not stop independent work for it.

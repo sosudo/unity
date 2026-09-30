@@ -17,6 +17,12 @@ class RequirementReview(BaseModel):
     checked_prerequisite_ids: list[str] = Field(default_factory=list)
     rationale: str = Field(min_length=1)
     argument_rationale: str = Field(min_length=1)
+    # Old persisted reviews have no checklist. New-submission policy lives in
+    # submit_critic_verdict, not this model (also used to read saved approvals).
+    repair_steps: list[str] = Field(default_factory=list, description=(
+        "For a new failed requirement review, provide 1-8 concrete repair steps, each nonblank "
+        "and at most 1000 characters. Pass/not_checked reviews must leave this empty."
+    ))
 
 
 class RepairReview(BaseModel):

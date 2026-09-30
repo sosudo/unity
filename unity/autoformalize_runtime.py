@@ -817,13 +817,72 @@ def _manifest_repair_prompt(repair: dict) -> str:
     )
 
 
+def _critic_repair_prompt(paths, state: dict, task_id: str, *, feedback: dict | None = None) -> str:
+    """Deliver exact historical semantic feedback independently of the bounded brief."""
+    if feedback is None:
+        feedback = autoformalize_state.critic_feedback_for_task(state, task_id)
+    direct, upstream = feedback.get("direct", []), feedback.get("upstream", [])
+    if not direct and not upstream:
+        return ""
+    sections = [
+        "CRITIC REPAIR GUIDANCE — historical review evidence, not acceptance or a current machine failure. "
+        "Each entry identifies its requirement, reviewed task mapping, verdict, snapshot and main commit. "
+        "Compare it with the current source/task revision; the recorded failure is not proof that every "
+        "current edit still has the defect. New edits and a successful build do not establish source faithfulness."
+    ]
+    if direct:
+        sections.append(
+            "DIRECT FAILED REQUIREMENTS FOR YOUR ASSIGNED TASK: read the full rationale, "
+            "argument_rationale and repair_steps below. Address the identified gaps before resubmitting; "
+            "do not just replay the previous proof or submit because it compiles. Explain how the current "
+            "implementation addresses each applicable repair step. A shared task mapping is a diagnosis, "
+            "not a claim that every mapped node independently has every defect. task_ids identify the "
+            "explicit repair targets; requirement_task_ids identify the requirement's implementing nodes. "
+            "An explicitly reopened dependency provider may need repair for another node's requirement. "
+            "Preserve correct existing "
+            "work and refine the task/representation explicitly if needed. Once the gaps are addressed, "
+            "submit the candidate for normal verification and independent review; do not wait for a new "
+            "critic approval before submitting."
+        )
+    if upstream:
+        sections.append(
+            "UPSTREAM FEEDBACK — NOT A NEW ASSIGNMENT: these failures concern dependencies of your task. "
+            "Do not redo your already-correct result or take over a dependency's proof merely because "
+            "it appears here. Keep working within your assigned task and actual readiness; if its progress "
+            "depends on the upstream repair, record that precise dependency blocker and yield_task. "
+            "Only an explicit assignment/refinement changes your work scope."
+        )
+    # artifact_read pages by byte offset. ASCII JSON escapes preserve exact
+    # Unicode evidence without splitting a multibyte character between pages.
+    payload = json.dumps({"task_id": task_id, "direct": direct, "upstream": upstream},
+                         ensure_ascii=True, sort_keys=True, indent=2)
+    compacted = artifacts.compact_text(
+        paths.artifacts, payload, kind="autoformalize_critic_feedback", producer="Unity", source=task_id,
+        metadata={"run_id": state.get("run_id"), "task_id": task_id,
+                  "direct_count": len(direct), "upstream_count": len(upstream)},
+    )
+    if isinstance(compacted, dict):
+        sections.append(
+            "The preview below is incomplete. Before editing or submitting, read the FULL feedback "
+            f"artifact `{compacted['artifact_id']}` with artifact_read starting at offset 0, then follow "
+            "next_offset until null. Read every rationale and repair step; do not treat the preview as "
+            "the complete repair checklist."
+        )
+    sections.append(artifacts.format_compacted(compacted))
+    return "\n\n".join(sections)
+
+
 def _compose_formal_task_prompt(*, recovery: str, resume: str, followup: str,
-                               normal: str, representation: str, repair: dict | None = None) -> str:
-    # Current rejection recovery suppresses opportunistic submission nudges.
-    # Dedicated manifest instructions survive either path, without implying success.
+                               normal: str, representation: str, repair: dict | None = None,
+                               critic_repair: str = "", direct_critic_repair: bool = False,
+                               work_context: str = "") -> str:
+    # Direct semantic failures and mechanical rejection recovery take precedence
+    # over opportunistic submission nudges; upstream guidance does not reassign work.
+    recovering = bool(recovery) or direct_critic_repair
     return "\n".join(part for part in (
         _manifest_repair_prompt(repair) if repair else "",
-        recovery or resume, normal if recovery else followup or normal, representation,
+        recovery, critic_repair, work_context, "" if recovering else resume,
+        normal if recovering else followup or normal, representation,
     ) if part)
 
 
@@ -1099,7 +1158,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             if pair[0] == name:
                 blocked_launch_keys.pop(pair)
 
-    def launch(name: str, task_id: str, followup: str = "") -> None:
+    def launch(name: str, task_id: str, followup: str = "", *, context_note: str = "") -> None:
         if integration is not None or name in stopping:
             return  # Worktree preparation takes merge.lock; never block this event loop on a review.
         if name in tasks:
@@ -1120,16 +1179,17 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         # Focus repair work only after a current candidate actually failed it.
         repair_blockers = [row for row in autoformalize_server.verification_blockers(current, task_id)
                            if row.get("candidate_id") and row.get("prerequisite_id")]
+        source_evidence_repair = ""
         if repair_blockers:
             if any(not running.done() and roles.get(owner) == "formalizing" and active_target(owner) == task_id
                    for owner, running in tasks.items()):
                 return  # One focused repair, not another full proof swarm.
-            followup = (
+            source_evidence_repair = (
                 "SOURCE EVIDENCE REPAIR: retain existing proof work. Resolve these exact prerequisite "
                 "records, including those belonging to other completed tasks. Use refine_chunks and "
                 "read their requirements; adding unrelated outputs or resubmitting unchanged bytes "
                 "cannot fix a prerequisite record. If you cannot repair it, yield_task with the blocker.\n"
-                + _blocker_recovery_context(repair_blockers) + followup
+                + _blocker_recovery_context(repair_blockers)
             )
         pair = (name, task_id)
         retry_key = _formal_launch_retry_key(current, name, task_id, worker_targets.get(name, ""))
@@ -1189,6 +1249,16 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             system += "\n\n" + context
         strategy = participating_strategy(current, name, task_id)
         dirty, _ = worktree_changes(name)
+        critic_feedback = autoformalize_state.critic_feedback_for_task(current, task_id)
+        direct_critic_repair = bool(critic_feedback["direct"])
+        critic_repair = _critic_repair_prompt(paths, current, task_id, feedback=critic_feedback)
+        # Checked prerequisite failures can belong to a different author's
+        # candidate. Keep their mandatory repair instructions even when direct
+        # semantic feedback suppresses the opportunistic followup prompt.
+        recovery = "\n".join(part for part in (
+            _rejection_recovery_prompt(current, name, task_id), source_evidence_repair,
+        ) if part)
+        recovering = bool(recovery) or direct_critic_repair
         resume = ""
         if strategy:
             resume += (
@@ -1201,18 +1271,29 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 "and any new Lean files before new research; scratch notes alone are not a candidate. "
                 "If the target is complete, call `finalize_formalization` immediately. "
             )
+        # Recovery suppresses the old "resume/finalize immediately" nudges, not
+        # the worker's ownership, preserved edits or synchronization warnings.
+        work_context = [context_note] if context_note else []
+        if recovering and strategy:
+            work_context.append(
+                f"Your currently claimed strategy is `{strategy['strategy_id']}`. Preserve its work "
+                "and reassess the approach against the repair guidance. Explicitly abandon it before "
+                "claiming a replacement strategy."
+            )
+        if recovering and dirty:
+            work_context.append(
+                "Your worktree contains uncommitted or untracked files. Inspect and preserve the source "
+                "diff and new Lean files before editing; scratch notes alone are not a candidate."
+            )
         if prepared.get("sync_warning"):
-            resume += prepared["sync_warning"] + " "
+            work_context.append(prepared["sync_warning"])
         strategy_instruction = (
-            "Continue the claimed strategy for this task. "
-            if strategy else
+            ("Reassess the claimed strategy against the repair guidance before continuing. "
+             if recovering else "Continue the claimed strategy for this task. ") if strategy else
             "Claim a suitable existing unclaimed strategy, or register one only when your approach "
             "is materially different. You may investigate or edit before registering, but claim a "
             "strategy before finalizing. "
         )
-        recovery = _rejection_recovery_prompt(current, name, task_id)
-        if recovery and prepared.get("sync_warning"):
-            recovery += prepared["sync_warning"] + " "
         if formal_task.get("representation", {}).get("status") == "adopted":
             representation_instruction = (
                 "This task's Lean representation is already adopted. Work on its remaining "
@@ -1251,6 +1332,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         task_prompt = _compose_formal_task_prompt(
             recovery=recovery, resume=resume, followup=followup, normal=normal_task_prompt,
             representation=representation_instruction, repair=repair,
+            critic_repair=critic_repair, direct_critic_repair=direct_critic_repair,
+            work_context="\n".join(work_context),
         )
         checkpoint = prepared.get("checkpoint") or prepared.get("parked_checkpoint")
         if checkpoint:
@@ -1362,7 +1445,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             successors = current.get("retired_tasks", {}).get(previous, {}).get("replaced_by", [])
             successor = next((key for key in successors if key in ready_ids), None)
             if successor:
-                launch(name, successor, "Your prior informal node was replaced. Read autoformalize_task "
+                launch(name, successor, context_note="Your prior informal node was replaced. Read autoformalize_task "
                        "for this successor and its lineage. Your worktree was preserved; reuse relevant "
                        "work, then claim a strategy for this node before finalizing.")
                 continue

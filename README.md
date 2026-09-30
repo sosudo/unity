@@ -92,6 +92,51 @@ Finally, press the settings icon in the top right, and set your max attempts (ho
 
 When you're ready, hover over the `run` button, press `formalize`, and press the `start` button. In the `targets` box, you can put in any specific Lean declarations you want fixed or specific theorems/lemmas/definitions/section from your sources you want formalized (you can also leave it blank and the agents will treat everything as a target).
 
+From the CLI, add the supplied documents with `unity source add <path>`, put your
+scope and instructions in `.unity/UNITY.md`, and run
+`unity formalize --targets "<existing declaration names or target description>"`. The
+`--targets` flag is optional; it narrows the source obligations and existing
+project gaps to address. `unity formalize --continue` resumes the same saved
+source, scope, and project baseline. To change sources, instructions, or targets,
+start in a separate project copy with fresh Unity run state, keeping the original
+run and its evidence intact; existing Formalize history is not overwritten.
+
+Start from an existing project that builds with its pinned toolchain and
+dependencies, on a clean named Git branch. Project source/configuration inputs
+must be tracked so private worktrees can preserve them; Unity will not stash,
+discard, or commit dirty user work to make the baseline pass. Supplied documents
+under `.unity/source/` are snapshotted separately. On resume, source documents,
+targets, and instructions remain frozen. Only the exact `## State` section in
+`.unity/UNITY.md` (outside a code fence, ending before the next level-one or
+level-two heading) is mutable progress text and excluded from the instruction identity.
+
+Formalize preserves the existing project's declarations and interfaces while
+filling the selected gaps or adding the requested missing source material. It
+does not run the Architect/bootstrap phase or automatically change dependencies,
+the toolchain, or project configuration. Out-of-scope holes remain untouched,
+but completed targets and their project-owned dependency closure must be clean:
+an unrelated existing `sorry` is not a reason to rewrite the whole project, and
+a target that depends on one is not complete.
+
+Current limitation: `--targets All` (the default) refuses projects whose selected
+holes include compiler-generated/internal auxiliary declarations, such as a
+structure-field proof moved into `foo._proof_1`. Explicit auxiliary targets and
+ordinary targets depending on such holes also stop because reliable source
+ownership is not yet available. Explicit ordinary targets independent of those
+holes remain supported; unrelated original holes stay protected.
+
+Formalize has its own source-bound chunking, private-worktree formalizers,
+representation and machine checks, independent faithfulness critic, repair
+loop, and final report. Its Forum, state, DAG, and telemetry live under
+`.unity/forum/formalize/`, separate from Autoformalize, Solve, and Prove. The
+dashboard shows this workspace and its separate verification/faithfulness
+statuses. Safe stop requests preserve work and stop Formalize's registered
+verification jobs; compilation alone does not mean the requested source has
+been faithfully formalized.
+
+Current validation covers offline regressions and native Lean fixtures; a full
+provider-backed Formalize run has not yet been validated.
+
 ### Prove
 
 First, go to the agents tab and set up your agent roster. There are some presets you can use to quickly add common agents (e.g. Claude via your Claude Code subscription, GPT via your Codex subscription, OpenRouter API models); if you want to use a model without a preset, you can press the `new` button and fill the fields in yourself. Check [Roster Configuration](#roster-configuration) for more information on how to fill them in yourself.
@@ -197,7 +242,7 @@ When you're ready, hover over the `run` button, press `optimize`, set the metric
 | `unity complete` | — | remove Unity artifacts from a finished project |
 | `unity update` / `unity uninstall` | — | manage the installation |
 
-`--targets` narrows a run's scope (default: everything in scope). For `prove`, pass exact unresolved declaration names or Lean file paths, separated by commas or newlines; its target DAG is extracted mechanically rather than interpreted by a model. `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists.
+`--targets` narrows a run's scope (default: everything in scope). For `prove`, pass exact unresolved declaration names or Lean file paths, separated by commas or newlines; its target DAG is extracted mechanically rather than interpreted by a model. `--continue` re-orients from the previous run's state before continuing — the web UI sets it automatically when prior state exists. Except for `formalize`, fresh (non-`--continue`) runs start with a bootstrap step that adds LeanArchitect when a toolchain-matching release exists. Formalize keeps the existing project's dependencies and configuration unchanged.
 
 ## Roster Configuration
 

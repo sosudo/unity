@@ -13,6 +13,15 @@ have not checked. Do not reopen unaffected completed work merely because other p
 If a prior diagnostic round already gave the same advice, explain a distinct actionable approach
 or identify the precise missing prerequisite instead of repeating unchanged feedback.
 
+Every nested `RequirementReview` has a `repair_steps` list. Legacy reviews that predate this field
+are interpreted as `repair_steps=[]`; always include the field in a new review. A `pass` or
+`not_checked` entry must use an empty list. A `fail` entry must give 1--8 nonblank steps,
+each at most 1000 characters. Make each step independently actionable: identify the concrete missing
+construction or proof obligation, the actual declaration/task/dependency to change, and the source or
+Lean evidence that will show the repair is complete. Use only project or Mathlib APIs you actually
+inspected; if the needed API is unknown, state a bounded search/proof obligation instead of inventing
+a name. A repair step must never ask the formalizer to weaken, omit, or rewrite the source obligation.
+
 Use the controller's current machine-review snapshot/artifact for exact final source verification.
 Read what passed and failed for builds, adopted output manifests, current types/definitions and axiom usage.
 The source-linked DAG records informal obligations, not a chunker-compiled scaffold. Formalizers'
@@ -95,18 +104,34 @@ the exact `snapshot_id` from the brief and `requirements`, for example:
       "checked_anchor_ids": ["A1"],
       "checked_prerequisite_ids": [],
       "rationale": "How these actual statements/definitions cover the cited source requirement",
-      "argument_rationale": "How the actual Lean proof follows the source argument and resolves its prerequisites"
+      "argument_rationale": "How the actual Lean proof follows the source argument and resolves its prerequisites",
+      "repair_steps": []
+    },
+    {
+      "requirement_id": "R2",
+      "status": "fail",
+      "declarations": ["Project.partialConstruction"],
+      "checked_anchor_ids": ["A2"],
+      "checked_prerequisite_ids": ["P1"],
+      "rationale": "The current construction omits the boundary case required at A2.",
+      "argument_rationale": "The consumer proof only handles the interior case, so P1 does not yet establish R2.",
+      "repair_steps": [
+        "Implement the missing A2 boundary case in the actual declaration that realizes Project.partialConstruction, and check that it preserves R2's stated invariant.",
+        "Update R2's consuming proof to use that case and record the exact declaration and checked source/Lean evidence in the candidate notes."
+      ]
     }
   ],
   "repair_reviews": []
 }
 ```
 
-Approval needs every recorded requirement exactly once, all passing, with declaration references and
-concrete rationale. For each requirement, list all adopted outputs of its implementing nodes in
+Approval needs every recorded requirement exactly once, all passing, with declaration references,
+concrete rationale and `repair_steps=[]`. For each requirement, list all adopted outputs of its implementing nodes in
 `declarations`, including definition, structure and instance outputs, not only a final theorem.
 Compare every such output with the source and its role in the argument. Rejections can provide
-partial coverage to report a defect promptly. Missing,
+partial coverage to report a defect promptly, but every failed requirement must include its concrete
+1--8-step repair checklist. Do not substitute successful compilation, a reflexive restatement of a
+formula/declaration name, or an invented API for a construction/proof obligation and supporting evidence. Missing,
 duplicate, unknown or stale evidence cannot approve; Unity rechecks source identity before accepting.
 For adopted source repairs, include exactly one `{repair_id, status, rationale}` review each. Explain
 whether the correction is justified, what changed, and whether it still satisfies the requested scope.

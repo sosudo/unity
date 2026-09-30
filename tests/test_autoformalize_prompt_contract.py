@@ -81,6 +81,48 @@ class AutoformalizePromptContractTests(unittest.TestCase):
                         self.assertNotIn(unavailable, text)
                     self.assertNotIn("accepted paper candidate", text)
 
+    def test_critic_documents_nested_repair_step_contract(self):
+        critic = self.phase("CRITIC")
+        catalog = self.tools("CRITIC")
+        for text in (critic, catalog):
+            with self.subTest(prefix=text[:60]):
+                self.assertIn("repair_steps", text)
+                self.assertRegex(text, r"1(?:--|–)8 nonblank")
+                self.assertIn("1000 characters", text)
+                self.assertIn("not_checked", text)
+                self.assertIn("invent", text.lower())
+                self.assertIn("source obligation", text)
+        self.assertIn("Legacy reviews that predate this field", critic)
+        self.assertIn('"repair_steps": []', critic)
+        self.assertRegex(critic, r'"status": "fail"[\s\S]*?"repair_steps": \[')
+        self.assertIn("concrete missing\nconstruction or proof obligation", critic)
+        self.assertIn("defaults to `[]` only for legacy reviews", catalog)
+        self.assertRegex(catalog, r'"status": "fail"[\s\S]*?"repair_steps": \[')
+
+    def test_formalizer_consumes_critic_feedback_without_self_approval(self):
+        formal = self.phase("FORMALIZING")
+        catalog = self.tools("FORMALIZING")
+        for text in (formal, catalog):
+            with self.subTest(prefix=text[:60]):
+                self.assertIn("critic_feedback", text)
+                self.assertIn("direct", text)
+                self.assertIn("upstream", text)
+                self.assertIn("repair_steps", text)
+                self.assertIn("provenance", text)
+                self.assertIn("revalidate", text)
+                self.assertIn("Compilation", text)
+                self.assertIn("independent critic", text)
+                self.assertIn("notes", text)
+        self.assertIn("map every applicable repair", formal)
+        self.assertIn("actual declaration(s), dependency resolution(s)", formal)
+        self.assertIn("candidate-rejection blocker", formal)
+        self.assertIn("do not wait indefinitely", formal)
+        self.assertIn("do not resolve the critic's semantic finding", formal)
+        self.assertIn("map every\n  applicable `repair_steps` item", catalog)
+        self.assertIn("verdict/snapshot/reviewed-main provenance", catalog)
+        self.assertIn("concrete candidate-rejection blocker", catalog)
+        self.assertIn("resubmit promptly", catalog)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -627,6 +627,7 @@ def autoformalize_task(task_id: str) -> str:
         "representation_review": autoformalize_representation.current_representation_review(state, task_id),
         "manifest_repairs": [row for row in autoformalize_state.current_manifest_repairs(state)
                              if row.get("task_id") == task_id],
+        "critic_feedback": autoformalize_state.critic_feedback_for_task(state, task_id),
         "file_reservations": {path: row for path, row in autoformalize_files.reservations(state).items()
                               if task_id in {row["owner_task"], *row["shared_with"]}},
         "source_refs": [

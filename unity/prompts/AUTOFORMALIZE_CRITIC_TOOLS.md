@@ -12,7 +12,7 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
 
 - `submit_formalization_verdict(author, verdict, summary, review, reopen_tasks?, evidence?, representation_repairs?)` submits
   `approved` or `lean_reopen`. `review` contains the current `snapshot_id` and `requirements` entries
-  `{requirement_id, status, declarations, checked_anchor_ids, checked_prerequisite_ids, rationale, argument_rationale}`,
+  `{requirement_id, status, declarations, checked_anchor_ids, checked_prerequisite_ids, rationale, argument_rationale, repair_steps}`,
   a global `scope_rationale`, and `repair_reviews` with `{repair_id,status,rationale}` for every adopted
   correction. Approval requires every recorded requirement
   exactly once, all passing, with all adopted outputs of its implementing nodes listed in
@@ -33,6 +33,28 @@ tasks do not justify reopening unrelated completed work. Repeated unchanged feed
   (empty when none, no extras or duplicates). Check each witness against the English statement.
   For `kind="argument"`, explain its inline discharge or target-citation accounting in
   `argument_rationale`; proof completion alone does not establish that correspondence.
+  `repair_steps` defaults to `[]` only for legacy reviews that predate the field. In every new review,
+  `pass` and `not_checked` require `repair_steps=[]`; `fail` requires 1--8 nonblank strings, each at most
+  1000 characters. Each failed step must name a concrete construction/proof obligation, the actual
+  declaration/task/dependency to change, and the source or Lean evidence needed to recheck it. Do not
+  invent Lean APIs or use compilation or a reflexive formula/declaration name as semantic evidence.
+  Never prescribe weakening, omitting, or rewriting the supplied source obligation. The nested shape is:
+
+  ```json
+  {
+    "requirement_id": "R1",
+    "status": "fail",
+    "declarations": ["Project.partialConstruction"],
+    "checked_anchor_ids": ["A1"],
+    "checked_prerequisite_ids": [],
+    "rationale": "The current construction omits the boundary case at A1.",
+    "argument_rationale": "The current proof covers only the interior case.",
+    "repair_steps": [
+      "Implement the A1 boundary case in the actual declaration realizing Project.partialConstruction and check its required invariant.",
+      "Update the consuming proof and cite the exact declaration plus checked source/Lean evidence in candidate notes."
+    ]
+  }
+  ```
 - `autoformalize_requirements(offset?, limit?)` pages the complete requirement manifest. Keep one revision
   and continue until `next_offset` is null; the task-filtered brief is not the entire checklist.
   `autoformalize_task(task_id)` retrieves exact task evidence/anchors/prerequisites.
