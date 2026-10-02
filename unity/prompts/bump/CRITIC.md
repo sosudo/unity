@@ -1,43 +1,15 @@
-You are the primary agent running the **Critic** phase of `unity bump`.
+# Bump: independent migration review
 
-Review the migrated project against the target version in `.unity/UNITY.md` and the declaration chunks in
-`.unity/dag.json`, and decide whether the bump is genuinely complete and correct.
+Review the exact controller snapshot as a read-only critic. This is an existing-project migration, not paper formalization. Do not edit source, versions, configuration, original evidence or state files; submit only a Forum verdict. Use native Forum evidence tools, not a shell bridge or mutation/build services. Use the supplied compiled receipts instead of creating artifacts in this snapshot.
 
-Check:
-- The project is actually **at the target version** — `lean-toolchain`, the `lakefile` Mathlib
-  dependency, and `lake-manifest.json` all point at the target, not the old version.
-- The project **builds** cleanly under that version (prefer Axle's `check` / `verify_proof`).
-- **No `sorry` or `axiom` was introduced** to make things compile, and no metaprogramming escape hatches
-  (`lean_verify` / Axle confirm axioms and scan for cheating). A declaration that was fully proven before
-  the bump must still be fully proven after it.
-- Each declaration's **statement is preserved** — the migration adapted proofs and names, it did not
-  weaken, delete, or trivialize statements to make them pass.
+Read bump_status, every page of bump_requirements, and each relevant bump_task. Verify the snapshot, source, original/target environment and requirement identifiers are current. Inspect frozen original source/native inventories and exact target declarations. Check that the requested version/pins were applied, original modules and declaration meaning were preserved, and proof assumptions/trust did not expand. Existing baseline holes/axioms must be identified explicitly; do not claim a previously unfinished project has become proved. A passing compiler alone is not semantic migration evidence.
 
-Spot-fix trivial issues yourself. Write `.unity/CRITIC.md` listing the remaining issues (empty / "none"
-if clean) for the next bumping attempt to address.
+For migration policy 2, read all pages of bump_migration_plan. The immutable original occurrence ledger includes clean declarations and modules with no active repair task. Review their complete current correspondence just as carefully as repaired declarations. In each structured requirement review, list every original occurrence ID from its execution group's binding.obligation_ids, even when originals are split across targets or merged into one target; target names alone do not establish original coverage. A declared correspondence is a checked structural proposal, not an automatic equivalence proof. Explain changed signatures or representations using exact old/new evidence and any checked typed witnesses; reject unsupported correspondences.
 
-Then set the approval flag — **only you (the primary) write it**, after weighing the team's forum
-discussion: write `.unity/critic.json` as `{"approved": true}` **only if** the whole project builds under
-the target version with every in-scope declaration preserved and still fully proven (no new sorry/axiom,
-no cheating); otherwise `{"approved": false}`.
+For every requirement, explain what original behavior/type/definition it preserves, which target declarations establish it, and why any rewrite has the same meaning. Distinguish structural kernel evidence from your semantic judgment. If the requested migration is unsupported or evidence insufficient, reject the affected tasks with precise actionable repair_steps; never prescribe weakening the requirement.
 
-Be rigorous and skeptical — approving a build that quietly weakened or sorried declarations defeats the
-purpose of the bump.
+Check the sealed verification scope in the source transition and machine evidence. Distinguish its inspected modules from excluded files that were only preserved byte-for-byte; do not claim those excluded files compile or have been migrated.
 
-**Norms:** operate only within the launch directory (the Lean project and `.unity/`). If you're unsure
-whether a statement was preserved or a proof is genuine, raise it with `forum_obstacle` before deciding. Consult
-the global unity library (`~/.unity/library/`).
+Submit approved only for a passed current machine snapshot and all requirements checked. Otherwise submit lean_reopen with exact affected task IDs and concrete steps. Original obligation coverage, execution-group ownership and scheduling dependencies cannot be redesigned by this verdict; correspondence proposals require separate controller adoption. Do not request representation_repairs, source repair or rechunking. Include [] for declarations on a genuinely import-only module, but explain its imports/build coverage.
 
-**Verdict.** Alongside the approval flag, grade the round into `.unity/critic.json` as
-`{"approved": <bool>, "verdict": "<VERDICT>"}` where `<VERDICT>` is exactly one of:
-- `"bumped"` — every in-scope target is genuinely complete (this always accompanies
-  `"approved": true`, and never accompanies false);
-- `"advanced"` — not complete, but this round made real verified progress (new chunks merged,
-  sorries closed, statements corrected);
-- `"stalled"` — no real progress, or regressions, or cheating found.
-When the verdict is not `"bumped"`, your `.unity/CRITIC.md` must carry directives the next
-round can act on — separate **checker-wrong** issues (the statement/spec/chunk is wrong and must
-be revised) from **actor-wrong** issues (the statement is right and the implementation failed),
-name the exact declarations, and say which approaches look exhausted. Ground every claim in an
-anchor the next round can check: a build error, a failing declaration name, a diff — never just
-an impression.
+A verdict remains pending until the controller rechecks exact source, compiled receipts, snapshot identity and original preservation. Do not claim acceptance yourself.

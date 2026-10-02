@@ -176,6 +176,12 @@ async def mcp(server, tool, args, args_file):
         run_state = json.loads((paths.unity / "state.json").read_text())
     except (OSError, json.JSONDecodeError):
         run_state = {}
+    active_bump = run_state.get("command") == "bump" and run_state.get("phase") != "done"
+    bump_profile = os.getenv("UNITY_BUMP_PROFILE", "").strip() or run_state.get("phase", "formalizing")
+    if active_bump:
+        from ..forum import bump_server
+        if bump_profile not in bump_server.PROFILES:
+            raise click.ClickException(f"unknown bump tool profile '{bump_profile}'")
     active_formalize = run_state.get("command") == "formalize" and run_state.get("phase") != "done"
     formalize_profile = run_state.get("phase", "chunking")
     if active_formalize:
@@ -213,7 +219,12 @@ async def mcp(server, tool, args, args_file):
             solve_profile = override
     client = None
     diagnostic_note = ""
-    if server in ("unity-forum", "forum") and active_formalize:
+    if server in ("unity-forum", "forum") and active_bump:
+        from ..forum import bump_server
+        shared_unity = paths.unity.resolve()
+        bump_server.configure(shared_unity / "forum" / "bump", shared_unity.parent, bump_profile)
+        client = Client(bump_server.build_server(bump_profile))
+    elif server in ("unity-forum", "forum") and active_formalize:
         from ..forum import formalize_server
         shared_forum, shared_root = _formalize_shared_paths(paths)
         formalize_server.configure(shared_forum, shared_root, formalize_profile)
@@ -240,7 +251,13 @@ async def mcp(server, tool, args, args_file):
         )
         client = Client(fsrv.mcp)  # in-process: no subprocess, same flock-safe storage
     else:
-        if active_formalize:
+        if active_bump:
+            from dataclasses import replace
+            from ..bump_orchestrator import build_bump_mcp
+            shared_unity = paths.unity.resolve()
+            specs = build_bump_mcp(replace(paths, forum=shared_unity / "forum" / "bump",
+                                          project_root=shared_unity.parent), bump_profile)
+        elif active_formalize:
             from dataclasses import replace
             from ..formalize_orchestrator import build_formalize_mcp
             shared_forum, shared_root = _formalize_shared_paths(paths)
@@ -265,7 +282,7 @@ async def mcp(server, tool, args, args_file):
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
         spec = specs[server]
-        if active_formalize and spec.get("command"):
+        if (active_bump or active_formalize) and spec.get("command"):
             res, diagnostic_note = await _call_solve_stdio(paths, server, spec, tool, kwargs)
         elif active_autoformalize and spec.get("command"):
             res, diagnostic_note = await _call_autoformalize_stdio(
@@ -290,7 +307,7 @@ async def mcp(server, tool, args, args_file):
     bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
         "artifact_read", "artifact_snapshot_file",
     }
-    if (active_prove or active_solve or active_autoformalize or active_formalize) and output and not bounded_artifact_read:
+    if (active_prove or active_solve or active_autoformalize or active_formalize or active_bump) and output and not bounded_artifact_read:
         from .. import artifacts
         compacted = artifacts.compact_text(
             paths.artifacts,

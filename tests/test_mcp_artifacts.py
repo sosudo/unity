@@ -66,7 +66,7 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
         )
 
         (self.unity / "state.json").write_text(json.dumps({
-            "command": "bump", "phase": "bumping",
+            "command": "optimize", "phase": "optimizing",
         }))
         other_result = await self.invoke()
         self.assertEqual(other_result.exit_code, 0)
