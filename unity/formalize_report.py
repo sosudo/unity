@@ -12,9 +12,75 @@ import fcntl
 import hashlib
 import json
 
-from . import artifacts, formalize_contract, formalize_state
+from . import artifacts, formalize_contract, formalize_scope, formalize_state
 from .formalize_input import require_source_matches
 from .formalize_review import SemanticReview
+
+
+def _project_verification(state: dict, snapshot: dict, *, accepted: bool = False) -> dict:
+    """State the frozen boundary without turning byte preservation into proof."""
+    baseline = ((state.get("formalization", {}).get("contract") or {}).get("project_baseline")
+                or state.get("project_baseline") or {})
+    mode = formalize_scope.mode(baseline)
+    if mode == "changes":
+        current = snapshot.get("project_verification")
+        if accepted and (
+                not isinstance(current, dict) or current.get("mode") != "changes"
+                or current.get("policy") != "changes-v1"
+                or current.get("inspection_policy") != 2
+                or current.get("baseline_sha256") != baseline.get("sha256")
+                or current.get("normal_default_build") is not True):
+            raise ValueError("accepted change-focused report requires matching current preservation coverage")
+        return {
+            "mode": mode, "policy": "changes-v1", "baseline_sha256": baseline.get("sha256"),
+            "original_files": sorted(baseline.get("files", {})),
+            "current_snapshot_coverage": current,
+            "qualification": (
+                "Change-focused preservation, not whole-project kernel verification. Original files, "
+                "configuration and dependencies are frozen; submitted outputs and affected existing "
+                "modules in the normal build or submitted import closure are inspected in their actual "
+                "import contexts. Original declaration evidence "
+                "is captured on demand from the immutable baseline. Untouched unrelated modules are "
+                "preserved byte-for-byte, not claimed semantically audited. The normal project build "
+                "and exact merged changes are checked separately from the critic's faithfulness judgment."
+            ),
+        }
+    policy = baseline.get("verification_scope") or {}
+    original = policy.get("original_modules", baseline.get("layout", {}).get("modules", {}))
+    verified = policy.get("verification_modules", original)
+    editable = policy.get("editable_modules", verified)
+    readonly_verified = {path: module for path, module in verified.items() if path not in editable}
+    byte_only = {path: module for path, module in original.items() if path not in verified}
+    byte_only_files = sorted(path for path in baseline.get("files", {})
+                             if path.endswith(".lean") and path not in verified)
+    current = snapshot.get("project_verification")
+    if accepted and mode == "libraries" and (
+            not isinstance(current, dict) or current.get("mode") != mode
+            or current.get("scope_sha256") != policy.get("sha256")
+            or current.get("selected_libraries") != policy.get("selected_libraries")):
+        raise ValueError("accepted library report requires matching current project verification coverage")
+    return {
+        "mode": mode,
+        "policy_sha256": policy.get("sha256"),
+        "selected_libraries": policy.get("selected_libraries", []),
+        "original_verification_modules": verified,
+        "original_editable_modules": editable,
+        "original_readonly_verified_modules": readonly_verified,
+        "original_byte_only_auxiliary_modules": byte_only,
+        "original_byte_only_auxiliary_files": byte_only_files,
+        "current_snapshot_coverage": current,
+        "qualification": (
+            "Library-scoped verification, not whole-project verification. Machine-check coverage "
+            "is limited to the selected libraries and their recorded project import closure; imported auxiliary "
+            "modules remain read-only. Excluded auxiliary sources are preserved byte-for-byte, "
+            "not claimed compiled or kernel-verified. New modules must remain inside the selected "
+            "libraries; imports cannot expand the frozen original verification boundary. The "
+            "recorded machine review separately states the checked revision and outcome."
+            if mode == "libraries" else
+            "All-project verification scope. Original modules are listed here; the exact current "
+            "revision and verification outcome are recorded separately in machine_review."
+        ),
+    }
 
 
 def completion_report(state: dict, *, accepted: bool = True) -> dict:
@@ -90,6 +156,7 @@ def completion_report(state: dict, *, accepted: bool = True) -> dict:
         "scope_sha256": state.get("problem_sha256"),
         "project_baseline_sha256": (state.get("project_baseline") or {}).get("sha256"),
         "project_scope": (formal.get("contract") or {}).get("project_baseline", {}).get("scope"),
+        "project_verification": _project_verification(state, snapshot, accepted=accepted),
         "formalization_revision": formal.get("revision"), "main_sha": formal.get("main_sha"),
         "contract_sha256": (formal.get("contract") or {}).get("sha256"),
         "scope": spec.get("scope", {}), "source_anchors": spec.get("anchors", []),

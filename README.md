@@ -90,7 +90,7 @@ Then, go to the prompt tab, and type in any specialized instructions you want (s
 
 Finally, press the settings icon in the top right, and set your max attempts (how many iterations of the formalization loop are allowed, the default of 5 typically works well), the port for your Lean LSP MCP (default 8888), your [Axle](https://axle.axiommath.ai/) API Key (optional), and your [Aristotle Agent](https://aristotle.harmonic.fun/) API key (also optional). Your Unity agents can call out to both Axle and Aristotle Agent using tool calls to help with formalization.
 
-When you're ready, hover over the `run` button, press `formalize`, and press the `start` button. In the `targets` box, you can put in any specific Lean declarations you want fixed or specific theorems/lemmas/definitions/section from your sources you want formalized (you can also leave it blank and the agents will treat everything as a target).
+When you're ready, hover over the `run` button, press `formalize`, and press the `start` button. In the `targets` box, put specific Lean declarations to complete or theorems/lemmas/definitions/sections from your sources to formalize. Leaving it blank requests the supplied source within the existing project's instructions, not repair of every unrelated project hole.
 
 From the CLI, add the supplied documents with `unity source add <path>`, put your
 scope and instructions in `.unity/UNITY.md`, and run
@@ -101,8 +101,36 @@ source, scope, and project baseline. To change sources, instructions, or targets
 start in a separate project copy with fresh Unity run state, keeping the original
 run and its evidence intact; existing Formalize history is not overwritten.
 
-Start from an existing project that builds with its pinned toolchain and
-dependencies, on a clean named Git branch. Project source/configuration inputs
+`--project-scope changes` is the fresh-run default. Unity records the original
+files, configuration and dependencies and checks the project's normal build;
+it does not import every library into one Lean environment. Candidate checks
+then validate the agent's complete diff, inspect submitted outputs in their real
+module/import contexts, and compare affected original declarations in the normal
+build or submitted import closure against the immutable snapshot on demand.
+Unrelated original files remain frozen, including broken optional tools.
+New results must not depend on old proof holes or forbidden axioms. Final review
+rechecks the merged changes and normal build, with exact coverage in the report.
+Changes mode currently requires default Lake targets whose Lean modules can be
+identified (libraries/executables); an opaque custom default target is reported
+as unsupported, not silently treated as checked. Original commands are protected
+with conservative source-edit checks plus native declaration comparison; unusual
+edits may be rejected rather than guessed safe. This is a preservation check,
+not a sandbox for hostile Lean metaprograms.
+
+`--project-scope all` retains the legacy whole-project audit policy.
+`--project-scope libraries` checks the project's declared Lean library roots and
+their project import closure; auxiliary modules outside that closure stay frozen
+byte-for-byte, without claiming those modules were compiled or kernel-verified.
+This is independent of `--targets`, which selects the mathematical work.
+Library-scoped workers cannot edit frozen auxiliary modules or add imports of
+previously excluded project modules. The saved report names the exact coverage.
+Auxiliary modules already imported by a library are verified but remain read-only.
+On `--continue`, omitting `--project-scope` reuses its saved value; changing it is
+rejected before any Lean build. Use a fresh separate project copy for a different
+verification scope.
+
+Start from an existing project whose normal build (or explicit legacy verification scope) builds with its
+pinned toolchain and dependencies, on a clean named Git branch. Project source/configuration inputs
 must be tracked so private worktrees can preserve them; Unity will not stash,
 discard, or commit dirty user work to make the baseline pass. Supplied documents
 under `.unity/source/` are snapshotted separately. On resume, source documents,
@@ -118,8 +146,10 @@ but completed targets and their project-owned dependency closure must be clean:
 an unrelated existing `sorry` is not a reason to rewrite the whole project, and
 a target that depends on one is not complete.
 
-Current limitation: `--targets All` (the default) refuses projects whose selected
-holes include compiler-generated/internal auxiliary declarations, such as a
+For change-focused runs, use bounded existing targets or a source description;
+the old `--targets All` whole-project hole enumeration is not the default and
+requires an explicit legacy audit mode. Selected holes in any mode cannot include
+compiler-generated/internal auxiliary declarations, such as a
 structure-field proof moved into `foo._proof_1`. Explicit auxiliary targets and
 ordinary targets depending on such holes also stop because reliable source
 ownership is not yet available. Explicit ordinary targets independent of those

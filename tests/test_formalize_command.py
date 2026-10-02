@@ -16,6 +16,20 @@ from unity.config import Paths
 from unity.formalize_input import formalize_paths, scope_bytes, snapshot_sources
 
 
+def changes_baseline(base):
+    from copy import deepcopy
+    result = deepcopy(base)
+    result.update(version=2, policy="changes-v1", project_scope="changes",
+                  declarations={}, original_contexts={}, project_axioms=[],
+                  project_sorries=[], project_used_axioms=[])
+    result["layout"].update(project_scope="changes", verification_modules={},
+                            default_modules=dict(result["layout"]["modules"]),
+                            unknown_default_targets=[])
+    result["import_headers"] = {p: [] for p in result["layout"]["modules"]}
+    result["scope"] = {"mode": "natural", "bound": False, "existing_targets": []}
+    return formalize_project._seal(result)
+
+
 class FormalizeCommandTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -94,9 +108,10 @@ class FormalizeCommandTests(unittest.IsolatedAsyncioTestCase):
             "project_sorries": ["target"], "project_used_axioms": ["sorryAx", "unrelated"],
         })
 
-    def capture(self, root, target_scope="All"):
+    def capture(self, root, target_scope="All", *, project_scope="all"):
         self.assertEqual(root, self.root)
-        return self.baseline(target_scope)
+        result = self.baseline(target_scope)
+        return changes_baseline(result) if project_scope == "changes" else result
 
     async def chunk(self, _roster, paths, _limit):
         formalize_state.set_phase(paths.forum, "formalizing")
@@ -120,7 +135,8 @@ class FormalizeCommandTests(unittest.IsolatedAsyncioTestCase):
         original = self.existing.read_bytes()
         result = await self.invoke("--targets", "target, source Lemma 2")
         self.assertEqual(result.exit_code, 0, result.output)
-        self.mocks["capture_baseline"].assert_called_once_with(self.root, target_scope="target, source Lemma 2")
+        self.mocks["capture_baseline"].assert_called_once_with(
+            self.root, target_scope="target, source Lemma 2", project_scope="changes")
         state = formalize_state.load_state(self.paths.forum)
         self.assertEqual(state["project_baseline"]["target_scope"], "target, source Lemma 2")
         self.assertEqual(state["pipeline"], "formalize")
@@ -130,10 +146,12 @@ class FormalizeCommandTests(unittest.IsolatedAsyncioTestCase):
         self.mocks["persist_report"].assert_called_once_with(self.paths, accepted=True)
         self.mocks["build_sources"].assert_not_called()  # mocked baseline capture owns the initial build
 
-    async def test_fresh_default_targets_remain_all(self):
+    async def test_fresh_default_targets_request_source_formalization(self):
         result = await self.invoke()
         self.assertEqual(result.exit_code, 0, result.output)
-        self.mocks["capture_baseline"].assert_called_once_with(self.root, target_scope="All")
+        self.mocks["capture_baseline"].assert_called_once_with(
+            self.root, target_scope="Formalize the supplied sources within this existing project.",
+            project_scope="changes")
 
     async def test_continue_without_targets_reuses_original_scope(self):
         original = self.bind(target_scope="target")
@@ -268,9 +286,9 @@ class FormalizeCommandTests(unittest.IsolatedAsyncioTestCase):
         stop_flag.write_text("stale request")
         self.mocks["stop_requested"].side_effect = lambda root: stop_flag.exists()
 
-        def capture_then_stop(root, target_scope="All"):
+        def capture_then_stop(root, target_scope="All", **scope_options):
             self.assertFalse(stop_flag.exists(), "stale stop must clear before the owned preflight")
-            baseline = self.capture(root, target_scope)
+            baseline = self.capture(root, target_scope, **scope_options)
             stop_flag.write_text("new stop during baseline capture")
             return baseline
 

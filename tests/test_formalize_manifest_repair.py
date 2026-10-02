@@ -245,6 +245,8 @@ class ManifestStateFixture(unittest.TestCase):
         )["candidate"]
         state.begin_formal_merge(self.forum, candidate["candidate_id"])
         proposed = deepcopy(self.current()["formalization"]["contract"])
+        proposed["adopted_outputs"] = contract.adopted_output_records(
+            proposed, task_id=task_id, outputs=candidate["outputs"])
         proposed["bindings"][task_id] = deepcopy(candidate["outputs"])
         for row in candidate["outputs"]:
             proposed["targets"][row["declaration"]] = {

@@ -112,27 +112,149 @@ _FORMALIZE_MCP_ENV_KEYS = (
     "TMPDIR",
     "TMP",
     "TEMP",
+    "UV_TOOL_DIR",
+    "UV_TOOL_BIN_DIR",
+    "LAKE_CACHE_DIR",
+)
+
+_FORMALIZE_UVX_ENV_KEYS = (
+    "PATH", "TMPDIR", "TMP", "TEMP", "UV_TOOL_DIR", "UV_TOOL_BIN_DIR",
 )
 
 
 def formalize_mcp_with_runtime_env(
     servers: dict, environ: Mapping[str, str],
 ) -> dict:
-    """Bind formalize's local Lean MCP server to a worker's non-secret runtime.
+    """Bind formalize's local services to a worker's non-secret runtime.
 
     Stdio SDKs may inherit the guarded PATH without its companion variables.
-    Copy only the local server mapping and its env; never forward the whole
-    worker environment (which contains credentials) or alter shared mappings.
+    They also omit UV_TOOL_DIR, causing uvx to write to the read-only global
+    tools install. Explicitly forward worker scratch paths to both uvx services.
+    Never forward the whole worker environment (which contains credentials) or
+    alter shared mappings; retain each service's explicitly configured keys.
     """
-    lean = servers.get("lean-lsp")
-    if not lean or not lean.get("command"):
-        return servers
-    server_env = {
-        key: value for key, value in (lean.get("env") or {}).items()
-        if key not in _FORMALIZE_MCP_ENV_KEYS
+    result = servers
+    for name, env_keys in (
+        ("lean-lsp", _FORMALIZE_MCP_ENV_KEYS),
+        ("axle", _FORMALIZE_UVX_ENV_KEYS),
+        ("unity-forum", _FORMALIZE_MCP_ENV_KEYS),
+    ):
+        server = servers.get(name)
+        if not server or not server.get("command"):
+            continue
+        server_env = {
+            key: value for key, value in (server.get("env") or {}).items()
+            if key not in env_keys
+        }
+        server_env.update({key: environ[key] for key in env_keys if key in environ})
+        result = {**result, name: {**server, "env": server_env}}
+    return result
+
+
+# Audited names from FORMALIZE_{LEAN,AXLE,ARISTOTLE}_TOOLS.md. A newly installed
+# service tool is not automatically authorized. Forum names come from its actual
+# phase registration below, rather than a second copy of that contract.
+_FORMALIZE_LEAN_INSPECTION_TOOLS = (
+    "lean_goal", "lean_term_goal", "lean_diagnostic_messages", "lean_file_outline",
+    "lean_hover_info", "lean_completions", "lean_declaration_file", "lean_references",
+    "lean_local_search", "lean_leansearch", "lean_loogle", "lean_leanfinder",
+    "lean_state_search", "lean_hammer_premise", "lean_code_actions", "lean_run_code",
+    "lean_verify", "lean_minimal_hypotheses", "lean_profile_proof", "lean_get_widgets",
+    "lean_get_widget_source",
+)
+_FORMALIZE_AXLE_INSPECTION_TOOLS = (
+    "check", "verify_proof", "highlight", "extract_decls", "list_environments",
+    "read_share_url", "read_docs",
+)
+_FORMALIZE_AXLE_PROOF_TOOLS = (
+    "repair_proofs", "simplify_theorems", "disprove", "merge", "rename", "normalize",
+    "theorem2lemma", "theorem2sorry", "have2lemma", "have2sorry", "sorry2lemma",
+    "share_url",
+)
+_FORMALIZE_ARISTOTLE_INSPECTION_TOOLS = (
+    "aristotle_status", "aristotle_wait", "aristotle_list",
+)
+
+
+def _formalize_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[str, ...]]:
+    """Authorize only this phase's existing public tools on known transports.
+
+    Codex MCP approval is independent of shell approval_policy. Preapproval here
+    is scoped to the pipeline API already delegated to this worker, not to an
+    arbitrary server or any tools it might advertise in a future release.
+    """
+    from .forum.formalize_server import PROFILE_TOOLS
+
+    if phase not in PROFILE_TOOLS:
+        raise ValueError(f"unknown formalize MCP phase {phase!r}")
+    catalogs = {
+        "unity-forum": tuple(tool.__name__ for tool in PROFILE_TOOLS[phase]),
+        "lean-lsp": _FORMALIZE_LEAN_INSPECTION_TOOLS
+            + (("lean_multi_attempt",) if phase == "formalizing" else ()),
+        "axle": _FORMALIZE_AXLE_INSPECTION_TOOLS
+            + (_FORMALIZE_AXLE_PROOF_TOOLS if phase == "formalizing" else ()),
+        "aristotle": _FORMALIZE_ARISTOTLE_INSPECTION_TOOLS
+            + (("aristotle_submit", "aristotle_result", "aristotle_cancel")
+               if phase == "formalizing" else ()),
     }
-    server_env.update({key: environ[key] for key in _FORMALIZE_MCP_ENV_KEYS if key in environ})
-    return {**servers, "lean-lsp": {**lean, "env": server_env}}
+    # lean_build is intentionally not authorized: workers must not initiate the
+    # controller's project-wide build through either native MCP or the bridge.
+    transports = {
+        "lean-lsp": ("uvx", ["lean-lsp-mcp"]),
+        "axle": ("uvx", ["--from", "axiom-axle-mcp", "axle-mcp-server"]),
+        "aristotle": (sys.executable, ["-m", "unity.aristotle"]),
+    }
+    result = {}
+    for name, cfg in mcp_servers.items():
+        if name not in catalogs or cfg.get("url"):
+            raise ValueError(f"unrecognized formalize MCP transport {name!r}")
+        args = cfg.get("args", [])
+        if name == "unity-forum":
+            trusted = (
+                cfg.get("command") == sys.executable
+                and isinstance(args, list) and len(args) == 8
+                and args[:3] == ["-m", "unity.forum.formalize_server", "--forum-dir"]
+                and args[4] == "--project-root" and args[6:] == ["--profile", phase]
+            )
+        else:
+            command, expected_args = transports[name]
+            trusted = cfg.get("command") == command and args == expected_args
+        if not trusted:
+            raise ValueError(f"unexpected formalize MCP command/profile for {name!r}")
+        allowed = catalogs[name]
+        if "enabled_tools" in cfg:
+            allowed = tuple(tool for tool in allowed if tool in cfg["enabled_tools"])
+        disabled = cfg.get("disabled_tools", ())
+        result[name] = tuple(tool for tool in allowed if tool not in disabled)
+    return result
+
+
+def _formalize_codex_policy_overrides(
+    policy: dict[str, tuple[str, ...]], mcp_servers: dict,
+) -> tuple[str, ...]:
+    """Pin scoped approval above project config, without changing shell approvals."""
+    overrides = []
+    for name, names in policy.items():
+        # These identifiers came from the fixed catalog, not user text. Bare
+        # TOML keys also match Codex's dotted CLI override parser exactly.
+        prefix = "mcp_servers." + name
+        overrides.extend((
+            prefix + ".command=" + json.dumps(mcp_servers[name]["command"]),
+            prefix + ".args=" + json.dumps(mcp_servers[name]["args"]),
+            prefix + ".enabled_tools=" + json.dumps(names),
+            prefix + '.default_tools_approval_mode="prompt"',
+        ))
+        overrides.extend(prefix + ".tools." + tool + '.approval_mode="approve"'
+                         for tool in names)
+    return tuple(overrides)
+
+
+def _formalize_codex_shell_overrides(environ: Mapping[str, str]) -> tuple[str, ...]:
+    """Keep every phase on its assigned runtime, including non-login shell calls."""
+    return ("allow_login_shell=false", "features.shell_snapshot=false") + tuple(
+        "shell_environment_policy.set." + key + "=" + json.dumps(environ[key])
+        for key in _FORMALIZE_MCP_ENV_KEYS if key in environ
+    )
 
 
 def _agent_env(
@@ -487,10 +609,13 @@ async def _claude_continuation(agent, options, prompt, cwd,
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
-                        writable_roots: tuple[Path, ...] = ()) -> str | None:
+                        writable_roots: tuple[Path, ...] = (), *,
+                        formalize_phase: str | None = None) -> str | None:
     """Seed CODEX_HOME/config.toml with a custom provider (if base_url), MCP servers,
     and workspace-write sandbox tuning. Returns the provider id to pass as
     model_provider, or None for the default openai provider."""
+    policy = (_formalize_codex_tool_policy(mcp_servers, formalize_phase)
+              if formalize_phase is not None else {})
     home.mkdir(parents=True, exist_ok=True)
     # No api_key -> ride the user's Codex subscription: copy their login into this
     # agent's isolated CODEX_HOME.
@@ -522,10 +647,9 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
     for name, cfg in (mcp_servers or {}).items():
         lines.append(f"[mcp_servers.{name}]")
         if cfg.get("command"):
-            lines.append(f'command = "{cfg["command"]}"')
+            lines.append("command = " + json.dumps(cfg["command"]))
             if cfg.get("args"):
-                args = ", ".join(f'"{a}"' for a in cfg["args"])
-                lines.append(f"args = [{args}]")
+                lines.append("args = " + json.dumps(cfg["args"]))
         elif cfg.get("url"):
             lines.append("url = " + json.dumps(cfg["url"]))
             headers = cfg.get("http_headers") or cfg.get("headers")
@@ -533,12 +657,18 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
                 lines.append("http_headers = { " + ", ".join(
                     f"{json.dumps(key)} = {json.dumps(value)}" for key, value in headers.items()
                 ) + " }")
+        if name in policy:
+            lines.append("enabled_tools = " + json.dumps(policy[name]))
+            lines.append('default_tools_approval_mode = "prompt"')
         lines.append("")
         if cfg.get("env"):
             lines.append(f"[mcp_servers.{name}.env]")
             for k, v in cfg["env"].items():
                 lines.append(f'{k} = {json.dumps(str(v), ensure_ascii=False)}')
             lines.append("")
+        for tool in policy.get(name, ()):
+            lines.extend((f"[mcp_servers.{name}.tools.{tool}]",
+                          'approval_mode = "approve"', ""))
     (home / "config.toml").write_text("\n".join(lines))
     return provider
 
@@ -559,12 +689,11 @@ def _write_codex_agents(home: Path, subagents) -> None:
         (adir / f'{s["name"]}.toml').write_text(toml)
 
 
-# codex >=0.117 does not expose MCP tools to custom Responses-API providers
-# (openai/codex#19871, #23186, #26977) — codex agents call them via `unity mcp` instead.
+# Some custom Responses providers do not expose native MCP. The documented
+# shell bridge remains a transport fallback, not a way around a denied call.
 _FORMALIZE_CODEX_MCP_NOTE = (
-    "\n\nIMPORTANT — formalize MCP tools on this backend: your model does NOT receive MCP tools "
-    "natively. Every formalize Forum, Lean, Axle, and Aristotle tool in this prompt is called "
-    "through the shell:\n"
+    "\n\nFORMALIZE MCP TOOLS: Use the native tools when exposed. If this backend does not "
+    "expose native MCP tools (as with some custom providers), use the shell bridge:\n"
     "    unity mcp <server> <tool> '<json-args>'\n"
     "Examples:\n"
     "    unity mcp unity-forum formalize_brief '{\"author\": \"<your agent name>\"}'\n"
@@ -572,8 +701,9 @@ _FORMALIZE_CODEX_MCP_NOTE = (
     "    unity mcp unity-forum claim_strategy '{\"strategy_id\": \"strategy-...\", \"author\": \"<you>\"}'\n"
     "    unity mcp unity-forum finalize_formalization '{\"strategy_id\": \"strategy-...\", \"task_id\": \"formal-task-id\", \"author\": \"<you>\"}'\n"
     "    unity mcp lean-lsp lean_goal '{\"file_path\": \"...\", \"line\": 12}'\n"
-    "Servers: unity-forum (formalize tools), lean-lsp, axle and aristotle when configured. Read "
-    "every tool instruction in this prompt as 'run it via unity mcp'. The formalize Forum contract "
+    "Servers: unity-forum (formalize tools), lean-lsp, axle and aristotle when configured. "
+    "An approval denial is a configuration blocker: report it, do not bypass it with another "
+    "transport. The formalize Forum contract "
     "is not optional on this backend. Use `target`, never prove's `decl` argument, when "
     "registering an formalize strategy. Only call tools exposed for your current phase.\n"
 )
@@ -658,8 +788,19 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     roots = _worktree_write_roots(cwd)
     if roots:
         system_prompt += _worktree_prompt(cwd)
+    formalize_phase = None
+    policy = {}
+    if mcp_profile == "formalize":
+        formalize_phase = (env_overrides or {}).get("UNITY_FORMALIZE_PROFILE")
+        if formalize_phase is None:
+            forum_args = mcp_servers.get("unity-forum", {}).get("args", [])
+            if len(forum_args) == 8 and forum_args[6] == "--profile":
+                formalize_phase = forum_args[7]
+        if formalize_phase is None:
+            raise ValueError("formalize Codex worker requires an explicit phase")
+        policy = _formalize_codex_tool_policy(mcp_servers, formalize_phase)
     provider = _write_codex_config(home, agent, mcp_servers,
-                                   writable_roots=roots)
+                                   writable_roots=roots, formalize_phase=formalize_phase)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
     sandbox = (Sandbox.workspace_write if roots or permission != "bypassPermissions"
@@ -696,13 +837,13 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 "sandbox_workspace_write.exclude_slash_tmp=true",
                 "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             )
-        if mcp_profile == "formalize" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
+        if mcp_profile == "formalize":
             # Login startup and cached shell state can move elan ahead of formalize's
             # Lake shim even when the app-server process receives the right PATH.
-            config_kwargs["config_overrides"] = config_kwargs.get("config_overrides", ()) + (
-                "allow_login_shell=false",
-                "features.shell_snapshot=false",
-                "shell_environment_policy.set.PATH=" + json.dumps(agent_env["PATH"]),
+            config_kwargs["config_overrides"] = (
+                config_kwargs.get("config_overrides", ())
+                + _formalize_codex_shell_overrides(agent_env)
+                + _formalize_codex_policy_overrides(policy, mcp_servers)
             )
         cfg = CodexConfig(
             cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,

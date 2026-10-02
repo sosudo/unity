@@ -98,16 +98,37 @@ def _agent_runtime_env(
     safe_agent = re.sub(r"[^a-zA-Z0-9_-]", "_", agent_name)
     scratch = paths.unity / "tmp" / run_id / safe_agent
     scratch.mkdir(parents=True, exist_ok=True)
+    # uvx also creates transient tool environments outside its package cache.
+    # Keep those writes in the already-permitted worker scratch, not the global
+    # uv tools directory (which may contain Unity itself and is read-only here).
+    uv_tools = scratch / "uv-tools"
+    uv_bin = scratch / "uv-bin"
+    lake_cache = scratch / "lake-cache"
+    uv_tools.mkdir(exist_ok=True)
+    uv_bin.mkdir(exist_ok=True)
+    lake_cache.mkdir(exist_ok=True)
     value = str(scratch.resolve())
+    # Preserve the active installation in every role, including chunking. Do
+    # not resolve the Python executable itself: a venv Python may be a symlink
+    # outside the venv while its sibling Unity console script is the right one.
+    runtime_bin = Path(sys.executable).absolute().parent.resolve()
     result = {
         "TMPDIR": value,
         "TMP": value,
         "TEMP": value,
+        "UV_TOOL_DIR": str(uv_tools.resolve()),
+        "UV_TOOL_BIN_DIR": str(uv_bin.resolve()),
+        # Lake 4.34 otherwise writes artifacts under the read-only elan
+        # toolchain. Relocate its cache without changing artifact/build policy.
+        "LAKE_CACHE_DIR": str(lake_cache.resolve()),
+        "PATH": str(runtime_bin) + os.pathsep + os.environ.get("PATH", ""),
         "PIP_REQUIRE_VIRTUALENV": "true",
         "PIP_DISABLE_PIP_VERSION_CHECK": "true",
         "UNITY_FORMALIZE_PROJECT_ROOT": str(paths.project_root.resolve()),
         "UNITY_FORMALIZE_TASK_ID": task_id,
     }
+    if phase := state.get("phase"):
+        result["UNITY_FORMALIZE_PROFILE"] = str(phase)
     if state.get("phase") == "formalizing":
         real_lake = shutil.which("lake")
         if real_lake:
@@ -125,7 +146,7 @@ def _agent_runtime_env(
                 temporary.chmod(0o700)
                 os.replace(temporary, wrapper)
             result.update({
-                "PATH": str(bin_dir.resolve()) + os.pathsep + os.environ.get("PATH", ""),
+                "PATH": str(bin_dir.resolve()) + os.pathsep + result["PATH"],
                 "UNITY_REAL_LAKE": str(Path(real_lake).resolve()),
                 "UNITY_FORMALIZE_PROJECT_ROOT": str(paths.project_root.resolve()),
                 "UNITY_FORMALIZE_TASK_ID": task_id,
@@ -179,13 +200,28 @@ def write_formalization_plan(paths, candidate: dict) -> Path:
         available = set(baseline["scope"]["existing_targets"])
         if not baseline["scope"].get("bound"):
             available = set(baseline["project_axioms"]) | set(baseline["project_sorries"])
+        if "verification_scope" in baseline:
+            editable = set(baseline["verification_scope"]["editable_modules"].values())
+            available = {name for name in available
+                         if baseline["declarations"][name]["module"] in editable}
         plan["project_baseline"] = {
-            key: deepcopy(baseline[key]) for key in ("sha256", "branch", "head", "target_scope", "scope")}
+            key: deepcopy(baseline[key]) for key in (
+                "sha256", "version", "policy", "project_scope", "branch", "head",
+                "target_scope", "scope", "verification_scope") if key in baseline}
         plan["project_baseline"]["existing_incomplete_declarations"] = {
             name: {key: deepcopy(baseline["declarations"][name].get(key))
                    for key in ("module", "target_kind", "type", "level_params")}
             for name in sorted(available)}
         plan["project_baseline"]["protected_modules"] = sorted(set(baseline["layout"]["modules"].values()))
+        if baseline.get("policy") == "changes-v1":
+            plan["project_baseline"]["preservation_policy"] = (
+                "Original files/configuration/dependencies are frozen. No whole-project native inventory "
+                "was taken: an empty existing_incomplete_declarations map is not evidence of no holes. "
+                "Read relevant source files, propose exact existing targets and output modules, and let "
+                "the controller inspect original target contexts on demand. Unrelated old holes and "
+                "optional sibling libraries are not task obligations. New results must not rely on "
+                "unproved assumptions. Preserve existing commands outside authorized edits."
+            )
     replan = state.get("replan") or {}
     if replan:
         previous = replan.get("previous_formalization") or {}
@@ -261,6 +297,32 @@ def normalize_chunking_dag(dag: dict, *, plan: dict, expected_solution_sha: str)
                                  requirements=dag["requirements"], tasks=chunks,
                                  allow_unresolved=True)
     nodes = normalize_informal_nodes(chunks, dag["requirements"], dag["spec"], source)
+    # Informal nodes intentionally discard implementation manifests. Retain
+    # only original locations needed for the *initial* existing-target binding;
+    # these do not populate trusted contract bindings or machine-owned outputs.
+    from .formalize_spec import _refs, PlanValidationError
+    selected = set(_refs(dag.get("existing_targets", []), "existing_targets", nonempty=False))
+    locations = {}
+    for chunk in chunks:
+        rows = chunk.get("outputs", [])
+        if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+            raise PlanValidationError("outputs", "original target locations must be a list of objects")
+        retained = []
+        for row in [chunk, *rows]:
+            name = row.get("declaration", row.get("lean_decl"))
+            if not isinstance(name, str) or name not in selected:
+                continue
+            filename = row.get("lean_file", row.get("file"))
+            if not isinstance(filename, str) or not filename:
+                raise PlanValidationError("outputs", "selected existing targets require their original lean_file")
+            if name in locations and locations[name] != filename:
+                raise PlanValidationError("outputs", "conflicting original locations for " + name)
+            locations[name] = filename
+            entry = {"declaration": name, "lean_file": filename}
+            if entry not in retained:
+                retained.append(entry)
+        if retained:
+            nodes[chunk["id"].strip()]["outputs"] = retained
     dag["chunks"] = list(nodes.values())
     dag["solution_sha256"] = expected_solution_sha
     return dag
@@ -628,8 +690,8 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
                                  "issues": issues, "blockers": blockers}}
     if contract.get("project_baseline") is not None:
         from .formalize_project import require_pinned_inputs
-        require_pinned_inputs(root, contract["project_baseline"], allowed_new_paths={
-            row["lean_file"] for row in formalize_contract._binding_tasks(contract)})
+        require_pinned_inputs(root, contract["project_baseline"],
+                              allowed_new_paths=formalize_contract.adopted_output_paths(contract))
     try:
         resolved = worktree.verify_candidate_commit(
             root, candidate["author"], candidate["commit_sha"], allow_unchanged=True,
@@ -696,13 +758,18 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     if contract.get("project_baseline") is not None:
         try:
             require_pinned_inputs(root, contract["project_baseline"], allowed_new_paths={
-                *[row["lean_file"] for row in formalize_contract._binding_tasks(contract)],
+                *formalize_contract.adopted_output_paths(contract),
                 *[row["file"] for row in candidate.get("outputs", [])]})
         except ValueError as exc:
             _rollback(root, before, receipt=receipt)
             return {"ok": False, "error": str(exc)}
     with formalize_contract.measure(timings, "workspace_seconds"):
-        layout = formalize_contract.workspace_layout(root)
+        try:
+            layout = formalize_contract.workspace_layout(root)
+            layout = formalize_contract.scoped_layout(root, layout, contract.get("project_baseline"))
+        except (OSError, ValueError) as exc:
+            _rollback(root, before, receipt=receipt)
+            return {"ok": False, "error": "project verification scope rejected candidate: " + str(exc)}
     with formalize_contract.measure(timings, "initial_identity_seconds"):
         checked_source = formalize_contract.source_identity(root, layout=layout)
     checked_tree = _checked_tree(root)
@@ -715,6 +782,10 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     try:
         build = formalize_contract.build_sources(
             root, full=True, layout=layout, task_id=task["task_id"], timings=timings,
+            **({"baseline": contract["project_baseline"], "tasks": [
+                *formalize_contract.adopted_output_tasks(contract, root=root),
+                *[{"lean_file": row["file"]} for row in candidate.get("outputs", [])],
+            ]} if contract.get("project_baseline", {}).get("policy") == "changes-v1" else {}),
         )
     except OSError as exc:
         build_seconds = time.monotonic() - build_started

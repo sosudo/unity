@@ -80,7 +80,7 @@ def policy_hash() -> str:
         "formalize_spec.py", "formalize_runtime.py", "formalize_state.py",
         "formalize_workspace.py", "formalize_workspace.lean",
         "formalize_native.py", "formalize_jobs.py", "formalize_cache.py",
-        "formalize_project.py", "formalize_input.py",
+        "formalize_project.py", "formalize_delta.py", "formalize_scope.py", "formalize_files.py", "formalize_input.py",
     )}
     return digest(policy)
 
@@ -265,6 +265,74 @@ def _dependency_file_hashes(root: Path) -> dict:
     return hashes
 
 
+def _dependency_directory_name(serialized: str) -> str:
+    """Decode Lake's JSON Name into its materialized directory name, without Lake.
+
+    Lake's PackageEntry.fromJson? uses Lean's String.toName; dirName then uses
+    Name.toString (escape := false). In particular, quoted dots are literal
+    dots, not directory separators. Keep this pure: pinned-input checks run
+    before it is safe to execute a project's Lake configuration.
+    """
+    if not isinstance(serialized, str) or not serialized or serialized == "[anonymous]":
+        raise ValueError("invalid or anonymous Lake package name")
+
+    def letter_like(char: str) -> bool:
+        code = ord(char)
+        return (
+            (0x3B1 <= code <= 0x3C9 and code != 0x3BB)
+            or (0x391 <= code <= 0x3A9 and code not in (0x3A0, 0x3A3))
+            or any(low <= code <= high for low, high in (
+                (0x3CA, 0x3FB), (0x1F00, 0x1FFE), (0x2100, 0x214F),
+                (0x1D49C, 0x1D59F), (0x0100, 0x017F),
+            ))
+            or (0xC0 <= code <= 0xFF and code not in (0xD7, 0xF7))
+        )
+
+    def first(char: str) -> bool:
+        return "a" <= char <= "z" or "A" <= char <= "Z" or char == "_" or letter_like(char)
+
+    def rest(char: str) -> bool:
+        code = ord(char)
+        return (first(char) or "0" <= char <= "9" or char in "'!?"
+                or any(low <= code <= high for low, high in (
+                    (0x2080, 0x2089), (0x2090, 0x209C), (0x1D62, 0x1D6A),
+                )) or code == 0x2C7C)
+
+    parts = []
+    index = 0
+    while index < len(serialized):
+        start = index
+        if serialized[index] == "«":
+            end = serialized.find("»", index + 1)
+            if end < 0:
+                raise ValueError("unterminated escaped Lake name component")
+            parts.append(serialized[index + 1:end])
+            index = end + 1
+        elif "0" <= serialized[index] <= "9":
+            while index < len(serialized) and "0" <= serialized[index] <= "9":
+                index += 1
+            parts.append(serialized[start:index].lstrip("0") or "0")
+        elif first(serialized[index]):
+            index += 1
+            while index < len(serialized) and rest(serialized[index]):
+                index += 1
+            parts.append(serialized[start:index])
+        else:
+            raise ValueError("invalid Lake name component")
+        if index == len(serialized):
+            break
+        if serialized[index] != "." or index + 1 == len(serialized):
+            raise ValueError("invalid Lake name separator")
+        index += 1
+
+    directory = ".".join(parts)
+    if (not directory or directory in {".", ".."} or directory in _EXCLUDED
+            or any(char in "/\\" or ord(char) < 32 or 0x7F <= ord(char) <= 0x9F
+                   or 0xD800 <= ord(char) <= 0xDFFF for char in directory)):
+        raise ValueError("unsafe Lake package directory name")
+    return directory
+
+
 def _dependencies(root: Path) -> dict:
     """Pin actual dependency source bytes, including local/path dependencies.
 
@@ -279,13 +347,24 @@ def _dependencies(root: Path) -> dict:
     except (OSError, ValueError) as exc:
         raise ContractEnvironmentError("cannot inspect Lake dependency manifest") from exc
     package_dir = root / manifest.get("packagesDir", ".lake/packages")
-    result = {}
+    decoded = []
+    directories = set()
     for package in manifest.get("packages", []):
-        name = package["name"]
+        try:
+            name = package["name"]
+            directory_name = _dependency_directory_name(name)
+            if directory_name in directories:
+                raise ValueError("ambiguous duplicate Lake package directory name")
+            directories.add(directory_name)
+            decoded.append((package, name, directory_name))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ContractEnvironmentError(f"Cannot decode Lake dependency name: {exc}") from exc
+    result = {}
+    for package, name, directory_name in decoded:
         if package.get("type") == "path":
             directory = root / package["dir"]
         else:
-            directory = package_dir / name
+            directory = package_dir / directory_name
         try:
             directory = directory.resolve()
             if not directory.is_dir():
@@ -319,8 +398,13 @@ def source_identity(root: Path, *, layout: dict | None = None) -> dict:
     versioned hash also invalidates pre-layout-bound verification receipts.
     """
     layout = workspace_layout(root) if layout is None else layout
+    # This identity always covers the WHOLE owned workspace and all input
+    # bytes. Scope is independently sealed into the baseline/contract and the
+    # build/inspection receipts, not inferred from a caller's layout hint.
+    ownership = {key: value for key, value in layout.items() if key not in {
+        "verification_modules", "editable_modules", "project_scope", "scope_sha256"}}
     return {"main_sha": _git(root, "rev-parse", "HEAD"),
-            "source_sha256": digest({"version": 2, "workspace": layout,
+            "source_sha256": digest({"version": 2, "workspace": ownership,
                                      "files": _file_hashes(root, build_dir=layout["build_dir"])}),
             "environment": environment_identity(root)}
 
@@ -341,6 +425,54 @@ def workspace_modules(root: Path) -> dict[str, str]:
     return workspace_layout(root)["modules"]
 
 
+def scoped_layout(root: Path, layout: dict, baseline: dict | None) -> dict:
+    """Apply only controller-sealed scope; keep full ownership discoverable."""
+    if baseline and baseline.get("project_scope") == "changes":
+        from . import formalize_delta
+        return formalize_delta.apply(root, layout, baseline)
+    if not baseline or "verification_scope" not in baseline:
+        return layout
+    from . import formalize_scope
+    return formalize_scope.apply(root, layout, baseline["verification_scope"])
+
+
+def _verification_modules(layout: dict) -> dict[str, str]:
+    return layout.get("verification_modules", layout["modules"])
+
+
+def _editable_modules(layout: dict) -> dict[str, str]:
+    return layout.get("editable_modules", layout["modules"])
+
+
+def project_verification(root: Path, baseline: dict, *, tasks: list[dict] | None = None) -> dict | None:
+    """Current controller-derived coverage, never an agent's coverage claim."""
+    if baseline.get("project_scope") == "changes":
+        layout = workspace_layout(root)
+        if tasks:
+            from . import formalize_delta
+            layout = formalize_delta.apply(root, layout, baseline, tasks=tasks)
+        else:
+            layout = scoped_layout(root, layout, baseline)
+        verified = _verification_modules(layout)
+        return {"mode": "changes", "policy": "changes-v1", "inspection_policy": 2,
+                "baseline_sha256": baseline["sha256"],
+                "verification_modules": dict(verified),
+                "byte_only_modules": {path: module for path, module in layout["modules"].items()
+                                      if path not in verified},
+                "contexts": sorted(set(verified.values())), "normal_default_build": True}
+    if "verification_scope" not in baseline:
+        return None
+    layout = scoped_layout(root, workspace_layout(root), baseline)
+    verified, editable = _verification_modules(layout), _editable_modules(layout)
+    return {
+        "mode": "libraries", "scope_sha256": baseline["verification_scope"]["sha256"],
+        "selected_libraries": list(baseline["verification_scope"]["selected_libraries"]),
+        "verification_modules": dict(verified), "editable_modules": dict(editable),
+        "readonly_imported_modules": {path: module for path, module in verified.items() if path not in editable},
+        "byte_only_modules": {path: module for path, module in layout["modules"].items() if path not in verified},
+    }
+
+
 def module_for_file(root: Path, filename: str, modules: dict | None = None) -> str:
     path = Path(filename)
     if (path.is_absolute() or path.suffix != ".lean" or ".." in path.parts
@@ -356,15 +488,96 @@ def module_for_file(root: Path, filename: str, modules: dict | None = None) -> s
     return modules[filename]
 
 
+def inspect_module_context(root: Path, module: str, *, layout: dict,
+                           tasks: list[dict] | None = None, inventory_only: bool = True) -> dict:
+    """Inspect one real import environment, never unrelated sibling modules."""
+    return inspect_environment(root, tasks or [], layout=layout, module_context=[module],
+                               _inventory_only=inventory_only)
+
+
+def _inspect_contexts(root: Path, tasks: list[dict], *, layout: dict, timings: dict | None,
+                      external_declarations: list[str] | None,
+                      prerequisite_declarations: list[str] | None, inventory_only: bool) -> dict:
+    grouped = {}
+    for task in tasks:
+        module = module_for_file(root, task["lean_file"], layout["modules"])
+        grouped.setdefault(module, []).append(task)
+    # Downstream elaboration can change without changing its source bytes.
+    # Its actual compiled context therefore belongs in the same receipt as
+    # submitted outputs, even when it has no output declaration of its own.
+    for module in _verification_modules(layout).values():
+        grouped.setdefault(module, [])
+    if not grouped:
+        raise ValueError("change-focused inspection has no requested module contexts")
+    result = {"targets": {}, "external_declarations": {}, "prerequisite_declarations": {},
+              "contexts": {}, "project_declarations": [], "project_axioms": [],
+              "project_sorries": [], "project_used_axioms": [], "compiled_modules": [],
+              "imported_modules": [], "issues": [], "inspection_policy": 2}
+    receipts = []
+    for module, selected in sorted(grouped.items()):
+        context_timings = {} if timings is not None else None
+        if timings is not None:
+            timings.setdefault("contexts", {})[module] = context_timings
+        data = inspect_environment(root, selected, layout=layout, timings=context_timings,
+            external_declarations=external_declarations,
+            prerequisite_declarations=prerequisite_declarations, module_context=[module],
+            _inventory_only=inventory_only or not selected, _optional_evidence=True)
+        result["contexts"][module] = data
+        # Targets remain unique manifest identities. Preservation inventories
+        # never use this name-only merge: each stays in its original context.
+        for field in ("targets", "external_declarations", "prerequisite_declarations"):
+            for name, row in data[field].items():
+                if name in result[field] and result[field][name] != row:
+                    raise ContractInspectionError(f"ambiguous {field} witness {name} across module contexts")
+                result[field][name] = row
+        result["project_declarations"].extend({**row, "context": module}
+                                               for row in data["project_declarations"])
+        for field in ("project_axioms", "project_sorries", "project_used_axioms",
+                      "compiled_modules", "imported_modules"):
+            result[field] = sorted(set(result[field]) | set(data[field]))
+        receipts.append(data.get("compiled_receipt"))
+    for field, requested in (("external_declarations", external_declarations or []),
+                             ("prerequisite_declarations", prerequisite_declarations or [])):
+        missing = sorted(set(requested) - set(result[field]))
+        if missing:
+            raise ContractInspectionError("requested evidence not found in any actual output context: "
+                + ", ".join(missing), [{"declaration": name, "code": "not_found"} for name in missing])
+    # Union only independently verified compiled input receipts, not unrelated
+    # declaration environments. Missing receipts disable reuse, not inspection.
+    combined = {}
+    for receipt in receipts:
+        if not formalize_cache.compiled_receipt_current(root, receipt):
+            combined = {}
+            break
+        payload = artifacts.artifact_bytes(root / ".unity" / "artifacts", receipt["artifact_id"])
+        for path, record in json.loads(payload).items():
+            if path in combined and combined[path] != record:
+                raise ContractInspectionError("compiled input changed between module contexts")
+            combined[path] = record
+    result["compiled_receipt"] = formalize_cache.compiled_receipt(root, combined or None)
+    return result
+
+
 def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = None,
                         timings: dict | None = None,
                         external_declarations: list[str] | None = None,
                         prerequisite_declarations: list[str] | None = None,
                         _compiled_before: dict | None = None,
-                        _inventory_only: bool = False) -> dict:
-    # Import every project module: generated/private dependencies are inspected by
-    # the Lean helper, not filtered through the web blueprint presentation model.
-    modules = sorted(set((workspace_modules(root) if layout is None else layout["modules"]).values()))
+                        _inventory_only: bool = False,
+                        module_context: list[str] | None = None,
+                        _optional_evidence: bool = False) -> dict:
+    # New change-focused baselines inspect actual contexts independently;
+    # explicit legacy all/library scopes retain their saved import semantics.
+    layout = workspace_layout(root) if layout is None else layout
+    if layout.get("project_scope") == "changes" and module_context is None:
+        return _inspect_contexts(root, tasks, layout=layout, timings=timings,
+            external_declarations=external_declarations,
+            prerequisite_declarations=prerequisite_declarations, inventory_only=_inventory_only)
+    if module_context is not None and (len(module_context) != 1
+            or module_context[0] not in layout["modules"].values()):
+        raise ValueError("inspection requires one actual project-owned module context")
+    modules = sorted(set(module_context if module_context is not None else _verification_modules(layout).values()))
+    owned = sorted(set(layout["modules"].values())) if module_context is not None else modules
     names = [task["lean_decl"] for task in tasks]
     requested_externals = external_declarations or []
     if (not isinstance(requested_externals, list)
@@ -392,10 +605,12 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
     if (root / ".git").exists():
         try:
             cache_identity = source_identity(root, layout=layout)
-            cache_key = digest({"version": 1, "source": cache_identity["source_sha256"],
+            cache_key = digest({"version": 2, "source": cache_identity["source_sha256"],
                 "environment": cache_identity["environment"], "policy": policy_hash(),
                 "executable": hashlib.sha256(executable.read_bytes()).hexdigest(),
                 "modules": modules, "targets": sorted(names), "externals": externals, "witnesses": witnesses,
+                "owned": owned, "optional_evidence": _optional_evidence,
+                "scope_sha256": layout.get("scope_sha256"),
                 "inventory_only": _inventory_only})
             cached, cache_before = formalize_cache.lookup(root, cache_key)
             if _compiled_before is not None:
@@ -409,6 +624,8 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
             root, ["lake", "env", str(executable), *modules, "--", *names,
                    *(["--external", *externals] if externals else []),
                    *(["--prerequisite", *witnesses] if witnesses else []),
+                   *(["--owned", *owned] if module_context is not None else []),
+                   *(["--optional-evidence"] if _optional_evidence else []),
                    *(["--inventory-only"] if _inventory_only else [])],
             cwd=root, owner="Unity", task_id="contract", serialize_build=True,
             timings=job_timings,
@@ -434,6 +651,56 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
         raise failure(message) from exc
     if not isinstance(data, dict):
         raise failure("formal contract inspector did not return a JSON object")
+    # Failed native imports deliberately return a small error envelope. Show
+    # that cause before validating fields which only successful imports have.
+    issues = data.get("issues", [])
+    if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
+        raise failure("formal contract inspector returned invalid issues")
+    declaration_errors = data.get("declaration_errors", [])
+    if (not isinstance(declaration_errors, list) or any(
+            not isinstance(row, dict) or set(row) != {"declaration", "code"}
+            or row["declaration"] not in set(names) | set(externals) | set(witnesses)
+            or row["code"] not in {"not_found", "project_owned", "not_project_owned"} for row in declaration_errors)):
+        raise failure("formal contract inspector returned invalid prerequisite diagnostics")
+    if issues or result.returncode:
+        inventory = data.get("project_declarations", [])
+        if not isinstance(inventory, list):
+            inventory = []
+        raise failure("formal contract inspection failed: " + artifacts.preview_text(
+            "; ".join(issues) or result.stderr or f"inspector exited {result.returncode} without reporting issues", 2000),
+            declaration_errors)
+    if layout.get("project_scope") in {"libraries", "changes"}:
+        # Check actual kernel imports too: a prebuilt artifact must not smuggle
+        # an excluded owned module into the native environment as a dependency.
+        imported = data.get("imported_modules")
+        if (not isinstance(imported, list)
+                or any(not isinstance(name, str) for name in imported)
+                or not set(modules) <= set(imported)):
+            raise failure("scoped inspection omitted the actual imported module identities")
+        allowed_owned = owned if module_context is not None else modules
+        outside = set(imported).intersection(layout["modules"].values()) - set(allowed_owned)
+        if outside:
+            raise failure("native imports cross the frozen project scope: " + ", ".join(sorted(outside)))
+        compiled = data.get("compiled_modules")
+        if (not isinstance(compiled, list) or len(compiled) != len(imported)
+                or len(set(imported)) != len(imported)
+                or any(not isinstance(path, str) or not Path(path).is_absolute()
+                       or not path.endswith(".olean") for path in compiled)):
+            raise failure("scoped inspection omitted native imported-module provenance")
+        # Names alone cannot classify unmatched project files or stale local
+        # artifacts as external dependencies. Use the native resolver's actual
+        # paths, exempting only manifest-pinned dependency directories.
+        dependencies = (cache_identity["environment"]["dependencies"] if cache_identity is not None
+                        else _dependencies(root))
+        dependency_roots = [Path(row["path"]).resolve() for row in dependencies.values()]
+        project_root, build_root = root.resolve(), (root / layout["build_dir"]).resolve()
+        for module, filename in zip(imported, compiled):
+            path = Path(filename).resolve()
+            in_build = path.is_relative_to(build_root)
+            in_project = path.is_relative_to(project_root) and not any(
+                path.is_relative_to(directory) for directory in dependency_roots)
+            if (module not in allowed_owned and (in_build or in_project)) or (module in allowed_owned and not in_build):
+                raise failure("native module provenance crosses the frozen project scope: " + module)
     inventory = data.get("project_declarations", [])
     if (not isinstance(inventory, list) or any(not isinstance(row, dict)
             or set(row) != {"name", "module", "kind"}
@@ -445,30 +712,17 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
             or len({row["name"] for row in inventory}) != len(inventory)):
         inventory = []
         raise failure("formal contract inspector returned invalid declaration inventory")
-    issues = data.get("issues", [])
-    if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
-        raise failure("formal contract inspector returned invalid issues")
-    declaration_errors = data.get("declaration_errors", [])
-    if (not isinstance(declaration_errors, list) or any(
-            not isinstance(row, dict) or set(row) != {"declaration", "code"}
-            or row["declaration"] not in set(names) | set(externals) | set(witnesses)
-            or row["code"] not in {"not_found", "project_owned", "not_project_owned"} for row in declaration_errors)):
-        raise failure("formal contract inspector returned invalid prerequisite diagnostics")
-    if issues:
-        raise failure("formal contract inspection failed: " + artifacts.preview_text("; ".join(issues), 2000),
-                      declaration_errors)
-    if result.returncode:
-        raise failure("formal contract inspection failed: " + artifacts.preview_text(
-            result.stderr or f"inspector exited {result.returncode} without reporting issues", 2000))
     if set(data.get("targets", {})) != set(names):
         raise failure("formal contract inspection incomplete: target declarations do not match")
     external_records = data.get("external_declarations", {})
-    if not isinstance(external_records, dict) or set(external_records) != set(externals):
+    if (not isinstance(external_records, dict)
+            or (set(external_records) - set(externals) if _optional_evidence
+                else set(external_records) != set(externals))):
         raise failure("formal contract inspection omitted requested external declarations")
     for name, row in external_records.items():
         if (not isinstance(row, dict) or row.get("name") != name
                 or not isinstance(row.get("module"), str) or not row["module"]
-                or row["module"] in modules or not isinstance(row.get("type"), list)
+                or row["module"] in owned or not isinstance(row.get("type"), list)
                 or row.get("target_kind") not in {"theorem", "def", "opaque", "inductive", "constructor", "recursor", "quot", "axiom"}
                 or not isinstance(row.get("level_params"), list)
                 or not isinstance(row.get("signature"), str) or not row["signature"].strip()
@@ -476,7 +730,9 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
             raise failure(f"incomplete kernel evidence for external declaration {name}")
     data["external_declarations"] = external_records
     witness_records = data.get("prerequisite_declarations", {})
-    if not isinstance(witness_records, dict) or set(witness_records) != set(witnesses):
+    if (not isinstance(witness_records, dict)
+            or (set(witness_records) - set(witnesses) if _optional_evidence
+                else set(witness_records) != set(witnesses))):
         raise failure("formal contract inspection omitted requested prerequisite declarations")
     for name, row in witness_records.items():
         if (not isinstance(row, dict) or row.get("name") != name
@@ -528,9 +784,24 @@ def inspect_environment(root: Path, tasks: list[dict], *, layout: dict | None = 
                 return inspect_environment(root, tasks, layout=layout, timings=timings,
                     external_declarations=external_declarations,
                     prerequisite_declarations=prerequisite_declarations, _compiled_before=exc.identity,
-                    _inventory_only=_inventory_only)
+                    _inventory_only=_inventory_only, module_context=module_context,
+                    _optional_evidence=_optional_evidence)
         except (OSError, ValueError):
             pass
+    if module_context is not None and compiled is None and _compiled_before is None and cache_key is not None:
+        # The shared import hint may describe a different sibling context. Pin
+        # this actual closure and inspect once more so multi-context checks can
+        # obtain receipts without requiring a later candidate to warm a cache.
+        try:
+            observed = formalize_cache.compiled_identity(data["compiled_modules"])
+        except (OSError, ValueError, KeyError, TypeError):
+            observed = None
+        if observed is not None:
+            return inspect_environment(root, tasks, layout=layout, timings=timings,
+                external_declarations=external_declarations,
+                prerequisite_declarations=prerequisite_declarations, _compiled_before=observed,
+                _inventory_only=_inventory_only, module_context=module_context,
+                _optional_evidence=_optional_evidence)
     data["compiled_receipt"] = formalize_cache.compiled_receipt(root, compiled)
     return data
 
@@ -574,13 +845,21 @@ def _external_records(records: dict, *, fingerprint_version: int = 1) -> dict:
 
 
 def build_sources(root: Path, *, full: bool = False, layout: dict | None = None,
-                  task_id: str = "contract", timings: dict | None = None) -> dict:
+                  task_id: str = "contract", timings: dict | None = None,
+                  baseline: dict | None = None, tasks: list[dict] | None = None) -> dict:
     layout = workspace_layout(root) if layout is None else layout
-    modules = sorted(set(layout["modules"].values()))
+    if baseline and baseline.get("project_scope") == "changes" and tasks:
+        from . import formalize_delta
+        layout = formalize_delta.apply(root, layout, baseline, tasks=tasks)
+    else:
+        layout = scoped_layout(root, layout, baseline)
+    selected = _verification_modules(layout)
+    modules = sorted(set(selected.values()))
     auxiliary = digest({name: value for name, value in _file_hashes(root, build_dir=layout["build_dir"]).items()
                         if Path(name).suffix != ".lean"})
     receipt_path = root / ".unity" / "formalize-build-inputs.json"
-    receipt = {"auxiliary": auxiliary, "modules": layout["modules"]}
+    receipt = {"auxiliary": auxiliary, "modules": selected,
+               **({"scope_sha256": layout["scope_sha256"]} if "scope_sha256" in layout else {})}
     try:
         previous = json.loads(receipt_path.read_text())
     except (OSError, ValueError):
@@ -592,19 +871,31 @@ def build_sources(root: Path, *, full: bool = False, layout: dict | None = None,
         directory = (root / layout["build_dir"]).resolve()
         if directory == root.resolve() or not directory.is_relative_to(root.resolve()):
             raise ValueError("project build directory must be strictly inside the project")
-        for filename in layout["traces"].values():
+        for module, filename in layout["traces"].items():
+            if module not in modules:
+                continue
             trace = root / filename
             if trace.suffix != ".trace" or not trace.resolve().is_relative_to(directory):
                 raise ValueError("unsafe project module trace path")
             trace.unlink(missing_ok=True)
     # Named module facets guarantee freshness even if a lakefile's default target
     # does not include the theorem module. The full default build is optional.
-    commands = ([["lake", "build"]] if full else []) + (
+    # An unqualified default build can include explicitly excluded executables.
+    # Module facets use Lake's normal dependency graph, so a required broken
+    # build tool is still a real failure, never an ignored optional failure.
+    if layout.get("project_scope") == "libraries":
+        libraries = layout.get("libraries", [])
+        if not libraries or not modules:
+            raise ValueError("library-scoped build has no verified library modules")
+        defaults = [["lake", "build", *libraries]] if full else []
+    else:
+        defaults = [["lake", "build"]] if full else []
+    commands = defaults + (
         [["lake", "--rehash", "build", *[f"+{module}" for module in modules]]] if modules else [])
     outputs = []
     for command in commands:
         job_timings = {} if timings is not None else None
-        stage = "default_build" if command == ["lake", "build"] else "module_build"
+        stage = "default_build" if command in defaults else "module_build"
         if timings is not None:
             timings[stage] = job_timings
         result = formalize_jobs.run(root, command, cwd=root, owner="Unity", task_id=task_id,
@@ -641,6 +932,13 @@ def _baseline_matches(state: dict, contract: dict) -> bool:
 
     original = state.get("project_baseline") or {}
     bound = contract.get("project_baseline") or {}
+    if original.get("version") == 2 or bound.get("version") == 2:
+        from . import formalize_delta
+        return (formalize_project.baseline_is_valid(original)
+                and formalize_project.baseline_is_valid(bound)
+                and bound.get("scope", {}).get("bound") is True
+                and contract.get("inspection_policy") == 2
+                and formalize_delta.baseline_matches(original, bound))
     if not (formalize_project.baseline_is_valid(original)
             and formalize_project.baseline_is_valid(bound)
             and bound.get("scope", {}).get("bound") is True
@@ -677,12 +975,20 @@ def _project_context_issues(root: Path, contract: dict, actual_tasks: list[dict]
         return errors
     if baseline.get("scope", {}).get("bound") is not True:
         return ["existing-project scope has not been bound to exact original targets"]
-    allowed_incomplete = {row["lean_decl"] for row in actual_tasks
+    retained = adopted_output_tasks(contract)
+    allowed_incomplete = {row["lean_decl"] for row in retained
                           if row["task_id"] not in completed}
+    incomplete_files = {}
+    for row in retained:
+        if row["task_id"] not in completed:
+            incomplete_files.setdefault(row["lean_decl"], set()).add(row["lean_file"])
     issues = formalize_project.validate_baseline(
         root, baseline, final=final,
-        allowed_new_paths={row["lean_file"] for row in actual_tasks},
+        allowed_new_paths=adopted_output_paths(contract),
         allowed_incomplete_declarations=allowed_incomplete if not final else set(),
+        allowed_incomplete_files=incomplete_files if not final else {},
+        **({"claimed_declarations": {row["lean_decl"]: row["lean_file"] for row in actual_tasks}}
+           if baseline.get("version") == 2 else {}),
     )
     if final:
         represented = {row["lean_decl"] for row in actual_tasks if row["task_id"] in completed}
@@ -719,7 +1025,8 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
         if not _baseline_matches(state, previous_contract):
             raise ValueError("formalize project preservation context changed during plan refinement")
         baseline = previous_contract["project_baseline"]
-    bound_baseline = formalize_project.bind_scope(baseline, dag)
+    bound_baseline = formalize_project.bind_scope(baseline, dag,
+        **({"root": paths.project_root} if baseline.get("version") == 2 else {}))
     if not formalize_project.baseline_is_valid(bound_baseline):
         raise ValueError("formalize could not bind the target scope to the project baseline")
     if environment is None:
@@ -728,11 +1035,12 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
         # with an explicitly pinned environment remain read-only pure checks.
         formalize_project.require_pinned_inputs(
             paths.project_root, bound_baseline,
-            allowed_new_paths={row["lean_file"] for row in _binding_tasks(previous_contract)}
+            allowed_new_paths=adopted_output_paths(previous_contract)
             if previous_contract else set(),
         )
     contract = _seal_contract({
         "version": 3,
+        **({"inspection_policy": 2} if bound_baseline.get("version") == 2 else {}),
         "fingerprint_version": previous_contract.get("fingerprint_version", 1) if previous_contract else 2,
         **({"representation_review_policy": previous_contract.get("representation_review_policy", 1)}
            if not previous_contract or "representation_review_policy" in previous_contract else {}),
@@ -743,6 +1051,7 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
         "source_main_sha": _git(paths.project_root, "rev-parse", "HEAD") if main_sha is None else main_sha,
         "obligation_ids": sorted(row.get("task_id", row.get("id")) for row in chunks),
         "bindings": {}, "targets": {}, "external_declarations": {}, "prerequisite_declarations": {},
+        "adopted_outputs": adopted_output_records(previous_contract),
     })
     return contract
 
@@ -762,6 +1071,10 @@ def invalidate_bindings(contract: dict, task_ids: set[str]) -> tuple[dict, set[s
     removed binding can only be adopted again by another checked candidate.
     """
     result = copy.deepcopy(contract)
+    # Reopening withdraws semantic acceptance, not the fact that the controller
+    # already admitted these exact outputs to the project. Never derive this
+    # provenance from submissions, reservations, or model-written history.
+    result["adopted_outputs"] = adopted_output_records(contract)
     affected = set(task_ids)
     bindings = result.get("bindings", {})
     targets = result.get("targets", {})
@@ -795,6 +1108,55 @@ def invalidate_bindings(contract: dict, task_ids: set[str]) -> tuple[dict, set[s
 def _binding_tasks(contract: dict) -> list[dict]:
     return [{"task_id": task_id, "lean_decl": output["declaration"], "lean_file": output["file"]}
             for task_id, outputs in contract.get("bindings", {}).items() for output in outputs]
+
+
+def adopted_output_records(contract: dict, *, task_id: str | None = None,
+                           outputs: list[dict] | None = None) -> list[dict]:
+    """Exact controller-adopted provenance; not current meaning or completion.
+
+    Legacy contracts can establish provenance only from their current sealed
+    bindings. A present ledger must be canonical and contain every live binding.
+    The optional extension is used only by checked candidate publication.
+    """
+    live = [{"task_id": owner, **row} for owner, rows in contract.get("bindings", {}).items()
+            for row in normalize_outputs(rows)]
+    raw = contract.get("adopted_outputs", live)
+    if not isinstance(raw, list):
+        raise ValueError("invalid adopted output provenance")
+    normalized = []
+    for row in raw:
+        if (not isinstance(row, dict) or set(row) != {"task_id", "declaration", "file"}
+                or not isinstance(row["task_id"], str) or not row["task_id"].strip()
+                or row["task_id"] != row["task_id"].strip()):
+            raise ValueError("invalid adopted output provenance")
+        output = normalize_outputs([{key: row[key] for key in ("declaration", "file")}])[0]
+        normalized.append({"task_id": row["task_id"], **output})
+    key = lambda row: (row["task_id"], row["declaration"], row["file"])
+    canonical = sorted({key(row): row for row in normalized}.values(), key=key)
+    if "adopted_outputs" in contract and canonical != raw:
+        raise ValueError("noncanonical adopted output provenance")
+    if {key(row) for row in live} - {key(row) for row in canonical}:
+        raise ValueError("adopted output provenance omits a current binding")
+    if outputs is not None:
+        if not isinstance(task_id, str) or not task_id.strip() or task_id != task_id.strip():
+            raise ValueError("adopted output extension requires an exact task")
+        canonical.extend({"task_id": task_id, **row} for row in normalize_outputs(outputs))
+    return sorted({key(row): row for row in canonical}.values(), key=key)
+
+
+def adopted_output_paths(contract: dict) -> set[str]:
+    return {row["file"] for row in adopted_output_records(contract)}
+
+
+def adopted_output_tasks(contract: dict, *, root: Path | None = None) -> list[dict]:
+    """Coverage includes retained files, without requiring removed scaffolds.
+
+    Missing retained files can result from separately checked explicit cleanup;
+    current bindings still undergo their ordinary declaration/existence checks.
+    """
+    return [{"task_id": row["task_id"], "lean_decl": row["declaration"], "lean_file": row["file"]}
+            for row in adopted_output_records(contract)
+            if root is None or (root / row["file"]).exists()]
 
 
 def output_manifest_blockers(contract: dict, *, task_ids: set[str], task_id: str,
@@ -901,14 +1263,17 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
                 issues.extend(row["message"] for row in manifest_issues)
                 raise ValueError(manifest_issues[0]["message"])
             bindings[task_id] = normalize_outputs(proposed_outputs)
+        proposed["adopted_outputs"] = adopted_output_records(
+            contract, task_id=task_id, outputs=proposed_outputs)
         actual_tasks = _binding_tasks(proposed)
         if not actual_tasks:
             reject("no Lean representations have been adopted or proposed", "output_manifest_missing", set(),
                    "Submit the current task's actual Lean declaration/file outputs.")
         layout = workspace_layout(root) if layout is None else layout
+        layout = scoped_layout(root, layout, contract.get("project_baseline"))
         for row in actual_tasks:
             try:
-                module_for_file(root, row["lean_file"], layout["modules"])
+                module_for_file(root, row["lean_file"], _editable_modules(layout))
             except ValueError as exc:
                 reject(str(exc), "output_file_invalid", {row["task_id"]},
                        "Use an existing project-owned Lean source file in the output manifest.")
@@ -1016,7 +1381,7 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
         name, owner = task["lean_decl"], task["task_id"]
         row = targets[name]
         fingerprint = digest(_semantic_record(row, fingerprint_version=fingerprint_version))
-        if row["module"] != module_for_file(root, task["lean_file"], layout["modules"]):
+        if row["module"] != module_for_file(root, task["lean_file"], _editable_modules(layout)):
             checked_issue(f"candidate declaration {name} is not in {task['lean_file']}", "target_wrong_file", {owner},
                           "Correct the output file mapping; explicitly reopen adopted representations before relocating them.")
         if name in contract["targets"] and fingerprint != contract["targets"][name].get("fingerprint"):
@@ -1070,7 +1435,9 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
     if "project_baseline" in contract:
         from . import formalize_project
         try:
-            paths = {row["lean_file"] for row in _binding_tasks(contract)}
+            if contract["project_baseline"].get("version") == 2 and contract.get("inspection_policy") != 2:
+                raise ValueError("change-focused baseline requires context-bound inspection policy 2")
+            paths = adopted_output_paths(contract)
             if proposed_outputs is not None:
                 paths.update(row["file"] for row in normalize_outputs(proposed_outputs))
             formalize_project.require_pinned_inputs(root, contract["project_baseline"], allowed_new_paths=paths)
@@ -1204,9 +1571,11 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
         formalize_project.require_original_branch(paths.project_root, contract["project_baseline"])
         formalize_project.require_pinned_inputs(
             paths.project_root, contract["project_baseline"],
-            allowed_new_paths={row["lean_file"] for row in _binding_tasks(contract)},
+            allowed_new_paths=adopted_output_paths(contract),
         )
         current = source_identity(paths.project_root)
+        coverage = project_verification(paths.project_root, contract["project_baseline"],
+            **({"tasks": adopted_output_tasks(contract, root=paths.project_root)} if contract["project_baseline"].get("version") == 2 else {}))
     except (OSError, ValueError, KeyError, TypeError):
         return False
     source = state.get("input_source") or {}
@@ -1214,6 +1583,7 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
         _baseline_matches(state, contract)
         and contract.get("version") == 3
         and snapshot.get("project_baseline_sha256") == contract["project_baseline"]["sha256"]
+        and snapshot.get("project_verification") == coverage
         and snapshot.get("policy_sha256") == policy_hash()
         and (snapshot.get("passed") is not True
              or formalize_cache.compiled_receipt_current(paths.project_root, snapshot.get("compiled_receipt")))
@@ -1248,6 +1618,18 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
     )
 
 
+def _candidate_build_reusable(root: Path, contract: dict, candidate: dict, current: dict) -> bool:
+    """A changes-mode build receipt includes every actual compiled context."""
+    verification = candidate.get("verification") or {}
+    reusable = (verification.get("status") == "passed"
+                and verification.get("policy_sha256") == policy_hash()
+                and verification.get("source_identity") == current
+                and candidate.get("build", {}).get("returncode") == 0)
+    if reusable and contract.get("project_baseline", {}).get("project_scope") == "changes":
+        reusable = formalize_cache.compiled_receipt_current(root, verification.get("compiled_receipt"))
+    return reusable
+
+
 def verify_final_project(paths, state: dict) -> dict:
     from . import formalize_project
     from .formalize_input import source_matches
@@ -1263,7 +1645,7 @@ def verify_final_project(paths, state: dict) -> dict:
     formalize_project.require_original_branch(root, contract["project_baseline"])
     formalize_project.require_pinned_inputs(
         root, contract["project_baseline"],
-        allowed_new_paths={row["lean_file"] for row in _binding_tasks(contract)},
+        allowed_new_paths=adopted_output_paths(contract),
     )
     before = source_identity(root)
     tasks = list(state["formal_tasks"].values())
@@ -1271,10 +1653,7 @@ def verify_final_project(paths, state: dict) -> dict:
                  if candidate.get("status") == "merged" and candidate.get("main_sha") == before["main_sha"]), {})
     verification = last.get("verification") or {}
     complete_ids = set(state["formal_tasks"])
-    build_reusable = (verification.get("status") == "passed"
-                      and verification.get("policy_sha256") == policy_hash()
-                      and verification.get("source_identity") == before
-                      and last.get("build", {}).get("returncode") == 0)
+    build_reusable = _candidate_build_reusable(root, contract, last, before)
     reusable = (baseline_current and contract.get("version") == 3 and build_reusable
                 and formalize_cache.compiled_receipt_current(root, verification.get("compiled_receipt"))
                 and verification.get("contract_sha256") == formal.get("contract", {}).get("sha256")
@@ -1294,7 +1673,12 @@ def verify_final_project(paths, state: dict) -> dict:
         # source needs no second build. Its current source contract is inspected
         # afresh, including global holes and coverage, before semantic review.
         build = ({"returncode": 0, "reused_candidate": last["candidate_id"]}
-                 if contract.get("version") == 3 and build_reusable else build_sources(root, full=True))
+                 if contract.get("version") == 3 and build_reusable else build_sources(root, full=True,
+                     **({"baseline": contract["project_baseline"]}
+                        if ("verification_scope" in contract.get("project_baseline", {})
+                            or contract.get("project_baseline", {}).get("version") == 2) else {}),
+                     **({"tasks": adopted_output_tasks(contract, root=root)}
+                        if contract.get("project_baseline", {}).get("version") == 2 else {})))
         check = (check_formal_contract(root, formal.get("contract", {}), tasks,
                                        completed=complete_ids, final=True)
                  if not build["returncode"] else
@@ -1322,6 +1706,8 @@ def verify_final_project(paths, state: dict) -> dict:
                 or set(contract.get("bindings", {})) != complete_ids
                 or any(not outputs for outputs in contract.get("bindings", {}).values())):
             issues.append("source obligations lack adopted Lean outputs")
+    coverage = project_verification(root, contract["project_baseline"],
+        **({"tasks": adopted_output_tasks(contract, root=root)} if contract["project_baseline"].get("version") == 2 else {}))
     if source_identity(root) != before:
         issues.append("source changed during final mechanical verification")
     if before["main_sha"] != formal.get("main_sha"):
@@ -1341,6 +1727,7 @@ def verify_final_project(paths, state: dict) -> dict:
         **before,
         "policy_sha256": policy_hash(),
         "project_baseline_sha256": (review_contract.get("project_baseline") or {}).get("sha256"),
+        **({"project_verification": coverage} if coverage is not None else {}),
         "compiled_receipt": check.get("compiled_receipt"),
         "passed": not issues,
         "issues": issues,

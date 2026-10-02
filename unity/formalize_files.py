@@ -131,6 +131,11 @@ def reserve_files(forum_dir: Path, author: str, task_id: str, paths: list[str],
         raise ValueError("share_with must be a list of task IDs")
     share_with = sorted(set(share_with or []) - {task_id})
     with runtime.transaction(forum_dir) as state:
+        baseline = ((state.get("formalization", {}).get("contract") or {}).get("project_baseline")
+                    or state.get("project_baseline"))
+        if baseline is not None:
+            from .formalize_scope import require_writable_paths
+            require_writable_paths(baseline, paths)
         if (state.get("phase") != "formalizing" or task_id not in state["formal_tasks"]
                 or not any(row.get("target") == task_id and row.get("status") in {"claimed", "succeeded"}
                            and runtime.strategy_is_current(state, row) and runtime.participates(row, author)
@@ -172,6 +177,12 @@ def validate_candidate_files(state: dict, candidate: dict, *, changed_paths: lis
     baseline = ((state.get("formalization", {}).get("contract") or {}).get("project_baseline")
                 or state.get("project_baseline"))
     if baseline is not None:
+        from .formalize_scope import require_writable_paths
+        for path in sorted(set(changed) | set(deleted) | {row["file"] for row in candidate.get("outputs", [])}):
+            try:
+                require_writable_paths(baseline, [path])
+            except ValueError as exc:
+                reject("project_scope_violation", str(exc), path)
         # Check immutable Git path metadata BEFORE apply/layout/build. In
         # particular lakefile.lean is executable configuration, not a proof.
         config = set((baseline.get("environment") or {}).get("config", {}))

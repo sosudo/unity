@@ -2,15 +2,18 @@
 FORMALIZE-only kernel contract and axiom extractor. This is deliberately independent of
 the human-readable blueprint extractor, and never applies its name/noise filters.
 
-After building all project modules, Unity runs the cached native inspector:
-  lake env <cache>/contract Module.One Module.Two -- Target.one Target.two
+After building the requested module, change-focused Formalize runs one context:
+  lake env <cache>/contract Module.One -- Target.one --owned Module.One Module.Two
+Legacy all/library coverage can still explicitly import several roots together.
 The same helper can be interpreted with lean --run for equivalence tests.
 
-The module arguments define project ownership; callers MUST separately pin/audit
+Import roots define the declaration inventory. --owned separately supplies the
+project ownership used for transitive meaning/proof dependencies; absent that
+flag ownership defaults to the import roots. Callers MUST separately pin/audit
 all external dependencies and the toolchain. Output is a JSON object containing
-`targets` (keyed by exact declaration name), `issues`, and whole-project
+`targets` (keyed by exact declaration name), `issues`, and root-context
 `project_axioms`/`project_sorries` lists, plus `project_used_axioms` containing
-the transitive axiom dependencies of every project-owned declaration.
+the transitive axiom dependencies of each declaration in those roots.
 The project_sorries list records direct sorryAx
 uses in any project declaration's type or value, so even unused private proof
 holes are visible. The direct axiom and placeholder lists are final-completion
@@ -212,21 +215,25 @@ private partial def collectMeanings (env : Environment) (projects : NameSet)
   modify fun s => { s with records := (n.toString, meaningJson env ci) :: s.records }
   for dep in meaningDeps env ci do collectMeanings env projects dep
 
-private def extract (modules targets externals witnesses : List String)
-    (inventoryOnly : Bool := false) : IO (Json × UInt32) := do
+private def extract (modules targets externals witnesses owned : List String)
+    (inventoryOnly : Bool := false) (optionalEvidence : Bool := false) : IO (Json × UInt32) := do
   let started ← IO.monoMsNow
   initSearchPath (← findSysroot)
   let mods := modules.toArray.map fun a => ({ module := a.toName, importAll := true } : Import)
   let env ← importModules mods {} 0
   let imported ← IO.monoMsNow
-  let projects : NameSet := modules.foldl (fun s a => s.insert a.toName) {}
+  -- Ownership and import roots are different. A single module context may use
+  -- local helpers transitively without importing incompatible sibling roots.
+  let projects : NameSet := (if owned.isEmpty then modules else owned).foldl
+    (fun s a => s.insert a.toName) {}
+  let inventoryModules : NameSet := modules.foldl (fun s a => s.insert a.toName) {}
   let mut projectAxioms : List String := []
   let mut projectSorries : List String := []
   let mut projectRoots : Array Name := #[]
   let mut inventory : Array Json := #[]
   let mut projectRecords : List (String × Json) := []
   for (n, ci) in env.constants.toList do
-    unless (moduleOf env n).any projects.contains do continue
+    unless (moduleOf env n).any inventoryModules.contains do continue
     projectRoots := projectRoots.push n
     inventory := inventory.push (Json.mkObj [
       ("name", Json.str n.toString), ("module", Json.str (((moduleOf env n).getD .anonymous).toString)),
@@ -293,9 +300,10 @@ private def extract (modules targets externals witnesses : List String)
   for target in externals do
     let n := target.toName
     let some ci := env.checked.get.find? n | do
-      issues := issues.push s!"external declaration {target} was not found in the imported kernel"
-      declarationErrors := declarationErrors.push (Json.mkObj [
-        ("declaration", Json.str target), ("code", Json.str "not_found")])
+      unless optionalEvidence do
+        issues := issues.push s!"external declaration {target} was not found in the imported kernel"
+        declarationErrors := declarationErrors.push (Json.mkObj [
+          ("declaration", Json.str target), ("code", Json.str "not_found")])
       continue
     if (moduleOf env n).any projects.contains then
       issues := issues.push s!"external declaration {target} is project-owned; use declaration evidence for this local witness"
@@ -323,9 +331,10 @@ private def extract (modules targets externals witnesses : List String)
   for target in witnesses do
     let n := target.toName
     let some ci := env.checked.get.find? n | do
-      issues := issues.push s!"prerequisite declaration {target} was not found in the imported kernel"
-      declarationErrors := declarationErrors.push (Json.mkObj [
-        ("declaration", Json.str target), ("code", Json.str "not_found")])
+      unless optionalEvidence do
+        issues := issues.push s!"prerequisite declaration {target} was not found in the imported kernel"
+        declarationErrors := declarationErrors.push (Json.mkObj [
+          ("declaration", Json.str target), ("code", Json.str "not_found")])
       continue
     let roots := match ci with
       | .thmInfo _ => usedConstants ci.type
@@ -354,6 +363,7 @@ private def extract (modules targets externals witnesses : List String)
     ("project_declarations", Json.arr inventory),
     ("project_records", Json.mkObj projectRecords),
     ("compiled_modules", toJson compiledModules),
+    ("imported_modules", toJson (env.header.moduleNames.toList.map Name.toString)),
     ("external_declarations", Json.mkObj externalRecords),
     ("prerequisite_declarations", Json.mkObj witnessRecords),
     ("declaration_errors", Json.arr declarationErrors),
@@ -372,19 +382,22 @@ end UnityFormalizeContract
 
 def main (args : List String) : IO UInt32 := do
   let inventoryOnly := args.contains "--inventory-only"
-  let filtered := args.filter (· != "--inventory-only")
+  let optionalEvidence := args.contains "--optional-evidence"
+  let filtered := args.filter fun a => a != "--inventory-only" && a != "--optional-evidence"
   let modules := filtered.takeWhile (· != "--")
   let rest := filtered.dropWhile (· != "--")
   let requested := rest.drop 1
-  let targets := requested.takeWhile fun a => a != "--external" && a != "--prerequisite"
-  let externals := ((requested.dropWhile (· != "--external")).drop 1).takeWhile (· != "--prerequisite")
-  let witnesses := (requested.dropWhile (· != "--prerequisite")).drop 1
+  let isValue := fun (a : String) => !a.startsWith "--"
+  let targets := requested.takeWhile isValue
+  let externals := ((requested.dropWhile (· != "--external")).drop 1).takeWhile isValue
+  let witnesses := ((requested.dropWhile (· != "--prerequisite")).drop 1).takeWhile isValue
+  let owned := ((requested.dropWhile (· != "--owned")).drop 1).takeWhile isValue
   if modules.isEmpty || (targets.isEmpty && !inventoryOnly) then
     IO.println (Json.mkObj [("targets", Json.mkObj []), ("issues", toJson [
       "usage: lake env <contract-executable> Module... -- Target... [--external Declaration...] [--prerequisite Declaration...] [--inventory-only]"])]).compress
     return 1
   try
-    let (result, code) ← UnityFormalizeContract.extract modules targets externals witnesses inventoryOnly
+    let (result, code) ← UnityFormalizeContract.extract modules targets externals witnesses owned inventoryOnly optionalEvidence
     IO.println result.compress
     return code
   catch e =>

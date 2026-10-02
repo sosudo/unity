@@ -1196,6 +1196,8 @@ def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: di
         for field in ("targets", "bindings", "external_declarations", "prerequisite_declarations"):
             if field in previous["contract"] or field != "prerequisite_declarations":
                 contract[field] = deepcopy(previous["contract"].get(field, {}))
+        from .formalize_contract import adopted_output_records
+        contract["adopted_outputs"] = adopted_output_records(previous["contract"])
         for field, kind in (("external_declarations", "library"), ("prerequisite_declarations", "declaration")):
             if field in contract:
                 names = {row["resolution"]["declaration"] for row in spec["prerequisites"]
@@ -2467,6 +2469,10 @@ def finish_formal_merge(
                 raise ValueError("successful merge requires verification under the current policy")
             incremental = current_contract.get("version") == 3
             if incremental:
+                from .formalize_contract import adopted_output_records
+                if adopted_output_records(contract) != adopted_output_records(
+                        current_contract, task_id=task["task_id"], outputs=candidate["outputs"]):
+                    raise ValueError("candidate contract changed controller-adopted output provenance")
                 if (contract.get("sha256") != _contract_digest(contract)
                         or contract.get("solution_candidate") != current_contract["solution_candidate"]
                         or contract.get("solution_sha256") != current_contract["solution_sha256"]
@@ -2641,6 +2647,19 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
         if (not _baseline_matches(state, contract)
                 or report.get("project_baseline_sha256") != contract["project_baseline"]["sha256"]):
             raise ValueError("review snapshot must bind the original existing-project baseline")
+        if contract["project_baseline"].get("policy") == "changes-v1":
+            coverage = report.get("project_verification")
+            if (not isinstance(coverage, dict) or coverage.get("mode") != "changes"
+                    or coverage.get("policy") != "changes-v1"
+                    or coverage.get("inspection_policy") != 2
+                    or coverage.get("baseline_sha256") != contract["project_baseline"]["sha256"]
+                    or coverage.get("normal_default_build") is not True
+                    or not isinstance(coverage.get("verification_modules"), dict)
+                    or not isinstance(coverage.get("byte_only_modules"), dict)
+                    or any(not isinstance(path, str) or not isinstance(module, str)
+                           for path, module in coverage["verification_modules"].items())
+                    or coverage.get("contexts") != sorted(set(coverage["verification_modules"].values()))):
+                raise ValueError("review snapshot must bind current change-focused module contexts")
     if "requirements" in contract:
         if _validate_requirements(contract["requirements"], state["formal_tasks"], source_refs(state)) != formal["requirements"]:
             raise ValueError("requirements ledger differs from the frozen formalization contract")
@@ -2746,6 +2765,9 @@ def record_review_snapshot(forum_dir: Path, report: dict) -> dict:
                           "spec", "spec_sha256", "bindings", "obligation_ids", "project_baseline"):
                 if proposed.get(field) != current.get(field):
                     raise ValueError("final evidence cannot change source, environment or adopted bindings")
+            from .formalize_contract import adopted_output_records
+            if adopted_output_records(proposed) != adopted_output_records(current):
+                raise ValueError("final evidence cannot change controller-adopted output provenance")
             if (set(proposed.get("targets", {})) != set(current.get("targets", {}))
                     or any(proposed["targets"][name].get("fingerprint") != row.get("fingerprint")
                            for name, row in current.get("targets", {}).items())):

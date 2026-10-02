@@ -249,7 +249,7 @@ class InventoryInspectorTests(unittest.TestCase):
                     "project_declarations": [{"name": "Project.original", "module": "Project", "kind": "theorem"}],
                     "project_records": {"Project.original": preserved("Project.original")},
                     "project_axioms": [], "project_sorries": [], "project_used_axioms": []}
-            with patch.object(contract, "workspace_modules", return_value={"Project.lean": "Project"}), \
+            with patch.object(contract, "workspace_layout", return_value={"modules": {"Project.lean": "Project"}}), \
                  patch.object(contract.formalize_native, "executable", return_value=root / "inspector"), \
                  patch.object(contract.formalize_jobs, "run", return_value=subprocess.CompletedProcess(
                      [], 0, json.dumps(data), "")) as run, \
@@ -266,7 +266,7 @@ class InventoryInspectorTests(unittest.TestCase):
             data = {"targets": {}, "issues": [], "external_declarations": {}, "prerequisite_declarations": {},
                     "project_declarations": [{"name": "Project.original", "module": "Project", "kind": "theorem"}],
                     "project_axioms": [], "project_sorries": [], "project_used_axioms": []}
-            with patch.object(contract, "workspace_modules", return_value={"Project.lean": "Project"}), \
+            with patch.object(contract, "workspace_layout", return_value={"modules": {"Project.lean": "Project"}}), \
                  patch.object(contract.formalize_native, "executable", return_value=root / "inspector"), \
                  patch.object(contract.formalize_jobs, "run", return_value=subprocess.CompletedProcess(
                      [], 0, json.dumps(data), "")), \

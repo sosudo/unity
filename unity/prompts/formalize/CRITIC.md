@@ -4,6 +4,24 @@ Read `.unity/forum/formalize/formalization-plan.json` for source references. The
 not a newly generated or independently approved solution paper. Do not edit Lean or supplied sources
 during this independent review.
 
+Check the frozen project verification mode separately from source/mathematical scope.
+The default `project_baseline.project_scope=changes` binds the original project bytes and
+checks submitted outputs and affected existing declarations in the normal build or submitted import
+closure, each in its real module import context.
+It is not a whole-repository semantic audit. Unrelated original modules may contain pre-existing
+holes; they are not source obligations, and their presence alone does not reject this work.
+The completed submitted results must nevertheless have no forbidden/unproved dependencies.
+Check that the current snapshot's delta/affected-context evidence matches the exact merged source.
+For legacy baselines, `project_baseline.verification_scope` records `libraries` coverage when
+selected; absence means legacy `all`. In library mode, machine checks cover the selected library roots and recorded
+project import closure. Excluded auxiliary modules are only preserved byte-for-byte, not verified.
+Do not approve edits to frozen auxiliary files, newly imported excluded project modules, or a claim
+that the entire repository was verified. If source faithfulness requires work outside the frozen
+coverage, report that scope conflict rather than asking workers to expand it. Keep every final
+coverage claim within the exact current machine snapshot and recorded project verification scope.
+Auxiliary modules in the existing import closure are verified but read-only; distinguish them
+from both editable library modules and byte-only excluded sources.
+
 The controller also requests diagnostic review when a formalization round ends with incomplete
 tasks or failed final checks. Read the current snapshot's `passed` flag. A failed snapshot is evidence
 for diagnosis, never authority to approve. Inspect yielded attempts, last-round launch blockers,

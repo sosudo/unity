@@ -128,12 +128,24 @@ async def dispatch(
             return ""
 
     async def spawn_one(agent):
+        # Chunking/critic/retrospective workers use this dispatcher rather than
+        # the formalizing scheduler. Their uvx children need the same scoped
+        # writable tool environment; never fall back to the global tools install.
+        from .config import Paths, find_unity_dir
+        from .formalize_runtime import _agent_runtime_env
+        unity = find_unity_dir(Path(agent_cwd(agent)))
+        runtime_env = {}
+        if unity is not None:
+            runtime_env = _agent_runtime_env(
+                Paths.from_unity_dir(unity.resolve()), log_context or {}, agent.name,
+            )
+        runtime_env.update(env_overrides or {})
         return await spawn(
             agent, _preamble(agent, roster) + brief(agent) + full, task,
             agent_cwd(agent), mcp, subagents=subagents,
             log_context=log_context, mcp_profile=mcp_profile,
             on_normal_completion=on_normal_completion,
-            env_overrides=env_overrides,
+            env_overrides=runtime_env,
         )
 
     results = await asyncio.gather(*(spawn_one(agent) for agent in agents), return_exceptions=True)

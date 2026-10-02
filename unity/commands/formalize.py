@@ -9,7 +9,7 @@ import tempfile
 
 import asyncclick as click
 
-from .. import library, formalize_contract, formalize_jobs, formalize_state, formalize_project
+from .. import library, formalize_contract, formalize_jobs, formalize_state, formalize_project, formalize_scope
 from .. import formalize_worktree as worktree
 from ..config import load_paths
 from ..formalize_input import formalize_paths, require_source_matches, snapshot_sources, scope_bytes
@@ -176,13 +176,15 @@ def _brief_provider(paths, profile: str):
 
 
 def _prepare_formalize_environment(
-    root, *, validate_project: bool = True,
+    root, *, validate_project: bool = True, baseline: dict | None = None,
 ) -> None:
     """Build the existing pinned project; never bootstrap or update its packages."""
     formalize_jobs.terminate(root)
     if validate_project:
         click.echo("Validating Lean project...")
-        result = formalize_contract.build_sources(root, full=True, task_id="resume-preflight")
+        scope_options = {"baseline": baseline} if baseline is not None else {}
+        result = formalize_contract.build_sources(
+            root, full=True, task_id="resume-preflight", **scope_options)
         if result["returncode"]:
             raise ValueError("existing project failed validation: " + result["output"][-3000:])
 
@@ -567,8 +569,10 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
 @click.option("--continue", "continue_", is_flag=True, default=False,
               help="Resume the existing supplied-source formalization state.")
 @click.option("--targets", default=None,
-              help="Existing declaration names or target description; fresh default: All incomplete declarations.")
-async def formalize(continue_, targets=None):
+              help="Existing declaration names or target description; fresh default: formalize the supplied sources in this project.")
+@click.option("--project-scope", type=click.Choice(["changes", "all", "libraries"]), default=None,
+              help="Verification policy: agent changes and affected modules (fresh default), or legacy all/library auditing. Continuation reuses the saved mode.")
+async def formalize(continue_, targets=None, project_scope=None):
     """Fill selected gaps in an existing Lean project without replacing its context."""
     paths = formalize_paths(load_paths())
     paths.forum.mkdir(parents=True, exist_ok=True)
@@ -578,12 +582,12 @@ async def formalize(continue_, targets=None):
         except BlockingIOError as exc:
             raise click.ClickException("another Formalize controller is already running in this project") from exc
         try:
-            await _run_formalize(paths, continue_, targets)
+            await _run_formalize(paths, continue_, targets, project_scope)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-async def _run_formalize(paths, continue_, targets):
+async def _run_formalize(paths, continue_, targets, project_scope=None):
     root = paths.project_root
     max_attempts = _attempt_limit()
     previous = formalize_state.load_state(paths.forum)
@@ -604,6 +608,16 @@ async def _run_formalize(paths, continue_, targets):
         )
     if not fresh and targets is not None and targets.strip() != previous["project_baseline"]["target_scope"]:
         raise click.ClickException("--continue cannot change the original --targets scope")
+    saved_project_scope = "changes" if fresh else formalize_scope.mode(previous["project_baseline"])
+    if not fresh and project_scope is not None and project_scope != saved_project_scope:
+        raise click.ClickException("--continue cannot change the original --project-scope mode")
+    selected_project_scope = project_scope or saved_project_scope
+    saved_contract = previous.get("formalization", {}).get("contract") or {}
+    if not fresh and saved_contract and not formalize_contract._baseline_matches(previous, saved_contract):
+        raise click.ClickException(
+            "saved Formalize contract does not match the original project baseline; "
+            "refusing continuation before project execution"
+        )
     if not paths.unity_md.is_file():
         raise click.ClickException("Missing .unity/UNITY.md; initialize the project or restore its scope/instructions file")
     try:
@@ -631,8 +645,14 @@ async def _run_formalize(paths, continue_, targets):
             # Clear only the prior invocation's stop before owned checks begin.
             # A stop posted during the build/inventory must survive to the loop.
             (paths.unity / "stop-requested").unlink(missing_ok=True)
-            click.echo("Capturing and validating the existing Lean project...")
-            baseline = formalize_project.capture_baseline(root, target_scope=targets or "All")
+            click.echo("Recording the original project and checking its normal build..."
+                       if selected_project_scope == "changes" else
+                       "Capturing and validating the existing Lean project...")
+            scope_options = {"project_scope": selected_project_scope} if selected_project_scope != "all" else {}
+            default_targets = ("Formalize the supplied sources within this existing project."
+                               if selected_project_scope == "changes" else "All")
+            baseline = formalize_project.capture_baseline(
+                root, target_scope=targets or default_targets, **scope_options)
         else:
             baseline = previous["project_baseline"]
             formalize_project.require_original_branch(root, baseline)
@@ -644,7 +664,11 @@ async def _run_formalize(paths, continue_, targets):
                 root, contract.get("project_baseline") or baseline,
                 allowed_new_paths={row["lean_file"] for row in formalize_contract._binding_tasks(contract)})
             (paths.unity / "stop-requested").unlink(missing_ok=True)
-            _prepare_formalize_environment(root)
+            verification_baseline = contract.get("project_baseline") or baseline
+            if formalize_scope.mode(verification_baseline) in {"changes", "libraries"}:
+                _prepare_formalize_environment(root, baseline=verification_baseline)
+            else:
+                _prepare_formalize_environment(root)
             if contract:
                 issues = formalize_contract._project_context_issues(
                     root, contract, formalize_contract._binding_tasks(contract),

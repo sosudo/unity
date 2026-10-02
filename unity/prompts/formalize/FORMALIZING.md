@@ -3,6 +3,23 @@ Lean definitions, structures, instances, statements and proofs collaboratively o
 faithfully against the user-supplied source in `.unity/source/` and scope in `.unity/UNITY.md`.
 `.unity/forum/formalize/formalization-plan.json` identifies the exact source snapshot and source references.
 There is no generated solution paper or informal-solving phase. Do not edit the supplied source.
+Read the plan's `project_baseline.project_scope` before choosing files or imports. The default
+`changes` policy preserves original files/configuration/dependencies and verifies your submitted
+outputs in their actual module import contexts. Existing modules you modify and affected downstream
+declarations in the normal build or your submitted import closure are compared to the immutable
+original snapshot on demand. Preserve existing commands
+outside authorized edits; appending a helper does not grant whole-file rewrite rights. Unrelated
+old holes and optional libraries need not be fixed, but your completed results cannot depend on
+old holes or forbidden axioms. Reserve every output file; do not change build configuration.
+For legacy runs, read `project_baseline.verification_scope`: if absent, coverage is `all`;
+if its mode is `libraries`, work is confined to the recorded library
+roots and their existing project import closure. Excluded auxiliary project modules are frozen
+byte-for-byte, not verified Lean context. Do not edit them or introduce imports of previously
+excluded project modules, even to obtain a convenient prerequisite. New support modules must stay
+inside the permitted library scope. Report a scope conflict instead of expanding it or changing
+build configuration. Library-scoped acceptance is not whole-project verification.
+Among existing modules, only recorded `editable_modules` may be changed. Auxiliary modules already inside the import
+closure are machine-checked but remain read-only; do not edit or claim their declarations.
 Coordinate through the formalization Forum using `formalize_brief`, `formalize_status`,
 and `finalize_formalization`.
 

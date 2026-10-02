@@ -8,12 +8,17 @@ The source is supplied by the user; there is no generated solution paper or info
 Do not rewrite, replace, or silently correct the supplied source.
 
 This is an EXISTING Lean project, not a fresh paper formalization. Read the supplied
-`project_baseline`: it freezes the branch, environment, declaration types and meanings, and
+`project_baseline`: it freezes the original project, environment and
 requested `target_scope`. Reuse the project's namespaces, structures, instances and completed
 lemmas. Do not broaden the job to the entire paper. Plan only requested incomplete targets
 and their necessary missing prerequisites; classify other source material as reference/excluded.
 For initial chunking include top-level `existing_targets`, a list of exact qualified existing
-declaration names. For All/explicit scope copy the baseline selection exactly. For a natural-language
+declaration names. In changes mode, locate each selected existing declaration in a corresponding
+chunk's `outputs` entry: `{"declaration":"Existing.name","lean_file":"Existing/File.lean"}`.
+These entries identify ORIGINAL source locations for preservation checks; they do not adopt
+new output declarations or require a Lean scaffold. For new-only work use `existing_targets: []`.
+For a bound All/explicit scope copy the baseline selection exactly; for an unresolved explicit scope
+select only the requested names and their original modules. For a natural-language
 selection, identify ALL matching incomplete declarations and explain their correspondence in
 the requirements and informal statements. Do not select a completed declaration for rewriting.
 Selected declarations must keep their original type and namespace. Proof holes may be filled;
@@ -21,6 +26,26 @@ an in-scope axiom may become a proved theorem of the SAME type. New support decl
 allowed, but cannot stand in for completing the existing targets. A mismatch between the source
 and an existing target is a blocker to report, not permission to change its statement.
 Replans preserve the selected existing targets mechanically; never change that selection.
+
+Project verification coverage is a separate frozen choice from mathematical `target_scope`.
+The default `project_baseline.project_scope=changes` checks the changes you propose, not every
+old module. There is no up-front whole-project declaration inventory: an empty
+`existing_incomplete_declarations` map does NOT mean the project has no holes. Read the relevant
+source files; the controller resolves original target meanings from the immutable baseline when
+binding your plan. Unrelated old holes and optional libraries are not extra tasks. Preserve
+original commands and definitions outside authorized completions; new support declarations are allowed.
+Do not claim the whole repository was kernel-audited. Actual outputs are checked in their real
+module import contexts, and affected existing declarations are compared before and after changes.
+For legacy baselines, read `project_baseline.verification_scope` when present; absence means legacy
+`all` coverage. In `libraries` mode, `selected_libraries` and `verification_modules` identify the
+declared library roots and their existing project import closure. Other project modules are
+frozen auxiliary files: their bytes are preserved, not claimed to be machine-verified.
+Do not select declarations in those excluded modules, propose editing them, or add imports that
+pull a previously excluded project module into the verification closure. If the requested source
+requires that expansion, report the scope conflict; no replan may silently enlarge project coverage.
+Do not describe a library-scoped result as verification of the entire repository.
+Among existing modules, only `editable_modules` may be changed: an auxiliary module already imported by a library is
+verified but remains read-only. Do not select its declarations for completion.
 
 Produce the assigned draft only; do not generate Lean files or a compilable
 scaffold. No Lean builds, proof search, import minimization, or theorem proving are required for chunking.
@@ -116,8 +141,10 @@ Copy the binding fields `solution_candidate` and `solution_sha256` exactly from
 the supplied formalization plan. These compatibility names identify the supplied source snapshot and
 bundle hash, not a newly authored or independently approved paper. Copy `source_components` from the
 plan's source-reference IDs exactly; put section/page/theorem locations in anchors instead of inventing
-new source IDs. Do not choose mandatory `lean_decl` or `lean_file` targets: output declarations and
-files are recorded by formalizers in versioned implementation candidates.
+new source IDs. Do not choose mandatory Lean names/files for NEW results: output declarations and
+files are recorded by formalizers in versioned implementation candidates. The original-location
+entries for selected EXISTING targets above are the exception. Once bound, replans keep the sealed
+selection without repeating these original-location entries.
 
 For initial chunking, write this schema:
 
@@ -149,6 +176,7 @@ For initial chunking, write this schema:
     {
       "id": "stable-task-id",
       "title": "short title",
+      "outputs": [{"declaration": "Existing.Project.target", "lean_file": "Existing/Project.lean"}],
       "predicted_kind": "theorem",
       "informal_statement": "Precise informal statement, or the definition of an object",
       "informal_proof": "The source proof or construction; null when none is supplied",

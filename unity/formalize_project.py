@@ -134,15 +134,19 @@ def _require_editable_targets(selected, records: dict, holes: set[str]) -> None:
                          + ", ".join(sorted(unsupported)))
 
 
-def _initial_scope(target_scope: str, records: dict, holes: set[str]) -> dict:
+def _initial_scope(target_scope: str, records: dict, holes: set[str], *, eligible: set[str] | None = None) -> dict:
     if not isinstance(target_scope, str) or not target_scope.strip():
         raise ValueError("target scope must be nonempty")
     text = target_scope.strip()
+    eligible = set(records) if eligible is None else eligible
     if text.lower() == "all":
-        _require_editable_targets(holes, records, holes)
-        return {"mode": "all", "existing_targets": sorted(holes), "bound": True}
+        selected = holes & eligible
+        _require_editable_targets(selected, records, holes)
+        return {"mode": "all", "existing_targets": sorted(selected), "bound": True}
     tokens = [token for token in re.split(r"[,\s]+", text) if token]
     if tokens and all(token in records for token in tokens):
+        if set(tokens) - eligible:
+            raise ValueError("existing targets are read-only auxiliary declarations: " + ", ".join(sorted(set(tokens) - eligible)))
         _require_editable_targets(set(tokens), records, holes)
         return {"mode": "explicit", "existing_targets": sorted(set(tokens)), "bound": True}
     # Names-only syntax with an unknown identifier is likely a typo, not license
@@ -154,13 +158,19 @@ def _initial_scope(target_scope: str, records: dict, holes: set[str]) -> dict:
     return {"mode": "natural", "existing_targets": [], "bound": False}
 
 
-def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | None = None) -> dict:
+def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | None = None,
+                     *, project_scope: str = "all") -> dict:
     """Build and freeze a clean, existing project before any agent dispatch.
 
     The optional native receipt is an internal testing/reuse hook; it is never an
     agent-supplied tool argument. Native build/environment checks still run.
     """
-    from . import formalize_contract as contract
+    from . import formalize_contract as contract, formalize_scope
+    if project_scope == "changes":
+        from . import formalize_delta
+        if inspection is not None:
+            raise ValueError("change-focused baselines do not accept a whole-project inventory")
+        return formalize_delta.capture(root, target_scope)
     root = Path(root).resolve()
     _require_clean(root)
     head = _git(root, "rev-parse", "HEAD")
@@ -168,6 +178,8 @@ def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | N
     if not branch:
         raise ValueError("existing-project baseline requires a named branch")
     layout = contract.workspace_layout(root)
+    policy = formalize_scope.capture(root, layout, project_scope)
+    layout = formalize_scope.apply(root, layout, policy)
     before = contract._file_hashes(root, build_dir=layout["build_dir"])
     tracked = _tracked(root)
     uncopied = set(before) - set(tracked)
@@ -181,6 +193,8 @@ def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | N
     if inspection is None:
         inspection = contract.inspect_environment(root, [], layout=layout, _inventory_only=True)
     records = _records(inspection)
+    if any(row["module"] not in set(layout["verification_modules"].values()) for row in records.values()):
+        raise ValueError("native preservation inventory escaped the verification scope")
     holes = set(inspection["project_axioms"]) | set(inspection["project_sorries"])
     if holes - records.keys():
         raise ValueError("native hole inventory contains unaccounted project declarations")
@@ -189,15 +203,21 @@ def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | N
             or before != contract._file_hashes(root, build_dir=layout["build_dir"])
             or environment != contract.environment_identity(root)):
         raise ValueError("project inputs changed while capturing the existing-project baseline")
+    eligible = {name for name, row in records.items() if row["module"] in set(layout["editable_modules"].values())}
     return _seal({"version": 1, "project_root": str(root), "branch": branch, "head": head, "files": before,
                   "tracked_files": tracked, "environment": environment, "layout": layout,
                   "declarations": records, "target_scope": target_scope.strip(),
-                  "scope": _initial_scope(target_scope, records, holes),
+                  "scope": _initial_scope(target_scope, records, holes, eligible=eligible),
+                  **({"verification_scope": policy} if project_scope == "libraries" else {}),
                   **{key: sorted(inspection[key]) for key in
                      ("project_axioms", "project_sorries", "project_used_axioms")}})
 
 
 def baseline_errors(baseline: dict) -> list[str]:
+    from . import formalize_scope
+    if isinstance(baseline, dict) and baseline.get("version") == 2:
+        from . import formalize_delta
+        return formalize_delta.errors(baseline)
     if not isinstance(baseline, dict) or baseline.get("version") != 1:
         return ["existing-project baseline is missing or unsupported"]
     expected = _seal(baseline)["sha256"]
@@ -223,11 +243,26 @@ def baseline_errors(baseline: dict) -> list[str]:
             or not set(baseline["scope"]["existing_targets"]) <= baseline["declarations"].keys()):
         return ["existing-project baseline has invalid scope/declaration evidence"]
     try:
+        if baseline["layout"].get("project_scope") == "libraries" and "verification_scope" not in baseline:
+            return ["library baseline is missing its verification scope"]
+        if "verification_scope" in baseline:
+            issues = formalize_scope.errors(baseline["verification_scope"], baseline["layout"])
+            if issues:
+                return issues
+            policy = baseline["verification_scope"]
+            if policy["mode"] != "libraries":
+                return ["unexpected stored verification scope mode"]
+            verified = set(policy["verification_modules"].values())
+            editable = set(policy["editable_modules"].values())
+            if (any(row.get("module") not in verified for row in baseline["declarations"].values())
+                    or any(baseline["declarations"][name].get("module") not in editable
+                           for name in baseline["scope"]["existing_targets"])):
+                return ["baseline declaration/target crosses the verification boundary"]
         _records({"project_records": baseline["declarations"],
                   "project_declarations": [{"name": name, "module": row["module"], "kind": row["target_kind"]}
                                            for name, row in baseline["declarations"].items()],
                   **{key: baseline[key] for key in ("project_axioms", "project_sorries", "project_used_axioms")}})
-    except (ValueError, KeyError, TypeError):
+    except (ValueError, KeyError, TypeError, AttributeError):
         return ["existing-project baseline has incomplete native declaration evidence"]
     return []
 
@@ -251,7 +286,7 @@ def require_pinned_inputs(root: Path, baseline: dict, *, allowed_new_paths=()) -
     inspect dependency sources before any Lake configuration/elaboration runs.
     This is preservation checking, not an adversarial Lean execution sandbox.
     """
-    from . import formalize_contract as contract
+    from . import formalize_contract as contract, formalize_scope
     errors = baseline_errors(baseline)
     if errors:
         raise ValueError("; ".join(errors))
@@ -260,6 +295,7 @@ def require_pinned_inputs(root: Path, baseline: dict, *, allowed_new_paths=()) -
     if any(not isinstance(path, str) or not _safe_path(path) or Path(path).suffix != ".lean"
            for path in allowed):
         raise ValueError("invalid controller-approved supporting source path")
+    formalize_scope.require_writable_paths(baseline, allowed)
 
     def file_hash(name: str) -> str:
         if not _safe_path(name):
@@ -278,7 +314,8 @@ def require_pinned_inputs(root: Path, baseline: dict, *, allowed_new_paths=()) -
         raise ValueError("pinned project toolchain/build configuration changed before Lake execution")
 
     selected = set(baseline["scope"]["existing_targets"])
-    modules = {baseline["declarations"][name]["module"] for name in selected}
+    modules = {baseline["declarations"][name]["module"] for name in selected
+               if name in baseline["declarations"]}
     writable = {name for name, module in baseline["layout"]["modules"].items() if module in modules}
     writable.update(allowed)
     for name, expected in baseline["files"].items():
@@ -290,6 +327,13 @@ def require_pinned_inputs(root: Path, baseline: dict, *, allowed_new_paths=()) -
             raise ValueError(f"pinned project input changed before Lake execution: {name}")
     if contract._dependencies(root) != baseline["environment"].get("dependencies", {}):
         raise ValueError("pinned dependency source bytes changed before Lake execution")
+    if baseline.get("version") == 2:
+        from . import formalize_delta
+        current_files = contract._file_hashes(root, build_dir=baseline["layout"]["build_dir"])
+        extra = set(current_files) - set(baseline["files"]) - allowed
+        if extra:
+            raise ValueError("unapproved new project input before Lake execution: " + ", ".join(sorted(extra)))
+        formalize_delta.require_source_edits(root, baseline, allowed_new_paths=writable)
 
 
 def _output_names(dag: dict) -> set[str]:
@@ -305,7 +349,7 @@ def _output_names(dag: dict) -> set[str]:
     return names
 
 
-def bind_scope(baseline: dict, dag: dict) -> dict:
+def bind_scope(baseline: dict, dag: dict, *, root: Path | None = None) -> dict:
     """Bind natural-language scope to exact planned existing names once.
 
     Mechanical binding only grants completion rights to pre-existing holes. The
@@ -314,6 +358,9 @@ def bind_scope(baseline: dict, dag: dict) -> dict:
     errors = baseline_errors(baseline)
     if errors:
         raise ValueError("; ".join(errors))
+    if baseline.get("version") == 2:
+        from . import formalize_delta
+        return formalize_delta.bind_scope(root, baseline, dag)
     result = copy.deepcopy(baseline)
     outputs = _output_names(dag)
     existing_outputs = outputs & baseline["declarations"].keys()
@@ -331,6 +378,11 @@ def bind_scope(baseline: dict, dag: dict) -> dict:
                              + ", ".join(sorted(selected - incomplete)))
         scope.update(existing_targets=sorted(selected), bound=True)
     selected = set(scope["existing_targets"])
+    policy = baseline.get("verification_scope")
+    if policy is not None:
+        editable = set(policy["editable_modules"].values())
+        if any(baseline["declarations"][name]["module"] not in editable for name in selected):
+            raise ValueError("plan cannot select read-only auxiliary declarations")
     _require_editable_targets(selected, baseline["declarations"],
                               set(baseline["project_axioms"]) | set(baseline["project_sorries"]))
     if set(proposed) != selected:
@@ -353,17 +405,24 @@ def _preserved_meaning(row: dict) -> dict:
 
 
 def validate_baseline(root: Path, baseline: dict, inspection: dict | None = None, *,
-                      final: bool = False, allowed_new_paths=(), allowed_incomplete_declarations=()) -> list[str]:
+                      final: bool = False, allowed_new_paths=(), allowed_incomplete_declarations=(),
+                      claimed_declarations=None, allowed_incomplete_files=None) -> list[str]:
     """Check original project preservation without changing sources or Git state.
 
     Caller builds fresh inputs before inspection. Allowed new paths/placeholder
     names must come from controller-validated manifests, never unchecked prose.
     """
-    from . import formalize_contract as contract
+    from . import formalize_contract as contract, formalize_scope
     errors = baseline_errors(baseline)
     if errors:
         return errors
     root = Path(root).resolve()
+    if baseline.get("version") == 2:
+        from . import formalize_delta
+        return formalize_delta.validate(root, baseline, inspection, final=final,
+            allowed_new_paths=allowed_new_paths,
+            allowed_incomplete_declarations=allowed_incomplete_declarations,
+            claimed_declarations=claimed_declarations, allowed_incomplete_files=allowed_incomplete_files)
     selected = set(baseline["scope"]["existing_targets"])
     if final and not baseline["scope"].get("bound"):
         errors.append("existing-project scope has not been bound to exact targets")
@@ -380,12 +439,20 @@ def validate_baseline(root: Path, baseline: dict, inspection: dict | None = None
         if _git(root, "merge-base", "--is-ancestor", baseline["head"], "HEAD"):
             errors.append("current project no longer descends from the preserved baseline")
         layout = contract.workspace_layout(root)
+        if baseline.get("verification_scope") is not None:
+            layout = formalize_scope.apply(root, layout, baseline["verification_scope"])
+            if new_paths - set(layout["editable_modules"]):
+                raise ValueError("supporting outputs must be owned by selected Lean libraries: "
+                                 + ", ".join(sorted(new_paths - set(layout["editable_modules"]))))
         current_files = contract._file_hashes(root, build_dir=layout["build_dir"])
         if contract.environment_identity(root) != baseline["environment"]:
             errors.append("existing-project toolchain, build configuration or dependency bytes changed")
         if inspection is None:
             inspection = contract.inspect_environment(root, [], layout=layout, _inventory_only=True)
         records = _records(inspection)
+        if baseline.get("verification_scope") is not None and any(
+                row["module"] not in set(layout["verification_modules"].values()) for row in records.values()):
+            raise ValueError("native preservation inventory escaped the verification scope")
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         return errors + ["cannot verify existing-project preservation: " + str(exc)]
     old = baseline["declarations"]
@@ -438,7 +505,19 @@ def validate_baseline(root: Path, baseline: dict, inspection: dict | None = None
         errors.append("new project axioms: " + ", ".join(sorted(new_axioms)))
     permitted_sorries = set(baseline["project_sorries"])
     if not final:
-        permitted_sorries.update(allowed_incomplete_declarations)
+        permitted = set(allowed_incomplete_declarations)
+        if allowed_incomplete_files is not None:
+            if (not isinstance(allowed_incomplete_files, dict)
+                    or any(not isinstance(name, str) or not isinstance(files, (set, list, tuple))
+                           or any(not isinstance(path, str) or path not in new_paths for path in files)
+                           for name, files in allowed_incomplete_files.items())):
+                return errors + ["invalid exact-file placeholder provenance"]
+            permitted &= {name for name, files in allowed_incomplete_files.items()
+                          if name in records and records[name]["target_kind"] == "theorem"
+                          and any(layout["modules"].get(path) == records[name]["module"] for path in files)
+                          and '"sorryAx"' not in json.dumps([
+                              records[name]["type"], records[name]["declaration_meaning"]])}
+        permitted_sorries.update(permitted)
     new_sorries = set(inspection["project_sorries"]) - permitted_sorries
     if new_sorries:
         errors.append("new out-of-scope proof holes: " + ", ".join(sorted(new_sorries)))
