@@ -519,6 +519,14 @@ def validate_snapshot(state: dict, report: dict) -> None:
     contract = state.get("formalization", {}).get("contract") or {}
     validate_contract(contract)
     baseline = state.get("project_baseline") or {}
+    local_mappings = report.get("group_mapping_content_sha256")
+    local_mapping_version = report.get("local_mapping_identity_version")
+    persisted_legacy = (local_mapping_version is None and local_mappings is None
+                        and state.get("review_snapshots", {}).get(report.get("snapshot_id")) == report)
+    if (not persisted_legacy and (local_mapping_version != 1 or type(local_mapping_version) is not int
+            or local_mappings != {key: api.digest(api.migration_group_mapping_content(contract, key))
+                                 for key in contract["task_bindings"]})):
+        raise ValueError("machine review has stale local correspondence identities")
     if (not api._baseline_matches(state, contract) or report.get("migration_policy") != 2
             or report.get("inspection_policy") != 5 or report.get("policy_sha256") != api.policy_hash()
             or report.get("project_baseline_sha256") != baseline.get("sha256")
@@ -593,6 +601,9 @@ def verify_final(paths, state: dict) -> dict:
         "project_verification": api.project_verification(paths.project_root, baseline),
         "contract_sha256": contract["sha256"], "mapping_sha256": contract["mapping_sha256"],
         "original_index_sha256": contract["original_index_sha256"],
+        "local_mapping_identity_version": 1,
+        "group_mapping_content_sha256": {key: api.digest(api.migration_group_mapping_content(contract, key))
+                                          for key in contract["task_bindings"]},
         "compiled_receipt": check_result.get("compiled_receipt"),
         "module_receipts": check_result.get("module_receipts", {}),
         "verified_targets": check_result.get("verified_targets", {}),

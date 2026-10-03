@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import patch
 from unity.forum import bump_server as forum
 from unity import bump_spawn
+from unity.bump_provider import BumpProviderFailure
 
 
 class ForumTests(unittest.TestCase):
@@ -24,6 +25,22 @@ class ForumTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 forum._author("Luna2")
 
-    def test_operational_errors_are_not_invisible_restarts(self):
+    def test_unclassified_operational_errors_do_not_authorize_restarts(self):
+        # Text alone does not make a controller/permission fault retryable.
         for message in ("timeout", "connection closed", "quota exhausted", "approval unavailable"):
             self.assertTrue(bump_spawn._give_up(RuntimeError(message), 1))
+
+    def test_identified_transient_transport_errors_use_existing_retry_cap(self):
+        with patch.dict(os.environ, {"MAX_ATTEMPTS": "3"}):
+            for category, status in (("rate_limited", 429), ("provider_unavailable", 503)):
+                failure = BumpProviderFailure(category, provider="freeinference", status=status)
+                self.assertFalse(bump_spawn._give_up(failure, 1))
+                self.assertFalse(bump_spawn._give_up(failure, 2))
+                self.assertTrue(bump_spawn._give_up(failure, 3))
+
+    def test_native_policy_and_auth_errors_remain_fatal_before_retry_cap(self):
+        with patch.dict(os.environ, {"MAX_ATTEMPTS": "5"}):
+            for failure in (
+                    BumpProviderFailure("native_mcp_required_tool_missing", provider="native_mcp"),
+                    BumpProviderFailure("authentication_or_access_denied", provider="freeinference", status=401)):
+                self.assertTrue(bump_spawn._give_up(failure, 1))

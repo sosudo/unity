@@ -246,8 +246,8 @@ def prepare(paths: Paths, version: str, dependency_pins: dict[str, str], *, proj
     migration = bump_migration_project.capture_build_scope(original, migration)
     record = {**record, "migration": migration}
     _json(pointer, record)
-    graph = bump_migration_project.compiler_modules(original, scope=migration["scope"])
-    _preparation_event(target_paths, run_id, "original_index_started", module_count=len(graph))
+    _preparation_event(target_paths, run_id, "original_index_started",
+                       module_count=len(migration["scope"]["selected_modules"]))
     started = time.monotonic()
     try:
         index_receipt = bump_inventory.capture_original_index(original, migration["scope"], artifact_dir=target_paths.artifacts)
@@ -256,6 +256,10 @@ def prepare(paths: Paths, version: str, dependency_pins: dict[str, str], *, proj
         _preparation_event(target_paths, run_id, "original_index_failed", error_type=type(exc).__name__,
                            elapsed_seconds=time.monotonic() - started)
         raise
+    # The index already binds the one native compiler-graph capture. Repeating
+    # --deps for every original module adds work but no independent evidence.
+    graph = {module: {"path": row["path"], "imports": list(row["imports"]), "compiler_derived": True}
+             for module, row in index["modules"].items()}
     _preparation_event(target_paths, run_id, "original_index_finished", module_count=len(index["modules"]),
                        occurrence_count=len(index["occurrences"]), elapsed_seconds=time.monotonic() - started,
                        index_sha256=index["index_sha256"])

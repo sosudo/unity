@@ -82,6 +82,7 @@ def policy_hash() -> str:
         "bump_native.py", "bump_jobs.py", "bump_cache.py",
         "bump_project.py", "bump_delta.py", "bump_scope.py", "bump_files.py", "bump_input.py",
         "bump_migration_contract.py", "bump_inspect.lean", "bump_migration_project.py", "bump_bootstrap.py",
+        "bump_planner.py", "bump_diagnostics.py",
         "bump_migration_defaults.lean",
         "bump_checker_v2.py", "bump_inventory.py", "bump_inventory.lean",
     )}
@@ -1670,6 +1671,34 @@ def migration_source_identity_v2(root: Path, contract: dict) -> dict:
     from . import bump_project
     bump_project.require_pinned_inputs(root, baseline)
     return source_identity(root, layout=baseline["layout"])
+
+
+def migration_group_mapping_content(contract: dict, task_id: str) -> dict:
+    """Task-local correspondence intent, never a build or acceptance receipt.
+
+    Global contract/mapping hashes and artifact identifiers intentionally do not
+    make an unrelated group a new repair input. Exact evidence is still checked
+    under the current complete contract at every integration and final review.
+    """
+    binding = contract.get("task_bindings", {}).get(task_id)
+    if not binding:
+        raise ValueError("unknown migration execution group")
+    originals = set(binding["obligation_ids"])
+    mappings = []
+    for row in contract.get("mapping", {}).values():
+        if not originals.intersection(row.get("original_ids", [])):
+            continue
+        mappings.append({
+            "original_ids": sorted(row["original_ids"]), "mode": row["mode"],
+            "targets": sorted(copy.deepcopy(row["targets"]), key=lambda value: digest(value)),
+            # Mapping evidence is checked by content SHA when adopted. Artifact
+            # aliases are not new intent, but changed evidence bytes are.
+            "evidence_sha256": sorted({ref["sha256"] for ref in row.get("evidence_refs", [])}),
+            **{key: row[key] for key in ("relation", "reason") if key in row},
+        })
+    return {"version": 1, "binding": copy.deepcopy(binding),
+            "outputs": copy.deepcopy(contract.get("bindings", {}).get(task_id, [])),
+            "mappings": sorted(mappings, key=lambda value: digest(value))}
 
 
 def validate_mapping_v2(contract: dict, mapping=None, task_bindings=None) -> None:

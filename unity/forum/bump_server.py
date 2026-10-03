@@ -939,6 +939,10 @@ def bump_brief(author: str, task_id: str = "") -> str:
             task = tasks[target]
             lines.append(f"- {target} [{task.get('status')}]: {task.get('title') or task.get('lean_decl')} "
                          f"{task.get('description', '')[:220]}")
+            if migration_focus := task.get("migration_focus"):
+                lines.append(f"  Private declaration focus: {migration_focus.get('subtask_id') or 'finalize complete module'}; "
+                             "checkpoint with refine_migration(checkpoint_subtask_id=..., checkpoint_summary=...). "
+                             "Checkpointed chunks are not accepted outputs; submit only the complete module.")
         lines.append("Exact requirements, source citations and evidence: bump_task(task_id).")
         owned_files = [(path, row) for path, row in bump_files.reservations(state).items()
                        if focus.intersection({row["owner_task"], *row["shared_with"]})]
@@ -1691,6 +1695,11 @@ def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
                                state: dict, *, pending: bool = False,
                                repair_handoff: dict | None = None) -> dict:
     assignment = {"task_id": task_id, "task_revision": revision, "pending": pending}
+    task = state.get("formal_tasks", {}).get(task_id, {})
+    if task.get("task_input_sha256"):
+        assignment["task_input_sha256"] = task["task_input_sha256"]
+    if task.get("migration_focus"):
+        assignment["migration_subtask_id"] = task["migration_focus"]["subtask_id"]
     if repair_handoff:
         assignment["repair_handoff"] = repair_handoff
     path = _worktree_assignment_path(author, state)
@@ -1699,6 +1708,26 @@ def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
     if not pending:
         state.setdefault("worker_tasks", {})[bump_state.author_key(author)] = task_id
     return assignment
+
+
+def record_migration_focus_assignment(author: str, task_id: str, expected_task_revision: int) -> dict:
+    """Persist initial private focus after dispatch, without touching source bytes.
+
+    Controller-only: begin_migration_attempt establishes the focus after the
+    worktree is prepared. Recheck its identity under the usual ownership locks.
+    """
+    author = _author(author)
+    with _merge_lock(), _finalization_lock(author):
+        current = bump_state.load_state(FORUM_DIR)
+        task = current.get("formal_tasks", {}).get(task_id, {})
+        focus = task.get("migration_focus") or {}
+        if (task.get("revision") != expected_task_revision
+                or bump_state.author_key(focus.get("author")) != bump_state.author_key(author)
+                or focus.get("task_input_sha256") != task.get("task_input_sha256")
+                or not focus.get("subtask_id")
+                or current.get("worker_tasks", {}).get(bump_state.author_key(author)) != task_id):
+            raise ValueError("migration focus assignment changed; work preserved")
+        return _record_worktree_assignment(author, task_id, task["revision"], current)
 
 
 def _saved_task_checkpoint(author: str, task_id: str, state: dict) -> dict | None:
@@ -1745,13 +1774,22 @@ def _checkpoint_task_worktree(tree: Path, author: str, task_id: str, task_revisi
         _artifacts_dir(), json.dumps({"files": files}), kind="bump_private_files",
         producer=author, metadata={"task_id": task_id, "task_revision": task_revision},
     ) if files else None
-    # Enumerate before staging: explicit ignored exclusion pathspecs make
-    # `git add` fail, and forcing them would accidentally track shared state.
-    names = _git(tree, "ls-files", "--cached", "--others", "--exclude-standard", "-z",
-                 "--", ".", ":(exclude).unity", ":(exclude).lake").stdout.split("\0")
-    names = sorted({name for name in names if name})
-    for start in range(0, len(names), 256):
-        _git(tree, "--literal-pathspecs", "add", "-A", "--", *names[start:start + 256])
+    # Update tracked files, including tracked-but-ignored edits and deletions.
+    # Add new files separately, respecting ignore rules.
+    for listing, staging in (
+        (("--cached",), ("--update",)),
+        (("--others", "--exclude-standard"), ()),
+    ):
+        names = _git(
+            tree, "ls-files", *listing, "-z",
+            "--", ".", ":(exclude).unity", ":(exclude).lake",
+        ).stdout.split("\0")
+        names = sorted({name for name in names if name})
+        for start in range(0, len(names), 256):
+            _git(
+                tree, "--literal-pathspecs", "add", *staging,
+                "--", *names[start:start + 256],
+            )
     staged = _git(tree, "diff", "--cached", "--quiet", check=False)
     if staged.returncode not in {0, 1}:
         raise ValueError("Cannot inspect checkpoint index; work preserved")
@@ -1861,6 +1899,43 @@ def _finish_repair_handoff(state: dict, author: str, handoff: dict) -> None:
     state["task_yields"][bump_state.author_key(author)][previous_task]["repair_handoff_sha256"] = (
         bump_state.digest(handoff)
     )
+
+
+def _completed_migration_assignment(state: dict, task_id: str) -> dict | None:
+    """Recognize exact successful retirement, never every absent/retired task."""
+    from ..bump_contract import migration_group_mapping_content, policy_hash
+    contract = state["formalization"].get("contract") or {}
+    plan = state.get("migration_plan") or {}
+    retired = state.get("retired_tasks", {}).get(task_id, {})
+    if (not bump_state._migration_v2(contract) or task_id in state.get("formal_tasks", {})
+            or retired.get("retired_reason") != "diagnostic_refresh" or retired.get("status") != "complete"
+            or retired.get("faithfulness", {}).get("status") == "changes_requested"
+            or retired.get("machine_repair", {}).get("status") == "required"
+            or state.get("migration_plan_main_sha") != state["formalization"].get("main_sha")
+            or retired.get("migration_module") not in plan.get("compiled_modules", [])):
+        return None
+    proof = retired.get("migration_retirement")
+    if not proof:
+        proof = bump_state._migration_retirement_receipt(state, retired, plan)
+        if proof:
+            retired["migration_retirement"] = proof
+    candidate = state.get("formal_candidates", {}).get(retired.get("accepted_candidate"), {})
+    verification = candidate.get("verification") or {}
+    source = bump_state.formal_source(state)
+    if (not proof or proof.get("version") != 1 or proof.get("task_id") != task_id
+            or proof.get("task_revision") != retired.get("revision")
+            or proof.get("candidate_id") != candidate.get("candidate_id")
+            or proof.get("original_index_sha256") != contract.get("original_index_sha256")
+            or proof.get("mapping_content_sha256") != bump_state.digest(migration_group_mapping_content(contract, task_id))
+            or candidate.get("status") != "merged" or candidate.get("task_id") != task_id
+            or candidate.get("task_revision") != retired.get("revision")
+            or candidate.get("stage", "complete") != "complete"
+            or candidate.get("solution_candidate") != source.get("candidate_id")
+            or candidate.get("solution_sha256") != source.get("sha256")
+            or verification.get("status") != "passed" or verification.get("policy_sha256") != policy_hash()
+            or verification.get("contract_sha256") != proof.get("verified_contract_sha256")):
+        return None
+    return retired
 
 
 def prepare_formal_worktree(
@@ -1974,6 +2049,9 @@ def prepare_formal_worktree(
                                        repair_handoff=handoff if not handoff_finished else None)
             return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
+        completed_retirement = _completed_migration_assignment(state, previous_task)
+        if completed_retirement:
+            previous = completed_retirement
         # A refinement can introduce a missing interface and block every former
         # assignment. An unclaimed attempt can help that prerequisite after its
         # private work has been saved.
@@ -1999,9 +2077,16 @@ def prepare_formal_worktree(
         if not main_sha:
             return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
         if previous.get("status") == "complete":
-            return _reset_formal_assignment(
+            checkpoint = None
+            if completed_retirement:
+                checkpoint = _checkpoint_task_worktree(tree, author, previous_task, previous_revision)
+                state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[previous_task] = checkpoint
+            result = _reset_formal_assignment(
                 tree, author, next_task, target_task.get("revision"), state, main_sha,
             )
+            if checkpoint:
+                result["parked_checkpoint"] = checkpoint
+            return result
 
         private_status = _git(tree, "status", "--porcelain", "--", ".",
                               ":(exclude).unity", ":(exclude).lake").stdout.strip()
@@ -2111,20 +2196,48 @@ def refine_chunks(author: str, expected_revision: int,
         return result
 
 
-def refine_migration(author: str, task_id: str, expected_revision: int, subtasks: list[dict],
+def refine_migration(author: str, task_id: str, expected_revision: int, subtasks: list[dict] | None = None,
                      dependencies: list[str] | None = None,
-                     mapping_proposal: dict | None = None, reason: str = "") -> dict:
+                     mapping_proposal: dict | None = None, reason: str = "",
+                     checkpoint_subtask_id: str = "", checkpoint_summary: str = "") -> dict:
     """Partition diagnosed repairs or propose correspondences without changing coverage.
 
     Keep exact original_ids/diagnostic_ids across the subtask partition and retain
     module dependencies. Mapping proposals require controller adoption and do not
     change source, permissions, attempts, receipts or semantic acceptance.
+    To advance private declaration focus, omit subtasks/dependencies/mapping and
+    pass checkpoint_subtask_id plus checkpoint_summary. This saves private work
+    and returns next_chunk without publishing a partial module or charging an attempt.
     """
     author = _author(author)
-    with _merge_lock():
-        return bump_state.refine_migration(FORUM_DIR, author, task_id,
+    with _merge_lock(), _finalization_lock(author):
+        if checkpoint_subtask_id:
+            if subtasks is not None or dependencies is not None or mapping_proposal is not None:
+                raise ValueError("a private chunk checkpoint cannot also change the partition or mapping")
+            current = bump_state.load_state(FORUM_DIR)
+            task = current.get("formal_tasks", {}).get(task_id, {})
+            focus = task.get("migration_focus") or {}
+            if (current["revision"] != expected_revision or focus.get("subtask_id") != checkpoint_subtask_id
+                    or bump_state.author_key(focus.get("author")) != bump_state.author_key(author)
+                    or has_pending_formal_candidate(current, author)):
+                raise ValueError("private migration chunk focus changed; work preserved")
+            tree = worktree.agent_worktree(_root(), author)
+            if not tree.is_dir():
+                raise ValueError("private migration checkpoint requires the owned worktree")
+            checkpoint = _checkpoint_task_worktree(tree, author, task_id, task.get("revision"))
+            result = bump_state.checkpoint_migration_chunk(FORUM_DIR, author, task_id, checkpoint_subtask_id,
+                expected_revision=expected_revision, checkpoint=checkpoint, summary=checkpoint_summary)
+            refreshed = bump_state.load_state(FORUM_DIR)
+            _record_worktree_assignment(author, task_id, result["task"]["revision"], refreshed)
+            return result
+        if subtasks is None:
+            raise ValueError("migration refinement requires subtasks or an explicit private checkpoint")
+        result = bump_state.refine_migration(FORUM_DIR, author, task_id,
             expected_revision=expected_revision, subtasks=subtasks, dependencies=dependencies,
             mapping_proposal=mapping_proposal, reason=reason)
+        refreshed = bump_state.load_state(FORUM_DIR)
+        _record_worktree_assignment(author, task_id, result["task"]["revision"], refreshed)
+        return result
 
 
 def report_source_issue(

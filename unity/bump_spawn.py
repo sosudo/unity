@@ -14,11 +14,15 @@ import sys
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 from rich.console import Console
 
 from .roster import Agent
-from .bump_provider import BumpProviderFailure, provider_failure
+from .bump_provider import (
+    BumpProviderFailure, BumpTransportRetriesExhausted,
+    is_transient_provider_failure, provider_failure,
+)
 
 _console = Console()
 
@@ -395,17 +399,45 @@ def _retry_sleep(exc) -> float:
     return 600.0
 
 
-# Signatures of permanent failures (dead CLI, bad/exhausted credentials): retrying
-# these forever just burns wall-clock — give up after two attempts regardless of
-# the MAX_ATTEMPTS-driven cap for transient errors.
-_PERMANENT = ("exit code 1", "usage limit", "upgrade to", "authentication", "unauthorized",
-              "401", "invalid api key", "login", "requires a newer version")
-
-
 def _give_up(exc, attempt: int) -> bool:
-    # Operational failures are not mathematical repair attempts. Preserve the
-    # run and surface the first failure rather than invisibly relaunching it.
-    return True
+    # Retain Formalize's transport cap, but do not retry unclassified controller
+    # or native-policy failures just because they share an exception base class.
+    return not is_transient_provider_failure(exc) or attempt >= _max_retries()
+
+
+def _transport_retry_delay(agent: Agent, error: BaseException, attempt: int, cwd: Path) -> float:
+    failure = provider_failure(agent, error, category="backend_exception")
+    if isinstance(failure, BumpTransportRetriesExhausted) or not is_transient_provider_failure(failure):
+        raise failure from None
+    if _give_up(failure, attempt):
+        raise BumpTransportRetriesExhausted(failure, attempt) from None
+    delay = _retry_sleep(failure)
+    _log(agent.name, SimpleNamespace(text=(
+        f"Transport {failure.category}; attempt {attempt}; retrying in {int(delay)}s"
+    )), cwd)
+    return delay
+
+
+async def _retry_pause(delay: float, cwd: Path,
+                       interrupt_event: asyncio.Event | None = None) -> bool:
+    """Wait after transport cleanup, honoring existing stop and cancellation."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + delay
+    while True:
+        if (_stop_requested(cwd)
+                or (interrupt_event is not None and interrupt_event.is_set())):
+            return False
+        remaining = deadline - loop.time()
+        if remaining <= 0:
+            return True
+        if interrupt_event is None:
+            await asyncio.sleep(min(1.0, remaining))
+        else:
+            try:
+                await asyncio.wait_for(interrupt_event.wait(), timeout=min(1.0, remaining))
+            except asyncio.TimeoutError:
+                continue
+            return False
 
 # Last-run accounting per agent name, harvested by spawn() into .unity/logs/run.jsonl
 # so benchmark runs can compare cost across rosters.
@@ -568,7 +600,10 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
     )
     attempt = 0
     while True:
+        if _stop_requested(cwd):
+            return None
         attempt += 1
+        retry_delay = None
         try:
             if on_normal_completion is not None:
                 return await _claude_continuation(
@@ -601,14 +636,11 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         except _UnsuccessfulTurnError:
             raise
         except Exception as e:
-            if _give_up(e, attempt):
-                raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await _terminate_process_group(pid_file)
-            await asyncio.sleep(wait)
+            retry_delay = _transport_retry_delay(agent, e, attempt, cwd)
         finally:
             await _terminate_process_group(pid_file)
+        if retry_delay is not None and not await _retry_pause(retry_delay, cwd):
+            return None
 
 
 async def _claude_continuation(agent, options, prompt, cwd,
@@ -894,7 +926,11 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
             codex_bin = str(wrapped)
     attempt = 0
     while True:
+        if (_stop_requested(cwd)
+                or (interrupt_event is not None and interrupt_event.is_set())):
+            return None
         attempt += 1
+        retry_delay = None
         agent_env = _agent_env(transport_agent, home, env_overrides)
         if _transport_agent is not None:
             # The child authenticates only to its private loopback transport.
@@ -933,6 +969,7 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
         interrupt_task = None
         turn_finished = asyncio.Event()
         stream_started = asyncio.Event()
+        retry_failure = None
         try:
             # login_api_key is OpenAI-official auth only; custom providers (base_url set)
             # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
@@ -1069,29 +1106,36 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
             raise exc.error
         except _UnsuccessfulTurnError:
             raise
-        except BumpProviderFailure:
-            raise
         except Exception as e:
             if interrupt_event is not None and interrupt_event.is_set():
                 return final
-            if _give_up(e, attempt):
-                # The SDK can reject thread/turn creation before notifications.
-                # Preserve a safe failure category, not a provider response body.
-                raise provider_failure(agent, e, category="backend_exception") from None
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await asyncio.sleep(wait)
+            failure = provider_failure(agent, e, category="backend_exception")
+            if is_transient_provider_failure(failure):
+                retry_failure = failure
+            retry_delay = _transport_retry_delay(agent, failure, attempt, cwd)
         finally:
             turn_finished.set()
             if interrupt_task is not None:
                 interrupt_task.cancel()
                 await asyncio.gather(interrupt_task, return_exceptions=True)
             # close() can hang after an aborted turn; don't let cleanup wedge the agent.
+            cleanup_failed = False
             try:
-                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            await _terminate_process_group(pid_file)
+                try:
+                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+                except Exception:
+                    cleanup_failed = True
+            finally:
+                await _terminate_process_group(pid_file)
+            if cleanup_failed and retry_failure is not None:
+                # Never restart or rotate to another critic with uncertain
+                # closure of the previous SDK session. This overrides even a
+                # pending transport-exhaustion error with a fatal local fault.
+                raise BumpProviderFailure(
+                    "backend_cleanup_failed", provider=retry_failure.provider,
+                ) from None
+        if retry_delay is not None and not await _retry_pause(retry_delay, cwd, interrupt_event):
+            return final
 
 
 async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
@@ -1138,6 +1182,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         if _stop_requested(cwd):
             return None
         attempt += 1
+        retry_delay = None
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
@@ -1215,13 +1260,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         except _UnsuccessfulTurnError:
             raise
         except Exception as e:
-            if proc.returncode is None:
-                proc.kill()
-            if _give_up(e, attempt):
-                raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await asyncio.sleep(wait)
+            retry_delay = _transport_retry_delay(agent, e, attempt, cwd)
         finally:
             if proc.returncode is None:
                 if own_process_group and os.name == "posix":
@@ -1232,6 +1271,8 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                 else:
                     proc.kill()
                 await proc.wait()
+        if retry_delay is not None and not await _retry_pause(retry_delay, cwd):
+            return None
 
 
 def _sum_usage(previous, current):
@@ -1354,6 +1395,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             "category": exc.category, "provider": exc.provider,
             "http_status": exc.http_status,
         }
+        if isinstance(exc, BumpTransportRetriesExhausted):
+            _last_run_stats[agent.name]["provider_failure"]["transport_attempts"] = exc.attempts
         raise
     finally:
         _write_run_log(agent, cwd, time.monotonic() - t0, log_context)

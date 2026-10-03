@@ -62,9 +62,10 @@ class BootstrapTests(unittest.TestCase):
         return bump_state.load_state(forum)
 
     def capture_index(self, root, scope, *, artifact_dir):
+        graph = bootstrap.bump_migration_project.compiler_modules(root, scope=scope)
         reports = {module: {"mode": "index", "module": module, "declaration_inventory": "raw-module-constants-v1",
                            "raw_declaration_count": 0, "declarations": []} for module in self.graph}
-        index = bump_inventory.assemble_index(reports, self.graph, bootstrap.bump_migration_project.source_files(root),
+        index = bump_inventory.assemble_index(reports, graph, bootstrap.bump_migration_project.source_files(root),
                                              scope_sha256=scope["sha256"], environment={})
         record = artifacts.store_text(artifact_dir, json.dumps(index), kind="bump_original_index")
         return {"index_ref": {key: record[key] for key in ("artifact_id", "sha256")}, "index_sha256": index["index_sha256"]}
@@ -95,6 +96,7 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(paths.env.stat().st_mode), 0o600)
         self.mocks["initialize_migration_plan"].assert_called_once()
         self.mocks["capture_original_index"].assert_called_once()
+        self.mocks["compiler_modules"].assert_called_once()
         source = bump_state.load_state(paths.forum)["input_source"]
         self.assertEqual(len(source["source_refs"]), 4)
         self.assertTrue(all(row["kind"] == "original_project_input" for row in source["source_refs"]))
@@ -154,6 +156,8 @@ class BootstrapTests(unittest.TestCase):
         with patch.object(bootstrap.bump_migration_project, "capture_build_scope", side_effect=scoped):
             self.prepare()
         self.assertEqual(events, ["build", "scope", "graph"])
+        self.mocks["compiler_modules"].assert_called_once()
+        self.assertEqual(self.mocks["capture_baseline_v2"].call_args.kwargs["compiler_modules"], self.graph)
 
     def test_fresh_attempt_never_overwrites_existing_evidence(self):
         paths = self.prepare()

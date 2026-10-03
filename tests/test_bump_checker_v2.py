@@ -328,6 +328,9 @@ class FinalEvidenceTests(unittest.TestCase):
         # Comparison seals require SHA hex, unlike opaque mocked source identifiers.
         receipt["evidence_refs"][0]["comparison_sha256"] = "a" * 64
         self.report = {"migration_policy": 2, "inspection_policy": 5, "policy_sha256": "p" * 64,
+            "local_mapping_identity_version": 1,
+            "group_mapping_content_sha256": {key: api.digest(api.migration_group_mapping_content(self.contract, key))
+                                             for key in self.contract["task_bindings"]},
             "project_baseline_sha256": "b" * 64, "contract_sha256": self.contract["sha256"],
             "mapping_sha256": self.contract["mapping_sha256"], "original_index_sha256": self.contract["original_index_sha256"],
             "project_verification": api.project_verification(Path("/fixture"), self.baseline),
@@ -347,6 +350,30 @@ class FinalEvidenceTests(unittest.TestCase):
         self.report["module_receipts"] = {}
         with self.assertRaisesRegex(ValueError, "omits original"):
             checker.validate_snapshot(self.state, self.report)
+
+    def test_fresh_snapshot_cannot_strip_or_downgrade_local_mapping_identity(self):
+        for fields in (("group_mapping_content_sha256",), ("local_mapping_identity_version",),
+                       ("group_mapping_content_sha256", "local_mapping_identity_version")):
+            report = copy.deepcopy(self.report)
+            for field in fields:
+                report.pop(field)
+            with self.assertRaisesRegex(ValueError, "local correspondence"):
+                checker.validate_snapshot(self.state, report)
+        report = copy.deepcopy(self.report)
+        report["local_mapping_identity_version"] = True
+        with self.assertRaisesRegex(ValueError, "local correspondence"):
+            checker.validate_snapshot(self.state, report)
+
+    def test_exact_persisted_legacy_snapshot_retains_conservative_validation(self):
+        report = copy.deepcopy(self.report)
+        report.pop("local_mapping_identity_version")
+        report.pop("group_mapping_content_sha256")
+        report["snapshot_id"] = "review-legacy"
+        self.state["review_snapshots"] = {report["snapshot_id"]: copy.deepcopy(report)}
+        checker.validate_snapshot(self.state, report)
+        report["mapping_sha256"] = "0" * 64
+        with self.assertRaises(ValueError):
+            checker.validate_snapshot(self.state, report)
 
     def test_pending_mapping_invalidates_machine_snapshot_without_source_change(self):
         self.state["migration_mapping_proposals"] = {"proposal": {"status": "proposed"}}

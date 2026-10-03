@@ -15,6 +15,7 @@ from rich.console import Console
 
 from . import library
 from .bump_spawn import bump_mcp_with_runtime_env, spawn
+from .bump_provider import BumpTransportRetriesExhausted
 from .orchestrator import load_prompt, mark_done, mark_phase, resume_point, toposort
 
 _console = Console()
@@ -219,6 +220,10 @@ async def dispatch(
     results = await asyncio.gather(*(spawn_one(agent) for agent in agents), return_exceptions=True)
     for agent, result in zip(agents, results):
         if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, BumpTransportRetriesExhausted):
+            # Keep transport exhaustion distinct from a missing critic verdict
+            # so the command can try another already-configured eligible critic.
             raise result
         if isinstance(result, BaseException):
             # Operational failure is not an ordinary missing verdict. Preserve

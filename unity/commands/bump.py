@@ -23,6 +23,7 @@ from ..bump_runtime import (
     run_formalizing_runtime, _merge_lock,
 )
 from ..bump_report import persist_report
+from ..bump_provider import BumpTransportRetriesExhausted
 
 PIPELINE = "bump"
 
@@ -301,6 +302,7 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
         raise click.ClickException("No independent Codex critic remains for the verified read-only review")
 
     _prepare_critic_snapshot(paths)
+    transport_blocked = {}
     for critic in critics:
         while True:
             current = bump_state.load_state(paths.forum)
@@ -314,9 +316,14 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
                 return
 
             attempt = _begin_critic_attempt(paths, binding, critic.name)
-            await _run_critic(
-                roster, paths, critic=critic, attempt=attempt,
-            )
+            try:
+                await _run_critic(
+                    roster, paths, critic=critic, attempt=attempt,
+                )
+            except BumpTransportRetriesExhausted as exc:
+                transport_blocked[critic.name] = str(exc)
+                click.echo(f"critic {critic.name} is transport-blocked; trying the next eligible configured critic")
+                break
 
             if stop_requested(paths.project_root):
                 return
@@ -325,6 +332,12 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
                     or bump_state.open_source_issues(after)):
                 return
 
+    if transport_blocked:
+        raise click.ClickException(
+            "critic review remains incomplete: transport retries exhausted for "
+            + ", ".join(transport_blocked)
+            + "; remaining eligible critics did not complete review. No verdict was invented."
+        )
     raise click.ClickException(
         "every configured agent exhausted its critic attempts "
         "without completing the review"

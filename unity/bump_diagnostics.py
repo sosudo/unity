@@ -20,8 +20,15 @@ from .bump_inventory import digest, validate_index, read_native_imports
 
 _LOCATION = re.compile(r"^(?:(error|warning|info):\s*)?(.+?\.lean):(\d+):(\d+):\s*(?:(error|warning|info):\s*)?(.*)$")
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_LAKE_METADATA = re.compile(r"^(?:trace|info):(?:[ \t]|$)")
 _MAX_LINE = 1024 * 1024
 _MAX_RECORDS = 100000
+
+
+def diagnostic_content_key(row: dict, full_message: str) -> str:
+    """Content identity before display truncation; offsets/artifact IDs are not inputs."""
+    return digest({key: row[key] for key in ("path", "line", "column", "severity", "kind")} | {
+        "message": full_message})
 
 
 def _missing_import_failure(result) -> bool:
@@ -88,6 +95,7 @@ def parse_diagnostics(log_path: Path, root: Path, *, source_sha256: str, returnc
     """Parse every line, preserving byte offsets; never treat parsing as build success."""
     root, log_path = Path(root).resolve(), Path(log_path)
     rows, offset, unparsed = [], 0, 0
+    active_diagnostic = None
     with log_path.open("rb") as stream:
         while True:
             raw = stream.readline(_MAX_LINE + 1)
@@ -116,15 +124,33 @@ def parse_diagnostics(log_path: Path, root: Path, *, source_sha256: str, returnc
                 row = {"path": filename or None, "line": int(line), "column": int(column),
                        "severity": severity, "kind": kind, "message": message[:2000],
                        "message_truncated": len(message) > 2000, "log_offset": offset, "log_bytes": len(raw)}
+                row["content_sha256"] = diagnostic_content_key(row, message)
                 row["id"] = "diag-" + digest([source_sha256, offset, hashlib.sha256(raw).hexdigest()])
                 rows.append(row)
+                active_diagnostic = row
             elif text.lstrip().startswith(("error:", "fatal error:", "PANIC", "uncaught exception")):
                 unparsed += 1
                 row = {"path": None, "line": None, "column": None, "severity": "error", "kind": "environment",
                        "message": text[:2000], "message_truncated": len(text) > 2000,
                        "log_offset": offset, "log_bytes": len(raw)}
+                row["content_sha256"] = diagnostic_content_key(row, text)
                 row["id"] = "diag-" + digest([source_sha256, offset, hashlib.sha256(raw).hexdigest()])
                 rows.append(row)
+                active_diagnostic = row
+            elif (_LAKE_METADATA.match(text)
+                  or text.startswith(("✔", "✖", "⚠", "ℹ", "Build completed", "Some required builds",
+                                      "Some required targets logged failures:"))):
+                # Unlocated Lake command/info records are separate log events,
+                # not continuation text of the previous Lean diagnostic. Their
+                # command paths, job order and cache chatter may change when an
+                # independent module is merged. Located info was parsed above;
+                # ordinary multiline Lean type/goal details still fold below.
+                active_diagnostic = None
+            elif active_diagnostic is not None:
+                # Lean's type/goal details commonly continue on following lines.
+                # Fold complete lines before truncation without retaining an
+                # unbounded message or incorporating the log's byte offsets.
+                active_diagnostic["content_sha256"] = digest([active_diagnostic["content_sha256"], text])
             offset += len(raw)
             if len(rows) > _MAX_RECORDS:
                 raise ValueError("too many compiler diagnostics; full log preserved")
@@ -135,10 +161,12 @@ def parse_diagnostics(log_path: Path, root: Path, *, source_sha256: str, returnc
             "error: build failed", "error: Lean exited with code 1"})]
         unparsed = sum(row["severity"] == "error" and row["path"] is None for row in rows)
     if returncode != 0 and not any(row["severity"] == "error" for row in rows):
-        rows.append({"id": "diag-" + digest([source_sha256, "unmapped-build-failure", returncode]),
+        row = {"id": "diag-" + digest([source_sha256, "unmapped-build-failure", returncode]),
             "path": None, "line": None, "column": None, "severity": "error", "kind": "environment",
             "message": "Build failed without a recognized located error; consult complete diagnostic artifact.",
-            "message_truncated": False, "log_offset": 0, "log_bytes": offset})
+            "message_truncated": False, "log_offset": 0, "log_bytes": offset}
+        row["content_sha256"] = diagnostic_content_key(row, row["message"])
+        rows.append(row)
         unparsed += 1
     return {"diagnostics": rows, "unmapped_error_count": unparsed, "log_bytes": offset,
             "parser": "lean-lake-located-lines-v1", "not_an_acceptance_check": True}
@@ -154,6 +182,45 @@ def _require_acyclic(graph: dict[str, list[str]]) -> None:
         completed.update(ready)
         for module in ready:
             del remaining[module]
+
+
+def _cycle_components(graph: dict[str, list[str]]) -> list[list[str]]:
+    """Iterative strongly connected components, excluding acyclic singletons."""
+    seen, order = set(), []
+    for start in sorted(graph):
+        if start in seen:
+            continue
+        seen.add(start)
+        stack = [(start, iter(graph[start]))]
+        while stack:
+            node, edges = stack[-1]
+            child = next(edges, None)
+            if child is None:
+                order.append(node)
+                stack.pop()
+            elif child not in seen:
+                seen.add(child)
+                stack.append((child, iter(graph[child])))
+    reverse = {node: [] for node in graph}
+    for node, edges in graph.items():
+        for child in edges:
+            reverse[child].append(node)
+    seen, cycles = set(), []
+    for start in reversed(order):
+        if start in seen:
+            continue
+        component, pending = [], [start]
+        seen.add(start)
+        while pending:
+            node = pending.pop()
+            component.append(node)
+            for child in reverse[node]:
+                if child not in seen:
+                    seen.add(child)
+                    pending.append(child)
+        if len(component) > 1 or start in graph[start]:
+            cycles.append(sorted(component))
+    return sorted(cycles)
 
 
 def validate_target_imports(receipt: dict, index: dict | None = None) -> None:
@@ -185,16 +252,35 @@ def validate_target_imports(receipt: dict, index: dict | None = None) -> None:
                 or set(graph) != set(index["modules"])
                 or any(row["path"] != index["modules"][module]["path"] for module, row in graph.items())):
             raise ValueError("target native imports change original module ownership")
-    _require_acyclic({module: row["imports"] for module, row in graph.items()})
+    # A known cycle may sit inside a larger SCC containing an unavailable
+    # header. Check the complete-native induced graph independently so the
+    # uncertain member cannot hide a proven current cycle.
+    complete = {module for module, row in graph.items() if row["status"] == "complete"}
+    current = {module: [dependency for dependency in graph[module]["imports"] if dependency in complete]
+               for module in complete}
+    for component in _cycle_components(current):
+        raise ValueError("current_import_cycle: " + ", ".join(component))
 
 
 def scheduling_dependencies(index: dict, target_imports: dict) -> dict[str, list[str]]:
-    """New native edges may add prerequisites, never erase original obligations."""
+    """Scheduling follows complete current evidence, not immutable old obligations."""
+    return scheduling_graph(index, target_imports)["dependencies"]
+
+
+def scheduling_graph(index: dict, target_imports: dict) -> dict:
+    """Retain uncertain old edges, but distinguish their cycles from current ones."""
     validate_target_imports(target_imports, index)
-    graph = {module: sorted(set(original["imports"]) | set(target_imports["modules"][module]["imports"]))
-             for module, original in index["modules"].items()}
-    _require_acyclic(graph)
-    return graph
+    graph, provenance = {}, {}
+    for module, original in index["modules"].items():
+        current = target_imports["modules"][module]
+        complete = current["status"] == "complete"
+        graph[module] = sorted(set(current["imports"]) | (set() if complete else set(original["imports"])))
+        provenance[module] = "current_native" if complete else "original_fallback"
+    cycles = _cycle_components(graph)
+    # validate_target_imports already rejects cycles in the complete-native
+    # subgraph; any remaining SCC necessarily depends on uncertain evidence.
+    return {"dependencies": graph, "dependency_provenance": provenance,
+            "unresolved_import_cycles": cycles}
 
 
 def capture_target_imports(root: Path, index: dict, scope: dict, identity: dict, source_files_sha: str) -> dict:
@@ -288,6 +374,8 @@ def validate_diagnostics(receipt: dict) -> None:
                 or row.get("severity") not in {"error", "warning", "info"}
                 or row.get("kind") not in {"declaration", "syntax", "import", "environment"}
                 or not isinstance(row.get("message"), str) or len(row["message"]) > 2000
+                or ("content_sha256" in row and (not isinstance(row["content_sha256"], str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", row["content_sha256"])))
                 or type(row.get("log_offset")) is not int or row["log_offset"] < 0
                 or type(row.get("log_bytes")) is not int or row["log_bytes"] < 0):
             raise ValueError("invalid diagnostic row")
@@ -315,7 +403,8 @@ def collect_build_diagnostics(target_root: Path, index: dict, *, artifact_dir: P
     before = bump_contract.source_identity(root)
     source_files_sha = project.snapshot(root)
     target_imports = capture_target_imports(root, index, scope, before, source_files_sha)
-    prerequisites = scheduling_dependencies(index, target_imports)
+    scheduling = scheduling_graph(index, target_imports)
+    prerequisites = scheduling["dependencies"]
     def one_build(names):
         log_path = root / ".unity" / "bump-diagnostics" / (uuid.uuid4().hex + ".log")
         built = project.build(root, modules=names, scope=scope, diagnostics_path=log_path,
@@ -348,7 +437,12 @@ def collect_build_diagnostics(target_root: Path, index: dict, *, artifact_dir: P
         while waiting:
             frontier = sorted(module for module in waiting if set(prerequisites[module]) <= finished)
             if not frontier:
-                raise ValueError("original module graph has a cycle; no repair dispatch is safe")
+                if scheduling["unresolved_import_cycles"]:
+                    # No module success is inferred through uncertain old edges.
+                    # The planner may assign only the located unavailable-header
+                    # repair; ordinary full-module publication checks still apply.
+                    break
+                raise ValueError("current_import_cycle: no module build frontier")
             for module in frontier:
                 waiting.remove(module)
                 finished.add(module)
@@ -369,7 +463,7 @@ def collect_build_diagnostics(target_root: Path, index: dict, *, artifact_dir: P
         # location and all complete aggregate/module log artifacts separately.
         unique = {}
         for row in parsed["diagnostics"]:
-            key = digest([row["path"], row["line"], row["column"], row["severity"], row["kind"], row["message"]])
+            key = row["content_sha256"]
             unique.setdefault(key, row)
         parsed["diagnostics"] = list(unique.values())
         parsed["unmapped_error_count"] = sum(row["severity"] == "error" and row["path"] is None

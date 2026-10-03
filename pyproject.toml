@@ -19,6 +19,9 @@ dependencies = [
     # lets `uv tool install .` resolve it without --prerelease=allow.
     "openai-codex>=0.1.0b2",
     "aristotlelib>=2.1.0,<3",
+    # The namespace transport and Aristotle use the stable HTTPX client API.
+    # Clean tool installs allow Codex prereleases, not HTTPX's incompatible 1.0 API.
+    "httpx==0.28.1",
 ]
 
 [project.scripts]

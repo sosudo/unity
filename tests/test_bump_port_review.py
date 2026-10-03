@@ -189,7 +189,8 @@ class BumpCriticBoundaryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             worker, home = root / "worker", root / "isolated"
-            client = SimpleNamespace(thread_start=AsyncMock(return_value=SimpleNamespace()), close=AsyncMock())
+            thread = SimpleNamespace(turn=AsyncMock())
+            client = SimpleNamespace(thread_start=AsyncMock(return_value=thread), close=AsyncMock())
             config_ctor = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
             sdk = SimpleNamespace(AsyncCodex=Mock(return_value=client), CodexConfig=config_ctor,
                                   Sandbox=SimpleNamespace(read_only="read-only", workspace_write="workspace-write"),
@@ -198,7 +199,7 @@ class BumpCriticBoundaryTests(unittest.TestCase):
             with patch.dict(sys.modules, {"openai_codex": sdk}), \
                     patch.object(bump_spawn.tempfile, "mkdtemp", return_value=str(home)), \
                     patch.object(bump_spawn, "_worktree_write_roots", return_value=(worker,)), \
-                    patch.object(bump_spawn, "_stop_requested", return_value=True), \
+                    patch.object(bump_spawn, "_stop_requested", side_effect=[False, True]), \
                     patch.object(Path, "home", return_value=root):
                 result = asyncio.run(bump_spawn.codex_spawner(
                     fixture_agent(), "review", "record evidence", worker, config,
@@ -211,6 +212,7 @@ class BumpCriticBoundaryTests(unittest.TestCase):
             self.assertEqual(overrides["approval_policy"], "never")
             self.assertNotIn("sandbox_workspace_write", overrides)
             self.assertEqual(set(overrides["mcp_servers"]), {"unity-forum"})
+            thread.turn.assert_not_awaited()
             client.close.assert_awaited_once()
 
 

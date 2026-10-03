@@ -32,6 +32,7 @@ from .bump_input import require_source_matches
 from .forum import bump_server
 from .bump_orchestrator import _preamble, load_prompt, stop_requested
 from .bump_spawn import spawn
+from .bump_provider import BumpTransportRetriesExhausted
 
 
 _console = Console()
@@ -794,6 +795,16 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         return {"ok": False, "error": "missing formal contract; request re-chunking before proving"}
     if not bump_state.candidate_is_current(current, candidate):
         return {"ok": False, "error": "candidate belongs to a superseded formal contract"}
+    if contract.get("migration_policy") == 2 and not _migration_frontier_is_current(current):
+        return {"ok": False, "deferred": True,
+                "error": "current migration diagnostics must be refreshed before integration"}
+    if (contract.get("migration_policy") == 2
+            and not bump_state.migration_candidate_context_current(current, candidate)):
+        return {"ok": False, "deferred": True,
+                "error": "current migration bindings or prerequisites are not ready for integration"}
+    # An independent merge may update observations without changing this
+    # candidate's repair inputs. Never verify using a captured old task row.
+    task = current["formal_tasks"][candidate["task_id"]]
     # A queued candidate may become the final task after another merge. Recheck
     # the same cheap gate used at submission before mutating main or building.
     blockers = _candidate_preflight(current, candidate)
@@ -1074,7 +1085,8 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
 def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Event | None = None) -> dict:
     """Serialize Git integration AND state publication under the same lock."""
     def record(result: dict) -> dict:
-        if result.get("cancelled") and bump_state.pending_replan(bump_state.load_state(paths.forum)):
+        if result.get("deferred") or (result.get("cancelled") and
+                bump_state.pending_replan(bump_state.load_state(paths.forum))):
             bump_state.defer_formal_merge(paths.forum, candidate["candidate_id"], reason=result["error"])
             return {**result, "deferred": True}
         bump_state.finish_formal_merge(
@@ -1351,6 +1363,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     worker_attempts: dict[str, dict] = {}
     interrupted_workers: set[str] = set()
     blocked_launches: dict[str, str] = {}
+    transport_blocked: dict[str, BumpTransportRetriesExhausted] = {}
     blocked_launch_keys: dict[tuple[str, str], str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     manifest_attempts: dict[str, dict] = {}
@@ -1504,7 +1517,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 blocked_launch_keys.pop(pair)
 
     def launch(name: str, task_id: str, followup: str = "", *, context_note: str = "") -> None:
-        if integration is not None or name in stopping:
+        if integration is not None or name in stopping or name in transport_blocked:
             return  # Worktree preparation takes merge.lock; never block this event loop on a review.
         if name in tasks:
             return
@@ -1588,8 +1601,19 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             repair = started["repair"]
             manifest_attempts[name] = repair
         formal_task = current["formal_tasks"][task_id]
+        chunk = None
         if formal_task.get("migration_module"):
-            formal_task = bump_state.begin_migration_attempt(paths.forum, task_id, name)
+            if (current["formalization"].get("contract") or {}).get("migration_policy") == 2:
+                chunk = bump_state.next_migration_chunk(current, task_id)
+            formal_task = bump_state.begin_migration_attempt(
+                paths.forum, task_id, name,
+                **({"subtask_id": chunk["id"]} if chunk else {}),
+            )
+            if chunk:
+                bump_server.record_migration_focus_assignment(
+                    name, task_id, formal_task.get("revision", 0),
+                )
+            current = bump_state.load_state(paths.forum)
         worker_targets[name] = task_id
         worker_revisions[name] = (task_id, formal_task.get("revision", 0))
         worker_attempts[name] = bump_state.snapshot_attempt(current, name, task_id)
@@ -1691,7 +1715,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 f"Migrate module {formal_task['migration_module']} in {formal_task['lean_file']}. "
                 f"Fixed outputs: {formal_task.get('outputs', [])}. "
                 f"Controller diagnostics: {formal_task.get('migration_diagnostics', {})}. "
-                "Its project imports have passed target-version checks. Refresh bump_brief, claim a strategy, "
+                + ("Its current header/import diagnostics remain unresolved; this is a narrowly scoped "
+                   "header-repair assignment. Corrected native imports and the complete module must still "
+                   "pass controller checks before publication. " if formal_task.get("header_repair_only") else
+                   "Its project imports have passed target-version checks. ")
+                + "Refresh bump_brief, claim a strategy, "
                 "and repair compatibility in your assigned file only. Preserve every original declaration, "
                 "definition meaning, assumptions and trust footprint. Do not edit versions, configuration, "
                 "other modules, the original snapshot, or the obligation graph. Check local diagnostics, "
@@ -1707,6 +1735,16 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     "edits are preserved in this worktree. Submit only a complete module repair, never "
                     "a partial declaration patch, and do not add holes or expand trust."
                 )
+                if chunk:
+                    normal_task_prompt += (
+                        f"\nYour initial repair focus is chunk `{chunk['id']}` ({chunk['kind']}): "
+                        f"original occurrences {chunk.get('original_ids', [])}; "
+                        f"diagnostics {chunk.get('diagnostic_ids', [])}. "
+                        "Work in declaration-dependency order. Use refine_migration with "
+                        "checkpoint_subtask_id and checkpoint_summary to preserve private work "
+                        "and receive the next focus within this same attempt. A checkpoint is "
+                        "not accepted completion: publish only when the whole module compiles."
+                    )
         task_prompt = _compose_formal_task_prompt(
             recovery=recovery, resume=resume, followup=followup, normal=normal_task_prompt,
             representation=representation_instruction, repair=repair,
@@ -1731,6 +1769,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 log_context={
                     "command": PIPELINE, "run_id": current.get("run_id"), "phase": "formalizing",
                     "task_id": task_id, "role": "bumpr",
+                    **({"chunk_id": chunk["id"]} if chunk else {}),
                 },
                 env_overrides=_agent_runtime_env(paths, current, name, task_id=task_id),
                 own_process_group=True,
@@ -1759,6 +1798,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 continue
             tried = bump_representation.attempted_reviewers(review)
             available = [name for name in agents if name not in tasks and name not in stopping
+                         and name not in transport_blocked
                          and bump_state.author_key(name) not in tried
                          and not bump_server.has_pending_formal_candidate(current, name)]
             available.sort(key=lambda name: bump_state.author_key(name)
@@ -1776,7 +1816,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         issues = bump_state.ready_source_issues(current)
         assigned_issues = set(repair_issues.values())
         for name in agents:
-            if name in tasks or name in stopping or bump_server.has_pending_formal_candidate(current, name):
+            if (name in tasks or name in stopping or name in transport_blocked
+                    or bump_server.has_pending_formal_candidate(current, name)):
                 continue
             issue = next((item for item in issues if item["issue_id"] not in assigned_issues
                           and name not in repair_exhausted.get(item["issue_id"], set())), None)
@@ -1805,7 +1846,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 participating_strategy(current, name, repair["task_id"]) is None,
             ))
             for name in owners:
-                if name in tasks or name in stopping:
+                if name in tasks or name in stopping or name in transport_blocked:
                     continue
                 launch(name, repair["task_id"])
                 if name in tasks:
@@ -1813,7 +1854,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         ready = bump_state.ready_formal_tasks(current)
         if not ready:
             return
-        idle = [name for name in agents if name not in tasks and name not in stopping]
+        idle = [name for name in agents if name not in tasks and name not in stopping
+                and name not in transport_blocked]
         ready_ids = {formal_task["task_id"] for formal_task in ready}
         unassigned = []
         for name in idle:
@@ -1933,6 +1975,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     ended_normally = True
                 except asyncio.CancelledError:
                     pass
+                except BumpTransportRetriesExhausted as exc:
+                    # Transport exhaustion is not a mathematical yield and must
+                    # not tear down healthy peers or discard queued candidates.
+                    transport_blocked[name] = exc
+                    blocked_launches[name] = str(exc)
+                    _console.print(f"[yellow]worker {name} transport retries exhausted: {exc}[/yellow]")
                 except Exception as exc:
                     _console.print(f"[red]worker {name} failed: {exc!r}[/red]")
                     if (bump_state.load_state(paths.forum)["formalization"].get("contract") or {}).get("migration_policy") in {1, 2}:
@@ -2037,12 +2085,20 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 state = observations.fresh()
                 if bump_state.pending_replan(state) or state.get("phase") != "formalizing":
                     continue
-                candidates = sorted(
-                    (item for item in state.get("formal_candidates", {}).values()
-                     if item.get("status") == "submitted"
-                     and bump_state.candidate_is_current(state, item)),
-                    key=lambda item: item.get("created_at", 0),
-                )
+                if ((state["formalization"].get("contract") or {}).get("migration_policy") == 2
+                        and not _migration_frontier_is_current(state)):
+                    # Leave immutable submissions queued while the normal
+                    # controller refresh below establishes a current frontier.
+                    candidates = []
+                else:
+                    candidates = sorted(
+                        (item for item in state.get("formal_candidates", {}).values()
+                         if item.get("status") == "submitted"
+                         and bump_state.candidate_is_current(state, item)
+                         and ((state["formalization"].get("contract") or {}).get("migration_policy") != 2
+                              or bump_state.migration_candidate_context_current(state, item))),
+                        key=lambda item: item.get("created_at", 0),
+                    )
                 for candidate in candidates:
                     if candidate_workers(candidate):
                         continue
@@ -2083,7 +2139,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                         continue
                     checked_frontier_sha = refreshed["formalization"].get("main_sha")
                 for name in agents:
-                    if name in tasks or name in stopping:
+                    if name in tasks or name in stopping or name in transport_blocked:
                         continue
                     current = bump_state.load_state(paths.forum)
                     task_id = worker_targets.get(name, "")
@@ -2110,9 +2166,29 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 return bump_state.record_round_end(
                     paths.forum, blocked_launches=blocked_launches, activity=activity,
                 )
-            if (integration is None and not tasks and not stopping
-                    and not bump_server.has_pending_formal_candidate(state)):
+            if integration is None and not tasks and not stopping:
+                # Queued bytes are not runnable work. In particular, an
+                # unavailable prerequisite or unmapped diagnostic can leave a
+                # current submission non-integrable after its worker stopped.
+                # Preserve it, but do not wait forever for a nonexistent job.
+                policy = (state["formalization"].get("contract") or {}).get("migration_policy")
+                can_integrate = _migration_frontier_is_current(state) and any(
+                    item.get("status") == "submitted"
+                    and bump_state.candidate_is_current(state, item)
+                    and (policy != 2 or bump_state.migration_candidate_context_current(state, item))
+                    for item in state.get("formal_candidates", {}).values()
+                )
+                if can_integrate:
+                    continue
                 bump_state.record_round_end(paths.forum, blocked_launches=blocked_launches, activity=activity)
+                if transport_blocked:
+                    # Returning normally would start another runtime immediately
+                    # and charge a new migration attempt for the same outage.
+                    raise next(iter(transport_blocked.values()))
+                if bump_server.has_pending_formal_candidate(state):
+                    raise RuntimeError(
+                        "Bump repair round is blocked: queued candidates cannot currently integrate "
+                        "and no worker is running; submissions and worktrees preserved")
                 return bump_state.load_state(paths.forum)
         return bump_state.load_state(paths.forum)
     finally:

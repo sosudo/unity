@@ -26,6 +26,8 @@ def fixture_diagnostics(index, *, compiled=(), errors=("B", "D")):
     rows = [{"id": "diag-" + module.lower() * 64, "path": module + ".lean", "line": 2, "column": 1,
              "severity": "error", "kind": "declaration", "message": "type mismatch", "message_truncated": False,
              "log_offset": 0, "log_bytes": 20} for module in errors]
+    for row in rows:
+        row["content_sha256"] = diagnostics.diagnostic_content_key(row, row["message"])
     result = {"version": 1, "kind": "bump-build-diagnostics-v1", "original_index_sha256": index["index_sha256"],
         "source_sha256": "1" * 64, "source_files_sha256": "2" * 64, "environment_sha256": "3" * 64,
         "artifact_ref": {"artifact_id": "artifact-" + "0" * 12, "sha256": "4" * 64},
@@ -39,6 +41,57 @@ def fixture_diagnostics(index, *, compiled=(), errors=("B", "D")):
 
 
 class BumpDiagnosticsTests(unittest.TestCase):
+    def test_full_content_keys_ignore_log_offset_but_include_truncated_tails_and_details(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "build.log"
+            def key(prefix, tail, detail):
+                log.write_text(prefix + "error: B.lean:2:1: " + "x" * 2500 + tail + "\n" + detail + "\n")
+                return diagnostics.parse_diagnostics(log, root, source_sha256="1" * 64, returncode=1)["diagnostics"][0]
+            one = key("", "first", "expected Nat")
+            shifted = key("ordinary progress\n", "first", "expected Nat")
+            changed_tail = key("", "second", "expected Nat")
+            changed_detail = key("", "first", "expected Int")
+            self.assertNotEqual(one["id"], shifted["id"])
+            self.assertEqual(one["content_sha256"], shifted["content_sha256"])
+            self.assertEqual(one["message"], changed_tail["message"])
+            self.assertNotEqual(one["content_sha256"], changed_tail["content_sha256"])
+            self.assertNotEqual(one["content_sha256"], changed_detail["content_sha256"])
+
+    def test_lake_command_and_info_records_do_not_change_previous_semantic_content(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "build.log"
+            def parsed(metadata, expected="Int"):
+                log.write_text("error: B.lean:2:1: type mismatch\n  value\nhas type\n  Nat\n"
+                               "but is expected to have type\n  " + expected + "\n" + metadata)
+                return diagnostics.parse_diagnostics(log, root, source_sha256="1" * 64,
+                                                     returncode=1)["diagnostics"][0]["content_sha256"]
+            baseline = parsed("")
+            for metadata in (
+                    "trace: .> /public/toolchain/bin/lean A.lean -o /public/build/A.olean\n",
+                    "info: Fixture: replaying a cached independent job\n",
+                    "trace: .> /other/public/toolchain/bin/lean C.lean\ninfo: completed another job\n"):
+                with self.subTest(metadata=metadata):
+                    self.assertEqual(parsed(metadata), baseline)
+                    self.assertNotEqual(parsed(metadata, expected="String"), baseline)
+
+    def test_lake_failed_target_summary_does_not_change_last_diagnostic_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / "build.log"
+            def parsed(summary):
+                log.write_text("error: Fixture/B.lean:1:27: Unknown identifier `missingFixtureProof`\n" + summary)
+                rows = diagnostics.parse_diagnostics(log, root, source_sha256="1" * 64,
+                                                     returncode=1)["diagnostics"]
+                self.assertEqual(len(rows), 1)
+                return rows[0]["content_sha256"]
+            bare = parsed("")
+            aggregate = parsed("Some required targets logged failures:\n- Fixture.A\n- Fixture.B\nerror: build failed\n")
+            single = parsed("Some required targets logged failures:\n- Fixture.B\nerror: build failed\n")
+            self.assertEqual(aggregate, bare)
+            self.assertEqual(single, bare)
+
     def test_registered_job_streams_complete_stdout_and_stderr_to_owned_file(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -115,6 +168,36 @@ class BumpDiagnosticsTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "actual successful"):
             diagnostics.validate_diagnostics(receipt)
 
+    def test_uncertain_cycle_preserves_diagnostics_without_inventing_success(self):
+        index = fixture_index()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for module in index["modules"]:
+                (root / (module + ".lean")).write_text("source")
+            identity = {"source_sha256": "1" * 64, "environment": {"lean": "fixed"}, "main_sha": "fixed"}
+            imports = fixture_imports(index, edges={"A": ["B"], "B": []},
+                                      environment_sha=digest(identity["environment"]))
+            imports["modules"]["B"].update(status="unavailable", unavailable_reason="header_syntax")
+            imports["sha256"] = digest({k: v for k, v in imports.items() if k != "sha256"})
+            calls = []
+            def build(root, modules, scope, diagnostics_path, diagnostic_imports):
+                calls.append(modules)
+                diagnostics_path.parent.mkdir(parents=True, exist_ok=True)
+                passed = modules == ["D"]
+                diagnostics_path.write_text("Build completed successfully.\n" if passed else
+                                            "error: B.lean:1:0: unexpected token in import header\n")
+                return {"passed": passed, "returncode": 0 if passed else 1,
+                        "source_unchanged": True, "diagnostics_complete": True}
+            with patch("unity.bump_contract.source_identity", return_value=identity), \
+                 patch.object(diagnostics.project, "snapshot", return_value="2" * 64), \
+                 patch.object(diagnostics, "capture_target_imports", return_value=imports), \
+                 patch.object(diagnostics.project, "build", side_effect=build):
+                receipt = diagnostics.collect_build_diagnostics(root, index, artifact_dir=root / "artifacts", scope={})
+            self.assertEqual(calls, [["A", "B", "C", "D"], ["D"]])
+            self.assertEqual(receipt["compiled_modules"], ["D"])
+            self.assertEqual(receipt["diagnostics"][0]["kind"], "syntax")
+            self.assertEqual(diagnostics.scheduling_graph(index, imports)["unresolved_import_cycles"], [["A", "B"]])
+
     def target_imports(self, index, headers, *, result=None):
         root = Path("/fixture")
         scope = {"mode": "all", "selected_modules": {key: row["path"] for key, row in index["modules"].items()},
@@ -143,6 +226,18 @@ class BumpDiagnosticsTests(unittest.TestCase):
         self.assertNotEqual(first["sha256"], second["sha256"])
         self.assertEqual(second["modules"]["D"]["imports"], ["B"])
         self.assertEqual(second["modules"]["D"]["unavailable_reason"], "header_syntax")
+
+    def test_proven_current_cycle_cannot_hide_inside_larger_unavailable_component(self):
+        index = fixture_index()
+        imports = fixture_imports(index, edges={"A": ["B", "C"], "B": ["A"], "C": ["A"]})
+        imports["modules"]["C"].update(status="unavailable", unavailable_reason="header_syntax")
+        imports["sha256"] = digest({k: v for k, v in imports.items() if k != "sha256"})
+        graph = {module: row["imports"] for module, row in imports["modules"].items()}
+        self.assertEqual(diagnostics._cycle_components(graph), [["A", "B", "C"]])
+        for check in (lambda: diagnostics.validate_target_imports(imports, index),
+                      lambda: diagnostics.scheduling_graph(index, imports)):
+            with self.assertRaisesRegex(ValueError, "current_import_cycle: A, B$"):
+                check()
 
     def test_excluded_native_header_is_rejected_even_when_malformed(self):
         headers = {module: {"imports": [], "header_errors": False} for module in fixture_index()["modules"]}
