@@ -141,9 +141,6 @@ def reserve_files(forum_dir: Path, author: str, task_id: str, paths: list[str],
                            and runtime.strategy_is_current(state, row) and runtime.participates(row, author)
                            for row in state["strategies"].values())):
             raise ValueError("reserve_files requires a current claimed or successful task strategy")
-        if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 2:
-            if share_with or set(paths) - {state["formal_tasks"][task_id]["lean_file"]}:
-                raise ValueError("migration execution groups cannot expand or share their original file ownership")
         if set(share_with) - state["formal_tasks"].keys():
             raise ValueError("sharing requires current task IDs")
         rows = reservations(state)
@@ -179,11 +176,6 @@ def validate_candidate_files(state: dict, candidate: dict, *, changed_paths: lis
 
     baseline = ((state.get("formalization", {}).get("contract") or {}).get("project_baseline")
                 or state.get("project_baseline"))
-    if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") in {1, 2}:
-        allowed = state.get("formal_tasks", {}).get(task_id, {}).get("lean_file")
-        for path in sorted(set(changed) | set(deleted)):
-            if path != allowed or path in deleted:
-                reject("migration_file_boundary", "Only the assigned original module may be edited; deletion is forbidden: " + path, path)
     if baseline is not None:
         from .bump_scope import require_writable_paths
         for path in sorted(set(changed) | set(deleted) | {row["file"] for row in candidate.get("outputs", [])}):

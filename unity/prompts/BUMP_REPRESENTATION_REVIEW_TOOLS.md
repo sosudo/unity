@@ -12,3 +12,6 @@ Call `submit_representation_review(author, task_id, review)` with:
 
 This tool neither submits proof candidates nor grants final faithfulness approval. A stale response
 means the representation changed; do not approve the new encoding without inspecting its new input.
+Check against the immutable original Lean declaration and explicit correspondence, not a replacement
+natural-language claim. No new holes or expanded per-declaration trust are allowed, including in a
+representation stage. Final all-selected native comparison and independent critic review remain required.

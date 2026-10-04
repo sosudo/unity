@@ -1,494 +1,238 @@
-"""Controller-only migration setup for the directly ported Formalize runtime.
-
-Original native modules replace paper chunking. This module installs the same
-source-linked plan/state/contract consumed by Bump's copied persistent scheduler;
-it is not another scheduler and never dispatches a model.
-"""
-
+"""Prepare a target migration and seed the copied workflow with declaration tasks."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
-import os
 from pathlib import Path
+import re
 import shutil
 import time
 import uuid
-from datetime import datetime, timezone
 
-from . import artifacts, bump_contract, bump_json, bump_migration_contract, bump_migration_project
-from . import bump_project, bump_state, bump_worktree
+from . import artifacts, bump_contract, bump_diagnostics, bump_inventory, bump_planner
+from . import bump_preparation, bump_project, bump_state, bump_worktree
 from .bump_input import bump_paths, require_source_matches, scope_bytes, snapshot_sources
 from .config import Paths
 
-
-def _sha(path: Path) -> str:
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"Bump configuration must be a regular file: {path.name}")
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+parse_dependency_pins = bump_preparation.parse_dependency_pins
 
 
 def _json(path: Path, value: dict) -> None:
-    # Native meaning trees are deep: pretty indentation can dwarf their data.
-    # Preserve the exact JSON value while avoiding a second encoded byte copy.
-    bump_json.atomic_dump(path, value)
-
-
-def _preparation_event(paths: Paths, run_id: str, event: str, **fields) -> None:
-    """Append bounded controller progress, never acceptance or a reuse cache.
-
-    Callers pass only module IDs, counts, hashes, elapsed times and exception
-    class names. Raw compiler/provider diagnostics and runtime configuration do
-    not enter this observer-facing file.
-    """
-    record = {"timestamp": datetime.now(timezone.utc).isoformat(), "run_id": run_id,
-              "event": event, **fields}
-    filename = paths.unity / "bump-preparation.jsonl"
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(filename, flags, 0o600)
-    with os.fdopen(descriptor, "a", encoding="utf-8") as output:
-        output.write(json.dumps(record, sort_keys=True) + "\n")
-        output.flush()
-        os.fsync(output.fileno())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    artifacts._atomic_write(path, (json.dumps(value, sort_keys=True, indent=2) + "\n").encode())
 
 
 def active_path(paths: Paths) -> Path:
     return paths.unity / "bump" / "active.json"
 
 
-def parse_dependency_pins(values: tuple[str, ...] | list[str]) -> dict[str, str]:
-    pins = {}
-    for value in values:
-        name, separator, revision = value.partition("=")
-        if not separator or not name or not revision or name != name.strip() or revision != revision.strip():
-            raise ValueError("--dependency requires NAME=EXACT_VERSION_OR_COMMIT")
-        if name in pins:
-            raise ValueError(f"Duplicate dependency pin: {name}")
-        pins[name] = revision
-    return pins
+def _event(paths: Paths, event: str, **details) -> None:
+    from datetime import datetime, timezone
+    path = paths.logs / "bump-preparation.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as handle:
+        handle.write(json.dumps({"timestamp": datetime.now(timezone.utc).isoformat(), "event": event, **details}) + "\n")
 
 
-def _copy_runtime_inputs(source: Paths, target: Path) -> tuple[Paths, dict]:
+def _runtime_inputs(source: Paths, target: Path) -> tuple[Paths, dict]:
     paths = bump_paths(Paths.from_unity_dir(target / ".unity"))
-    paths.unity.mkdir(parents=True, exist_ok=True)
     for directory in (paths.forum, paths.logs, paths.artifacts, paths.unity / "source"):
         directory.mkdir(parents=True, exist_ok=True)
     hashes = {}
-    for original, destination, required in (
-            (source.unity_md, paths.unity_md, True),
-            (source.agents_yaml, paths.agents_yaml, True),
-            (source.env, paths.env, False)):
-        if not original.exists() and not required:
+    for before, after, required in ((source.unity_md, paths.unity_md, True),
+                                    (source.agents_yaml, paths.agents_yaml, True),
+                                    (source.env, paths.env, False)):
+        if not before.is_file() and not required:
             continue
-        hashes[original.name] = _sha(original)
-        if destination.exists() or destination.is_symlink():
-            raise ValueError("Private Bump runtime configuration already exists; refusing overwrite")
-        shutil.copyfile(original, destination)
-        destination.chmod(0o600)
+        if before.is_symlink() or not before.is_file() or after.exists() or after.is_symlink():
+            raise ValueError("invalid or already existing Bump runtime input: " + before.name)
+        data = before.read_bytes()
+        after.write_bytes(data)
+        after.chmod(0o600)
+        hashes[before.name] = hashlib.sha256(data).hexdigest()
     return paths, hashes
 
 
-def freeze_source_bundle(paths: Paths, migration: dict, graph: dict, reports: dict) -> dict:
-    """Retain original bytes and native receipts; never ask agents for a paper."""
-    original = Path(migration["original_path"])
-    source_root = paths.unity / "source"
-    if any(source_root.iterdir()):
-        raise ValueError("Bump input bundle already exists; refusing to replace original evidence")
-    transition = {"version": 2, "migration_occurrence_policy": 1,
-                  "original_commit": migration["source_commit"],
-                  "original_source_hash": migration["source_hash"],
-                  "target_version": migration["target_version"],
-                  "dependency_pins": migration["dependency_pins"],
-                  "verification_scope": migration["scope"],
-                  "scope_note": "Only the sealed module scope receives native migration checks; excluded files remain byte-preserved, not newly kernel-verified.",
-                  "occurrence_note": "Each declaration in each original raw module artifact is a distinct obligation, including same-named generated declarations; no other module's evidence discharges its meaning or trust check.",
-                  "migration_identity": migration["identity"]}
-    _json(source_root / "transition.json", transition)
-    for module, entry in sorted(graph.items()):
-        destination = source_root / "project" / entry["path"]
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        data = (original / entry["path"]).read_bytes()
-        if hashlib.sha256(data).hexdigest() != migration["source_files"][entry["path"]]:
-            raise ValueError(f"Original module changed before input freezing: {module}")
-        destination.write_bytes(data)
-        _json(source_root / "native" / (module + ".json"), reports[module])
-    return snapshot_sources(paths)
-
-
-def migration_dag(graph: dict, reports: dict, source: dict) -> dict:
-    """One source-bound obligation per compiler module, including empty modules."""
-    if not graph or set(graph) != set(reports):
-        raise ValueError("Original compiler graph and native inventory must cover the same modules")
-    refs = {row["ref_id"] for row in source["source_refs"]}
-    chunks, requirements, anchors, arguments = [], [], [], []
-    transition_ref = "source:transition.json"
-    if transition_ref not in refs:
-        raise ValueError("Migration source is missing its requested transition")
-    anchors.append({"id": "transition", "source_ref": transition_ref,
-                    "location": "Exact controller-requested version and dependency transition",
-                    "excerpt": "Preserve the original project meaning and per-declaration trusted assumptions under the pinned target environment."})
-    accounted = {transition_ref}
-    for module, entry in sorted(graph.items()):
-        if entry.get("compiler_derived") is not True:
-            raise ValueError("Migration graph must come from the original Lean compiler")
-        if set(entry["imports"]) - set(graph) or module in entry["imports"]:
-            raise ValueError(f"Invalid original compiler dependency graph for {module}")
-        report = reports[module]
-        if report.get("module") != module or not report.get("verified") or not report.get("complete_inventory"):
-            raise ValueError(f"Original module lacks a complete native inventory: {module}")
-        native_ref = "source:native/" + module + ".json"
-        code_ref = "source:project/" + entry["path"]
-        sources = [code_ref, native_ref, transition_ref]
-        if set(sources) - refs:
-            raise ValueError(f"Missing frozen native/source input for {module}")
-        accounted.update(sources)
-        native_anchor, code_anchor = module + ":native", module + ":source"
-        ids = [native_anchor, code_anchor, "transition"]
-        declarations = sorted(report.get("declarations", {}))
-        statement = (f"Migrate module {module} at {entry['path']} to the requested pinned environment; "
-                     "preserve every original declaration occurrence's meaning, definition behavior, and trusted assumptions independently, "
-                     "and compile the complete module/import closure.")
-        anchors.extend([
-            {"id": native_anchor, "source_ref": native_ref,
-             "location": f"Native inventory for {module}; evidence {report.get('evidence_sha256', '')}",
-             "excerpt": "Original declarations: " + (", ".join(declarations) or "none; import-only module remains in build scope")},
-            {"id": code_anchor, "source_ref": code_ref,
-             "location": "Entire original Lean module", "excerpt": statement},
-        ])
-        requirement = "preserve:" + module
-        requirements.append({"id": requirement, "statement": statement, "source_components": sources,
-                             "tasks": [module], "anchor_ids": ids})
-        chunks.append({"id": module, "title": "Migrate " + module, "predicted_kind": "module",
-                       "informal_statement": statement,
-                       "informal_proof": "Use the frozen original native declarations and source as the preservation specification; repair target compiler failures without weakening that specification.",
-                       "statement_dependencies": sorted(entry["imports"]), "proof_dependencies": [],
-                       "source_components": sources, "anchor_ids": ids, "requirement_ids": [requirement],
-                       "proposed_formal_statement": None, "proposed_formal_strategy": None})
-        arguments.append({"requirement_id": requirement, "anchor_ids": ids,
-                          "outline": "Check old and target compiled contexts independently, then compare native semantic and trust closures. A passing build alone does not establish preservation.",
-                          "prerequisites": [], "repair_ids": []})
-    if accounted != refs:
-        raise ValueError("Every frozen original input must be accounted for in the migration plan")
-    return {"solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
-            "chunks": chunks, "requirements": requirements,
-            "spec": {"version": 1, "anchors": anchors,
-                     "scope": {"targets": [row["id"] for row in anchors], "references": [], "excluded": []},
-                     "prerequisites": [], "arguments": arguments}}
-
-
-def freeze_source_bundle_v2(paths: Paths, migration: dict, index: dict) -> dict:
-    """Freeze original source and a slim inventory, never recursive meanings."""
-    original = Path(migration["original_path"])
-    source_root = paths.unity / "source"
-    if any(source_root.iterdir()):
-        raise ValueError("Bump input bundle already exists; refusing to replace original evidence")
-    _json(source_root / "transition.json", {
-        "version": 3, "migration_policy": 2, "migration_occurrence_policy": 1,
-        "original_commit": migration["source_commit"], "original_source_hash": migration["source_hash"],
-        "target_version": migration["target_version"], "dependency_pins": migration["dependency_pins"],
-        "auxiliary_dependencies": migration.get("auxiliary_dependencies", {}),
-        "verification_scope": migration["scope"], "migration_identity": migration["identity"],
-        "assumption": "Pinned upgraded imports are compatible; recursive upstream structural equality is not claimed.",
-        "acceptance": "Complete selected builds, original occurrence coverage, no-new-trust, explicit correspondence and independent semantic review.",
-        "excluded": "Excluded files are byte-preserved, not newly compiled or semantically verified.",
-    })
-    _json(source_root / "original-index.json", index)
-    for module, entry in sorted(index["modules"].items()):
-        relative = entry["path"]
+def freeze_source_bundle(paths: Paths, migration: dict, index: dict) -> dict:
+    root = paths.unity / "source"
+    if any(root.iterdir()):
+        raise ValueError("Bump original source bundle already exists")
+    original = Path(migration["original_root"])
+    for module, relative in migration["selected_modules"].items():
         data = (original / relative).read_bytes()
-        if hashlib.sha256(data).hexdigest() != migration["source_files"][relative]:
-            raise ValueError(f"Original source changed during input freezing: {module}")
-        destination = source_root / "project" / relative
+        if hashlib.sha256(data).hexdigest() != migration["original_files"][relative]:
+            raise ValueError("original source changed while freezing migration input: " + module)
+        destination = root / "project" / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
-    return snapshot_sources(paths)
+    _json(root / "original-index.json", index)
+    _json(root / "transition.json", {"original_commit": migration["original_commit"],
+        "target_version": migration["target_version"], "dependency_pins": migration["dependency_pins"],
+        "scope": migration["scope"],
+        "assumption": "The pinned upgraded imports are compatible; recursive upstream structural equivalence is not asserted.",
+        "acceptance": "Preserve every selected original declaration and its trust; require the complete selected build and independent review."})
+    return {**snapshot_sources(paths), "migration": True}
 
 
-def prepare(paths: Paths, version: str, dependency_pins: dict[str, str], *, project_scope: str = "build",
-            architect: str = "auto") -> Paths:
-    """Index the working original, build the bumped target, then plan failures.
+def _prepare_plan(paths: Paths, migration: dict, index: dict, source: dict, *, state: dict,
+                  build: dict | None = None) -> tuple[dict, dict, dict]:
+    if build is None:
+        diagnostics = bump_diagnostics.collect_build_diagnostics(paths.project_root, index,
+            artifact_dir=paths.artifacts, original_root=Path(migration["original_root"]), scope=migration["scope"])
+    else:
+        output = build.get("output", build.get("stdout", "") + "\n" + build.get("stderr", ""))
+        diagnostics = bump_diagnostics.diagnostics_from_output(paths.project_root, index, output,
+            build["returncode"], original_root=Path(migration["original_root"]),
+            build_dir=migration["scope"]["build_dir"])
+        log = artifacts.store_text(paths.artifacts, output, kind="bump_build_diagnostics", producer="Unity")
+        diagnostics["log_ref"] = {"artifact_id": log["artifact_id"], "sha256": log["sha256"]}
+    # Missing downstream diagnostics do not prove that a declaration was
+    # repaired when Lake could not build its current import prerequisites.
+    diagnostics.update(bump_diagnostics.scheduling_imports(paths.project_root, index))
+    main_sha = bump_worktree.main_commit(paths.project_root)
+    diagnostics["main_sha"] = main_sha
+    _json(paths.unity / "bump" / "diagnostics.json", diagnostics)
+    dag = bump_planner.plan_repairs(index, diagnostics, source, state)
+    contract = bump_contract.prepare_source_contract(paths, dag, state=state, main_sha=main_sha)
+    old = state.get("formalization", {}).get("contract") or {}
+    # Source obligations and the original index remain immutable. Successful
+    # candidate evidence survives a refresh of compiler-discovered work.
+    for key in ("bindings", "targets", "external_declarations", "prerequisite_declarations", "adopted_outputs"):
+        if key in old:
+            contract[key] = deepcopy(old[key])
+    contract.pop("representation_review_policy", None)
+    contract["sha256"] = bump_contract.digest({k: v for k, v in contract.items() if k not in {"sha256", "artifact_id"}})
+    return diagnostics, dag, contract
 
-    There is no pre-worker semantic-closure sweep. Diagnostic planning does not
-    certify a migration: the candidate and final native/critic gates still run.
-    """
-    from . import bump_architect, bump_diagnostics, bump_inventory, bump_planner
 
-    pointer = active_path(paths)
-    if pointer.exists() or pointer.is_symlink():
-        raise ValueError("A Bump attempt already exists; no work was overwritten. Only a compatible v2 run can continue.")
-    if not version:
-        raise ValueError("Fresh Bump requires an exact Lean version")
-    if architect not in {"auto", "off"}:
-        raise ValueError("Bump LeanArchitect mode must be auto or off")
-    # Validate required private runtime inputs before creating any worktrees.
-    _sha(paths.unity_md)
-    _sha(paths.agents_yaml)
+def prepare(paths: Paths, version: str, dependency_pins: dict[str, str], *,
+            project_scope: str = "build", architect: str = "auto") -> Paths:
+    if active_path(paths).exists() or active_path(paths).is_symlink():
+        raise ValueError("an existing Bump workspace is preserved; use --continue for a ready migration")
+    if not paths.unity_md.is_file() or not paths.agents_yaml.is_file():
+        raise ValueError("initialize the existing project before Bump")
     run_id = "bump-" + uuid.uuid4().hex[:12]
-    migration = bump_migration_project.prepare(paths.project_root, version, dependency_pins,
-                                              run_id=run_id, project_scope=project_scope)
-    original, target = bump_migration_project.resolve_paths(paths.project_root, migration)
-    record = {"version": 2, "migration_policy": 2, "run_id": run_id, "status": "preparing", "project_root": str(paths.project_root.resolve()),
-              "target_path": str(target), "migration": migration}
-    _json(pointer, record)
-    target_paths, runtime_hashes = _copy_runtime_inputs(paths, target)
-    _json(target_paths.unity / "bump-origin.json", {"project_root": str(paths.project_root.resolve()),
-                                                   "run_id": run_id, "target_path": str(target)})
-    _preparation_event(target_paths, run_id, "original_build_started")
+    migration = bump_preparation.prepare(paths.project_root, version, dependency_pins,
+                                          run_id=run_id, project_scope=project_scope)
+    original, target = Path(migration["original_root"]), Path(migration["target_root"])
+    target_paths, config = _runtime_inputs(paths, target)
+    pointer = {"version": 1, "run_id": run_id, "project_root": str(paths.project_root.resolve()),
+               "source_root": str(paths.project_root.resolve()), "target_path": str(target), "status": "preparing"}
+    _json(active_path(paths), pointer)
+    _json(target_paths.unity / "bump-origin.json", {key: pointer[key] for key in ("project_root", "run_id", "target_path")})
+    _event(target_paths, "original_build_started")
     started = time.monotonic()
-    baseline_build = bump_migration_project.build(original)
-    _json(target_paths.unity / "original-build.json", baseline_build)
-    if not baseline_build["passed"]:
-        raise ValueError("Original project must build before migration: " + baseline_build["diagnostics"][-3000:])
-    _preparation_event(target_paths, run_id, "original_build_finished", elapsed_seconds=time.monotonic() - started)
-    dependency_errors = bump_migration_project.validate_dependencies(original)
-    if dependency_errors:
-        raise ValueError("Original dependency checkouts failed verification: " + "; ".join(dependency_errors))
-    migration = bump_migration_project.capture_build_scope(original, migration)
-    record = {**record, "migration": migration}
-    _json(pointer, record)
-    _preparation_event(target_paths, run_id, "original_index_started",
-                       module_count=len(migration["scope"]["selected_modules"]))
+    original_build = bump_preparation.build(original, task_id="original-build")
+    log = artifacts.store_text(target_paths.artifacts, original_build.stdout + "\n" + original_build.stderr,
+                               kind="bump_original_build", producer="Unity")
+    if original_build.returncode:
+        raise ValueError("original project build failed; build log artifact: " + log["artifact_id"])
+    _event(target_paths, "original_build_finished", elapsed_seconds=time.monotonic() - started)
+    migration["scope"] = bump_preparation.capture_scope(original, migration)
+    migration["selected_modules"] = migration["scope"]["selected_modules"]
+    migration["excluded_files"] = migration["scope"]["excluded_files"]
+    if project_scope == "all":
+        selected_build = bump_preparation.build(original, task_id="original-selected-build",
+                                                  modules=sorted(migration["selected_modules"]))
+        selected_log = artifacts.store_text(target_paths.artifacts, selected_build.stdout + "\n" + selected_build.stderr,
+                                           kind="bump_original_selected_build", producer="Unity")
+        if selected_build.returncode:
+            raise ValueError("selected original source build failed; build log artifact: " + selected_log["artifact_id"])
+    _event(target_paths, "original_index_started", module_count=len(migration["selected_modules"]))
     started = time.monotonic()
-    try:
-        index_receipt = bump_inventory.capture_original_index(original, migration["scope"], artifact_dir=target_paths.artifacts)
-        index = bump_inventory.load_original_index(target_paths.artifacts, index_receipt["index_ref"])
-    except BaseException as exc:
-        _preparation_event(target_paths, run_id, "original_index_failed", error_type=type(exc).__name__,
-                           elapsed_seconds=time.monotonic() - started)
-        raise
-    # The index already binds the one native compiler-graph capture. Repeating
-    # --deps for every original module adds work but no independent evidence.
-    graph = {module: {"path": row["path"], "imports": list(row["imports"]), "compiler_derived": True}
-             for module, row in index["modules"].items()}
-    _preparation_event(target_paths, run_id, "original_index_finished", module_count=len(index["modules"]),
-                       occurrence_count=len(index["occurrences"]), elapsed_seconds=time.monotonic() - started,
-                       index_sha256=index["index_sha256"])
-    if bump_migration_project.validate_original(paths.project_root, migration):
-        raise ValueError("Original project changed during native baseline capture")
-    resolution = bump_migration_project.resolve_dependencies(target, migration)
-    _json(target_paths.unity / "target-resolution.json", resolution)
-    if not resolution["passed"]:
-        raise ValueError("Target dependency resolution rejected: " + "; ".join(resolution["errors"]))
-    migration, resolution, architect_receipt = bump_architect.prepare_optional_architect(
-        target, migration, resolution, mode=architect)
-    _json(target_paths.unity / "optional-architect.json", architect_receipt)
-    _json(target_paths.unity / "target-resolution.json", resolution)
-    migration = bump_migration_project.seal_target(target, migration, resolution=resolution)
-    branch = "unity/" + run_id
-    bump_migration_project._git(target, "switch", "-c", branch)
-    bump_migration_project._git(target, "add", "--", "lean-toolchain", "lake-manifest.json",
-                                *[name for name in ("lakefile.toml", "lakefile.lean") if (target / name).is_file()])
-    bump_migration_project._git(target, "-c", "user.name=Unity", "-c", "user.email=unity@localhost",
-                                "commit", "--allow-empty", "-m", "UNITY: pin Bump target environment")
-    baseline = bump_project.capture_baseline_v2(target, migration=migration,
-                                               original_index_ref=index_receipt["index_ref"], compiler_modules=graph,
-                                               index=index)
-    source = freeze_source_bundle_v2(target_paths, migration, index)
-    _preparation_event(target_paths, run_id, "target_build_started")
+    indexed = bump_inventory.capture_original_index(original, migration["scope"], artifact_dir=target_paths.artifacts)
+    index = indexed["index"]
+    migration["original_environment"] = index["environment"]
+    migration["index_ref"] = indexed["index_ref"]
+    _event(target_paths, "original_index_finished", module_count=indexed["module_count"],
+           occurrence_count=indexed["occurrence_count"], elapsed_seconds=time.monotonic() - started)
+    _event(target_paths, "target_dependencies_started")
+    migration["target_manifest"] = bump_preparation.resolve_dependencies(target, migration)
+    migration["architect_mode"] = architect
+    migration["architect"] = bump_preparation.optional_architect(target, mode=architect,
+        version=migration["target_version"], build_dir=migration["scope"]["build_dir"])
+    migration["target_config"] = bump_preparation.config_hashes(target)
+    migration["target_environment"] = bump_contract.environment_identity(target)
+    _event(target_paths, "target_dependencies_finished", architect=migration["architect"]["status"])
+    bump_preparation.git(target, "switch", "-c", "unity/" + run_id)
+    bump_preparation.git(target, "add", "--", *[name for name in bump_preparation._CONFIG if (target / name).is_file()])
+    bump_preparation.git(target, "-c", "user.name=Unity", "-c", "user.email=unity@localhost",
+                         "commit", "--allow-empty", "-m", "UNITY: pin Bump target environment")
+    _json(target_paths.unity / "bump" / "migration.json", migration)
+    baseline = bump_project.capture_migration_baseline(target, migration=migration, original_index=index)
+    source = freeze_source_bundle(target_paths, migration, index)
+    main_sha = bump_worktree.main_commit(target)
+    state = bump_state.initialize_source(target_paths.forum, hashlib.sha256(scope_bytes(target_paths)).hexdigest(),
+                                         main_sha, source, reset=True, project_baseline=baseline)
+    _event(target_paths, "target_build_started")
     started = time.monotonic()
-    diagnostics = bump_diagnostics.collect_build_diagnostics(target, index, modules=sorted(graph),
-        scope=migration["scope"], artifact_dir=target_paths.artifacts)
-    _preparation_event(target_paths, run_id, "target_build_finished", passed=diagnostics["passed"],
-                       elapsed_seconds=time.monotonic() - started)
-    plan = bump_planner.plan_repairs(index, diagnostics)
-    bump_state.initialize_source(target_paths.forum, hashlib.sha256(scope_bytes(target_paths)).hexdigest(),
-                                 bump_worktree.main_commit(target), source, reset=True, project_baseline=baseline,
-                                 return_state=False)
-    contract = bump_contract.prepare_migration_contract_v2(target_paths, baseline=baseline, graph=plan,
-                                                           source=source, main_sha=bump_worktree.main_commit(target))
-    bump_state.initialize_migration_plan(target_paths.forum, index, plan, contract=contract, source=source,
-                                         main_sha=bump_worktree.main_commit(target), return_state=False)
-    _json(target_paths.forum / "dag.json", plan)
-    _preparation_event(target_paths, run_id, "repair_plan_ready", plan_sha256=plan.get("plan_sha256"),
-                       module_count=len(graph), occurrence_count=len(index["occurrences"]))
-    _json(pointer, {**record, "status": "ready", "migration": migration,
-                    "runtime_hashes": runtime_hashes, "branch": branch, "baseline_sha256": baseline["sha256"]})
+    diagnostics, dag, contract = _prepare_plan(target_paths, migration, index, source, state=state)
+    _event(target_paths, "target_build_finished", elapsed_seconds=time.monotonic() - started,
+           passed=diagnostics["passed"], declaration_tasks=len(dag["chunks"]))
+    bump_state.initialize_migration_plan(target_paths.forum, dag, main_sha=main_sha, contract=contract)
+    _json(target_paths.forum / "dag.json", dag)
+    _json(active_path(paths), {**pointer, "status": "ready", "runtime_hashes": config,
+                             "baseline_sha256": baseline["sha256"]})
+    _event(target_paths, "repair_plan_ready", declaration_tasks=len(dag["chunks"]),
+           original_occurrences=len(index["occurrences"]))
     return target_paths
 
 
-def resume(paths: Paths, version: str | None = None, dependency_pins: dict[str, str] | None = None,
-           *, project_scope: str | None = None) -> Paths:
-    pointer = active_path(paths)
-    if pointer.is_symlink() or not pointer.is_file():
-        raise ValueError("No new-runtime Bump attempt is available to continue; legacy work was preserved")
-    record = json.loads(pointer.read_text())
-    if record.get("version") != 2 or record.get("migration_policy") != 2:
-        raise ValueError("Old-policy Bump attempts cannot resume under migration-v2; their evidence is preserved")
-    if record.get("status") != "ready" or record.get("project_root") != str(paths.project_root.resolve()):
-        raise ValueError("Bump preparation did not finish; its evidence is preserved and must not be overwritten or blindly repeated")
-    migration = record["migration"]
-    if project_scope is not None and project_scope != migration.get("scope", {}).get("mode"):
-        raise ValueError("--continue cannot change the sealed project scope")
-    _, target = bump_migration_project.resolve_paths(paths.project_root, migration)
-    if record.get("target_path") != str(target):
-        raise ValueError("Bump target pointer does not match its owned workspace")
-    if version is not None:
-        wanted = version if ":" in version else "leanprover/lean4:" + version
-        if wanted != migration["target_version"]:
-            raise ValueError("--continue cannot change the pinned target Lean version")
+def resume(paths: Paths, version: str | None = None, dependency_pins: dict | None = None,
+           *, project_scope: str | None = None, architect: str | None = None) -> Paths:
+    pointer = json.loads(active_path(paths).read_text())
+    source = paths.project_root.resolve()
+    if not isinstance(pointer.get("run_id"), str) or not re.fullmatch(r"bump-[0-9a-f]{12}", pointer["run_id"]):
+        raise ValueError("saved Bump workspace identifier is invalid")
+    target = source / ".unity" / "bump" / pointer["run_id"] / "target"
+    if (pointer.get("version") != 1 or pointer.get("status") != "ready"
+            or pointer.get("project_root") != str(source) or pointer.get("target_path") != str(target)):
+        raise ValueError("saved Bump workspace is not a ready owned declaration migration")
+    if target.is_symlink() or target.resolve() != target:
+        raise ValueError("saved Bump target is not its exact owned path")
+    target_paths = bump_paths(Paths.from_unity_dir(target / ".unity"))
+    origin = json.loads((target_paths.unity / "bump-origin.json").read_text())
+    if origin != {key: pointer[key] for key in ("project_root", "run_id", "target_path")}:
+        raise ValueError("saved Bump target origin disagrees with its source pointer")
+    migration = json.loads((target_paths.unity / "bump" / "migration.json").read_text())
+    requested = version if not version or ":" in version else "leanprover/lean4:" + version
+    if requested and requested != migration["target_version"]:
+        raise ValueError("--continue cannot change the saved Lean version")
     if dependency_pins and dependency_pins != migration["dependency_pins"]:
         raise ValueError("--continue cannot change dependency pins")
-    errors = bump_migration_project.validate_original(paths.project_root, migration)
-    errors.extend(bump_migration_project.validate_target(target, migration))
-    if errors:
-        raise ValueError("Cannot continue Bump: " + "; ".join(errors))
-    target_paths = bump_paths(Paths.from_unity_dir(target / ".unity"))
-    for name, expected in record["runtime_hashes"].items():
-        if _sha(paths.unity / name) != expected or _sha(target_paths.unity / name) != expected:
-            raise ValueError(f"Bump runtime configuration changed: {name}")
+    if project_scope and project_scope != migration["scope"]["mode"]:
+        raise ValueError("--continue cannot change the saved scope")
+    if architect and architect != migration.get("architect_mode"):
+        raise ValueError("--continue cannot change the saved Architect policy")
+    for name, sha in pointer["runtime_hashes"].items():
+        if any(hashlib.sha256((root / name).read_bytes()).hexdigest() != sha for root in (paths.unity, target_paths.unity)):
+            raise ValueError("Bump runtime configuration changed: " + name)
     state = bump_state.load_state(target_paths.forum)
-    if not state.get("run_id") or (state.get("project_baseline") or {}).get("sha256") != record["baseline_sha256"]:
-        raise ValueError("Bump saved state does not match the initialized native baseline")
-    bump_contract.validate_migration_state(state)
-    bump_project.require_original_branch(target, state["project_baseline"])
+    if state.get("project_baseline", {}).get("sha256") != pointer["baseline_sha256"]:
+        raise ValueError("saved Bump baseline does not match the workspace")
+    if not bump_contract._baseline_matches(state, state.get("formalization", {}).get("contract") or {}):
+        raise ValueError("saved Bump contract does not match the original migration baseline")
+    bump_project.require_pinned_inputs(target, state["project_baseline"])
     bump_project._require_clean(target)
     if bump_worktree.main_commit(target) != state["formalization"]["main_sha"]:
-        raise ValueError("Bump target HEAD changed outside checked candidate integration")
+        raise ValueError("target HEAD changed outside the Bump controller")
     require_source_matches(target_paths, state)
     return target_paths
 
 
-def check_ready_modules(paths: Paths) -> dict:
-    """Refresh v2 compiler diagnostics under the serialized integration boundary.
-
-    Legacy saved-state fixtures retain the old controller verification path;
-    fresh v2 attempts do not run that semantic sweep before dispatching workers.
-    """
-    # The integration path owns this same lock; never inspect source while a
-    # candidate is changing main. Forum activity remains possible and is guarded
-    # separately by the state's compare-and-swap revision at publication.
-    from .bump_runtime import _merge_lock
-
-    with _merge_lock(paths.project_root):
-        state = bump_state.load_state(paths.forum)
-        if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 2:
-            return refresh_target_diagnostics(paths, state=state)
-        return _check_ready_modules_locked(paths)
-
-
-def refresh_target_diagnostics(paths: Paths, *, state: dict | None = None) -> dict:
-    """Rebuild the changed target frontier and replace source-bound diagnostics.
-
-    Caller owns the integration lock. No semantic acceptance is inferred from a
-    disappearing error, and an unchanged diagnostic generation is never rebuilt
-    merely because the scheduler polled again.
-    """
-    from . import bump_diagnostics, bump_inventory, bump_planner
-
-    state = state or bump_state.load_state(paths.forum)
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") != 2:
-        raise ValueError("Diagnostic refresh requires migration-v2")
-    # Proposals only describe correspondences. The controller validates their
-    # exact evidence and owns publication; semantic approval remains separate.
-    pending = tuple(key for key, proposal in state.get("migration_mapping_proposals", {}).items()
-                    if proposal.get("status") == "proposed")
-    for proposal_id in pending:
-        state = bump_state.load_state(paths.forum)
-        proposal = state.get("migration_mapping_proposals", {}).get(proposal_id)
-        if not proposal or proposal.get("status") != "proposed":
-            continue
-        contract = state["formalization"]["contract"]
-        proposed_contract, reason = None, ""
-        try:
-            current = bump_contract.migration_source_identity_v2(paths.project_root, contract)
-            if (proposal.get("source_sha256") != current["source_sha256"]
-                    or proposal.get("main_sha") != bump_worktree.main_commit(paths.project_root)
-                    or proposal.get("contract_sha256") != contract["sha256"]):
-                raise ValueError("mapping proposal is stale against the current source/contract")
-            proposed_contract = bump_contract.with_migration_mapping_v2(paths.project_root, contract, proposal["mapping"])
-        except (OSError, ValueError, KeyError) as exc:
-            reason = str(exc)[:1000] or type(exc).__name__
-        bump_state.resolve_migration_mapping(paths.forum, proposal_id,
-            expected_revision=state["revision"], proposed_contract=proposed_contract, reason=reason)
-    if pending:
-        state = bump_state.load_state(paths.forum)
-        contract = state["formalization"]["contract"]
+def refresh_diagnostics(paths: Paths, state: dict | None = None, *, build: dict | None = None) -> dict:
+    state = bump_state.load_state(paths.forum) if state is None else state
     baseline = state["project_baseline"]
-    bump_project.require_original_branch(paths.project_root, baseline)
-    bump_project.require_pinned_inputs(paths.project_root, baseline)
-    main_sha = bump_worktree.main_commit(paths.project_root)
-    if main_sha != state["formalization"]["main_sha"]:
-        raise ValueError("Target HEAD changed outside checked integration")
-    source_sha256 = bump_contract.source_identity(paths.project_root)["source_sha256"]
-    prior = state.get("migration_plan") or {}
-    if prior.get("source_sha256") == source_sha256 and not state.get("migration_refresh_required"):
-        return state
-    index = bump_inventory.load_original_index(paths.artifacts, baseline["original_index_ref"])
-    diagnostics = bump_diagnostics.collect_build_diagnostics(paths.project_root, index,
-        modules=sorted(baseline["compiler_modules"]), scope=baseline["build_scope"], artifact_dir=paths.artifacts)
-    plan = bump_planner.plan_repairs(index, diagnostics, prior_plan=prior)
-    bump_state.refresh_migration_plan(paths.forum, index, plan, expected_revision=state["revision"],
-                                      expected_main_sha=main_sha, return_state=False)
-    return bump_state.load_state(paths.forum)
+    migration = baseline["migration"]
+    index = migration["original_index"]
+    diagnostics, dag, contract = _prepare_plan(paths, migration, index, state["input_source"], state=state, build=build)
+    return {"index": index, "diagnostics": diagnostics, "dag": dag, "contract": contract}
 
 
-def _archive_controller_verification(paths: Paths, verification: dict) -> dict:
-    """Keep full frontier evidence before publishing an artifact-backed view."""
-    payload = json.dumps(verification, sort_keys=True, separators=(",", ":"))
-    record = artifacts.store_text(paths.artifacts, payload,
-                                  kind="bump_formal_verification", producer="Unity")
-    digest = hashlib.sha256()
-    for offset in range(0, len(payload), 65536):
-        digest.update(payload[offset:offset + 65536].encode("utf-8"))
-    if record["sha256"] != digest.hexdigest():
-        raise ValueError("controller verification artifact has inconsistent bytes")
-    return {**verification, "artifact_id": record["artifact_id"],
-            "verification_artifact": {"artifact_id": record["artifact_id"], "sha256": record["sha256"]}}
-
-
-def _frontier_eligible(state: dict, key: str) -> bool:
-    task = state["formal_tasks"][key]
-    return (task.get("status") == "pending" and bool(task.get("migration_module"))
-            and task.get("faithfulness", {}).get("status") != "changes_requested"
-            and all(state["formal_tasks"][dependency].get("status") == "complete"
-                    for dependency in task.get("dependencies", [])))
-
-
-def _check_ready_modules_locked(paths: Paths) -> dict:
-    while True:
-        state = bump_state.load_state(paths.forum)
-        progressed = False
-        # Routing hints only: every actual check below reloads and rechecks its
-        # preconditions. Blocked modules do not each require a giant JSON parse.
-        eligible = tuple(key for key in state["formal_tasks"] if _frontier_eligible(state, key))
-        for key in eligible:
-            state = bump_state.load_state(paths.forum)
-            task = state["formal_tasks"][key]
-            if not _frontier_eligible(state, key):
-                continue
-            # A failed check stays visible as compiler diagnostics; do not build
-            # it repeatedly without a source/context change.
-            current = bump_contract.source_identity(paths.project_root)
-            main_sha = bump_worktree.main_commit(paths.project_root)
-            if (task.get("migration_check") or {}).get("source_sha256") == current["source_sha256"]:
-                continue
-            receipt = bump_contract.check_migration_module(paths, state, key)
-            receipt = dict(receipt)
-            expected_contract = state["formalization"]["contract"]["sha256"]
-            if receipt.setdefault("contract_sha256", expected_contract) != expected_contract:
-                raise ValueError("controller module check has an unexpected contract identity")
-            if receipt.get("passed"):
-                verification = {**receipt, "status": "passed",
-                                "policy_sha256": bump_contract.policy_hash(),
-                                "contract_sha256": state["formalization"]["contract"]["sha256"]}
-                verification = _archive_controller_verification(paths, verification)
-                published = bump_state.record_migration_module_check(
-                    paths.forum, key, verification, main_sha=main_sha,
-                    expected_revision=state["revision"])
-                if published is not False:
-                    progressed = True
-            else:
-                diagnostic = _archive_controller_verification(
-                    paths, {**receipt, "source_sha256": current["source_sha256"]})
-                bump_state.record_migration_diagnostic(paths.forum, key,
-                    diagnostic,
-                    expected_revision=state["revision"])
-        if not progressed:
-            current = bump_state.load_state(paths.forum)
-            # Do not miss a concurrently unblocked module that the initial
-            # routing snapshot excluded. No native result is cached here.
-            if any(key not in eligible and _frontier_eligible(current, key)
-                   for key in current["formal_tasks"]):
-                continue
-            return current
+def refresh(paths: Paths, *, build: dict | None = None) -> dict:
+    prepared = refresh_diagnostics(paths, build=build)
+    state = bump_state.refresh_migration_plan(paths.forum, prepared["dag"],
+        main_sha=bump_worktree.main_commit(paths.project_root), contract=prepared["contract"])
+    _json(paths.forum / "dag.json", prepared["dag"])
+    return state

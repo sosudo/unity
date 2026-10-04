@@ -30,16 +30,6 @@ def _seal(value: dict) -> dict:
     return value
 
 
-def _baseline_digest(value: dict) -> str:
-    """Recompute the identical seal without copying immutable evidence to discard it.
-
-    This is deliberately recomputed on every validation. No cached digest or
-    earlier validation result can conceal mutation of a nested native record.
-    Publication still uses ``_seal`` and owns an independent deep copy.
-    """
-    return _digest({key: item for key, item in value.items() if key != "sha256"})
-
-
 def _git(root: Path, *args: str) -> str:
     result = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True)
     if result.returncode:
@@ -169,16 +159,13 @@ def _initial_scope(target_scope: str, records: dict, holes: set[str], *, eligibl
 
 
 def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | None = None,
-                     *, project_scope: str = "all", migration: dict | None = None,
-                     original_inspections: dict | None = None, compiler_modules: dict | None = None) -> dict:
+                     *, project_scope: str = "all") -> dict:
     """Build and freeze a clean, existing project before any agent dispatch.
 
     The optional native receipt is an internal testing/reuse hook; it is never an
     agent-supplied tool argument. Native build/environment checks still run.
     """
     from . import bump_contract as contract, bump_scope
-    if migration is not None:
-        return _capture_migration_baseline(root, migration, original_inspections, compiler_modules)
     if project_scope == "changes":
         from . import bump_delta
         if inspection is not None:
@@ -226,342 +213,17 @@ def capture_baseline(root: Path, target_scope: str = "All", inspection: dict | N
                      ("project_axioms", "project_sorries", "project_used_axioms")}})
 
 
-def _capture_migration_baseline(root, migration, reports, graph) -> dict:
-    from . import bump_contract, bump_migration_contract as native, bump_migration_project as project
-    root = Path(root).resolve()
-    errors = project.validate_original(Path(migration["root"]), migration) + project.validate_target(root, migration)
-    if errors:
-        raise ValueError("; ".join(errors))
-    _require_clean(root)
-    branch = _git(root, "branch", "--show-current")
-    if not branch:
-        raise ValueError("Bump target baseline requires a named branch")
-    if not isinstance(graph, dict) or not graph or not isinstance(reports, dict) or set(reports) != set(graph):
-        raise ValueError("Bump requires native original reports for every compiler module")
-    scope = migration.get("scope")
-    errors = project.scope_errors(scope, migration.get("source_files"))
-    if errors or scope.get("selected_modules") != {name: row["path"] for name, row in graph.items()}:
-        raise ValueError("Bump requires a sealed selected-module build scope: " + "; ".join(errors))
-    for module, report in sorted(reports.items()):
-        issues = native._report_issues(report)
-        if issues or report.get("module") != module or set(report.get("owned_modules", [])) != set(graph):
-            raise ValueError("invalid original native inspection for " + module + ": " + "; ".join(issues))
-    declarations = migration_declarations(reports)
-    layout = bump_contract.workspace_layout(root)
-    expected = {row["path"]: name for name, row in graph.items()}
-    if any(layout["modules"].get(path) != name for path, name in expected.items()):
-        raise ValueError("target Lake ownership differs from the selected original compiler graph")
-    files = project.source_files(root)
-    value = _seal({"version": 5, "policy": "migration-v1", "scope_policy": 1, "occurrence_policy": 1,
-        "build_scope": copy.deepcopy(scope), "project_root": str(root),
-        "branch": branch, "head": _git(root, "rev-parse", "HEAD"), "files": files,
-        "tracked_files": _tracked(root), "environment": bump_contract.environment_identity(root),
-        "layout": layout, "migration": copy.deepcopy(migration),
-        "compiler_modules": copy.deepcopy(graph), "original_reports": copy.deepcopy(reports),
-        "declarations": declarations, "target_scope": "All", "scope": {"mode": "all", "bound": True,
-            "existing_targets": sorted(declarations)},
-        "project_axioms": sorted(n for n, r in declarations.items() if r["kind"] == "axiom"),
-        "project_sorries": sorted(n for n, r in declarations.items() if r["direct_sorry"]),
-        "project_used_axioms": sorted({a for r in declarations.values() for a in r["axioms"]})})
-    errors = _migration_baseline_errors(value)
-    if errors:
-        raise ValueError("; ".join(errors))
-    _require_migration_inputs(root, value)
-    return value
-
-
-def capture_baseline_v2(root: Path, *, migration: dict, original_index_ref: dict,
-                        compiler_modules: dict, index: dict | None = None) -> dict:
-    """Capture policy 2 metadata without copying native expression inventories."""
-    from . import bump_contract, bump_migration_project as project
-    from .bump_inventory import load_original_index
-    root = Path(root).resolve(strict=True)
-    artifact_root = root / ".unity" / "artifacts"
-    loaded = load_original_index(artifact_root, original_index_ref)
-    if index is not None and index != loaded:
-        raise ValueError("supplied original index differs from its immutable artifact")
-    errors = project.validate_original(Path(migration["root"]), migration) + project.validate_target(root, migration)
-    if errors:
-        raise ValueError("; ".join(errors))
-    _require_clean(root)
-    graph = compiler_modules
-    scope = migration.get("scope")
-    if (project.scope_errors(scope, migration.get("source_files")) or not graph
-            or scope["selected_modules"] != {name: row["path"] for name, row in graph.items()}
-            or set(loaded["modules"]) != set(graph)
-            or any(loaded["modules"][name]["path"] != row["path"] for name, row in graph.items())
-            or loaded["scope_sha256"] != scope["sha256"]):
-        raise ValueError("original index does not cover the sealed build scope")
-    branch = _git(root, "branch", "--show-current")
-    if not branch:
-        raise ValueError("Bump target baseline requires a named branch")
-    files = project.source_files(root)
-    layout = bump_contract.workspace_layout(root)
-    if any(layout["modules"].get(row["path"]) != module for module, row in graph.items()):
-        raise ValueError("target Lake ownership differs from the original compiler graph")
-    value = _seal({"version": 6, "policy": "migration-v2", "scope_policy": 1, "occurrence_policy": 1,
-        "build_scope": copy.deepcopy(scope), "project_root": str(root), "branch": branch,
-        "head": _git(root, "rev-parse", "HEAD"), "files": files, "tracked_files": _tracked(root),
-        "environment": bump_contract.environment_identity(root), "layout": layout,
-        "migration": copy.deepcopy(migration), "compiler_modules": copy.deepcopy(graph),
-        "artifact_root": str(artifact_root), "original_index_ref": copy.deepcopy(original_index_ref),
-        "original_index_sha256": loaded["index_sha256"],
-        "occurrence_count": len(loaded["occurrences"]), "target_scope": "All",
-        "scope": {"mode": "all", "bound": True}})
-    errors = _migration_v2_baseline_errors(value)
-    if errors:
-        raise ValueError("; ".join(errors))
-    _require_migration_inputs(root, value)
-    return value
-
-
-def _migration_v2_baseline_errors(baseline: dict) -> list[str]:
-    """Pure compact schema guard; artifact bytes are resolved at check boundaries."""
-    from . import bump_migration_project as project
-    try:
-        if (baseline.get("version") != 6 or baseline.get("policy") != "migration-v2"
-                or baseline.get("scope_policy") != 1 or baseline.get("occurrence_policy") != 1
-                or baseline.get("sha256") != _baseline_digest(baseline)
-                or any(key in baseline for key in ("original_reports", "declarations", "meanings"))):
-            return ["compact migration baseline integrity mismatch"]
-        migration, graph, scope = baseline["migration"], baseline["compiler_modules"], baseline["build_scope"]
-        reference = baseline["original_index_ref"]
-        if (not isinstance(reference, dict)
-                or not re.fullmatch(r"artifact-[0-9a-f]{12}", str(reference.get("artifact_id", "")))
-                or not re.fullmatch(r"[0-9a-f]{64}", str(reference.get("sha256", "")))
-                or not re.fullmatch(r"[0-9a-f]{64}", str(baseline.get("original_index_sha256", "")))
-                or type(baseline.get("occurrence_count")) is not int or baseline["occurrence_count"] < 0
-                or not graph or not baseline["branch"] or not baseline["environment"]
-                or baseline["project_root"] != migration["target"]
-                or baseline["artifact_root"] != str(Path(baseline["project_root"]) / ".unity" / "artifacts")
-                or migration.get("target_sealed") is not True
-                or migration.get("identity") != project._digest({k: v for k, v in migration.items() if k != "identity"})
-                or scope != migration.get("scope") or project.scope_errors(scope, migration.get("source_files"))
-                or baseline["scope"] != {"mode": "all", "bound": True}):
-            return ["compact migration baseline has inconsistent pinned metadata"]
-        paths = [row["path"] for row in graph.values()]
-        if (len(paths) != len(set(paths)) or scope["selected_modules"] != {key: row["path"] for key, row in graph.items()}
-                or any(not _safe_path(row["path"]) or row["path"] not in baseline["files"]
-                    or Path(row["path"]).suffix != ".lean" or row.get("compiler_derived") is not True
-                    or not isinstance(row.get("imports"), list) or set(row["imports"]) - set(graph)
-                    or baseline["layout"]["modules"].get(row["path"]) != key for key, row in graph.items())
-                or any(baseline["files"].get(path) != value for path, value in scope["excluded_files"].items())):
-            return ["compact migration baseline has inconsistent module ownership"]
-        return []
-    except (KeyError, TypeError, ValueError, AttributeError):
-        return ["compact migration baseline is incomplete"]
-
-
-def migration_occurrence_id(module: str, native_name: object) -> str:
-    """A kernel Name in one raw module inventory, not a global first owner.
-
-    The same Name can occur in multiple module artifacts with independently
-    checked meanings and proof assumptions. Display names are never parsed to
-    recover identity, and an occurrence in one module cannot discharge another.
-    """
-    from . import bump_migration_contract as native
-    if not isinstance(module, str) or not module:
-        raise ValueError("migration occurrence requires an exact module")
-    native._name(native_name)
-    return "occurrence-" + native.digest({"module": module, "name": native_name})
-
-
-def migration_declarations(reports: dict) -> dict:
-    """Lossless aggregate retaining every module's own declaration and trust."""
-    declarations = {}
-    for module, report in sorted(reports.items()):
-        for name, row in sorted(report["declarations"].items()):
-            meaning = report["meanings"][name]["meaning"]
-            occurrence = migration_occurrence_id(module, meaning["name"])
-            if occurrence in declarations:
-                raise ValueError("duplicate native declaration occurrence: " + module + ": " + name)
-            declarations[occurrence] = {**copy.deepcopy(row), "module": module,
-                "occurrence_id": occurrence, "declaration": name,
-                "native_name": copy.deepcopy(meaning["name"]), "target_kind": row["kind"],
-                "declaration_meaning": copy.deepcopy(meaning)}
-    return declarations
-
-
-def _migration_declarations_match(reports: dict, declarations: dict) -> bool:
-    """Compare every exact occurrence without allocating another native tree.
-
-    Only validation uses these short-lived views. Published inventories still
-    deep-copy their records, and duplicates/extras are checked independently.
-    """
-    if not isinstance(declarations, dict):
-        return False
-    seen = set()
-    for module, report in sorted(reports.items()):
-        for name, row in sorted(report["declarations"].items()):
-            meaning = report["meanings"][name]["meaning"]
-            occurrence = migration_occurrence_id(module, meaning["name"])
-            if occurrence in seen:
-                return False
-            seen.add(occurrence)
-            expected = {**row, "module": module, "occurrence_id": occurrence,
-                "declaration": name, "native_name": meaning["name"],
-                "target_kind": row["kind"], "declaration_meaning": meaning}
-            if declarations.get(occurrence) != expected:
-                return False
-    return seen == declarations.keys()
-
-
-def _migration_baseline_errors(baseline: dict) -> list[str]:
-    from . import bump_migration_contract as native, bump_migration_project as project
-    try:
-        if (baseline.get("version") != 5 or baseline.get("scope_policy") != 1
-                or baseline.get("occurrence_policy") != 1
-                or baseline.get("sha256") != _baseline_digest(baseline)):
-            return ["migration baseline integrity mismatch"]
-        migration, graph, reports = baseline["migration"], baseline["compiler_modules"], baseline["original_reports"]
-        scope = baseline.get("build_scope")
-        scope_errors = project.scope_errors(scope, migration.get("source_files"))
-        if scope_errors or scope != migration.get("scope"):
-            return ["migration baseline has missing or inconsistent sealed build scope", *scope_errors]
-        if (migration.get("target_sealed") is not True or migration.get("identity") != project._digest(
-                {k: v for k, v in migration.items() if k != "identity"})
-                or not graph or set(graph) != set(reports) or not baseline["environment"]
-                or baseline["project_root"] != migration["target"] or not baseline["branch"]
-                or baseline["scope"] != {"mode": "all", "bound": True,
-                    "existing_targets": sorted(baseline["declarations"])}):
-            return ["migration baseline has inconsistent sealed environment/module coverage"]
-        paths = []
-        # Original contexts share most toolchain imports. Canonicalize each
-        # path once in this validation only; never retain filesystem answers
-        # across a later baseline/candidate check.
-        resolved_paths: dict[str, Path] = {}
-        for module, row in graph.items():
-            path = row["path"]
-            if (not _safe_path(path) or Path(path).suffix != ".lean" or path not in baseline["files"]
-                    or not isinstance(row["imports"], list) or set(row["imports"]) - set(graph)
-                    or row.get("compiler_derived") is not True):
-                return ["migration baseline has invalid compiler module ownership"]
-            paths.append(path)
-            report = reports[module]
-            if native._report_issues(report) or report["module"] != module or set(report["owned_modules"]) != set(graph):
-                return ["migration baseline has invalid original native evidence: " + module]
-            scope_issues = migration_inspection_scope_errors(
-                report, baseline, root=Path(migration.get("original", migration["root"])),
-                _resolved_paths=resolved_paths)
-            if scope_issues:
-                return scope_issues
-            if (report["source_hashes"] != {path: value for path, value in migration["source_files"].items()
-                                           if path.endswith(".lean")}
-                    or report["environment"].get("config") != migration["original_config"]):
-                return ["original native context does not match the sealed original sources/configuration: " + module]
-        if len(paths) != len(set(paths)) or not _migration_declarations_match(reports, baseline["declarations"]):
-            return ["migration original declaration inventory is inconsistent"]
-        expected = {module: row["path"] for module, row in graph.items()}
-        if (scope["selected_modules"] != expected
-                or any(baseline["layout"]["modules"].get(path) != module for module, path in expected.items())
-                or any(baseline["files"].get(path) != value for path, value in scope["excluded_files"].items())):
-            return ["migration selected native/byte-preserved ownership is inconsistent"]
-        return []
-    except (KeyError, TypeError, ValueError, AttributeError):
-        return ["migration baseline is incomplete or unsupported"]
-
-
-def migration_inspection_scope_errors(report: dict, baseline: dict, *, root: Path,
-                                     _resolved_paths: dict[str, Path] | None = None) -> list[str]:
-    """Require actual transitive native imports to stay inside the sealed boundary."""
-    scope = baseline.get("build_scope") or {}
-    imported = report.get("imported_modules")
-    if (not isinstance(imported, list) or not imported
-            or any(not isinstance(module, str) or not module for module in imported)
-            or len(imported) != len(set(imported)) or report.get("module") not in imported):
-        return ["migration inspection lacks complete native imported-module evidence"]
-    excluded = set(scope.get("excluded_modules", {})) & set(imported)
-    if excluded:
-        return ["native imports cross the frozen migration build scope: " + ", ".join(sorted(excluded))]
-    compiled, identities = report.get("compiled_modules"), report.get("compiled_inputs")
-    if (not isinstance(compiled, list) or len(compiled) != len(imported)
-            or not isinstance(identities, dict)
-            or any(not isinstance(path, str) or not Path(path).is_absolute()
-                   or Path(path).suffix != ".olean" for path in compiled)):
-        return ["migration inspection lacks paired native artifact provenance"]
-    build_dir = scope.get("native_metadata", {}).get("build_dir", ".lake/build")
-    resolved = {} if _resolved_paths is None else _resolved_paths
-
-    def canonical(path: Path | str) -> Path:
-        key = str(path)
-        if key not in resolved:
-            resolved[key] = Path(path).resolve()
-        return resolved[key]
-
-    local_artifacts = canonical(Path(root) / build_dir / "lib" / "lean")
-    local_parts = local_artifacts.parts
-    selected = scope.get("selected_modules", {})
-    for module, filename in zip(imported, compiled):
-        identity = identities.get(filename)
-        if (not isinstance(identity, dict) or not isinstance(identity.get("path"), str)
-                or not re.fullmatch(r"[0-9a-f]{64}", str(identity.get("sha256", "")))
-                or canonical(identity["path"]) != canonical(filename)):
-            return ["native import artifact is not bound to its compiled receipt: " + module]
-        artifact = canonical(identity["path"])
-        if module in selected:
-            expected = canonical(local_artifacts / (module.replace(".", "/") + ".olean"))
-            if artifact != expected:
-                return ["selected module resolved outside its sealed local artifact: " + module]
-        # Both sides are already canonical absolute paths. Component comparison
-        # preserves containment semantics without allocating Path.parents.
-        if artifact.parts[:len(local_parts)] == local_parts and module not in selected:
-            # An unmatched original Notes.lean has no invented ownership label.
-            # Its stale local artifact still cannot enter a selected native context.
-            return ["native local artifact crosses the selected migration boundary: " + module]
-    return []
-
-
-def _require_migration_inputs(root: Path, baseline: dict) -> None:
-    from . import bump_contract as contract, bump_migration_project as project
-    errors = (_migration_v2_baseline_errors(baseline) if baseline.get("policy") == "migration-v2"
-              else _migration_baseline_errors(baseline))
-    if errors:
-        raise ValueError("; ".join(errors))
-    root, migration = Path(root).resolve(), baseline["migration"]
-    errors = project.validate_original(Path(migration["root"]), migration)
-    # Candidates are independent Git worktrees, not the controller's target path.
-    # The sealed config/dependency bytes apply equally in every candidate.
-    if project.config_hashes(root) != migration["target_config"]:
-        errors.append("sealed target configuration changed")
-    if errors:
-        raise ValueError("; ".join(errors))
-    # Check excluded source bytes BEFORE Lake configuration or compiler import
-    # queries. Broken out-of-scope files are preserved, not compiled or repaired.
-    errors.extend(project.validate_dependencies(root))
-    files = project.source_files(root)
-    if set(files) != set(baseline["files"]):
-        errors.append("migration added or removed an original project file")
-    editable = {row["path"] for row in baseline["compiler_modules"].values()}
-    for name in set(files) & set(baseline["files"]):
-        if name not in editable and files[name] != baseline["files"][name]:
-            errors.append("protected non-module input changed: " + name)
-        if name in editable and ((root / name).is_symlink() or not (root / name).is_file()):
-            errors.append("module input is missing or symlinked: " + name)
-    if errors:
-        raise ValueError("; ".join(errors))
-    # The Git-based inventory also deliberately scans untracked Lean files;
-    # independently account for untracked/ignored non-Lean inputs before a
-    # compiler can consume them through include_str or an elaborator helper.
-    all_inputs = contract._file_hashes(root, build_dir=baseline["layout"].get("build_dir", ".lake/build"))
-    if all_inputs != files:
-        raise ValueError("migration has unaccounted, symlinked or changed non-runtime input files")
-    errors = project.validate_build_scope(root, baseline["build_scope"])
-    if errors:
-        raise ValueError("; ".join(errors))
-
-
 def baseline_errors(baseline: dict) -> list[str]:
     from . import bump_scope
-    if isinstance(baseline, dict) and baseline.get("policy") == "migration-v2":
-        return _migration_v2_baseline_errors(baseline)
     if isinstance(baseline, dict) and baseline.get("policy") == "migration-v1":
-        return _migration_baseline_errors(baseline)
+        from .bump_migration import baseline_errors as migration_errors
+        return migration_errors(baseline)
     if isinstance(baseline, dict) and baseline.get("version") == 2:
         from . import bump_delta
         return bump_delta.errors(baseline)
     if not isinstance(baseline, dict) or baseline.get("version") != 1:
         return ["existing-project baseline is missing or unsupported"]
-    expected = _baseline_digest(baseline)
+    expected = _seal(baseline)["sha256"]
     if baseline.get("sha256") != expected:
         return ["existing-project baseline integrity mismatch"]
     required = {"branch", "head", "files", "tracked_files", "environment", "layout", "declarations",
@@ -613,12 +275,14 @@ def baseline_is_valid(baseline: dict) -> bool:
     return not baseline_errors(baseline)
 
 
+def capture_migration_baseline(root: Path, *, migration: dict, original_index: dict) -> dict:
+    """Bind the original universe and the separately prepared target environment."""
+    from .bump_migration import capture_baseline
+    return capture_baseline(root, migration=migration, original_index=original_index)
+
+
 def require_original_branch(root: Path, baseline: dict) -> None:
     """Controller continuation guard; call on the original project checkout."""
-    if baseline.get("policy") in {"migration-v1", "migration-v2"}:
-        if str(Path(root).resolve()) != baseline["project_root"] or _git(root, "branch", "--show-current") != baseline["branch"]:
-            raise ValueError("Bump target branch identity changed")
-        return
     branch = _git(Path(root).resolve(), "branch", "--show-current")
     if branch != baseline.get("branch"):
         raise ValueError("existing project branch changed from the preserved baseline")
@@ -631,10 +295,11 @@ def require_pinned_inputs(root: Path, baseline: dict, *, allowed_new_paths=()) -
     inspect dependency sources before any Lake configuration/elaboration runs.
     This is preservation checking, not an adversarial Lean execution sandbox.
     """
-    if baseline.get("policy") in {"migration-v1", "migration-v2"}:
-        _require_migration_inputs(root, baseline)
-        return
     from . import bump_contract as contract, bump_scope
+    if baseline.get("policy") == "migration-v1":
+        from .bump_migration import require_inputs
+        require_inputs(root, baseline, allowed_new_paths=allowed_new_paths)
+        return
     errors = baseline_errors(baseline)
     if errors:
         raise ValueError("; ".join(errors))
@@ -700,9 +365,7 @@ def _output_names(dag: dict) -> set[str]:
 def bind_scope(baseline: dict, dag: dict, *, root: Path | None = None) -> dict:
     if baseline.get("policy") == "migration-v1":
         if baseline_errors(baseline):
-            raise ValueError("invalid migration baseline")
-        if {row.get("task_id", row.get("id")) for row in dag.get("chunks", [])} != set(baseline["compiler_modules"]):
-            raise ValueError("migration plan must cover every original module")
+            raise ValueError("invalid original migration baseline")
         return copy.deepcopy(baseline)
     """Bind natural-language scope to exact planned existing names once.
 
@@ -766,17 +429,18 @@ def validate_baseline(root: Path, baseline: dict, inspection: dict | None = None
     Caller builds fresh inputs before inspection. Allowed new paths/placeholder
     names must come from controller-validated manifests, never unchecked prose.
     """
-    if baseline.get("policy") == "migration-v1":
-        try:
-            _require_migration_inputs(root, baseline)
-            return []
-        except (ValueError, OSError) as exc:
-            return [str(exc)]
     from . import bump_contract as contract, bump_scope
     errors = baseline_errors(baseline)
     if errors:
         return errors
     root = Path(root).resolve()
+    if baseline.get("policy") == "migration-v1":
+        from . import bump_migration
+        try:
+            bump_migration.require_inputs(root, baseline, allowed_new_paths=allowed_new_paths)
+            return []
+        except ValueError as exc:
+            return [str(exc)]
     if baseline.get("version") == 2:
         from . import bump_delta
         return bump_delta.validate(root, baseline, inspection, final=final,

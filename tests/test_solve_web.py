@@ -113,7 +113,8 @@ class SolveWebTests(unittest.TestCase):
                 (self.unity / "state.json").write_text(json.dumps({"command": command}))
                 self.assertFalse(web._icrl_visible())
         (self.unity / "state.json").write_text(json.dumps({"command": "bump"}))
-        self.assertTrue(web._icrl_visible())
+        # Bump owns a structured Forum too; Solve's behavior is unchanged.
+        self.assertFalse(web._icrl_visible())
 
 
 if __name__ == "__main__":

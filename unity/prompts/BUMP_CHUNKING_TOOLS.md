@@ -1,8 +1,9 @@
-# Available tools for `unity bump` — semantic chunking
+# Available tools for `unity bump` — declaration repair planning
 
 Start with `bump_brief(author)` and the absolute formalization-plan path in your task for the immutable supplied-source
-snapshot, file paths/artifacts and exact source-reference IDs. Read source files directly as appropriate
-to their format; use `artifact_info` and bounded `artifact_read` for stored text. `bump_status()` exposes
+snapshot of the original Lean project, file paths/artifacts and exact source-reference IDs. Read the
+original occurrence/dependency index and compiler diagnostics; use `artifact_info` and bounded
+`artifact_read` for stored text. `bump_status()` exposes
 the current state; `forum_read` provides discussion detail.
 
 - `publish_finding(author, kind, title, content, confidence, target?, strategy_id?, evidence?, supersedes?)`
@@ -18,10 +19,12 @@ the current state; `forum_read` provides discussion detail.
 Write only the assigned draft: an informal, source-linked DAG with stable node IDs, titles,
 `predicted_kind`, `informal_statement`, nullable `informal_proof`, `statement_dependencies`,
 `proof_dependencies`, source/anchor/requirement references, and optional proposed formal hints.
-Initially use one node per in-scope source definition, theorem, lemma, corollary or construction,
-keeping its statement and proof together. Do not pre-decompose routine proof steps or prospective
-Lean helpers; bumprs can add needed helpers and edges later with `refine_chunks`.
-Initial plans include anchored `requirements` and `spec` (scope, arguments and prerequisites).
+The controller seeds initial declaration-level tasks from compiler errors. Retain one independently
+repairable original declaration per task, or a true mutual group; located source-command errors are
+separate assignments. Never substitute one task per failing module or expand blocked downstream
+imports into invented declaration errors. Several tasks may share a file; integration is serialized.
+The original obligation ledger covers ALL selected declarations, including compiled unchanged ones
+with no repair task. Initial plans and their anchored `requirements`/`spec` are controller-generated.
 Replans use the seeded mutable-only draft: `base_revision`, `requirement_tasks`, `prerequisites`,
 `arguments`, `chunks`, and unchanged source-binding fields. Unity supplies frozen obligations.
 Use `kind="declaration"` for a known proposed witness (external or project-local), `kind="argument"`
@@ -31,8 +34,10 @@ Do not generate Lean files or a compilable scaffold, run builds,
 or perform proof search/import minimization for chunking.
 Copy the plan's `solution_candidate` and `solution_sha256` compatibility fields exactly: they identify
 the supplied-source snapshot and bundle hash, not a generated solution or an informal review result.
-Unity validates source links and the dependency graph before formalization. Bumprs create and
-submit versioned Lean outputs later. Do not edit the supplied source files or silently drop obligations.
+Unity validates source links and the dependency graph before repairs. Workers submit versioned Lean
+repairs later. Provisional declaration integration may coexist with other same-file errors; final
+acceptance still requires complete selected build/native/no-new-trust and independent critic evidence.
+Do not edit the supplied source files, frozen build/all scope or pins, or silently drop obligations.
 
 `validate_chunks()` reads your assigned draft and returns precise validation diagnostics without
 publishing it. Correct and revalidate in this same session. Ordinary corrections do not count as failed
@@ -46,4 +51,5 @@ Before freezing, use the plan's source-reference IDs as anchors. `submit_source_
 explanation, evidence, replacement?)` records an explicit justified correction without changing source bytes.
 Inspect existing proposals in the plan; adopted repairs must appear in `spec.arguments[].repair_ids`
 for initial chunking, or `arguments[].repair_ids` in a mutable-only replan.
-Unity schedules optional repair attempts for open issues rather than silently dropping their requirements.
+These proposals cannot waive original declaration meanings or per-declaration trust. A genuine change
+to the original mathematics requires user direction, not an easier replacement obligation.

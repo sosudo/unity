@@ -81,10 +81,8 @@ def policy_hash() -> str:
         "bump_workspace.py", "bump_workspace.lean",
         "bump_native.py", "bump_jobs.py", "bump_cache.py",
         "bump_project.py", "bump_delta.py", "bump_scope.py", "bump_files.py", "bump_input.py",
-        "bump_migration_contract.py", "bump_inspect.lean", "bump_migration_project.py", "bump_bootstrap.py",
-        "bump_planner.py", "bump_diagnostics.py",
-        "bump_migration_defaults.lean",
-        "bump_checker_v2.py", "bump_inventory.py", "bump_inventory.lean",
+        "bump_migration.py", "bump_inventory.py", "bump_inventory.lean", "bump_planner.py", "bump_diagnostics.py",
+        "bump_preparation.py", "bump_bootstrap.py",
     )}
     return digest(policy)
 
@@ -383,21 +381,15 @@ def _dependencies(root: Path) -> dict:
 
 
 def environment_identity(root: Path) -> dict:
-    from . import bump_migration_project
-    version = bump_migration_project._run(root, ["lake", "env", "lean", "--version"])
-    prefix = bump_migration_project._run(root, ["lake", "env", "lean", "--print-prefix"])
-    sysroot = Path(prefix.stdout.strip())
-    if version.returncode or prefix.returncode or not sysroot.is_absolute() or not (sysroot / "bin" / "lean").is_file():
+    version = bump_jobs.run(root, ["lake", "env", "lean", "--version"], cwd=root,
+                             owner="Unity", task_id="contract", serialize_build=True)
+    if version.returncode:
         raise ValueError("cannot determine Lean toolchain identity")
     return {
         "lean_version": version.stdout.strip(),
-        "lean_sysroot": str(sysroot.resolve()),
-        "lean_binary_sha256": hashlib.sha256((sysroot / "bin" / "lean").read_bytes()).hexdigest(),
         "config": {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
                    for name in sorted(_CONFIGS) if (root / name).exists()},
-        # Worktrees have distinct physical dependency paths, not distinct source identities.
-        "dependencies": {name: {k: v for k, v in row.items() if k != "path"}
-                         for name, row in _dependencies(root).items()},
+        "dependencies": _dependencies(root),
     }
 
 
@@ -420,6 +412,10 @@ def source_identity(root: Path, *, layout: dict | None = None) -> dict:
 
 
 def workspace_layout(root: Path) -> dict:
+    migration_path = root / ".unity" / "bump" / "migration.json"
+    if migration_path.is_file():
+        from .bump_migration import workspace_layout as migration_layout
+        return migration_layout(root, json.loads(migration_path.read_text()))
     executable = bump_workspace._executable(root)
     layout = bump_workspace.discover(root, ["--layout-only"], executable=executable)
     files = [str(path.relative_to(root))
@@ -437,6 +433,14 @@ def workspace_modules(root: Path) -> dict[str, str]:
 
 def scoped_layout(root: Path, layout: dict, baseline: dict | None) -> dict:
     """Apply only controller-sealed scope; keep full ownership discoverable."""
+    if baseline and baseline.get("policy") == "migration-v1":
+        selected = {path: module for module, path in baseline["migration"]["selected_modules"].items()}
+        if any(layout["modules"].get(path) != module for path, module in selected.items()):
+            raise ValueError("migration selected module ownership changed")
+        current = {path: module for path, module in layout["modules"].items()
+                   if path in selected or path not in baseline["files"]}
+        return {**layout, "verification_modules": current, "editable_modules": current,
+                "project_scope": baseline["project_scope"], "scope_sha256": baseline["migration"]["scope"]["sha256"]}
     if baseline and baseline.get("project_scope") == "changes":
         from . import bump_delta
         return bump_delta.apply(root, layout, baseline)
@@ -454,44 +458,11 @@ def _editable_modules(layout: dict) -> dict[str, str]:
     return layout.get("editable_modules", layout["modules"])
 
 
-def _migration_project_verification(baseline: dict) -> dict:
-    """Pure exact coverage shape; callers separately validate baseline authority."""
-    migration = baseline["migration"]
-    scope = baseline["build_scope"]
-    return {"mode": "migration", "policy": "migration-v1", "inspection_policy": 4, "occurrence_policy": 1,
-                "scope_policy": 1, "scope_sha256": scope["sha256"], "project_scope": scope["mode"],
-                "baseline_sha256": baseline["sha256"],
-                "original_source_commit": migration["source_commit"],
-                "original_source_sha256": migration["source_hash"],
-                "target_version": migration["target_version"],
-                "verification_modules": {row["path"]: name for name, row in baseline["compiler_modules"].items()},
-                "byte_only_modules": {path: name for name, path in scope["excluded_modules"].items()},
-                "byte_preserved_files": copy.deepcopy(scope["excluded_files"]),
-                "contexts": sorted(baseline["compiler_modules"]),
-                "declaration_occurrences": {key: {"module": row["module"],
-                    "declaration": row["declaration"], "native_name": copy.deepcopy(row["native_name"])}
-                    for key, row in baseline["declarations"].items()},
-                "normal_default_build": True}
-
-
 def project_verification(root: Path, baseline: dict, *, tasks: list[dict] | None = None) -> dict | None:
-    if baseline.get("policy") == "migration-v2":
-        return {"mode": "migration", "migration_policy": 2, "inspection_policy": 5,
-            "scope_policy": 1, "occurrence_policy": 1, "baseline_sha256": baseline["sha256"],
-            "scope_sha256": baseline["build_scope"]["sha256"],
-            "original_index_ref": baseline["original_index_ref"],
-            "original_index_sha256": baseline["original_index_sha256"],
-            "occurrence_count": baseline["occurrence_count"],
-            "selected_modules": {name: row["path"] for name, row in baseline["compiler_modules"].items()},
-            "excluded_files": baseline["build_scope"]["excluded_files"],
-            "upstream_compatibility_assumption": True,
-            "recursive_upstream_ast_equality": False}
     """Current controller-derived coverage, never an agent's coverage claim."""
     if baseline.get("policy") == "migration-v1":
-        from . import bump_project
-        if not bump_project.baseline_is_valid(baseline):
-            raise ValueError("migration coverage requires a sealed scope-aware baseline")
-        return _migration_project_verification(baseline)
+        from .bump_migration import coverage
+        return coverage(baseline)
     if baseline.get("project_scope") == "changes":
         layout = workspace_layout(root)
         if tasks:
@@ -893,23 +864,6 @@ def _external_records(records: dict, *, fingerprint_version: int = 1) -> dict:
 def build_sources(root: Path, *, full: bool = False, layout: dict | None = None,
                   task_id: str = "contract", timings: dict | None = None,
                   baseline: dict | None = None, tasks: list[dict] | None = None) -> dict:
-    if baseline and baseline.get("policy") in {"migration-v1", "migration-v2"}:
-        from . import bump_project, bump_migration_project
-        bump_project.require_pinned_inputs(root, baseline)
-        graph = baseline["compiler_modules"]
-        selected = sorted({t.get("migration_module", t.get("task_id", t.get("id"))) for t in (tasks or [])})
-        if not selected and task_id in graph:
-            selected = [task_id]
-        if set(selected) - set(graph):
-            raise ValueError("candidate build requested a module outside the migration contract")
-        commands = ([None, sorted(graph)] if full and not selected else [selected or sorted(graph)])
-        outputs = []
-        for modules in commands:
-            result = bump_migration_project.build(root, modules, scope=baseline["build_scope"])
-            outputs.append(result["diagnostics"])
-            if not result["passed"]:
-                return {"returncode": result["returncode"] or 1, "output": "\n".join(outputs)}
-        return {"returncode": 0, "output": "\n".join(outputs)}
     layout = workspace_layout(root) if layout is None else layout
     if baseline and baseline.get("project_scope") == "changes" and tasks:
         from . import bump_delta
@@ -985,16 +939,6 @@ def _seal_contract(contract: dict) -> dict:
     return {**body, "sha256": digest(body)}
 
 
-def _contract_digest(contract: dict) -> str:
-    """Recompute the exact contract seal without an unused evidence deep copy.
-
-    Publication keeps its independent copy; validation reads every current
-    nested value and never trusts a memoized seal or prior validation result.
-    """
-    return digest({key: value for key, value in contract.items()
-                   if key not in {"sha256", "artifact_id"}})
-
-
 def _baseline_matches(state: dict, contract: dict) -> bool:
     """Bind the accepted contract to the originally captured project context.
 
@@ -1004,21 +948,10 @@ def _baseline_matches(state: dict, contract: dict) -> bool:
     from . import bump_project
 
     original = state.get("project_baseline") or {}
-    if contract.get("migration_policy") == 2 or original.get("policy") == "migration-v2":
-        return (contract.get("version") == 4 and contract.get("migration_policy") == 2
-            and contract.get("inspection_policy") == 5 and bump_project.baseline_is_valid(original)
-            and original.get("policy") == "migration-v2" and "project_baseline" not in contract
-            and original["sha256"] == contract.get("project_baseline_sha256")
-            and original["original_index_ref"] == contract.get("original_index_ref")
-            and original["original_index_sha256"] == contract.get("original_index_sha256")
-            and original["environment"] == contract.get("environment")
-            and original["artifact_root"] == contract.get("artifact_root"))
     bound = contract.get("project_baseline") or {}
     if original.get("policy") == "migration-v1" or bound.get("policy") == "migration-v1":
-        return (contract.get("migration_policy") == 1 and contract.get("migration_scope_policy") == 1
-                and contract.get("migration_occurrence_policy") == 1
-                and contract.get("inspection_policy") == 4 and bump_project.baseline_is_valid(original)
-                and original == bound)
+        return (original == bound and bump_project.baseline_is_valid(original)
+                and contract.get("migration_policy") == 1)
     if original.get("version") == 2 or bound.get("version") == 2:
         from . import bump_delta
         return (bump_project.baseline_is_valid(original)
@@ -1095,9 +1028,6 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
     from . import bump_project, bump_state
 
     state = bump_state.load_state(paths.forum) if state is None else state
-    if (state.get("project_baseline") or {}).get("policy") == "migration-v2":
-        return prepare_migration_contract_v2(paths, baseline=state["project_baseline"], graph=dag,
-            source=bump_state.formal_source(state), main_sha=main_sha)
     source = bump_state.formal_source(state)
     if (not source or dag.get("solution_candidate") != source["candidate_id"]
             or dag.get("solution_sha256") != source["sha256"]):
@@ -1109,6 +1039,9 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
                           tasks=chunks, allow_unresolved=True)
     previous_contract = state.get("formalization", {}).get("contract") or {}
     baseline = state.get("project_baseline") or {}
+    if baseline.get("policy") == "migration-v1":
+        from .bump_migration import prepare_contract
+        return prepare_contract(paths, dag, state=state, environment=environment, main_sha=main_sha)
     if not bump_project.baseline_is_valid(baseline):
         raise ValueError("bump requires a verified existing-project baseline before chunking")
     if previous_contract:
@@ -1119,23 +1052,6 @@ def prepare_source_contract(paths, dag: dict, *, state: dict | None = None,
         **({"root": paths.project_root} if baseline.get("version") == 2 else {}))
     if not bump_project.baseline_is_valid(bound_baseline):
         raise ValueError("bump could not bind the target scope to the project baseline")
-    if bound_baseline.get("policy") == "migration-v1":
-        bump_project.require_pinned_inputs(paths.project_root, bound_baseline)
-        bindings, targets = _migration_bindings(bound_baseline)
-        value = {"version": 3, "migration_policy": 1, "migration_scope_policy": 1,
-                 "migration_occurrence_policy": 1, "inspection_policy": 4,
-                 "fingerprint_version": 2, "solution_candidate": source["candidate_id"],
-                 "solution_sha256": source["sha256"], "requirements": requirements, "spec": spec,
-                 "spec_sha256": digest(spec), "project_baseline": bound_baseline,
-                 "environment": bound_baseline["environment"],
-                 "source_main_sha": _git(paths.project_root, "rev-parse", "HEAD") if main_sha is None else main_sha,
-                 "obligation_ids": sorted(bindings), "bindings": bindings, "targets": targets,
-                 "external_declarations": {}, "prerequisite_declarations": {}}
-        value["adopted_outputs"] = adopted_output_records(value)
-        result = _seal_contract(value)
-        if previous_contract and previous_contract != result:
-            raise ValueError("migration module contract is fixed and cannot be replanned")
-        return result
     if environment is None:
         # Authoritative publication must reject changed Lake/config/dependency
         # inputs before invoking any introspection/build command. Draft checks
@@ -1217,89 +1133,6 @@ def _binding_tasks(contract: dict) -> list[dict]:
             for task_id, outputs in contract.get("bindings", {}).items() for output in outputs]
 
 
-def output_target_key(contract: dict, task_id: str, declaration: str) -> str:
-    """Resolve a task-local display reference to its sealed occurrence target."""
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import output_target_key as resolve
-        return resolve(contract, task_id, declaration)
-    if contract.get("migration_policy") != 1:
-        return declaration
-    from . import bump_project
-    baseline = contract.get("project_baseline") or {}
-    if (contract.get("migration_occurrence_policy") != 1 or baseline.get("version") != 5
-            or baseline.get("occurrence_policy") != 1):
-        raise ValueError("migration requires module-occurrence evidence; start a fresh run")
-    try:
-        original = baseline["original_reports"][task_id]
-        if declaration not in original["declarations"]:
-            raise ValueError("output is absent from its original module inventory")
-        native_name = original["meanings"][declaration]["meaning"]["name"]
-        occurrence = bump_project.migration_occurrence_id(task_id, native_name)
-        target = contract["targets"][occurrence]
-        if (target.get("module") != task_id or target.get("declaration") != declaration
-                or target.get("native_name") != native_name):
-            raise ValueError("migration target changed its module or kernel-name identity")
-        return occurrence
-    except (KeyError, TypeError) as exc:
-        raise ValueError("migration output lacks exact original occurrence evidence") from exc
-
-
-def output_fingerprints(contract: dict, task_id: str, outputs: list[dict] | None = None) -> dict:
-    """Every output fingerprint, keyed without collapsing same-named modules."""
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import output_fingerprints as fingerprints
-        return fingerprints(contract, task_id, outputs)
-    rows = contract.get("bindings", {}).get(task_id, []) if outputs is None else outputs
-    rows = normalize_outputs(rows)
-    if contract.get("migration_policy") == 1 and rows != contract.get("bindings", {}).get(task_id):
-        raise ValueError("migration outputs changed the fixed module occurrence inventory")
-    return {key: contract["targets"][key]["fingerprint"] for key in
-            (output_target_key(contract, task_id, row["declaration"]) for row in rows)}
-
-
-def snapshot_declarations(contract: dict) -> dict:
-    """Exact obligation lookup for snapshots; migration keys are occurrence IDs."""
-    if contract.get("migration_policy") == 2:
-        return {key: task for task, group in contract["task_bindings"].items() for key in group["obligation_ids"]}
-    return {output_target_key(contract, row["task_id"], row["lean_decl"]): row["task_id"]
-            for row in _binding_tasks(contract)}
-
-
-def declaration_occurrences(contract: dict) -> dict:
-    """Readable metadata lets critics cite exact occurrences without guessing IDs."""
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import declaration_occurrences as occurrences
-        return occurrences(contract)
-    if contract.get("migration_policy") != 1:
-        return {}
-    return {output_target_key(contract, row["task_id"], row["lean_decl"]): {
-                "task_id": row["task_id"], "module": row["task_id"],
-                "declaration": row["lean_decl"], "file": row["lean_file"],
-                "native_name": copy.deepcopy(contract["targets"][output_target_key(
-                    contract, row["task_id"], row["lean_decl"])]["native_name"])}
-            for row in _binding_tasks(contract)}
-
-
-def resolve_review_declarations(contract: dict, task_ids: list[str], references: list[str]) -> list[str]:
-    """Accept names only within an unambiguous requirement's explicit modules."""
-    if contract.get("migration_policy") not in {1, 2}:
-        return references
-    occurrences = declaration_occurrences(contract)
-    eligible = {key: row for key, row in occurrences.items() if row["task_id"] in task_ids}
-    resolved = []
-    for reference in references:
-        if reference in eligible:
-            matches = [reference]
-        else:
-            matches = [key for key, row in eligible.items() if row["declaration"] == reference]
-        if len(matches) != 1:
-            raise ValueError("review must reference an unambiguous declaration occurrence: " + reference)
-        resolved.append(matches[0])
-    if len(resolved) != len(set(resolved)):
-        raise ValueError("requirement review has duplicate declaration occurrences")
-    return resolved
-
-
 def adopted_output_records(contract: dict, *, task_id: str | None = None,
                            outputs: list[dict] | None = None) -> list[dict]:
     """Exact controller-adopted provenance; not current meaning or completion.
@@ -1335,10 +1168,6 @@ def adopted_output_records(contract: dict, *, task_id: str | None = None,
 
 
 def adopted_output_paths(contract: dict) -> set[str]:
-    if contract.get("migration_policy") == 2:
-        return {path for group in contract["task_bindings"].values() for path in group["files"]}
-    if contract.get("migration_policy") == 1:
-        return {row["path"] for row in contract["project_baseline"]["compiler_modules"].values()}
     return {row["file"] for row in adopted_output_records(contract)}
 
 
@@ -1360,34 +1189,12 @@ def output_manifest_blockers(contract: dict, *, task_ids: set[str], task_id: str
     This does not establish declaration existence, mathematical coverage or proof
     correctness. Changing adopted outputs always requires explicit refinement.
     """
-    if contract.get("migration_policy") == 2:
-        try:
-            from .bump_checker_v2 import validate_contract
-            validate_contract(contract)
-            if (task_id not in task_ids or not task_ids <= contract["task_bindings"].keys()
-                    or normalize_outputs(proposed_outputs) != contract["bindings"].get(task_id)):
-                raise ValueError("migration outputs differ from their explicit current mapping")
-            return []
-        except (ValueError, KeyError, TypeError) as exc:
-            return [{"code": "migration_mapping_changed", "prerequisite_id": "", "task_ids": [task_id],
-                "message": str(exc), "required_action": "Explicitly propose and adopt the correspondence before submission.",
-                "deterministic": True}]
     if contract.get("version") != 3:
         return []
 
     def blocked(code: str, message: str, action: str, **details) -> list[dict]:
         return [{"code": code, "prerequisite_id": "", "task_ids": [task_id] if task_id in task_ids else [],
                  "message": message, "required_action": action, "deterministic": True, **details}]
-
-    if contract.get("migration_policy") == 1:
-        try:
-            bindings, targets = _migration_bindings(contract["project_baseline"])
-            if (task_ids != set(bindings) or contract["bindings"] != bindings or contract["targets"] != targets
-                    or task_id not in bindings or normalize_outputs(proposed_outputs) != bindings[task_id]):
-                raise ValueError("migration outputs must exactly preserve the sealed original module inventory")
-            return []
-        except (ValueError, KeyError, TypeError) as exc:
-            return blocked("migration_outputs_changed", str(exc), "Restore the original module output inventory.")
 
     if task_id not in task_ids or not isinstance(proposed_outputs, list) or not proposed_outputs:
         return blocked("output_manifest_invalid", "candidate outputs require a current task and nonempty declaration/file list",
@@ -1633,254 +1440,6 @@ def _check_incremental_contract(root: Path, contract: dict, tasks: list[dict], *
             **({"proposed_contract": _seal_contract(proposed)} if not issues else {})}
 
 
-def _migration_bindings(baseline: dict) -> tuple[dict, dict]:
-    """Immutable original inventories, including private and generated declarations."""
-    from . import bump_project
-    if baseline.get("policy") != "migration-v1" or not bump_project.baseline_is_valid(baseline):
-        raise ValueError("missing sealed migration baseline")
-    bindings, targets = {}, {}
-    for module, graph in sorted(baseline["compiler_modules"].items()):
-        original = baseline["original_reports"][module]
-        bindings[module] = [{"declaration": name, "file": graph["path"]}
-                            for name in sorted(original["declarations"])]
-        for name, row in original["declarations"].items():
-            native_name = original["meanings"][name]["meaning"]["name"]
-            occurrence = bump_project.migration_occurrence_id(module, native_name)
-            targets[occurrence] = {"fingerprint": digest({"module": module, "name": native_name,
-                "original_evidence": original["evidence_sha256"]}),
-                "target_kind": row["kind"], "axioms": row["axioms"],
-                "meaning_dependencies": original["meanings"][name]["dependencies"],
-                "module": module, "declaration": name, "native_name": copy.deepcopy(native_name)}
-    return bindings, targets
-
-
-def prepare_migration_contract_v2(paths, *, baseline: dict, graph: dict, mapping=None,
-                                  source: dict | None = None, main_sha: str | None = None) -> dict:
-    from .bump_checker_v2 import prepare_migration_contract
-    return prepare_migration_contract(paths, baseline=baseline, graph=graph, mapping=mapping,
-                                      source=source, main_sha=main_sha)
-
-
-def migration_baseline_v2(root: Path, contract: dict) -> dict:
-    from .bump_checker_v2 import resolved_baseline
-    return resolved_baseline(root, contract)
-
-
-def migration_source_identity_v2(root: Path, contract: dict) -> dict:
-    baseline = migration_baseline_v2(root, contract)
-    from . import bump_project
-    bump_project.require_pinned_inputs(root, baseline)
-    return source_identity(root, layout=baseline["layout"])
-
-
-def migration_group_mapping_content(contract: dict, task_id: str) -> dict:
-    """Task-local correspondence intent, never a build or acceptance receipt.
-
-    Global contract/mapping hashes and artifact identifiers intentionally do not
-    make an unrelated group a new repair input. Exact evidence is still checked
-    under the current complete contract at every integration and final review.
-    """
-    binding = contract.get("task_bindings", {}).get(task_id)
-    if not binding:
-        raise ValueError("unknown migration execution group")
-    originals = set(binding["obligation_ids"])
-    mappings = []
-    for row in contract.get("mapping", {}).values():
-        if not originals.intersection(row.get("original_ids", [])):
-            continue
-        mappings.append({
-            "original_ids": sorted(row["original_ids"]), "mode": row["mode"],
-            "targets": sorted(copy.deepcopy(row["targets"]), key=lambda value: digest(value)),
-            # Mapping evidence is checked by content SHA when adopted. Artifact
-            # aliases are not new intent, but changed evidence bytes are.
-            "evidence_sha256": sorted({ref["sha256"] for ref in row.get("evidence_refs", [])}),
-            **{key: row[key] for key in ("relation", "reason") if key in row},
-        })
-    return {"version": 1, "binding": copy.deepcopy(binding),
-            "outputs": copy.deepcopy(contract.get("bindings", {}).get(task_id, [])),
-            "mappings": sorted(mappings, key=lambda value: digest(value))}
-
-
-def validate_mapping_v2(contract: dict, mapping=None, task_bindings=None) -> None:
-    from .bump_checker_v2 import validate_mapping
-    validate_mapping(contract, mapping, task_bindings)
-
-
-def with_migration_mapping_v2(root: Path, contract: dict, mapping: dict) -> dict:
-    from .bump_checker_v2 import with_mapping
-    return with_mapping(root, contract, mapping)
-
-
-def require_migration_receipt_v2(task: dict, contract: dict, verification: dict) -> None:
-    from .bump_checker_v2 import require_receipt
-    require_receipt(task, contract, verification)
-
-
-def _check_migration_contract(root: Path, contract: dict, *, task_id: str | None,
-                              proposed_outputs: list[dict] | None, stage: str, final: bool) -> dict:
-    from . import bump_migration_contract as native, bump_project
-    issues, targets, verified, comparisons, compiled = [], {}, {}, {}, {}
-    checked = []
-    before = None
-    try:
-        baseline = contract["project_baseline"]
-        if (contract.get("inspection_policy") != 4 or contract.get("migration_policy") != 1
-                or contract.get("migration_scope_policy") != 1
-                or contract.get("migration_occurrence_policy") != 1):
-            raise ValueError("migration requires sealed build scope and native environment inspection policy 4")
-        bindings, expected_targets = _migration_bindings(baseline)
-        if (contract["bindings"] != bindings or contract["targets"] != expected_targets
-                or contract["obligation_ids"] != sorted(bindings)
-                or contract.get("adopted_outputs") != adopted_output_records({"bindings": bindings})):
-            raise ValueError("original migration declarations or meanings changed in the contract")
-        if stage != "complete":
-            raise ValueError("migration candidates must be complete module repairs")
-        if not final and task_id not in bindings:
-            raise ValueError("migration candidate requires an exact original module task")
-        if proposed_outputs is not None and (task_id not in bindings or normalize_outputs(proposed_outputs) != bindings[task_id]):
-            raise ValueError("migration candidate changed its fixed original output inventory")
-        bump_project.require_pinned_inputs(root, baseline)
-        before = source_identity(root)
-        if before["environment"] != contract["environment"]:
-            raise ValueError("target environment changed from the sealed migration contract")
-        modules = sorted(bindings) if final else [task_id]
-        for module in modules:
-            original = baseline["original_reports"][module]
-            current = native.inspect_module(root, module, sorted(bindings))
-            scope_issues = bump_project.migration_inspection_scope_errors(current, baseline, root=root)
-            if scope_issues:
-                raise ValueError("; ".join(scope_issues))
-            comparison = native.compare_module(original, current)
-            comparisons[module] = comparison
-            issues.extend(module + ": " + issue for issue in comparison["issues"])
-            if not comparison["passed"]:
-                continue
-            checked.append(module)
-            for name in original["declarations"]:
-                occurrence = output_target_key(contract, module, name)
-                targets[occurrence] = {**current["declarations"][name], "occurrence_id": occurrence,
-                    "declaration": name, "module": module,
-                    "native_name": copy.deepcopy(expected_targets[occurrence]["native_name"])}
-                verified[occurrence] = expected_targets[occurrence]["fingerprint"]
-            for filename, identity in current["compiled_inputs"].items():
-                if filename in compiled and compiled[filename] != identity:
-                    raise ValueError("compiled import changed between module inspection contexts: " + filename)
-                compiled[filename] = identity
-        bump_project.require_pinned_inputs(root, baseline)
-        if source_identity(root) != before:
-            raise ValueError("source or environment changed during migration verification")
-    except bump_jobs.JobCancelled:
-        raise
-    except (ValueError, OSError, KeyError, TypeError) as exc:
-        issues.append(str(exc))
-    receipt = bump_cache.compiled_receipt(root, compiled) if compiled and not issues else None
-    if not issues and not bump_cache.compiled_receipt_current(root, receipt):
-        issues.append("migration compiled-input receipt is missing or stale")
-    passed = not issues
-    module_receipts = {module: {"module": module, "passed": passed,
-        "scope_sha256": baseline["build_scope"]["sha256"], "occurrence_policy": 1,
-        "verified_targets": output_fingerprints(contract, module) if passed else {},
-        "policy_sha256": policy_hash(), "source_sha256": before["source_sha256"] if before else None,
-        "compiled_receipt": receipt, "original_evidence": result["original_evidence"],
-        "current_evidence": result["current_evidence"], "comparison_sha256": result["evidence_sha256"]}
-        for module, result in comparisons.items()}
-    return {"passed": passed, "issues": issues, "blockers": [], "targets": targets,
-            "source_identity": before,
-            "verified_targets": verified if passed else {}, "verified_tasks": checked if passed else [],
-            "compiled_receipt": receipt, "final": final, "proposed_contract": contract,
-            "module_receipts": module_receipts,
-            "module_receipt": module_receipts.get(task_id, {"module": task_id, "passed": False,
-                "policy_sha256": policy_hash(), "source_sha256": before["source_sha256"] if before else None}),
-            "project_declarations": list(targets.values())}
-
-
-def check_migration_module(paths, state: dict, module: str) -> dict:
-    """Controller frontier check; never advances state or persists acceptance."""
-    contract = state.get("formalization", {}).get("contract") or {}
-    return check_formal_contract(paths.project_root, contract, list(state.get("formal_tasks", {}).values()),
-        completed={module}, task_id=module, proposed_outputs=contract.get("bindings", {}).get(module, []))
-
-
-def validate_migration_state(state: dict) -> None:
-    """Pure resume guard over original occurrences and saved task receipts.
-
-    A historical completed leaf may precede later changes elsewhere in main;
-    its recorded check is not reinterpreted as a fresh whole-project check.
-    Normal candidate/final boundaries still inspect current native artifacts.
-    """
-    from . import bump_state
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import validate_saved_state
-        validate_saved_state(state)
-        return
-    if (contract.get("migration_policy") != 1 or not _baseline_matches(state, contract)
-            or contract.get("sha256") != _contract_digest(contract)):
-        raise ValueError("Bump resume requires the sealed module-occurrence contract")
-    baseline = contract["project_baseline"]
-    bindings, targets = _migration_bindings(baseline)
-    tasks = state.get("formal_tasks", {})
-    if (contract.get("bindings") != bindings or contract.get("targets") != targets
-            or contract.get("obligation_ids") != sorted(bindings) or set(tasks) != set(bindings)
-            or adopted_output_records(contract) != adopted_output_records({"bindings": bindings})):
-        raise ValueError("Bump saved state lost original module declaration occurrences")
-    for module, task in tasks.items():
-        graph = baseline["compiler_modules"][module]
-        if (task.get("task_id") != module or task.get("migration_module") != module
-                or task.get("lean_file") != graph["path"] or task.get("outputs") != bindings[module]
-                or task.get("dependencies") != sorted(set(graph["imports"]) & set(bindings))):
-            raise ValueError("Bump saved task changed its original occurrence inventory: " + module)
-        if task.get("status") != "complete":
-            continue
-        candidate_id = task.get("accepted_candidate")
-        candidate = state.get("formal_candidates", {}).get(candidate_id, {})
-        if (not candidate_id or candidate.get("status") != "merged" or candidate.get("task_id") != module
-                or candidate.get("outputs") != bindings[module]
-                or candidate.get("stage", "complete") != "complete"
-                or not bump_state.candidate_is_current(state, candidate)):
-            raise ValueError("Bump completed occurrence lacks its current merged candidate: " + module)
-        bump_state._require_migration_receipt(task, contract, candidate.get("verification") or {})
-
-
-def validate_migration_snapshot(state: dict, report: dict) -> None:
-    """Pure state-boundary validation; exact compiled-byte freshness is separate."""
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import validate_snapshot
-        validate_snapshot(state, report)
-        return
-    baseline = state.get("project_baseline") or {}
-    if contract.get("migration_policy") != 1 or not _baseline_matches(state, contract):
-        raise ValueError("machine review is not bound to a sealed migration contract")
-    bindings, targets = _migration_bindings(baseline)
-    if (contract.get("inspection_policy") != 4 or contract.get("migration_scope_policy") != 1
-            or contract.get("migration_occurrence_policy") != 1
-            or contract.get("bindings") != bindings
-            or contract.get("targets") != targets or report.get("policy_sha256") != policy_hash()
-            or report.get("project_baseline_sha256") != baseline["sha256"]
-            or report.get("project_verification") != project_verification(Path(baseline["project_root"]), baseline)):
-        raise ValueError("machine review migration policy or original module coverage changed")
-    if report.get("passed") is True:
-        receipts = report.get("module_receipts")
-        if (not isinstance(receipts, dict) or set(receipts) != set(bindings)
-                or report.get("verified_targets") != {n: r["fingerprint"] for n, r in targets.items()}
-                or report.get("declarations") != snapshot_declarations(contract)
-                or report.get("declaration_occurrences") != declaration_occurrences(contract)):
-            raise ValueError("accepted migration review lacks complete native module/original meaning receipts")
-        for module, receipt in receipts.items():
-            if (receipt.get("module") != module or receipt.get("passed") is not True
-                    or receipt.get("occurrence_policy") != 1
-                    or receipt.get("verified_targets") != output_fingerprints(contract, module)
-                    or receipt.get("scope_sha256") != baseline["build_scope"]["sha256"]
-                    or receipt.get("policy_sha256") != report["policy_sha256"]
-                    or receipt.get("source_sha256") != report.get("source_sha256")
-                    or receipt.get("compiled_receipt") != report.get("compiled_receipt")
-                    or receipt.get("original_evidence") != baseline["original_reports"][module]["evidence_sha256"]
-                    or any(not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get(key, "")))
-                           for key in ("current_evidence", "comparison_sha256"))):
-                raise ValueError("accepted migration review has invalid native receipt for " + module)
-
-
 def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
                           *, completed: set[str], layout: dict | None = None,
                           environment: dict | None = None, timings: dict | None = None,
@@ -1890,18 +1449,12 @@ def check_formal_contract(root: Path, contract: dict, tasks: list[dict],
     body = {key: value for key, value in contract.items() if key not in {"sha256", "artifact_id"}}
     if not contract or digest(body) != contract.get("sha256"):
         return {"passed": False, "issues": ["formal contract is missing or corrupt"], "targets": {}}
-    if contract.get("migration_policy") == 2 or contract.get("version") == 4:
-        from .bump_checker_v2 import check
-        return check(root, contract, task_id=task_id, proposed_outputs=proposed_outputs, stage=stage, final=final)
     if contract.get("fingerprint_version", 1) not in {1, 2}:
         return {"passed": False, "issues": ["unsupported semantic fingerprint version"], "targets": {}}
     if contract.get("version") not in {2, 3} or not isinstance(contract.get("spec"), dict):
         return {"passed": False, "issues": ["formal contract lacks source-evidence metadata; re-chunk it"], "targets": {}}
     if digest(contract["spec"]) != contract.get("spec_sha256"):
         return {"passed": False, "issues": ["formal contract spec digest is inconsistent"], "targets": {}}
-    if contract.get("migration_policy") == 1:
-        return _check_migration_contract(root, contract, task_id=task_id,
-            proposed_outputs=proposed_outputs, stage=stage, final=final)
     if "project_baseline" in contract:
         from . import bump_project
         try:
@@ -2026,6 +1579,9 @@ def _prerequisite_evidence(contract: dict) -> dict:
 
 
 def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete: bool = True) -> bool:
+    if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 1:
+        from .bump_migration import snapshot_is_current as migration_current
+        return migration_current(paths, state, snapshot, require_complete=require_complete)
     from . import bump_project
     from .bump_input import source_matches
     from .bump_representation import snapshot as representation_snapshot
@@ -2035,14 +1591,9 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
         return False
     formal = state["formalization"]
     contract = formal.get("contract") or {}
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import snapshot_is_current as current
-        return current(paths, state, snapshot, require_complete=require_complete)
     if not _baseline_matches(state, contract) or contract.get("version") != 3:
         return False
     try:
-        if contract.get("migration_policy") == 1:
-            validate_migration_snapshot(state, snapshot)
         bump_project.require_original_branch(paths.project_root, contract["project_baseline"])
         bump_project.require_pinned_inputs(
             paths.project_root, contract["project_baseline"],
@@ -2072,8 +1623,8 @@ def snapshot_is_current(paths, state: dict, snapshot: dict, *, require_complete:
         and snapshot.get("task_statuses") == {
             key: task.get("status") for key, task in state["formal_tasks"].items()}
         and (contract.get("version") != 3
-             or (contract.get("sha256") == _contract_digest(contract)
-                 and snapshot_declarations(contract)
+             or (contract.get("sha256") == _seal_contract(contract)["sha256"]
+                 and {row["lean_decl"]: row["task_id"] for row in _binding_tasks(contract)}
                  == snapshot.get("declarations")))
         and contract.get("spec_sha256") == snapshot.get("spec_sha256")
         == digest(formal.get("spec")) == digest(contract.get("spec"))
@@ -2106,6 +1657,9 @@ def _candidate_build_reusable(root: Path, contract: dict, candidate: dict, curre
 
 
 def verify_final_project(paths, state: dict) -> dict:
+    if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 1:
+        from .bump_migration import verify_final
+        return verify_final(paths, state)
     from . import bump_project
     from .bump_input import source_matches
     from .bump_representation import snapshot as representation_snapshot
@@ -2114,9 +1668,6 @@ def verify_final_project(paths, state: dict) -> dict:
     root = paths.project_root
     formal = state["formalization"]
     contract = formal.get("contract") or {}
-    if contract.get("migration_policy") == 2:
-        from .bump_checker_v2 import verify_final
-        return verify_final(paths, state)
     baseline_current = _baseline_matches(state, contract)
     if not baseline_current or contract.get("version") != 3:
         raise ValueError("verified existing-project context is missing or changed; legacy scaffold contracts cannot be accepted")
@@ -2131,8 +1682,7 @@ def verify_final_project(paths, state: dict) -> dict:
                  if candidate.get("status") == "merged" and candidate.get("main_sha") == before["main_sha"]), {})
     verification = last.get("verification") or {}
     complete_ids = set(state["formal_tasks"])
-    build_reusable = (contract.get("migration_policy") != 1
-                      and _candidate_build_reusable(root, contract, last, before))
+    build_reusable = _candidate_build_reusable(root, contract, last, before)
     reusable = (baseline_current and contract.get("version") == 3 and build_reusable
                 and bump_cache.compiled_receipt_current(root, verification.get("compiled_receipt"))
                 and verification.get("contract_sha256") == formal.get("contract", {}).get("sha256")
@@ -2155,8 +1705,7 @@ def verify_final_project(paths, state: dict) -> dict:
                  if contract.get("version") == 3 and build_reusable else build_sources(root, full=True,
                      **({"baseline": contract["project_baseline"]}
                         if ("verification_scope" in contract.get("project_baseline", {})
-                            or contract.get("project_baseline", {}).get("version") == 2
-                            or contract.get("migration_policy") == 1) else {}),
+                            or contract.get("project_baseline", {}).get("version") == 2) else {}),
                      **({"tasks": adopted_output_tasks(contract, root=root)}
                         if contract.get("project_baseline", {}).get("version") == 2 else {})))
         check = (check_formal_contract(root, formal.get("contract", {}), tasks,
@@ -2180,12 +1729,11 @@ def verify_final_project(paths, state: dict) -> dict:
         if unreviewed:
             issues.append("representation review is not aligned for tasks: " + ", ".join(unreviewed))
     if contract.get("version") == 3:
-        if contract.get("sha256") != _contract_digest(contract):
+        if contract.get("sha256") != _seal_contract(contract)["sha256"]:
             issues.append("source contract is corrupt")
         if (set(contract.get("obligation_ids", [])) != complete_ids
                 or set(contract.get("bindings", {})) != complete_ids
-                or (contract.get("migration_policy") != 1
-                    and any(not outputs for outputs in contract.get("bindings", {}).values()))):
+                or any(not outputs for outputs in contract.get("bindings", {}).values())):
             issues.append("source obligations lack adopted Lean outputs")
     coverage = project_verification(root, contract["project_baseline"],
         **({"tasks": adopted_output_tasks(contract, root=root)} if contract["project_baseline"].get("version") == 2 else {}))
@@ -2210,10 +1758,6 @@ def verify_final_project(paths, state: dict) -> dict:
         "project_baseline_sha256": (review_contract.get("project_baseline") or {}).get("sha256"),
         **({"project_verification": coverage} if coverage is not None else {}),
         "compiled_receipt": check.get("compiled_receipt"),
-        **({"module_receipts": check.get("module_receipts", {}),
-            "verified_targets": check.get("verified_targets", {}),
-            "declaration_occurrences": declaration_occurrences(review_contract)}
-           if contract.get("migration_policy") == 1 else {}),
         "passed": not issues,
         "issues": issues,
         "blockers": blockers,
@@ -2228,8 +1772,8 @@ def verify_final_project(paths, state: dict) -> dict:
         "representation_reviews": representation_snapshot(state),
         "accepted_candidates": {task["task_id"]: task.get("accepted_candidate") for task in tasks},
         "task_statuses": {task["task_id"]: task.get("status") for task in tasks},
-        "declarations": (snapshot_declarations(contract) if contract.get("version") == 3 else
-                         {task["lean_decl"]: task["task_id"] for task in tasks}),
+        "declarations": {task["lean_decl"]: task["task_id"] for task in
+                         (_binding_tasks(contract) if contract.get("version") == 3 else tasks)},
         "build": build,
         "targets": check["targets"],
         **extension,

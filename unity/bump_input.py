@@ -1,8 +1,7 @@
-"""Immutable original-project inputs for the Formalize-derived Bump workflow.
+"""Immutable original-source input binding owned by the Bump workflow.
 
-The controller supplies original Lean bytes, native inventories, and the exact
-version transition. There is no user paper, English-solving, or model chunking
-phase. The retained bundle uses the copied artifact/state wire format.
+Migration preparation supplies the original Lean files, native declaration
+inventory and transition request. The inherited source ledger binds those bytes.
 """
 
 from __future__ import annotations
@@ -61,7 +60,7 @@ def store_bytes(
 def _source_files(paths) -> list[Path]:
     root = paths.unity / "source"
     if not root.is_dir() or root.is_symlink():
-        raise ValueError("Bump controller has not frozen the original project inputs")
+        raise ValueError("Bump requires the original source bundle written by migration preparation")
     files = []
     for path in sorted(root.rglob("*")):
         # Do not snapshot arbitrary external files through source symlinks.
@@ -70,7 +69,7 @@ def _source_files(paths) -> list[Path]:
         if path.is_file() and path.name != ".DS_Store":
             files.append(path)
     if not files or not any(path.stat().st_size for path in files):
-        raise ValueError("Bump original-project input bundle is empty")
+        raise ValueError("Bump original source bundle is missing or empty")
     return files
 
 
@@ -87,7 +86,7 @@ def source_digest(paths) -> str:
 
 
 def snapshot_sources(paths) -> dict:
-    """Record the controller's original-project bundle without changing its bytes."""
+    """Record a byte-preserving document bundle without changing the source tree."""
     refs = []
     files = {}
     for path in _source_files(paths):
@@ -98,13 +97,13 @@ def snapshot_sources(paths) -> dict:
         )
         files[relative] = record["sha256"]
         refs.append({
-            "ref_id": f"source:{relative}", "kind": "original_project_input",
+            "ref_id": f"source:{relative}", "kind": "supplied_file",
             "path": f".unity/source/{relative}", "sha256": record["sha256"],
             "artifact_id": record["artifact_id"], "bytes": record["bytes"],
         })
     sha256 = _digest(files)
     if source_digest(paths) != sha256:
-        raise ValueError("original-project inputs changed while taking the Bump snapshot")
+        raise ValueError("source documents changed while taking the input snapshot; retry")
     return {"kind": "supplied_sources", "candidate_id": f"source-{sha256}",
             "sha256": sha256, "source_refs": refs}
 
@@ -149,7 +148,7 @@ def require_source_matches(paths, state: dict) -> None:
     try:
         scope = scope_bytes(paths)
     except OSError as exc:
-        raise ValueError("Bump requires its frozen original UNITY.md instructions") from exc
+        raise ValueError("bump requires the original UNITY.md scope") from exc
     if (not source_matches(paths, state)
             or hashlib.sha256(scope).hexdigest() != state.get("problem_sha256")):
-        raise ValueError("Bump original-project inputs or immutable UNITY.md instructions changed; this run cannot be continued")
+        raise ValueError("bump sources or immutable UNITY.md scope changed; preserve this run and use a separate project copy for the new scope")

@@ -1,4 +1,4 @@
-"""Formalize-derived Bump runtime and snapshot-bound critic command."""
+"""Compiler-driven declaration migration using Bump's own copied gate loops."""
 
 import hashlib
 import fcntl
@@ -9,10 +9,10 @@ import tempfile
 
 import asyncclick as click
 
-from .. import library, bump_contract, bump_jobs, bump_state, bump_project, bump_bootstrap
+from .. import library, bump_contract, bump_jobs, bump_state, bump_project, bump_scope
 from .. import bump_worktree as worktree
 from ..config import load_paths
-from ..bump_input import require_source_matches
+from ..bump_input import bump_paths, require_source_matches, snapshot_sources, scope_bytes
 from ..bump_orchestrator import (
     build_bump_mcp, dispatch, load_prompt, mark_done, mark_phase,
     resume_point, stop_requested,
@@ -20,10 +20,11 @@ from ..bump_orchestrator import (
 from ..roster import load_roster
 from ..bump_runtime import (
     configure_forum, forum_brief, recover_interrupted_formal_merges,
-    run_formalizing_runtime, _merge_lock,
+    run_formalizing_runtime, write_formalization_plan, _merge_lock,
+    refresh_replanned_worktrees,
 )
+from ..bump_repairs import run_source_repairs
 from ..bump_report import persist_report
-from ..bump_provider import BumpTransportRetriesExhausted
 
 PIPELINE = "bump"
 
@@ -160,18 +161,255 @@ async def _run_retrospective(roster, paths) -> dict:
 def _attempt_limit() -> int | float:
     raw = os.getenv("MAX_ATTEMPTS", "").strip()
     if not raw:
-        return 5
+        return float("inf")
     try:
         value = int(raw)
     except ValueError as exc:
-        raise click.ClickException("MAX_ATTEMPTS must be a positive integer (blank defaults to 5)") from exc
+        raise click.ClickException("MAX_ATTEMPTS must be a positive integer or blank") from exc
     if value < 1:
-        raise click.ClickException("MAX_ATTEMPTS must be a positive integer (blank defaults to 5)")
+        raise click.ClickException("MAX_ATTEMPTS must be a positive integer or blank")
     return value
 
 
 def _brief_provider(paths, profile: str):
     return lambda author: forum_brief(paths, profile, author)
+
+
+def _prepare_bump_environment(
+    root, *, validate_project: bool = True, baseline: dict | None = None,
+) -> None:
+    """Build the existing pinned project; never bootstrap or update its packages."""
+    bump_jobs.terminate(root)
+    if validate_project:
+        click.echo("Validating Lean project...")
+        scope_options = {"baseline": baseline} if baseline is not None else {}
+        result = bump_contract.build_sources(
+            root, full=True, task_id="resume-preflight", **scope_options)
+        if result["returncode"]:
+            raise ValueError("existing project failed validation: " + result["output"][-3000:])
+
+
+async def _chunk_source(roster, paths, max_attempts: int | float) -> None:
+    """Rotate failed executions; correct proposals inside their existing session."""
+    from .. import artifacts
+    from ..bump_chunking import chunking_workspace
+    from ..bump_input import store_bytes
+    from ..bump_runtime import (
+        read_chunking_draft, prepare_chunking_draft, seed_chunking_draft, chunking_diagnostic,
+    )
+
+    state = bump_state.load_state(paths.forum)
+    candidate = bump_state.formal_source(state)
+    if not candidate:
+        raise click.ClickException("chunking requires a bound formalization source")
+    require_source_matches(paths, state)
+    chunkers = [roster.primary] + [a for a in roster.agents if a.name != roster.primary.name]
+    failures = []
+    # The last submitted bytes survive genuine session failures without requiring
+    # another agent to recreate the proposal. Interrupted runs also retain this artifact.
+    resume_draft = None
+    for row in reversed(state["chunking_attempts"]):
+        if not row.get("obsolete") and row.get("draft_artifact"):
+            try:
+                resume_draft = artifacts.artifact_bytes(paths.artifacts, row["draft_artifact"])
+            except (OSError, ValueError):
+                continue
+            break
+
+    for chunker in chunkers:
+        while not stop_requested(paths.project_root):
+            current = bump_state.load_state(paths.forum)
+            if bump_state.chunking_attempt_count(current, candidate["candidate_id"], chunker.name) >= max_attempts:
+                break
+            attempt = bump_state.begin_chunking_attempt(paths.forum, candidate["candidate_id"], chunker.name)
+            plan_path = write_formalization_plan(paths, candidate)
+            installed = None
+            assignments = {}
+            last_feedback = None
+            execution_started = False
+            try:
+                async with chunking_workspace(paths, chunker.name, attempt) as workspace:
+                    seed = seed_chunking_draft(current)
+                    if resume_draft is not None:
+                        workspace.draft_path.write_bytes(resume_draft)
+                    elif seed is not None:
+                        workspace.draft_path.write_text(json.dumps(seed, indent=2) + "\n")
+
+                    async def complete_draft(_final):
+                        nonlocal installed, assignments, resume_draft, last_feedback
+                        if stop_requested(paths.project_root):
+                            return None
+                        current = bump_state.load_state(paths.forum)
+                        try:
+                            require_source_matches(paths, current)
+                        except ValueError as exc:
+                            raise click.ClickException(str(exc)) from exc
+                        repaired = await run_source_repairs(roster, paths, max_attempts)
+                        if stop_requested(paths.project_root):
+                            return None
+                        if any(row.get("status") == "unresolved"
+                               for row in bump_state.open_source_issues(repaired)):
+                            raise click.ClickException("Source-repair attempts exhausted; original input and evidence preserved")
+                        write_formalization_plan(paths, candidate)
+                        current = bump_state.load_state(paths.forum)
+                        payload = None
+                        try:
+                            payload = read_chunking_draft(workspace.draft_path)
+                            resume_draft = payload
+                            dag, _ = prepare_chunking_draft(paths, current, payload)
+                        except (ValueError, RecursionError) as exc:
+                            diagnostic = chunking_diagnostic(exc)
+                            signature = (hashlib.sha256(payload).hexdigest() if payload is not None else None,
+                                         json.dumps(diagnostic, sort_keys=True))
+                            artifact_id = None
+                            if payload is not None and signature != last_feedback:
+                                record = store_bytes(paths.artifacts, payload, kind="bump_chunking_draft",
+                                                     producer=chunker.name, source=attempt["attempt_id"])
+                                artifact_id = record["artifact_id"]
+                            bump_state.record_chunking_feedback(
+                                paths.forum, attempt["attempt_id"], diagnostic, artifact_id=artifact_id,
+                            )
+                            last_feedback = signature
+                            return ("Unity rejected this draft, not this execution. Correct the fields below in "
+                                    "the same draft; call validate_chunks() before finishing. Do not rewrite frozen "
+                                    "source obligations or call Unity internals.\n"
+                                    + json.dumps(diagnostic, ensure_ascii=False)
+                                    + "\nRead updated source-repair context at " + str(plan_path))
+
+                        # A plan preflight never approves itself. Refresh live environment
+                        # once here, outside the model/API retry machinery.
+                        try:
+                            contract = bump_contract.prepare_source_contract(paths, dag, state=current)
+                        except (OSError, ValueError) as exc:
+                            raise click.ClickException("Contract environment check failed: " + str(exc)) from exc
+                        old_environment = (current["formalization"].get("contract") or {}).get("environment")
+                        if old_environment is not None and old_environment != contract["environment"]:
+                            raise click.ClickException("Protected Lean environment changed; not retrying chunking")
+                        with _merge_lock(paths.project_root):
+                            latest = bump_state.load_state(paths.forum)
+                            try:
+                                unchanged = read_chunking_draft(workspace.draft_path) == payload
+                            except ValueError as exc:
+                                return json.dumps(chunking_diagnostic(exc), ensure_ascii=False)
+                            if latest["revision"] != current["revision"] or not unchanged:
+                                return "The draft or shared state changed during acceptance. Refresh validate_chunks() and finish again."
+                            require_source_matches(paths, latest)
+                            main_sha = worktree.main_commit(paths.project_root)
+                            if main_sha != contract["source_main_sha"]:
+                                return "Accepted main changed during validation. Refresh validate_chunks() and finish again."
+                            record = artifacts.store_text(
+                                paths.artifacts, json.dumps(dag, sort_keys=True, ensure_ascii=False),
+                                kind="bump_accepted_plan", producer="Unity", source=attempt["attempt_id"],
+                            )
+                            try:
+                                installed = bump_state.initialize_informal_plan(
+                                    paths.forum, dag, main_sha=main_sha, contract=contract,
+                                    attempt_id=attempt["attempt_id"], expected_revision=latest["revision"],
+                                    plan_artifact=record["artifact_id"],
+                                )
+                            except ValueError as exc:
+                                return ("Publication did not change state. Refresh validate_chunks() and correct: "
+                                        + json.dumps(chunking_diagnostic(exc), ensure_ascii=False))
+                            assignments = (latest.get("replan") or {}).get("assignments", {})
+                            # State and its immutable artifact are authoritative if the process
+                            # exits before this convenience JSON mirror is replaced.
+                            artifacts._atomic_write(paths.forum / "dag.json",
+                                                    (json.dumps(dag, indent=2) + "\n").encode())
+                        return None
+
+                    async def completed(final):
+                        try:
+                            return await complete_draft(final)
+                        except click.ClickException:
+                            raise
+                        except Exception as exc:
+                            # Unexpected controller/IO failures are not agent/API
+                            # failures: stop rather than spending the whole roster.
+                            raise click.ClickException("Chunking controller failed: " + str(exc)) from exc
+
+                    try:
+                        execution_started = True
+                        results = await dispatch(
+                            [chunker], roster, load_prompt(f"{PIPELINE}/CHUNKING"),
+                            f"You are the chunker for execution {attempt['attempt']} ({chunker.name}). "
+                            f"Read scope at {paths.unity_md} and the source/repair plan at {plan_path}. "
+                            f"Write only the draft at {workspace.draft_path}. "
+                            + ("This is a replan: edit the seeded mutable-only draft; Unity supplies frozen obligations. "
+                               if seed is not None else
+                               "This is initial chunking: use the full informal DAG schema in your instructions. ")
+                            + "Keep one initial node per source definition/result, with its statement and supplied proof. "
+                              "Use separate statement/proof dependencies. Do not write Lean or build anything. "
+                              "Correct validation feedback in this session; ordinary corrections do not consume attempts. "
+                            + ("Previous execution failures: " + " | ".join(failures[-3:]) if failures else ""),
+                            workspace.cwd, workspace.mcp,
+                            tools_prompt=f"{PIPELINE.upper()}_CHUNKING_TOOLS", icrl_enabled=False,
+                            brief_provider=_brief_provider(paths, "chunking"),
+                            log_context={"command": PIPELINE, "run_id": state["run_id"], "phase": "chunking",
+                                         "role": "chunker", "candidate_id": candidate["candidate_id"],
+                                         "attempt": attempt["attempt"], "attempt_id": attempt["attempt_id"]},
+                            on_normal_completion=completed, env_overrides=workspace.env,
+                        )
+                    finally:
+                        # Archive before the scratch workspace is removed, including
+                        # a transport failure/cancellation before a completed turn.
+                        if installed is None:
+                            try:
+                                resume_draft = read_chunking_draft(workspace.draft_path)
+                            except ValueError:
+                                pass
+                            except OSError as exc:
+                                workspace.preserve = True
+                                raise click.ClickException(
+                                    f"Cannot read chunking draft; retained at {workspace.draft_path}: {exc}"
+                                ) from exc
+                            else:
+                                try:
+                                    record = store_bytes(paths.artifacts, resume_draft,
+                                        kind="bump_chunking_draft", producer=chunker.name,
+                                        source=attempt["attempt_id"])
+                                    bump_state.save_chunking_draft(
+                                        paths.forum, attempt["attempt_id"], record["artifact_id"],
+                                    )
+                                except Exception as exc:
+                                    workspace.preserve = True
+                                    raise click.ClickException(
+                                        f"Cannot archive chunking draft; retained at {workspace.draft_path}: {exc}"
+                                    ) from exc
+                    if stop_requested(paths.project_root):
+                        return
+                    error = next((result for result in results if isinstance(result, Exception)), None)
+                    if error is not None:
+                        raise error
+                    if installed is None:
+                        raise RuntimeError("chunker execution ended without controller plan publication")
+            except click.ClickException:
+                if installed is None:
+                    bump_state.finish_chunking_attempt(paths.forum, attempt["attempt_id"],
+                        succeeded=False, reason="controller/source/environment failure; see terminal diagnostic")
+                raise
+            except Exception as exc:
+                if installed is not None:
+                    raise click.ClickException("Plan accepted but chunker cleanup failed: " + str(exc)) from exc
+                if not execution_started:
+                    raise click.ClickException("Cannot start chunker workspace: " + str(exc)) from exc
+                # Only genuinely failed executions reach here, never schema corrections.
+                reason = f"{type(exc).__name__}: {exc}"[:2000]
+                bump_state.finish_chunking_attempt(paths.forum, attempt["attempt_id"],
+                                                            succeeded=False, reason=reason)
+                failures.append(f"{chunker.name} attempt {attempt['attempt']}: {reason}")
+                click.echo(f"chunker {failures[-1]}")
+                continue
+            if assignments:
+                refresh_replanned_worktrees(paths, assignments, installed)
+            click.echo(f"created {len(installed['formal_tasks'])} formalization task(s) "
+                       f"using {chunker.name} on execution {attempt['attempt']}")
+            return
+
+    if stop_requested(paths.project_root):
+        return
+    summary = " | ".join(failures[-10:]) or "attempt limits were already exhausted"
+    bump_state.record_chunking_exhausted(paths.forum, summary)
+    raise click.ClickException("every configured agent exhausted its chunking executions: " + summary)
 
 
 def _prepare_critic_snapshot(paths) -> bool:
@@ -253,14 +491,14 @@ async def _run_critic(roster, paths, *, critic, attempt: int = 1) -> None:
            "or request a justified replan/source repair. Mark unchecked requirements not_checked. "
            "Do not approve incomplete proofs or reopen unaffected work. "
            if diagnostic else
-           "Audit the migrated project against frozen original sources/native inventories and the pinned version transition. ")
+           "Audit the complete Lean project against the supplied source documents and UNITY.md scope. ")
         + "Use the exact recorded "
         "machine snapshot for build, contract, and axiom status. Independently check requirement "
         "completeness and the mathematical meaning of statements and definitions against the source. "
         "Submit one structured verdict with submit_formalization_verdict and mandatory snapshot-bound "
         "per-requirement review evidence. Reopen only the exact Lean tasks that "
         "need repair. "
-        + "Do not rewrite original project obligations or request paper/source repairs. Report migration discrepancies with evidence; "
+        + "Do not rewrite supplied documents or reopen solving. Report source defects with evidence; "
         "do not approve a changed or weakened result.",
         worktree.role_view(paths.project_root, "critic"),
         build_bump_mcp(paths, "critic"),
@@ -296,34 +534,23 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
                for key in row["repair_ids"]}
     repair_authors = {bump_state.author_key(state["source_repairs"][key]["author"])
                       for key in adopted}
-    critics = [critic for critic in critics if getattr(critic, "backend", None) == "codex"
-               and bump_state.author_key(critic.name) not in repair_authors]
+    critics = [critic for critic in critics if bump_state.author_key(critic.name) not in repair_authors]
     if not critics:
-        raise click.ClickException("No independent Codex critic remains for the verified read-only review")
+        raise click.ClickException("No independent critic remains to review the adopted source repairs")
 
-    _prepare_critic_snapshot(paths)
-    transport_blocked = {}
     for critic in critics:
-        while True:
-            current = bump_state.load_state(paths.forum)
-            binding = (current["formalization"].get("review_snapshot") or {}).get("snapshot_id")
-            if _critic_attempt_count(current, binding, critic.name) >= max_attempts:
-                break
+        attempt = 0
+        while attempt < max_attempts:
             if stop_requested(paths.project_root):
                 return
             current = bump_state.load_state(paths.forum)
             if bump_state.pending_replan(current) or bump_state.open_source_issues(current):
                 return
 
-            attempt = _begin_critic_attempt(paths, binding, critic.name)
-            try:
-                await _run_critic(
-                    roster, paths, critic=critic, attempt=attempt,
-                )
-            except BumpTransportRetriesExhausted as exc:
-                transport_blocked[critic.name] = str(exc)
-                click.echo(f"critic {critic.name} is transport-blocked; trying the next eligible configured critic")
-                break
+            attempt += 1
+            await _run_critic(
+                roster, paths, critic=critic, attempt=attempt,
+            )
 
             if stop_requested(paths.project_root):
                 return
@@ -332,71 +559,33 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
                     or bump_state.open_source_issues(after)):
                 return
 
-    if transport_blocked:
-        raise click.ClickException(
-            "critic review remains incomplete: transport retries exhausted for "
-            + ", ".join(transport_blocked)
-            + "; remaining eligible critics did not complete review. No verdict was invented."
-        )
     raise click.ClickException(
         "every configured agent exhausted its critic attempts "
         "without completing the review"
     )
 
 
-
-def _critic_attempt_count(state, binding, author):
-    return sum(row.get("snapshot_id") == binding and row.get("author") == bump_state.author_key(author)
-               for row in state.get("migration_critic_attempts", []))
-
-
-def _begin_critic_attempt(paths, binding, author):
-    if not binding:
-        raise ValueError("Critic attempts require an exact machine snapshot")
-    with bump_state.transaction(paths.forum) as state:
-        if (state["formalization"].get("review_snapshot") or {}).get("snapshot_id") != binding:
-            raise ValueError("Critic snapshot changed before dispatch")
-        count = _critic_attempt_count(state, binding, author) + 1
-        state.setdefault("migration_critic_attempts", []).append(
-            {"snapshot_id": binding, "author": bump_state.author_key(author), "attempt": count})
-    return count
-
-
-def _charge_completed_round(paths):
-    with bump_state.transaction(paths.forum) as state:
-        seen = state.setdefault("migration_runtime_rounds", [])
-        summary = state["formalization"].get("last_round") or {}
-        if summary.get("round_id") not in seen and _formal_round_attempted(state, None):
-            seen.append(summary["round_id"])
-            state["migration_attempts"] = state.get("migration_attempts", 0) + 1
-        return state.get("migration_attempts", 0)
-
-
 @click.command(name="bump")
 @click.argument("version", required=False)
-@click.option("--dependency", "dependency_values", multiple=True, metavar="NAME=REV",
-              help="Exact requested Git dependency revision; unrelated pins stay frozen.")
-@click.option("--continue", "continue_", is_flag=True, default=False,
-              help="Continue the preserved private migration and its attempt budgets.")
+@click.option("--dependency", "dependency_values", multiple=True, help="Exact target dependency NAME=COMMIT or NAME=VERSION.")
+@click.option("--continue", "continue_", is_flag=True, default=False, help="Resume this saved declaration migration.")
 @click.option("--project-scope", type=click.Choice(["build", "all"]), default=None,
-              help="Fresh runs default to the configured build module closure; all requires every local Lean file. Continuation preserves the sealed scope.")
+              help="Original native default targets/import closure (build), or all original project modules.")
 @click.option("--architect", type=click.Choice(["auto", "off"]), default=None,
-              help="Fresh runs try a target-version-matched optional LeanArchitect package; off disables it. Cannot change on continuation.")
+              help="Optionally install the exact target-version LeanArchitect release.")
 async def bump(version=None, dependency_values=(), continue_=False, project_scope=None, architect=None):
-    """Migrate an existing Lean project through the Formalize-derived runtime."""
-    paths = load_paths()
-    controller = paths.unity / "bump"
-    controller.mkdir(parents=True, exist_ok=True)
-    with (controller / "controller.lock").open("a+") as lock:
+    """Migrate an existing Lean project using declaration-level compiler repairs."""
+    from .. import bump_bootstrap
+    paths = bump_paths(load_paths())
+    paths.forum.mkdir(parents=True, exist_ok=True)
+    with (paths.forum / "controller.lock").open("a+") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
-            raise click.ClickException("another Bump controller is already running") from exc
+            raise click.ClickException("another Bump controller is already running in this project") from exc
         try:
-            if continue_ and architect is not None:
-                raise click.ClickException("--continue cannot change optional instrumentation")
-            await _run_bump(paths, continue_, version, bump_bootstrap.parse_dependency_pins(dependency_values),
-                            project_scope=project_scope, architect=architect)
+            pins = bump_bootstrap.parse_dependency_pins(dependency_values)
+            await _run_bump(paths, continue_, version, pins, project_scope=project_scope, architect=architect)
         except (OSError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
         finally:
@@ -404,97 +593,128 @@ async def bump(version=None, dependency_values=(), continue_=False, project_scop
 
 
 async def _run_bump(source_paths, continue_, version=None, dependency_pins=None, *, project_scope=None, architect=None):
+    from .. import bump_bootstrap
     max_attempts = _attempt_limit()
-    roster = load_roster(source_paths.agents_yaml, use_learned_strength=False)
-    names = [bump_state.author_key(agent.name) for agent in roster.agents]
-    if len(names) != len(set(names)):
-        raise click.ClickException("bump agent names must be unique ignoring case")
-    if not any(getattr(agent, "backend", None) == "codex" for agent in roster.agents):
-        raise click.ClickException("Bump requires a Codex agent for its verified read-only critic")
-    if not continue_:
-        (source_paths.unity / "stop-requested").unlink(missing_ok=True)
-    prepare_options = {"project_scope": project_scope or "build"}
-    if architect is not None:
-        prepare_options["architect"] = architect
-    paths = (bump_bootstrap.resume(source_paths, version, dependency_pins, project_scope=project_scope)
-             if continue_ else bump_bootstrap.prepare(source_paths, version, dependency_pins or {}, **prepare_options))
-    root = paths.project_root
-    state = bump_state.load_state(paths.forum)
-    if continue_:
-        if state.get("migration_max_attempts") != max_attempts:
-            raise click.ClickException("--continue cannot reset or change the saved Bump attempt policy")
-        bump_jobs.terminate(root)
-        recover_interrupted_formal_merges(paths)
-    else:
-        with bump_state.transaction(paths.forum) as saved:
-            saved["migration_max_attempts"] = max_attempts
-    if continue_:
-        (paths.unity / "stop-requested").unlink(missing_ok=True)
-        (source_paths.unity / "stop-requested").unlink(missing_ok=True)
-    previous_cwd = Path.cwd()
-    os.chdir(root)
+    saved_cwd = Path.cwd()
+    paths = None
     try:
+        if continue_:
+            paths = bump_bootstrap.resume(source_paths, version, dependency_pins,
+                                           project_scope=project_scope, architect=architect)
+        else:
+            if not version:
+                raise click.ClickException("Fresh Bump requires an exact target Lean version.")
+            bump_bootstrap._json(source_paths.unity / "state.json",
+                                 {"command": "bump", "phase": "preparing"})
+            (source_paths.unity / "stop-requested").unlink(missing_ok=True)
+            paths = bump_bootstrap.prepare(source_paths, version, dependency_pins or {},
+                                           project_scope=project_scope or "build", architect=architect or "auto")
+        root = paths.project_root
+        os.chdir(root)
+        roster = load_roster(paths.agents_yaml, use_learned_strength=False)
+        names = [bump_state.author_key(agent.name) for agent in roster.agents]
+        if len(names) != len(set(names)):
+            raise click.ClickException("bump agent names must be unique ignoring case")
+        if continue_:
+            bump_jobs.terminate(root)
+            recover_interrupted_formal_merges(paths)
+            bump_state.recover_source_repairs(paths.forum)
+        if continue_:
+            (paths.unity / "stop-requested").unlink(missing_ok=True)
+        elif (source_paths.unity / "stop-requested").exists():
+            (paths.unity / "stop-requested").touch()
+        bump_bootstrap._json(source_paths.unity / "state.json",
+                             {"command": "bump", "phase": bump_state.load_state(paths.forum)["phase"]})
+        await _run_migration_loop(roster, paths, max_attempts)
+        final_state = bump_state.load_state(paths.forum)
+        bump_bootstrap._json(source_paths.unity / "state.json",
+                             {"command": "bump", "phase": "done" if final_state["phase"] == "complete" else final_state["phase"]})
+    except BaseException:
+        bump_bootstrap._json(source_paths.unity / "state.json", {"command": "bump", "phase": "stopped"})
+        raise
+    finally:
+        os.chdir(saved_cwd)
+
+
+async def _run_migration_loop(roster, paths, max_attempts):
+    """Keep the copied Formalize phase/retry loop after compiler task discovery."""
+    root = paths.project_root
+    try:
+        attempts = 0
         while not stop_requested(root):
             state = bump_state.load_state(paths.forum)
             require_source_matches(paths, state)
-            if state["phase"] == "complete":
+            phase = state["phase"]
+            if phase == "complete":
                 break
-            if bump_state.pending_replan(state) or bump_state.open_source_issues(state):
-                raise click.ClickException(
-                    "Bump cannot rewrite frozen original-project obligations. "
-                    "The requested replan/source change is preserved; migration remains incomplete.")
-            if state["phase"] == "formalizing":
-                state = bump_bootstrap.check_ready_modules(paths)
-                if bump_state.all_formal_tasks_complete(state):
-                    _prepare_critic_snapshot(paths)
+            # Critic tools only queue changes. No integration workers remain here,
+            # so the command can safely dispatch repairs or enter replanning.
+            if phase == "critic":
+                if bump_state.ready_source_issues(state):
+                    state = await run_source_repairs(roster, paths, max_attempts)
+                request = bump_state.pending_replan(state)
+                if request:
+                    with _merge_lock(root):
+                        bump_state.begin_replan(paths.forum, request["request_id"])
                     continue
-                if _charge_completed_round(paths) >= max_attempts:
-                    raise click.ClickException(f"bump exhausted MAX_ATTEMPTS={max_attempts} before migration acceptance")
-                before = (state["formalization"].get("last_round") or {}).get("round_id")
+                if bump_state.open_source_issues(state):
+                    raise click.ClickException("Source issues remain unresolved after repair attempts; review is incomplete")
+            if phase == "chunking":
+                await _chunk_source(roster, paths, max_attempts)
+            elif phase == "formalizing":
+                if attempts >= max_attempts:
+                    raise click.ClickException(
+                        f"bump exhausted MAX_ATTEMPTS={max_attempts} before formalization acceptance"
+                    )
+                before_round = (state["formalization"].get("last_round") or {}).get("round_id")
                 state = await run_formalizing_runtime(
-                    roster, paths, build_bump_mcp(paths, "formalizing"), load_prompt("bump/FORMALIZING"))
+                    roster, paths, build_bump_mcp(paths, "formalizing"),
+                    load_prompt("bump/FORMALIZING"),
+                )
+                # Replans/cancellation interrupt a round; they do not complete
+                # one. The drained runtime is the authority on round endings.
                 if (not stop_requested(root) and state.get("phase") == "formalizing"
-                        and _formal_round_attempted(state, before)):
-                    _charge_completed_round(paths)
+                        and _formal_round_attempted(state, before_round)):
+                    attempts += 1
                 if (not stop_requested(root) and state.get("phase") == "formalizing"
-                        and not bump_state.pending_replan(state) and not bump_state.open_source_issues(state)):
-                    # A changed source can expose further compiler failures.
-                    # Refresh the repair DAG before considering final review;
-                    # a vanished error is not a preservation receipt.
-                    if (state["formalization"].get("contract") or {}).get("migration_policy") == 2:
-                        state = bump_bootstrap.check_ready_modules(paths)
-                        if not bump_state.all_formal_tasks_complete(state):
-                            continue
+                        and not bump_state.pending_replan(state)
+                        and not bump_state.open_source_issues(state)):
                     _prepare_critic_snapshot(paths)
-            elif state["phase"] == "critic":
+            elif phase == "critic":
                 await _run_critics(roster, paths, max_attempts)
             else:
-                raise click.ClickException(
-                    f"Unsupported Bump phase '{state['phase']}'; native module obligations cannot be replaced by paper chunking")
-        if stop_requested(root):
-            _save_incomplete_report(paths)
-            click.echo(f"bump stopped safely; work retained at {root}; use --continue")
-            return
-        persist_report(paths, accepted=True)
-        if _retrospective_enabled():
-            await _run_retrospective(roster, paths)
-            persist_report(paths, accepted=True)
-        mark_done(paths, "bump")
-        click.echo(f"bump complete: migration accepted in {root}; original checkout unchanged")
-    except (OSError, ValueError, RuntimeError, click.ClickException) as exc:
+                raise click.ClickException(f"unknown bump phase '{phase}'")
+    except (OSError, ValueError, click.ClickException) as exc:
         _save_incomplete_report(paths)
         if isinstance(exc, click.ClickException):
             raise
         raise click.ClickException(str(exc)) from exc
-    finally:
-        os.chdir(previous_cwd)
 
-
+    if stop_requested(root):
+        _save_incomplete_report(paths)
+        click.echo("bump stopped safely; rerun with --continue to resume")
+        return
+    try:
+        persist_report(paths, accepted=True)
+    except (OSError, ValueError) as exc:
+        _save_incomplete_report(paths)
+        raise click.ClickException(f"Could not publish the accepted snapshot report: {exc}") from exc
+    if _retrospective_enabled():
+        await _run_retrospective(roster, paths)
+        # A retrospective is not permission to change the verified project.
+        # Rebind the final handoff after that optional worker has finished.
+        try:
+            persist_report(paths, accepted=True)
+        except (OSError, ValueError) as exc:
+            _save_incomplete_report(paths)
+            raise click.ClickException(f"Project changed after acceptance; evidence preserved: {exc}") from exc
+    mark_done(paths, "bump")
+    click.echo("bump complete: selected original Lean declarations preserved and migration accepted")
 command = bump
 
 
-def _save_incomplete_report(paths):
+def _save_incomplete_report(paths) -> None:
     try:
         persist_report(paths, accepted=False)
     except (OSError, ValueError) as exc:
-        click.echo(f"Warning: could not persist incomplete Bump report: {exc}")
+        click.echo(f"Warning: could not persist incomplete formalization report: {exc}")

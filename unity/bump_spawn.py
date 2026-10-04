@@ -14,15 +14,10 @@ import sys
 import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
-from types import SimpleNamespace
 
 from rich.console import Console
 
 from .roster import Agent
-from .bump_provider import (
-    BumpProviderFailure, BumpTransportRetriesExhausted,
-    is_transient_provider_failure, provider_failure,
-)
 
 _console = Console()
 
@@ -108,7 +103,6 @@ def _worktree_prompt(cwd: Path) -> str:
 
 _BUMP_MCP_ENV_KEYS = (
     "PATH",
-    "ELAN_TOOLCHAIN",
     "UNITY_REAL_LAKE",
     "UNITY_BUMP_PROJECT_ROOT",
     "UNITY_BUMP_TASK_ID",
@@ -182,23 +176,6 @@ _BUMP_ARISTOTLE_INSPECTION_TOOLS = (
 )
 
 
-def _bump_worker_phase(mcp_servers: dict, *, log_context=None, env_overrides=None) -> str:
-    """Resolve one phase identity before selecting a backend or creating a worker."""
-    from .forum.bump_server import PROFILE_TOOLS
-
-    args = mcp_servers.get("unity-forum", {}).get("args", [])
-    transport = args[7] if isinstance(args, list) and len(args) == 8 and args[6] == "--profile" else None
-    phases = {value for value in (
-        transport, (log_context or {}).get("phase"),
-        (env_overrides or {}).get("UNITY_BUMP_PROFILE"),
-    ) if value is not None}
-    if transport not in PROFILE_TOOLS:
-        raise ValueError("Bump worker requires an explicit phase-scoped Forum transport")
-    if phases != {transport}:
-        raise ValueError("Bump worker phase identities disagree")
-    return transport
-
-
 def _bump_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[str, ...]]:
     """Authorize only this phase's existing public tools on known transports.
 
@@ -210,8 +187,6 @@ def _bump_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[st
 
     if phase not in PROFILE_TOOLS:
         raise ValueError(f"unknown bump MCP phase {phase!r}")
-    if phase == "critic" and set(mcp_servers) != {"unity-forum"}:
-        raise ValueError("Bump critic accepts only the phase-scoped Forum transport")
     catalogs = {
         "unity-forum": tuple(tool.__name__ for tool in PROFILE_TOOLS[phase]),
         "lean-lsp": _BUMP_LEAN_INSPECTION_TOOLS
@@ -276,28 +251,9 @@ def _bump_codex_policy_overrides(
 
 def _bump_codex_shell_overrides(environ: Mapping[str, str]) -> tuple[str, ...]:
     """Keep every phase on its assigned runtime, including non-login shell calls."""
-    return ("allow_login_shell=false", "features.shell_snapshot=false",
-            'shell_environment_policy.exclude=["LEAN_PATH","LEAN_SRC_PATH","LEAN_SYSROOT","LAKE_HOME","LAKE_PACKAGES_DIR"]') + tuple(
+    return ("allow_login_shell=false", "features.shell_snapshot=false") + tuple(
         "shell_environment_policy.set." + key + "=" + json.dumps(environ[key])
         for key in _BUMP_MCP_ENV_KEYS if key in environ
-    )
-
-
-def _bump_codex_feature_overrides(phase: str) -> tuple[str, ...]:
-    """Pin supported native flags, not an adapter-side tool catalog filter."""
-    # Unity owns the exact roster and its scheduling; a backend must not spawn
-    # additional untracked models outside that controller.
-    common = ("features.multi_agent=false",)
-    if phase != "critic":
-        return common
-    # Critic evidence is available through its snapshot-bound Forum tools.
-    # CLI 0.159.3 exposes these as supported native settings. Do not use the
-    # removed apply_patch_freeform flag as evidence of a real restriction.
-    return common + (
-        "features.shell_tool=false", "features.goals=false", "features.view_image=false",
-        "features.apps=false", "features.plugins=false", "features.browser_use=false",
-        "features.browser_use_external=false", "features.computer_use=false",
-        "features.image_generation=false", 'web_search="disabled"',
     )
 
 
@@ -324,8 +280,6 @@ def _agent_env(
     # codex: the child env is replaced wholesale, so start from os.environ and
     # isolate creds + config under a per-agent CODEX_HOME.
     env = dict(os.environ)
-    for key in ("LEAN_PATH", "LEAN_SRC_PATH", "LEAN_SYSROOT", "LAKE_HOME", "LAKE_PACKAGES_DIR"):
-        env.pop(key, None)
     if agent.api_key:
         env["CODEX_API_KEY"] = agent.api_key
     if codex_home is not None:
@@ -342,8 +296,6 @@ def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tup
     wrapper.write_text(
         f"#!{sys.executable}\n"
         "import os, sys\n"
-        "for key in ('LEAN_PATH', 'LEAN_SRC_PATH', 'LEAN_SYSROOT', 'LAKE_HOME', 'LAKE_PACKAGES_DIR'):\n"
-        "    os.environ.pop(key, None)\n"
         "os.setsid()\n"
         f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
         f"os.execv({str(executable)!r}, [{str(executable)!r}, *sys.argv[1:]])\n"
@@ -399,45 +351,18 @@ def _retry_sleep(exc) -> float:
     return 600.0
 
 
+# Signatures of permanent failures (dead CLI, bad/exhausted credentials): retrying
+# these forever just burns wall-clock — give up after two attempts regardless of
+# the MAX_ATTEMPTS-driven cap for transient errors.
+_PERMANENT = ("exit code 1", "usage limit", "upgrade to", "authentication", "unauthorized",
+              "401", "invalid api key", "login", "requires a newer version")
+
+
 def _give_up(exc, attempt: int) -> bool:
-    # Retain Formalize's transport cap, but do not retry unclassified controller
-    # or native-policy failures just because they share an exception base class.
-    return not is_transient_provider_failure(exc) or attempt >= _max_retries()
-
-
-def _transport_retry_delay(agent: Agent, error: BaseException, attempt: int, cwd: Path) -> float:
-    failure = provider_failure(agent, error, category="backend_exception")
-    if isinstance(failure, BumpTransportRetriesExhausted) or not is_transient_provider_failure(failure):
-        raise failure from None
-    if _give_up(failure, attempt):
-        raise BumpTransportRetriesExhausted(failure, attempt) from None
-    delay = _retry_sleep(failure)
-    _log(agent.name, SimpleNamespace(text=(
-        f"Transport {failure.category}; attempt {attempt}; retrying in {int(delay)}s"
-    )), cwd)
-    return delay
-
-
-async def _retry_pause(delay: float, cwd: Path,
-                       interrupt_event: asyncio.Event | None = None) -> bool:
-    """Wait after transport cleanup, honoring existing stop and cancellation."""
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + delay
-    while True:
-        if (_stop_requested(cwd)
-                or (interrupt_event is not None and interrupt_event.is_set())):
-            return False
-        remaining = deadline - loop.time()
-        if remaining <= 0:
-            return True
-        if interrupt_event is None:
-            await asyncio.sleep(min(1.0, remaining))
-        else:
-            try:
-                await asyncio.wait_for(interrupt_event.wait(), timeout=min(1.0, remaining))
-            except asyncio.TimeoutError:
-                continue
-            return False
+    s = str(exc).lower()
+    if any(sig in s for sig in _PERMANENT):
+        return attempt >= 2
+    return attempt >= _max_retries()
 
 # Last-run accounting per agent name, harvested by spawn() into .unity/logs/run.jsonl
 # so benchmark runs can compare cost across rosters.
@@ -470,8 +395,9 @@ def _ts() -> str:
 
 def _stop_requested(cwd) -> bool:
     """Safe stop: .unity/stop-requested asks agents to end after the current stream item."""
-    from .bump_orchestrator import stop_requested
-    return stop_requested(Path(cwd))
+    from .config import find_unity_dir
+    u = find_unity_dir(Path(cwd))
+    return u is not None and (u / "stop-requested").exists()
 
 
 def _tool_log(cwd, name: str, tool: str, detail: str = "") -> None:
@@ -546,7 +472,12 @@ def _log(name: str, msg, cwd=None) -> None:
             tail = _delta_buf.pop(name, "")
             if tail.strip():
                 _console.print(f"[dim]{_ts()} \\[{name}][/dim] {tail[:300]}")
-            _console.print(f"[green]{_ts()} \\[{name}] ✓ turn complete[/green]")
+            status = getattr(getattr(payload, "turn", None), "status", None)
+            status = getattr(status, "value", status)
+            if status == "completed":
+                _console.print(f"[green]{_ts()} \\[{name}] ✓ turn complete[/green]")
+            else:
+                _console.print(f"[yellow]{_ts()} \\[{name}] turn ended: {status or 'unknown'}[/yellow]")
         return
     text = getattr(msg, "text", None) or getattr(msg, "message", None)
     if text:
@@ -600,10 +531,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
     )
     attempt = 0
     while True:
-        if _stop_requested(cwd):
-            return None
         attempt += 1
-        retry_delay = None
         try:
             if on_normal_completion is not None:
                 return await _claude_continuation(
@@ -636,11 +564,14 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
         except _UnsuccessfulTurnError:
             raise
         except Exception as e:
-            retry_delay = _transport_retry_delay(agent, e, attempt, cwd)
+            if _give_up(e, attempt):
+                raise
+            wait = _retry_sleep(e)
+            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await _terminate_process_group(pid_file)
+            await asyncio.sleep(wait)
         finally:
             await _terminate_process_group(pid_file)
-        if retry_delay is not None and not await _retry_pause(retry_delay, cwd):
-            return None
 
 
 async def _claude_continuation(agent, options, prompt, cwd,
@@ -711,12 +642,11 @@ def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
         lines += [
             "[model_providers.unity]",
             'name = "unity"',
-            "base_url = " + json.dumps(agent.base_url),
+            f'base_url = "{agent.base_url}"',
             'env_key = "CODEX_API_KEY"',
             # codex-cli >= 0.132 dropped wire_api="chat"; providers must speak the
             # OpenAI Responses API (vLLM and FreeInference both serve /v1/responses).
             'wire_api = "responses"',
-            "requires_openai_auth = false",
             "",
         ]
     for name, cfg in (mcp_servers or {}).items():
@@ -785,14 +715,6 @@ _BUMP_CODEX_MCP_NOTE = (
 
 
 def _codex_mcp_note(profile: str, phase: str | None = None) -> str:
-    if phase == "critic":
-        return (
-            "\n\nCRITIC MCP TOOLS: Use only the native unity-forum tools exposed for "
-            "the critic phase. Shell tools are disabled; do not use a shell bridge "
-            "or another transport to publish a verdict or modify Forum state. Missing native tools or "
-            "an approval denial is a configuration blocker: report it without "
-            "changing transports or permissions."
-        )
     if phase == "chunking":
         return (
             "\n\nCHUNKING MCP TOOLS: Use only the chunking tools described in your role prompt. "
@@ -861,53 +783,33 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         own_process_group: bool = False,
                         mcp_profile: str = "bump",
                         on_normal_completion: CompletionCallback | None = None) -> str | None:
-    from dataclasses import replace
-    from .bump_provider import is_freeinference
-    from .bump_responses_adapter import NamespaceResponsesAdapter
-
-    options = dict(permission=permission, idle_timeout=idle_timeout, subagents=subagents,
-                   interrupt_event=interrupt_event, env_overrides=env_overrides,
-                   own_process_group=own_process_group, mcp_profile=mcp_profile,
-                   on_normal_completion=on_normal_completion)
-    if is_freeinference(agent):
-        # Serialization only. Calls return to the unchanged native MCP registry,
-        # which enforces the same phase authorization and filesystem sandbox.
-        with NamespaceResponsesAdapter(agent) as transport:
-            local_agent = replace(agent, base_url=transport.base_url, api_key=transport.api_key)
-            return await _codex_spawner_impl(agent, system_prompt, prompt, cwd, mcp_servers,
-                                             _transport_agent=local_agent, **options)
-    return await _codex_spawner_impl(agent, system_prompt, prompt, cwd, mcp_servers, **options)
-
-
-async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
-                        mcp_servers: dict, *, permission: str = "bypassPermissions",
-                        idle_timeout: float = 600.0, subagents=(),
-                        interrupt_event: asyncio.Event | None = None,
-                        env_overrides: dict[str, str] | None = None,
-                        own_process_group: bool = False,
-                        mcp_profile: str = "bump",
-                        on_normal_completion: CompletionCallback | None = None,
-                        _transport_agent: Agent | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
-    if mcp_profile != "bump":
-        raise ValueError("Bump workers require the Bump-scoped MCP profile")
-    bump_phase = _bump_worker_phase(mcp_servers, env_overrides=env_overrides)
     system_prompt = system_prompt + _codex_mcp_note(
-        mcp_profile, bump_phase,
+        mcp_profile, (env_overrides or {}).get("UNITY_BUMP_PROFILE"),
     )
 
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
     roots = _worktree_write_roots(cwd)
     if roots:
         system_prompt += _worktree_prompt(cwd)
-    policy = _bump_codex_tool_policy(mcp_servers, bump_phase)
-    transport_agent = _transport_agent or agent
-    provider = _write_codex_config(home, transport_agent, mcp_servers,
+    bump_phase = None
+    policy = {}
+    if mcp_profile == "bump":
+        bump_phase = (env_overrides or {}).get("UNITY_BUMP_PROFILE")
+        if bump_phase is None:
+            forum_args = mcp_servers.get("unity-forum", {}).get("args", [])
+            if len(forum_args) == 8 and forum_args[6] == "--profile":
+                bump_phase = forum_args[7]
+        if bump_phase is None:
+            raise ValueError("bump Codex worker requires an explicit phase")
+        policy = _bump_codex_tool_policy(mcp_servers, bump_phase)
+    provider = _write_codex_config(home, agent, mcp_servers,
                                    writable_roots=roots, bump_phase=bump_phase)
     _write_codex_agents(home, subagents)
     # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
-    sandbox = (Sandbox.read_only if bump_phase == "critic" else Sandbox.workspace_write)
+    sandbox = (Sandbox.workspace_write if roots or permission != "bypassPermissions"
+               else Sandbox.full_access)
 
     # Prefer the user's installed codex CLI (kept current by its own updater) over the
     # SDK's pinned bundled binary — newest models often require a newer runtime.
@@ -926,18 +828,8 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
             codex_bin = str(wrapped)
     attempt = 0
     while True:
-        if (_stop_requested(cwd)
-                or (interrupt_event is not None and interrupt_event.is_set())):
-            return None
         attempt += 1
-        retry_delay = None
-        agent_env = _agent_env(transport_agent, home, env_overrides)
-        if _transport_agent is not None:
-            # The child authenticates only to its private loopback transport.
-            # The actual FreeInference credential stays in the controller.
-            for key in ("FREEINFERENCE_API_KEY", "FREEINFERENCE_SESSION_TOKEN"):
-                agent_env.pop(key, None)
-            agent_env["CODEX_API_KEY"] = transport_agent.api_key
+        agent_env = _agent_env(agent, home, env_overrides)
         config_kwargs = {}
         if roots:
             # CLI overrides outrank project configuration; workers cannot inherit
@@ -950,8 +842,6 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
                 "sandbox_workspace_write.exclude_slash_tmp=true",
                 "sandbox_workspace_write.exclude_tmpdir_env_var=true",
             )
-        if bump_phase == "critic":
-            config_kwargs["config_overrides"] = ('sandbox_mode="read-only"', 'approval_policy="never"')
         if mcp_profile == "bump":
             # Login startup and cached shell state can move elan ahead of bump's
             # Lake shim even when the app-server process receives the right PATH.
@@ -959,7 +849,6 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
                 config_kwargs.get("config_overrides", ())
                 + _bump_codex_shell_overrides(agent_env)
                 + _bump_codex_policy_overrides(policy, mcp_servers)
-                + _bump_codex_feature_overrides(bump_phase)
             )
         cfg = CodexConfig(
             cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,
@@ -969,7 +858,6 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
         interrupt_task = None
         turn_finished = asyncio.Event()
         stream_started = asyncio.Event()
-        retry_failure = None
         try:
             # login_api_key is OpenAI-official auth only; custom providers (base_url set)
             # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
@@ -987,16 +875,6 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
                 cwd=str(cwd),
                 **thread_options,
             )
-            from .bump_mcp_ready import wait_for_native_tools
-            if (_stop_requested(cwd)
-                    or (interrupt_event is not None and interrupt_event.is_set())):
-                return final
-            if not await wait_for_native_tools(codex, thread.id, policy,
-                    stopped=lambda: (_stop_requested(cwd)
-                        or (interrupt_event is not None and interrupt_event.is_set())),
-                    observe=lambda observation: _last_run_stats.setdefault(agent.name, {}).update(
-                        native_mcp_startup=observation)):
-                return final
             next_prompt = prompt
             thread_usage = None
             while True:
@@ -1049,31 +927,27 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
                 # stream and assemble the final response from agentMessage items ourselves.
                 usage = None
                 successful = False
-                terminal_error = None
+                failure_detail = ""
                 async for note in _codex_notifications(
                     handle, codex, idle_timeout, stream_started
                 ):
-                    method = getattr(note, "method", "") or ""
-                    payload = getattr(note, "payload", None)
-                    if method in {"error", "turn/failed"}:
-                        failure = provider_failure(agent, getattr(payload, "error", payload))
-                        # Raw provider messages can contain request URLs, headers
-                        # or credentials. Publish only the bounded classification.
-                        _console.print(f"[red]{_ts()} \\[{agent.name}] {failure}[/red]")
-                        if (failure.category == "freeinference_credit_exhausted"
-                                or not getattr(payload, "will_retry", False)):
-                            raise failure
-                    else:
-                        _log(agent.name, note, cwd)
+                    _log(agent.name, note, cwd)
                     if _stop_requested(cwd):
                         _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
                         break
+                    method = getattr(note, "method", "") or ""
+                    payload = getattr(note, "payload", None)
+                    if method in {"error", "turn/failed"}:
+                        error = getattr(payload, "error", None)
+                        failure_detail = str(getattr(error, "message", None)
+                                             or getattr(payload, "message", None) or failure_detail)[:1000]
                     if method == "turn/completed":
                         turn_finished.set()
                         turn = getattr(payload, "turn", None)
                         status = getattr(turn, "status", None)
                         successful = getattr(status, "value", status) == "completed"
-                        terminal_error = getattr(turn, "error", None)
+                        error = getattr(turn, "error", None)
+                        failure_detail = str(getattr(error, "message", None) or failure_detail)[:1000]
                     if method == "item/completed":
                         root = getattr(getattr(payload, "item", None), "root", None)
                         if getattr(root, "type", "") == "agentMessage":
@@ -1085,7 +959,7 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
                                      ("input_tokens", "cached_input_tokens", "output_tokens",
                                       "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
                 thread_usage = usage if usage is not None else thread_usage
-                _last_run_stats.setdefault(agent.name, {}).update(cost_usd=None, usage=thread_usage)
+                _last_run_stats[agent.name] = {"cost_usd": None, "usage": thread_usage}
                 if interrupt_task is not None:
                     interrupt_task.cancel()
                     await asyncio.gather(interrupt_task, return_exceptions=True)
@@ -1094,7 +968,11 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
                         or (interrupt_event is not None and interrupt_event.is_set())):
                     return final
                 if not successful:
-                    raise provider_failure(agent, terminal_error)
+                    # Codex can report provider errors as a terminal notification
+                    # rather than raising from the stream. Route those through
+                    # the same inherited transport retry cap and backoff.
+                    raise RuntimeError("Codex turn did not complete successfully"
+                                       + (": " + failure_detail if failure_detail else ""))
                 if on_normal_completion is None:
                     return final
                 next_prompt = await _completion_feedback(on_normal_completion, final, cwd)
@@ -1109,33 +987,22 @@ async def _codex_spawner_impl(agent: Agent, system_prompt: str, prompt: str, cwd
         except Exception as e:
             if interrupt_event is not None and interrupt_event.is_set():
                 return final
-            failure = provider_failure(agent, e, category="backend_exception")
-            if is_transient_provider_failure(failure):
-                retry_failure = failure
-            retry_delay = _transport_retry_delay(agent, failure, attempt, cwd)
+            if _give_up(e, attempt):
+                raise
+            wait = _retry_sleep(e)
+            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await asyncio.sleep(wait)
         finally:
             turn_finished.set()
             if interrupt_task is not None:
                 interrupt_task.cancel()
                 await asyncio.gather(interrupt_task, return_exceptions=True)
             # close() can hang after an aborted turn; don't let cleanup wedge the agent.
-            cleanup_failed = False
             try:
-                try:
-                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-                except Exception:
-                    cleanup_failed = True
-            finally:
-                await _terminate_process_group(pid_file)
-            if cleanup_failed and retry_failure is not None:
-                # Never restart or rotate to another critic with uncertain
-                # closure of the previous SDK session. This overrides even a
-                # pending transport-exhaustion error with a fatal local fault.
-                raise BumpProviderFailure(
-                    "backend_cleanup_failed", provider=retry_failure.provider,
-                ) from None
-        if retry_delay is not None and not await _retry_pause(retry_delay, cwd, interrupt_event):
-            return final
+                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
+            except (asyncio.TimeoutError, Exception):
+                pass
+            await _terminate_process_group(pid_file)
 
 
 async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
@@ -1182,7 +1049,6 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         if _stop_requested(cwd):
             return None
         attempt += 1
-        retry_delay = None
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
@@ -1260,7 +1126,13 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
         except _UnsuccessfulTurnError:
             raise
         except Exception as e:
-            retry_delay = _transport_retry_delay(agent, e, attempt, cwd)
+            if proc.returncode is None:
+                proc.kill()
+            if _give_up(e, attempt):
+                raise
+            wait = _retry_sleep(e)
+            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            await asyncio.sleep(wait)
         finally:
             if proc.returncode is None:
                 if own_process_group and os.name == "posix":
@@ -1271,8 +1143,6 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                 else:
                     proc.kill()
                 await proc.wait()
-        if retry_delay is not None and not await _retry_pause(retry_delay, cwd):
-            return None
 
 
 def _sum_usage(previous, current):
@@ -1351,14 +1221,6 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 own_process_group: bool = False,
                 mcp_profile: str = "bump",
                 on_normal_completion: CompletionCallback | None = None) -> str | None:
-    if mcp_profile != "bump":
-        raise ValueError("Bump workers require the Bump-scoped MCP profile")
-    phase = _bump_worker_phase(mcp_servers, log_context=log_context, env_overrides=env_overrides)
-    env_overrides = {**(env_overrides or {}), "UNITY_BUMP_PROFILE": phase}
-    if phase == "critic":
-        if agent.backend != "codex":
-            raise ValueError("Bump critic currently requires the verified read-only Codex backend")
-        _bump_codex_tool_policy(mcp_servers, phase)
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
@@ -1366,6 +1228,9 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
     try:
         if _stop_requested(cwd):
             return None
+        phase = (log_context or {}).get("phase")
+        if phase and "UNITY_BUMP_PROFILE" not in (env_overrides or {}):
+            env_overrides = {**(env_overrides or {}), "UNITY_BUMP_PROFILE": phase}
         # Other bump phases keep their own prompts, without proof-development catalogs.
         if (mcp_profile == "bump"
                 and (env_overrides or {}).get("UNITY_BUMP_PROFILE", phase) == "formalizing"):
@@ -1388,15 +1253,5 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
         elif agent.backend == "antigravity":
             kwargs["mcp_profile"] = mcp_profile
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
-    except BumpProviderFailure as exc:
-        # Persist only safe machine-readable categories for the authorized
-        # controller/monitor. A failed provider turn is never mathematical work.
-        _last_run_stats.setdefault(agent.name, {})["provider_failure"] = {
-            "category": exc.category, "provider": exc.provider,
-            "http_status": exc.http_status,
-        }
-        if isinstance(exc, BumpTransportRetriesExhausted):
-            _last_run_stats[agent.name]["provider_failure"]["transport_attempts"] = exc.attempts
-        raise
     finally:
         _write_run_log(agent, cwd, time.monotonic() - t0, log_context)

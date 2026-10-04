@@ -92,13 +92,15 @@ def normalize_requirements(requirements, tasks, source_refs) -> list[dict]:
             raise ValueError("requirements have duplicate ids")
         seen.add(identifier)
         sources = _refs(row["source_components"], "requirement source_components")
-        task_ids = _refs(row["tasks"], "requirement tasks")
+        # Original migration obligations outlive the compiler repair queue.
+        # A declaration which already builds needs review, not an artificial job.
+        task_ids = _refs(row["tasks"], "requirement tasks", nonempty=False)
         anchors = _refs(row["anchor_ids"], "requirement anchor_ids")
         _known(sources, source_refs, "requirement source_components")
         _known(task_ids, tasks, "requirement tasks")
         covered = {ref for task_id in task_ids for ref in _refs(
             tasks[task_id].get("source_components"), f"chunks[{task_id}].source_components")}
-        if set(sources) - covered:
+        if task_ids and set(sources) - covered:
             raise ValueError(f"requirement {identifier} sources are not covered by its tasks")
         result.append({"id": identifier, "statement": _text(row["statement"], "requirement statement"),
                        "source_components": sources, "tasks": task_ids, "anchor_ids": anchors})
@@ -262,7 +264,7 @@ def normalize_outputs(value) -> list[dict]:
 def normalize_informal_nodes(chunks, requirements, spec, source) -> dict[str, dict]:
     """Extract a source-linked plan without requiring Lean names, files or builds."""
     rows = _task_map(chunks)
-    if not rows:
+    if not rows and not source.get("migration"):
         raise ValueError("informal DAG contains no chunks")
     refs = {row["ref_id"] for row in source.get("source_refs", [])}
     anchors = {row["id"]: row for row in spec["anchors"]}

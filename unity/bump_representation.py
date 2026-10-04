@@ -37,16 +37,13 @@ def representation_review_input(state: dict, task_id: str) -> dict | None:
     """Identity excludes proof bytes, receipt IDs and unrelated main commits."""
     formal = state.get("formalization", {})
     contract = formal.get("contract") or {}
-    if contract.get("migration_policy") == 2:
-        return None  # Correspondence proposals have their own controller/critic boundary.
     task = state.get("formal_tasks", {}).get(task_id, {})
     outputs = contract.get("bindings", {}).get(task_id, [])
     if (contract.get("representation_review_policy") != 1 or not outputs
             or task.get("representation", {}).get("status") != "adopted"):
         return None
-    from .bump_contract import output_target_key
-    targets = {key: contract.get("targets", {}).get(key, {}).get("fingerprint")
-               for key in (output_target_key(contract, task_id, row["declaration"]) for row in outputs)}
+    targets = {row["declaration"]: contract.get("targets", {}).get(row["declaration"], {}).get("fingerprint")
+               for row in outputs}
     if not all(isinstance(value, str) and value for value in targets.values()):
         return None
     requirements = sorted(({key: value for key, value in row.items() if key != "tasks"}
@@ -78,8 +75,7 @@ def current_representation_review(state: dict, task_id: str) -> dict | None:
 
 def snapshot(state: dict) -> dict:
     """Compact current semantic evidence for final snapshots, never historical IDs."""
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") == 2 or contract.get("representation_review_policy") != 1:
+    if (state.get("formalization", {}).get("contract") or {}).get("representation_review_policy") != 1:
         return {}
     result = {}
     for task_id in sorted(state.get("formal_tasks", {})):
@@ -253,7 +249,6 @@ def recover_representation_reviews(forum_dir: Path) -> None:
 
 
 def source_diagnosis_input(state: dict, issue_id: str) -> dict:
-    from .bump_contract import output_target_key
     issue = state.get("source_issues", {}).get(issue_id)
     if not issue:
         raise ValueError("unknown source issue")
@@ -262,9 +257,8 @@ def source_diagnosis_input(state: dict, issue_id: str) -> dict:
     contract = formal.get("contract") or {}
     representations = {key: {
         "statement": state.get("formal_tasks", {}).get(key, {}).get("informal_statement"),
-        "targets": {target: contract.get("targets", {}).get(target, {}).get("fingerprint")
-                    for target in (output_target_key(contract, key, row["declaration"])
-                                   for row in contract.get("bindings", {}).get(key, []))},
+        "targets": {row["declaration"]: contract.get("targets", {}).get(row["declaration"], {}).get("fingerprint")
+                    for row in contract.get("bindings", {}).get(key, [])},
     } for key in targets}
     payload = {"issue_id": issue_id, "source_sha256": _state().formal_source(state).get("sha256"),
                "description": issue["description"], "anchor_ids": issue["anchor_ids"], "task_ids": targets,

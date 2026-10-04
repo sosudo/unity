@@ -32,118 +32,10 @@ from .bump_input import require_source_matches
 from .forum import bump_server
 from .bump_orchestrator import _preamble, load_prompt, stop_requested
 from .bump_spawn import spawn
-from .bump_provider import BumpTransportRetriesExhausted
 
 
 _console = Console()
 PIPELINE = "bump"
-
-
-def _scheduler_projection(state: dict) -> dict:
-    """Detach routing data without copying native baselines or granting authority.
-
-    This is deliberately not a valid migration state/contract. Eligibility,
-    dispatch, merge, and terminal decisions still read the complete state.
-    The two omitted payloads are not used by the loop's routing observations.
-    """
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") == 1 and contract.get("representation_review_policy") == 1:
-        # Existing representation helpers resolve typed names through this
-        # baseline. Fixed migration contracts do not enable that policy, but
-        # preserve the original behavior if an explicit policy is encountered.
-        return deepcopy(state)
-    value = {key: item for key, item in state.items() if key != "project_baseline"}
-    formal = dict(value.get("formalization") or {})
-    contract = formal.get("contract")
-    if isinstance(contract, dict):
-        formal["contract"] = {key: item for key, item in contract.items()
-                              if key != "project_baseline"}
-    value["formalization"] = formal
-    return deepcopy(value)
-
-
-class _SchedulerObservations:
-    """Coalesce unchanged routing reads within ONE event-loop iteration only.
-
-    File metadata is an observation hint, never a receipt or proof cache. Every
-    public result is detached; the private projection cannot become a mutable
-    state alias. A new instance is required after each scheduling sleep. Normal
-    atomic publication, same-size replacements, and in-place changes invalidate
-    it. Full authority boundaries use ``fresh`` or the ordinary state loader.
-    """
-
-    def __init__(self, forum: Path):
-        self.forum = Path(forum)
-        self.path = bump_state.state_path(self.forum)
-        self._identity = None
-        self._projection = None
-
-    def _file_identity(self):
-        try:
-            value = self.path.stat()
-        except FileNotFoundError:
-            return None
-        return (value.st_dev, value.st_ino, value.st_size,
-                value.st_mtime_ns, value.st_ctime_ns)
-
-    def fresh(self) -> dict:
-        """Load full state anew; no cached snapshot authorizes a boundary."""
-        self._identity, self._projection = None, None
-        for _ in range(3):
-            before = self._file_identity()
-            state = bump_state.load_state(self.forum)
-            projection = _scheduler_projection(state)
-            after = self._file_identity()
-            if before == after:
-                # Missing state retains the ordinary loader's behavior, but is
-                # never a cache hit: creation must be observed immediately.
-                if after is not None:
-                    self._identity, self._projection = after, projection
-                return state
-        raise ValueError("Bump state changed repeatedly during a scheduler read; no stale routing was used")
-
-    def observe(self) -> dict:
-        """Return detached coordination data, never the cached object itself."""
-        before = self._file_identity()
-        if self._projection is not None and before == self._identity:
-            result = deepcopy(self._projection)
-            if self._file_identity() == before:
-                return result
-        return _scheduler_projection(self.fresh())
-
-
-def _observe_scheduler_sources(paths, observations: _SchedulerObservations) -> dict:
-    """Read-only top-of-pass work; the caller awaits completion before routing."""
-    state = observations.observe()
-    require_source_matches(paths, state)
-    return state
-
-
-def _reconcile_for_scheduler(forum: Path) -> dict:
-    """Avoid an inapplicable migration transaction, never an applicable repair.
-
-    Fixed migration contracts do not install representation-review policy.
-    ``representation_review_input`` consequently returns None for every task,
-    so reconciliation would only parse/hash the full unchanged state twice.
-    Read full state afresh, and leave every other policy on the original path.
-    """
-    state = bump_state.load_state(forum)
-    contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") in {1, 2} and "representation_review_policy" not in contract:
-        return state
-    return bump_state.reconcile_rejected_representations(forum)
-
-
-def _migration_frontier_is_current(state: dict) -> bool:
-    """A failed diagnostic-publication CAS is not a checked frontier."""
-    formal = state.get("formalization", {})
-    if (formal.get("contract") or {}).get("migration_policy") != 2:
-        return True
-    return bool(state.get("migration_plan")
-                and state.get("migration_plan_main_sha") == formal.get("main_sha")
-                and not state.get("migration_refresh_required")
-                and not any(row.get("status") == "proposed" for row in
-                            state.get("migration_mapping_proposals", {}).values()))
 
 
 def configure_forum(paths, profile: str) -> None:
@@ -237,9 +129,6 @@ def _agent_runtime_env(
     }
     if phase := state.get("phase"):
         result["UNITY_BUMP_PROFILE"] = str(phase)
-    toolchain = paths.project_root / "lean-toolchain"
-    if toolchain.is_file():
-        result["ELAN_TOOLCHAIN"] = toolchain.read_text().strip()
     if state.get("phase") == "formalizing":
         real_lake = shutil.which("lake")
         if real_lake:
@@ -681,7 +570,7 @@ def _preview_candidate_tree(root: Path, before: str, patch: str, task_id: str) -
 def _formal_worktree(project_root: Path, author: str) -> Path:
     """Reuse an owned registered tree; never let generic creation erase old work."""
     tree = worktree.agent_worktree(project_root, author)
-    branch = worktree.agent_branch(author, project_path=project_root)
+    branch = worktree.agent_branch(author)
     if not tree.exists() and not tree.is_symlink():
         if _git(project_root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0:
             raise ValueError(f"Preserved branch {branch} has no worktree; reconcile it before resuming bump")
@@ -736,10 +625,10 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
                  if item.get("status") == "complete"
                  or (item["task_id"] == task["task_id"] and stage == "complete")}
     incremental = {}
-    if (contract or {}).get("version") in {3, 4}:
+    if (contract or {}).get("version") == 3:
         incremental = {"task_id": task["task_id"], "stage": stage,
                        "proposed_outputs": (candidate or {}).get("outputs"),
-                       "final": (contract or {}).get("migration_policy") not in {1, 2} and len(completed) == len(tasks)}
+                       "final": len(completed) == len(tasks)}
     try:
         check = bump_contract.check_formal_contract(project_root, contract or {}, tasks,
                                                      completed=completed, layout=layout,
@@ -757,7 +646,7 @@ def _review_new_declaration(project_root: Path, task: dict, diff: str, *,
         "policy_sha256": bump_contract.policy_hash(),
         "stage": stage,
         "verified_tasks": check.get("verified_tasks", sorted(completed)),
-        **{key: check[key] for key in ("proposed_contract", "verified_targets", "final", "project_declarations", "compiled_receipt", "module_receipt", "source_identity") if key in check},
+        **{key: check[key] for key in ("proposed_contract", "verified_targets", "final", "project_declarations", "compiled_receipt") if key in check},
         "issues": issues,
         "blockers": check.get("blockers", []),
     }
@@ -779,11 +668,6 @@ def _checked_tree(root: Path, revision: str | None = None) -> str:
     return result.stdout.strip()
 
 
-def _verification_payload(verification: dict) -> str:
-    """Keep every verification field without indenting deep native evidence."""
-    return json.dumps(verification, sort_keys=True, separators=(",", ":")) + "\n"
-
-
 def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict | None = None,
                             rollback_receipt: dict | None = None) -> dict:
     """Verify an immutable candidate; commit only if its integration changes main."""
@@ -795,16 +679,6 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         return {"ok": False, "error": "missing formal contract; request re-chunking before proving"}
     if not bump_state.candidate_is_current(current, candidate):
         return {"ok": False, "error": "candidate belongs to a superseded formal contract"}
-    if contract.get("migration_policy") == 2 and not _migration_frontier_is_current(current):
-        return {"ok": False, "deferred": True,
-                "error": "current migration diagnostics must be refreshed before integration"}
-    if (contract.get("migration_policy") == 2
-            and not bump_state.migration_candidate_context_current(current, candidate)):
-        return {"ok": False, "deferred": True,
-                "error": "current migration bindings or prerequisites are not ready for integration"}
-    # An independent merge may update observations without changing this
-    # candidate's repair inputs. Never verify using a captured old task row.
-    task = current["formal_tasks"][candidate["task_id"]]
     # A queued candidate may become the final task after another merge. Recheck
     # the same cheap gate used at submission before mutating main or building.
     blockers = _candidate_preflight(current, candidate)
@@ -814,11 +688,9 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
                 "failure_context": bump_state.failure_state_context(current),
                 "verification": {"status": "failed", "mode": "preflight",
                                  "issues": issues, "blockers": blockers}}
-    baseline = (bump_contract.migration_baseline_v2(root, contract)
-                if contract.get("migration_policy") == 2 else contract.get("project_baseline"))
-    if baseline is not None:
+    if contract.get("project_baseline") is not None:
         from .bump_project import require_pinned_inputs
-        require_pinned_inputs(root, baseline,
+        require_pinned_inputs(root, contract["project_baseline"],
                               allowed_new_paths=bump_contract.adopted_output_paths(contract))
     try:
         resolved = worktree.verify_candidate_commit(
@@ -883,9 +755,9 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         return {"ok": False, "error": "Main differs from this empty candidate; sync_from_main and resubmit."}
     if not _owned_application(root, before, receipt):
         raise ValueError("Main changed during candidate application; preserving unknown edits and commits")
-    if baseline is not None:
+    if contract.get("project_baseline") is not None:
         try:
-            require_pinned_inputs(root, baseline, allowed_new_paths={
+            require_pinned_inputs(root, contract["project_baseline"], allowed_new_paths={
                 *bump_contract.adopted_output_paths(contract),
                 *[row["file"] for row in candidate.get("outputs", [])]})
         except ValueError as exc:
@@ -893,9 +765,8 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             return {"ok": False, "error": str(exc)}
     with bump_contract.measure(timings, "workspace_seconds"):
         try:
-            layout = (deepcopy(baseline["layout"]) if contract.get("migration_policy") == 2
-                      else bump_contract.workspace_layout(root))
-            layout = bump_contract.scoped_layout(root, layout, baseline)
+            layout = bump_contract.workspace_layout(root)
+            layout = bump_contract.scoped_layout(root, layout, contract.get("project_baseline"))
         except (OSError, ValueError) as exc:
             _rollback(root, before, receipt=receipt)
             return {"ok": False, "error": "project verification scope rejected candidate: " + str(exc)}
@@ -914,9 +785,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             **({"baseline": contract["project_baseline"], "tasks": [
                 *bump_contract.adopted_output_tasks(contract, root=root),
                 *[{"lean_file": row["file"]} for row in candidate.get("outputs", [])],
-            ]} if contract.get("project_baseline", {}).get("policy") == "changes-v1" else
-               {"baseline": baseline, "tasks": [task]}
-               if contract.get("migration_policy") in {1, 2} else {}),
+            ]} if contract.get("project_baseline", {}).get("policy") == "changes-v1" else {}),
         )
     except OSError as exc:
         build_seconds = time.monotonic() - build_started
@@ -929,6 +798,8 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
     # Invalidation precedes BOTH build passes, whose complete duration/output is
     # recorded. Default targets alone need not include every inspected module.
     output = build["output"]
+    from .bump_migration import is_migration
+    migration = is_migration(contract)
     build_record = {"returncode": build["returncode"], "seconds": build_seconds}
     if output:
         record = artifacts.store_text(
@@ -937,7 +808,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
             metadata={"candidate_id": candidate["candidate_id"], "task_id": task["task_id"]},
         )
         build_record.update({"artifact_id": record["artifact_id"], "sha256": record["sha256"]})
-    if build["returncode"]:
+    if build["returncode"] and not migration:
         _rollback(root, before, receipt=receipt)
         return {
             "ok": False,
@@ -949,12 +820,21 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         return {"ok": False, "error": "lake build changed tracked files", "build": build_record}
     staged = _git(root, "diff", "--cached", "--no-ext-diff", before).stdout
     verification_started = time.monotonic()
-    verification = _review_new_declaration(
-        root, task, staged, contract=contract,
-        formal_tasks=list(current["formal_tasks"].values()),
-        layout=layout, environment=checked_source["environment"], timings=timings,
-        candidate=candidate,
-    )
+    if migration:
+        # A declaration repair can integrate while sibling declarations still
+        # fail. This receipt is provisional; final native review remains separate.
+        from .bump_migration import verify_candidate
+        verification = verify_candidate(
+            root, contract, task, candidate,
+            formal_tasks=list(current["formal_tasks"].values()), build=build, layout=layout,
+        )
+    else:
+        verification = _review_new_declaration(
+            root, task, staged, contract=contract,
+            formal_tasks=list(current["formal_tasks"].values()),
+            layout=layout, environment=checked_source["environment"], timings=timings,
+            candidate=candidate,
+        )
     verification["environment_sha256"] = bump_contract.digest(checked_source["environment"])
     with bump_contract.measure(timings, "postcheck_identity_seconds"):
         reviewed_source = bump_contract.source_identity(root)
@@ -963,14 +843,11 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         raise ValueError("source changed during candidate build or kernel inspection")
     verification["seconds"] = time.monotonic() - verification_started
     record = artifacts.store_text(
-        paths.artifacts, _verification_payload(verification),
+        paths.artifacts, json.dumps(verification, indent=2, sort_keys=True) + "\n",
         kind="bump_formal_verification", producer="Unity",
         source=f"formal task {task['task_id']}",
     )
     verification["artifact_id"] = record["artifact_id"]
-    verification["verification_artifact"] = {
-        "artifact_id": record["artifact_id"], "sha256": record["sha256"],
-    }
     if verification.pop("project_declarations", None):
         verification["inventory_artifact"] = {"artifact_id": record["artifact_id"], "sha256": record["sha256"]}
     if verification["status"] != "passed":
@@ -1004,6 +881,7 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
         "main_sha": committed_source["main_sha"],
         "build": build_record,
         "verification": verification,
+        **({"_migration_build": build} if migration else {}),
     }
 
 
@@ -1085,8 +963,8 @@ def _integrate_formal_candidate(paths, candidate: dict, task: dict) -> dict:
 def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Event | None = None) -> dict:
     """Serialize Git integration AND state publication under the same lock."""
     def record(result: dict) -> dict:
-        if result.get("deferred") or (result.get("cancelled") and
-                bump_state.pending_replan(bump_state.load_state(paths.forum))):
+        migration_build = result.pop("_migration_build", None)
+        if result.get("cancelled") and bump_state.pending_replan(bump_state.load_state(paths.forum)):
             bump_state.defer_formal_merge(paths.forum, candidate["candidate_id"], reason=result["error"])
             return {**result, "deferred": True}
         bump_state.finish_formal_merge(
@@ -1097,6 +975,12 @@ def _integrate_and_record(paths, candidate: dict, task: dict, cancel_event: Even
             failure_main_sha=result.get("failure_main_sha", ""),
             blockers=result.get("blockers"), failure_context=result.get("failure_context"),
         )
+        if result.get("ok"):
+            from .bump_migration import is_migration
+            current = bump_state.load_state(paths.forum)
+            if is_migration(current["formalization"].get("contract") or {}):
+                from .bump_bootstrap import refresh
+                refresh(paths, build=migration_build)
         return result
 
     with bump_jobs.cancellation_scope(cancel_event):
@@ -1340,8 +1224,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     configure_forum(paths, "formalizing")
     state = bump_state.load_state(paths.forum)
     require_source_matches(paths, state)
-    if state.get("migration_global_blocker"):
-        raise ValueError("Bump has a saved global machine-review blocker; inspect its exact evidence before retrying")
     tools_prompt = load_prompt(f"{PIPELINE.upper()}_FORMALIZING_TOOLS")
     context = library.library_context()
     subagents = library.library_subagents()
@@ -1363,15 +1245,13 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     worker_attempts: dict[str, dict] = {}
     interrupted_workers: set[str] = set()
     blocked_launches: dict[str, str] = {}
-    transport_blocked: dict[str, BumpTransportRetriesExhausted] = {}
     blocked_launch_keys: dict[tuple[str, str], str] = {}
     submission_nudges: set[tuple[str, str, str]] = set()
     manifest_attempts: dict[str, dict] = {}
     activity = {"worker_launches": 0, "integrations": 0, "review_launches": 0, "source_repairs": 0}
-    checked_frontier_sha = state["formalization"].get("main_sha")
     # Persisted states can predate merge-time rejection reconciliation. Repair
     # that bookkeeping before deciding whether any work is dispatchable.
-    state = _reconcile_for_scheduler(paths.forum)
+    state = bump_state.reconcile_rejected_representations(paths.forum)
     bump_representation.recover_representation_reviews(paths.forum)
     # A prior controller may have stopped between starting an attempt and
     # recording its end. Do not let restarts repeat that author/input forever.
@@ -1517,21 +1397,12 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 blocked_launch_keys.pop(pair)
 
     def launch(name: str, task_id: str, followup: str = "", *, context_note: str = "") -> None:
-        if integration is not None or name in stopping or name in transport_blocked:
+        if integration is not None or name in stopping:
             return  # Worktree preparation takes merge.lock; never block this event loop on a review.
         if name in tasks:
             return
         current = bump_state.load_state(paths.forum)
         formal_task = current["formal_tasks"].get(task_id)
-        if formal_task and formal_task.get("migration_module"):
-            if formal_task.get("migration_attempts", 0) >= formal_task.get("migration_max_attempts", 5):
-                blocked_launches[name] = f"{task_id}: persistent migration attempt budget exhausted"
-                return
-            if any(not running.done() and (
-                    active_target(owner) == task_id or
-                    current["formal_tasks"].get(active_target(owner), {}).get("lean_file") == formal_task.get("lean_file"))
-                   for owner, running in tasks.items()):
-                return
         allowed, repair = launch_manifest_repair(current, name, task_id)
         if not allowed:
             return
@@ -1601,19 +1472,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             repair = started["repair"]
             manifest_attempts[name] = repair
         formal_task = current["formal_tasks"][task_id]
-        chunk = None
-        if formal_task.get("migration_module"):
-            if (current["formalization"].get("contract") or {}).get("migration_policy") == 2:
-                chunk = bump_state.next_migration_chunk(current, task_id)
-            formal_task = bump_state.begin_migration_attempt(
-                paths.forum, task_id, name,
-                **({"subtask_id": chunk["id"]} if chunk else {}),
-            )
-            if chunk:
-                bump_server.record_migration_focus_assignment(
-                    name, task_id, formal_task.get("revision", 0),
-                )
-            current = bump_state.load_state(paths.forum)
         worker_targets[name] = task_id
         worker_revisions[name] = (task_id, formal_task.get("revision", 0))
         worker_attempts[name] = bump_state.snapshot_attempt(current, name, task_id)
@@ -1709,42 +1567,31 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             "Do not change the source or silently bump a different result. "
             "Use refine_chunks for explicit graph/interpretation revisions; use source repair for source defects."
         )
-        if formal_task.get("migration_module"):
-            representation_instruction = "Submit stage='complete' with the fixed original outputs only. "
-            normal_task_prompt = (
-                f"Migrate module {formal_task['migration_module']} in {formal_task['lean_file']}. "
-                f"Fixed outputs: {formal_task.get('outputs', [])}. "
-                f"Controller diagnostics: {formal_task.get('migration_diagnostics', {})}. "
-                + ("Its current header/import diagnostics remain unresolved; this is a narrowly scoped "
-                   "header-repair assignment. Corrected native imports and the complete module must still "
-                   "pass controller checks before publication. " if formal_task.get("header_repair_only") else
-                   "Its project imports have passed target-version checks. ")
-                + "Refresh bump_brief, claim a strategy, "
-                "and repair compatibility in your assigned file only. Preserve every original declaration, "
-                "definition meaning, assumptions and trust footprint. Do not edit versions, configuration, "
-                "other modules, the original snapshot, or the obligation graph. Check local diagnostics, "
-                "then finalize_formalization for controller verification and merge. Publish concrete blockers "
-                "and yield if no justified repair is available. " + strategy_instruction
+        if formal_task.get("migration"):
+            migration = formal_task["migration"]
+            representation_instruction = (
+                "Preserve the original declaration's meaning and existing trust dependencies. "
+                "Submit this task's repair with `finalize_formalization`, stage='complete'. "
+                "The controller records an integrated repair provisionally; whole-scope native "
+                "verification and independent review determine migration acceptance. "
             )
-            if (current["formalization"].get("contract") or {}).get("migration_policy") == 2:
-                normal_task_prompt += (
-                    f" Diagnostic generation: {formal_task.get('diagnostic_generation')}. "
-                    "Use bump_task to read declaration subtasks and exact diagnostic artifacts. "
-                    "Use refine_migration only to partition current diagnosed work or propose an explicit "
-                    "correspondence; proposals do not establish semantic acceptance. Private incomplete "
-                    "edits are preserved in this worktree. Submit only a complete module repair, never "
-                    "a partial declaration patch, and do not add holes or expand trust."
-                )
-                if chunk:
-                    normal_task_prompt += (
-                        f"\nYour initial repair focus is chunk `{chunk['id']}` ({chunk['kind']}): "
-                        f"original occurrences {chunk.get('original_ids', [])}; "
-                        f"diagnostics {chunk.get('diagnostic_ids', [])}. "
-                        "Work in declaration-dependency order. Use refine_migration with "
-                        "checkpoint_subtask_id and checkpoint_summary to preserve private work "
-                        "and receive the next focus within this same attempt. A checkpoint is "
-                        "not accepted completion: publish only when the whole module compiles."
-                    )
+            normal_task_prompt = (
+                f"Repair declaration task `{task_id}`: {formal_task.get('description', '')}. "
+                f"Original identities: {migration.get('original_ids', [])}; "
+                f"source file: {migration.get('path')}; module: {migration.get('module')}. "
+                f"Current outputs: {formal_task.get('outputs', [])}. "
+                "Refresh bump_brief and bump_task for exact compiler diagnostics, original "
+                "obligations and declared prerequisites. " + strategy_instruction +
+                "Edit in your own worktree. Independent declarations in the same file can be "
+                "assigned to other workers; keep your patch scoped to this task and its explicit "
+                "refinement. Submit a repaired declaration even when unrelated declarations in "
+                "the file still fail. Unity serializes integration and checks each exact patch. "
+                "Use enabled Axle or Lean tools for local goals and diagnostics and direct shell "
+                "checks when compiled artifacts are needed. Publish useful compatibility findings. "
+                "Use refine_chunks for explicit dependency or correspondence changes; preserve "
+                "all original obligations. If concretely blocked and ending the attempt, call "
+                "yield_task with the exact blocker."
+            )
         task_prompt = _compose_formal_task_prompt(
             recovery=recovery, resume=resume, followup=followup, normal=normal_task_prompt,
             representation=representation_instruction, repair=repair,
@@ -1769,7 +1616,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 log_context={
                     "command": PIPELINE, "run_id": current.get("run_id"), "phase": "formalizing",
                     "task_id": task_id, "role": "bumpr",
-                    **({"chunk_id": chunk["id"]} if chunk else {}),
                 },
                 env_overrides=_agent_runtime_env(paths, current, name, task_id=task_id),
                 own_process_group=True,
@@ -1785,7 +1631,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         # An unrelated merge changes dispatch context, not the rejected
         # semantic input's retry budget. Refresh that context before scheduling
         # or concluding that the round has no runnable work.
-        current = _reconcile_for_scheduler(paths.forum)
+        current = bump_state.reconcile_rejected_representations(paths.forum)
         if current.get("phase") != "formalizing" or bump_state.pending_replan(current):
             return
         refresh_worker_targets(current)
@@ -1798,7 +1644,6 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 continue
             tried = bump_representation.attempted_reviewers(review)
             available = [name for name in agents if name not in tasks and name not in stopping
-                         and name not in transport_blocked
                          and bump_state.author_key(name) not in tried
                          and not bump_server.has_pending_formal_candidate(current, name)]
             available.sort(key=lambda name: bump_state.author_key(name)
@@ -1816,8 +1661,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         issues = bump_state.ready_source_issues(current)
         assigned_issues = set(repair_issues.values())
         for name in agents:
-            if (name in tasks or name in stopping or name in transport_blocked
-                    or bump_server.has_pending_formal_candidate(current, name)):
+            if name in tasks or name in stopping or bump_server.has_pending_formal_candidate(current, name):
                 continue
             issue = next((item for item in issues if item["issue_id"] not in assigned_issues
                           and name not in repair_exhausted.get(item["issue_id"], set())), None)
@@ -1846,7 +1690,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 participating_strategy(current, name, repair["task_id"]) is None,
             ))
             for name in owners:
-                if name in tasks or name in stopping or name in transport_blocked:
+                if name in tasks or name in stopping:
                     continue
                 launch(name, repair["task_id"])
                 if name in tasks:
@@ -1854,8 +1698,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         ready = bump_state.ready_formal_tasks(current)
         if not ready:
             return
-        idle = [name for name in agents if name not in tasks and name not in stopping
-                and name not in transport_blocked]
+        idle = [name for name in agents if name not in tasks and name not in stopping]
         ready_ids = {formal_task["task_id"] for formal_task in ready}
         unassigned = []
         for name in idle:
@@ -1927,13 +1770,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
         launch_idle()
         while not stop_requested(paths.project_root):
             await asyncio.sleep(0.1)
-            # Never carry parsed routing observations across scheduling ticks.
-            observations = _SchedulerObservations(paths.forum)
-            # Keep source I/O and hashing off the transport event loop. JSON's
-            # C decoder can still hold the GIL; this is not a latency guarantee.
-            # No routing/action proceeds until the complete source check passes.
-            state = await asyncio.to_thread(_observe_scheduler_sources, paths, observations)
+            state = bump_state.load_state(paths.forum)
             refresh_worker_targets(state)
+            require_source_matches(paths, state)
             if state.get("phase") == "formalizing":
                 reconcile_manifest_workers(state)
             for name in list(tasks):
@@ -1975,16 +1814,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     ended_normally = True
                 except asyncio.CancelledError:
                     pass
-                except BumpTransportRetriesExhausted as exc:
-                    # Transport exhaustion is not a mathematical yield and must
-                    # not tear down healthy peers or discard queued candidates.
-                    transport_blocked[name] = exc
-                    blocked_launches[name] = str(exc)
-                    _console.print(f"[yellow]worker {name} transport retries exhausted: {exc}[/yellow]")
                 except Exception as exc:
                     _console.print(f"[red]worker {name} failed: {exc!r}[/red]")
-                    if (bump_state.load_state(paths.forum)["formalization"].get("contract") or {}).get("migration_policy") in {1, 2}:
-                        raise RuntimeError(f"Bump worker {name} failed; migration preserved") from exc
                 tasks.pop(name, None)
                 # A consumed worker/stop job may have changed private source.
                 # Manual filesystem repairs require resuming the runtime or a
@@ -2027,7 +1858,7 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                             )
 
             # Consume all submissions while a separate serial integration owns main.
-            state = observations.observe()
+            state = bump_state.load_state(paths.forum)
             refresh_worker_targets(state)
             for candidate in state.get("formal_candidates", {}).values():
                 if (candidate.get("status") in {"submitted", "merging"}
@@ -2043,18 +1874,23 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 integration_cancel = None
                 if result.get("ok"):
                     retire_completed_task(finished["task_id"])
+                    current = bump_state.load_state(paths.forum)
+                    from .bump_migration import is_migration
+                    if is_migration(current["formalization"].get("contract") or {}):
+                        # A repair can also clear a sibling's diagnostic. Use
+                        # the same inherited stop-and-preserve handoff for its
+                        # worker; do not let it submit obsolete private work.
+                        for task_id, task in current["formal_tasks"].items():
+                            if task_id != finished["task_id"] and task.get("status") == "complete":
+                                retire_completed_task(task_id)
                 elif not result.get("deferred"):
                     require_source_matches(paths, bump_state.load_state(paths.forum))
                     _console.print(f"[red]candidate {finished['candidate_id']} failed: {result.get('error', '')}[/red]")
 
-            state = observations.observe()
+            state = bump_state.load_state(paths.forum)
             replan = bump_state.pending_replan(state)
             if replan:
                 if integration is None and not tasks and not stopping:
-                    state = observations.fresh()
-                    replan = bump_state.pending_replan(state)
-                    if not replan:
-                        continue
                     assignments = {
                         name: {"task_id": task_id,
                                "task_revision": state.get("formal_tasks", {}).get(task_id, {}).get("revision"),
@@ -2071,34 +1907,16 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 continue
             if state.get("phase") != "formalizing":
                 if integration is None and not tasks and not stopping:
-                    state = observations.fresh()
-                    if state.get("phase") != "formalizing":
-                        return state
+                    return state
                 continue
 
-            if integration is None and any(
-                item.get("status") == "submitted"
-                for item in state.get("formal_candidates", {}).values()
-            ):
-                # Candidate admission is a full-state boundary, not a routing
-                # cache decision. Integration revalidates again under its lock.
-                state = observations.fresh()
-                if bump_state.pending_replan(state) or state.get("phase") != "formalizing":
-                    continue
-                if ((state["formalization"].get("contract") or {}).get("migration_policy") == 2
-                        and not _migration_frontier_is_current(state)):
-                    # Leave immutable submissions queued while the normal
-                    # controller refresh below establishes a current frontier.
-                    candidates = []
-                else:
-                    candidates = sorted(
-                        (item for item in state.get("formal_candidates", {}).values()
-                         if item.get("status") == "submitted"
-                         and bump_state.candidate_is_current(state, item)
-                         and ((state["formalization"].get("contract") or {}).get("migration_policy") != 2
-                              or bump_state.migration_candidate_context_current(state, item))),
-                        key=lambda item: item.get("created_at", 0),
-                    )
+            if integration is None:
+                candidates = sorted(
+                    (item for item in state.get("formal_candidates", {}).values()
+                     if item.get("status") == "submitted"
+                     and bump_state.candidate_is_current(state, item)),
+                    key=lambda item: item.get("created_at", 0),
+                )
                 for candidate in candidates:
                     if candidate_workers(candidate):
                         continue
@@ -2122,24 +1940,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
 
             if integration is None:
                 # These source checks/preparations must never wait on a build's merge lock.
-                current = bump_state.load_state(paths.forum)
-                if ((current["formalization"].get("contract") or {}).get("migration_policy") in {1, 2}
-                        and (current["formalization"].get("main_sha") != checked_frontier_sha
-                             or not _migration_frontier_is_current(current)
-                             or current.get("migration_refresh_required")
-                             or any(row.get("status") == "proposed" for row in
-                                    current.get("migration_mapping_proposals", {}).values()))):
-                    from .bump_bootstrap import check_ready_modules
-                    await asyncio.to_thread(check_ready_modules, paths)
-                    refreshed = bump_state.load_state(paths.forum)
-                    if not _migration_frontier_is_current(refreshed):
-                        # Concurrent Forum activity can reject publication. Retry
-                        # on the next fresh pass; never return a false blocked
-                        # round or dispatch from stale diagnostics.
-                        continue
-                    checked_frontier_sha = refreshed["formalization"].get("main_sha")
                 for name in agents:
-                    if name in tasks or name in stopping or name in transport_blocked:
+                    if name in tasks or name in stopping:
                         continue
                     current = bump_state.load_state(paths.forum)
                     task_id = worker_targets.get(name, "")
@@ -2166,29 +1968,9 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 return bump_state.record_round_end(
                     paths.forum, blocked_launches=blocked_launches, activity=activity,
                 )
-            if integration is None and not tasks and not stopping:
-                # Queued bytes are not runnable work. In particular, an
-                # unavailable prerequisite or unmapped diagnostic can leave a
-                # current submission non-integrable after its worker stopped.
-                # Preserve it, but do not wait forever for a nonexistent job.
-                policy = (state["formalization"].get("contract") or {}).get("migration_policy")
-                can_integrate = _migration_frontier_is_current(state) and any(
-                    item.get("status") == "submitted"
-                    and bump_state.candidate_is_current(state, item)
-                    and (policy != 2 or bump_state.migration_candidate_context_current(state, item))
-                    for item in state.get("formal_candidates", {}).values()
-                )
-                if can_integrate:
-                    continue
+            if (integration is None and not tasks and not stopping
+                    and not bump_server.has_pending_formal_candidate(state)):
                 bump_state.record_round_end(paths.forum, blocked_launches=blocked_launches, activity=activity)
-                if transport_blocked:
-                    # Returning normally would start another runtime immediately
-                    # and charge a new migration attempt for the same outage.
-                    raise next(iter(transport_blocked.values()))
-                if bump_server.has_pending_formal_candidate(state):
-                    raise RuntimeError(
-                        "Bump repair round is blocked: queued candidates cannot currently integrate "
-                        "and no worker is running; submissions and worktrees preserved")
                 return bump_state.load_state(paths.forum)
         return bump_state.load_state(paths.forum)
     finally:

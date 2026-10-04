@@ -12,76 +12,99 @@ import fcntl
 import hashlib
 import json
 
-from . import artifacts, bump_contract, bump_state
+from . import artifacts, bump_contract, bump_scope, bump_state
 from .bump_input import require_source_matches
 from .bump_review import SemanticReview
 
 
 def _project_verification(state: dict, snapshot: dict, *, accepted: bool = False) -> dict:
-    """Report the two-version boundary without calling inherited holes proofs."""
+    """State the frozen boundary without turning byte preservation into proof."""
     baseline = ((state.get("formalization", {}).get("contract") or {}).get("project_baseline")
                 or state.get("project_baseline") or {})
-    migration = baseline.get("migration") or {}
-    scope = baseline.get("build_scope") or {}
+    mode = bump_scope.mode(baseline)
+    if baseline.get("policy") == "migration-v1":
+        from . import bump_migration
+        if accepted:
+            bump_migration.validate_native_snapshot(state, snapshot)
+        return {**bump_migration.coverage(baseline),
+            "current_snapshot_coverage": snapshot.get("project_verification"),
+            "native_review": snapshot.get("migration_review"),
+            "qualification": (
+                "All selected original declaration occurrences are checked against the immutable original "
+                "Lean project, with explicit refinement correspondences and per-declaration no-new-trust. "
+                "Compatible upgraded imports are assumed, not recursively proven equivalent. Excluded "
+                "original files are byte-preserved, not claimed compiled or migrated. Individual compiler "
+                "repairs are provisional; final native evidence and independent semantic review are separate."
+            )}
+    if mode == "changes":
+        current = snapshot.get("project_verification")
+        if accepted and (
+                not isinstance(current, dict) or current.get("mode") != "changes"
+                or current.get("policy") != "changes-v1"
+                or current.get("inspection_policy") != 2
+                or current.get("baseline_sha256") != baseline.get("sha256")
+                or current.get("normal_default_build") is not True):
+            raise ValueError("accepted change-focused report requires matching current preservation coverage")
+        return {
+            "mode": mode, "policy": "changes-v1", "baseline_sha256": baseline.get("sha256"),
+            "original_files": sorted(baseline.get("files", {})),
+            "current_snapshot_coverage": current,
+            "qualification": (
+                "Change-focused preservation, not whole-project kernel verification. Original files, "
+                "configuration and dependencies are frozen; submitted outputs and affected existing "
+                "modules in the normal build or submitted import closure are inspected in their actual "
+                "import contexts. Original declaration evidence "
+                "is captured on demand from the immutable baseline. Untouched unrelated modules are "
+                "preserved byte-for-byte, not claimed semantically audited. The normal project build "
+                "and exact merged changes are checked separately from the critic's faithfulness judgment."
+            ),
+        }
+    policy = baseline.get("verification_scope") or {}
+    original = policy.get("original_modules", baseline.get("layout", {}).get("modules", {}))
+    verified = policy.get("verification_modules", original)
+    editable = policy.get("editable_modules", verified)
+    readonly_verified = {path: module for path, module in verified.items() if path not in editable}
+    byte_only = {path: module for path, module in original.items() if path not in verified}
+    byte_only_files = sorted(path for path in baseline.get("files", {})
+                             if path.endswith(".lean") and path not in verified)
     current = snapshot.get("project_verification")
-    modules = {row["path"]: module for module, row in baseline.get("compiler_modules", {}).items()}
-    if accepted:
-        from . import bump_migration_project
-        if (baseline.get("policy") != "migration-v1" or baseline.get("version") != 5
-                or baseline.get("occurrence_policy") != 1
-                or baseline.get("scope_policy") != 1 or scope != migration.get("scope")
-                or bump_migration_project.scope_errors(scope, migration.get("source_files"))
-                or current != bump_contract._migration_project_verification(baseline)):
-            raise ValueError("accepted migration report requires matching current two-version coverage")
-    inherited = {
-        module: {name: {"kind": row.get("kind"), "direct_sorry": row.get("direct_sorry"),
-                        "axioms": row.get("axioms", [])}
-                 for name, row in report.get("declarations", {}).items()
-                 if row.get("kind") == "axiom" or row.get("direct_sorry") or "sorryAx" in row.get("axioms", [])}
-        for module, report in baseline.get("original_reports", {}).items()
-    }
+    if accepted and mode == "libraries" and (
+            not isinstance(current, dict) or current.get("mode") != mode
+            or current.get("scope_sha256") != policy.get("sha256")
+            or current.get("selected_libraries") != policy.get("selected_libraries")):
+        raise ValueError("accepted library report requires matching current project verification coverage")
     return {
-        "mode": "migration", "policy": baseline.get("policy"),
-        "baseline_sha256": baseline.get("sha256"),
-        "original_source_commit": migration.get("source_commit"),
-        "original_source_sha256": migration.get("source_hash"),
-        "target_version": migration.get("target_version"),
-        "original_verification_modules": modules,
-        "project_scope": scope.get("mode"), "scope_sha256": scope.get("sha256"),
-        "byte_preserved_excluded_files": deepcopy(scope.get("excluded_files", {})),
-        "byte_only_modules": {path: name for name, path in scope.get("excluded_modules", {}).items()},
-        "inherited_assumptions_and_holes": inherited,
-        "declaration_occurrences": deepcopy(current.get("declaration_occurrences", {})) if current else {},
+        "mode": mode,
+        "policy_sha256": policy.get("sha256"),
+        "selected_libraries": policy.get("selected_libraries", []),
+        "original_verification_modules": verified,
+        "original_editable_modules": editable,
+        "original_readonly_verified_modules": readonly_verified,
+        "original_byte_only_auxiliary_modules": byte_only,
+        "original_byte_only_auxiliary_files": byte_only_files,
         "current_snapshot_coverage": current,
         "qualification": (
-            "Cross-version preservation checks compare each selected original module's declarations and "
-            "meanings with its migrated native context, including modules with no declarations. "
-            "Same-named declarations in different original module artifacts remain separate obligations "
-            "with separate type, meaning, proof-assumption and compiled-context evidence. "
-            "Excluded files are preserved byte-for-byte, not compiled, repaired, or claimed newly "
-            "kernel-verified. No whole-repository compilation claim follows from scoped acceptance. "
-            "A successful target build is not sufficient. Original axioms and incomplete proofs "
-            "are recorded inherited assumptions, not newly proved results; the migration must not "
-            "introduce or broaden them. The original checkout remains separate from the migrated "
-            "target. Structural checks and the independent critic's semantic judgment are distinct."
+            "Library-scoped verification, not whole-project verification. Machine-check coverage "
+            "is limited to the selected libraries and their recorded project import closure; imported auxiliary "
+            "modules remain read-only. Excluded auxiliary sources are preserved byte-for-byte, "
+            "not claimed compiled or kernel-verified. New modules must remain inside the selected "
+            "libraries; imports cannot expand the frozen original verification boundary. The "
+            "recorded machine review separately states the checked revision and outcome."
+            if mode == "libraries" else
+            "All-project verification scope. Original modules are listed here; the exact current "
+            "revision and verification outcome are recorded separately in machine_review."
         ),
     }
 
 
 def completion_report(state: dict, *, accepted: bool = True) -> dict:
     """Describe exact recorded coverage; accepted reports require valid gate evidence."""
-    if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 2:
-        return _completion_report_v2(state, accepted=accepted)
     formal = state.get("formalization", {})
     snapshot = formal.get("review_snapshot") or {}
     verdict = None
     if accepted:
         if state.get("phase") != "complete" or formal.get("status") != "accepted":
             raise ValueError("formalization has not been accepted")
-        if ((formal.get("contract") or {}).get("migration_policy") != 1
-                or (formal.get("contract") or {}).get("migration_scope_policy") != 1
-                or (formal.get("contract") or {}).get("migration_occurrence_policy") != 1):
-            raise ValueError("accepted Bump report requires the migration contract policy")
         if not bump_contract._baseline_matches(state, formal.get("contract") or {}):
             raise ValueError("accepted Bump report requires the original project baseline")
         bump_state._validate_snapshot_binding(state, snapshot, require_passed=True)
@@ -119,7 +142,6 @@ def completion_report(state: dict, *, accepted: bool = True) -> dict:
             candidate = candidates.get(task.get("accepted_candidate"), {})
             implementation.append({
                 "task_id": task_id, "status": task.get("status", "missing"),
-                "migration_module": task.get("migration_module"),
                 "lean_file": task.get("lean_file"), "lean_decl": task.get("lean_decl"),
                 "outputs": task.get("outputs", []),
                 "representation": task.get("representation"),
@@ -147,7 +169,7 @@ def completion_report(state: dict, *, accepted: bool = True) -> dict:
         "original_source": state.get("input_source"),
         "scope_sha256": state.get("problem_sha256"),
         "project_baseline_sha256": (state.get("project_baseline") or {}).get("sha256"),
-        "project_scope": "migration",
+        "project_scope": (formal.get("contract") or {}).get("project_baseline", {}).get("scope"),
         "project_verification": _project_verification(state, snapshot, accepted=accepted),
         "formalization_revision": formal.get("revision"), "main_sha": formal.get("main_sha"),
         "contract_sha256": (formal.get("contract") or {}).get("sha256"),
@@ -159,74 +181,12 @@ def completion_report(state: dict, *, accepted: bool = True) -> dict:
         "machine_review_scope": "accepted exact revision" if accepted else "historical recorded evidence only",
         "coverage": coverage,
         "qualification": (
-            "Machine checks bind the original project and exact migrated revision to their "
-            "respective Lean environments. The critic separately judges migration faithfulness; "
-            "this is not a proof of arbitrary cross-version equivalence. Preserved original "
-            "axioms or incomplete proofs are not certified as new proofs. No source paper is "
-            "required and no user project changes are implied by a private target's acceptance."
+            "Machine checks validate the recorded Lean revision. Faithfulness and source-repair "
+            "justification are the recorded critic's semantic judgments, not mechanically proven "
+            "equivalence to natural language. The original documents are identified by the "
+            "immutable input snapshot; repairs are explicit proposals or argument amendments."
         ),
     })
-
-
-def _completion_report_v2(state: dict, *, accepted: bool) -> dict:
-    """Policy-2 coverage is the original ledger, not the currently active repair queue."""
-    from . import bump_checker_v2
-    formal = state.get("formalization", {})
-    contract = formal.get("contract") or {}
-    snapshot = formal.get("review_snapshot") or {}
-    verdict = None
-    if accepted:
-        if state.get("phase") != "complete" or formal.get("status") != "accepted":
-            raise ValueError("migration has not been accepted")
-        bump_checker_v2.validate_contract(contract)
-        bump_contract.validate_migration_snapshot(state, snapshot)
-        bump_state._validate_snapshot_binding(state, snapshot, require_passed=True)
-        verdict = next((row for row in state.get("critic_verdicts", [])
-            if row.get("verdict_id") == formal.get("accepted_verdict_id")), None)
-        if (not verdict or verdict.get("verdict") != "approved"
-                or verdict.get("snapshot_id") != snapshot.get("snapshot_id")
-                or verdict.get("snapshot_sha256") != bump_state._report_digest(snapshot)
-                or verdict.get("requirements_sha256") != bump_state._report_digest(formal.get("requirements", []))):
-            raise ValueError("accepted semantic verdict does not match the migration snapshot")
-        review = SemanticReview.model_validate(verdict["review"]).model_dump()
-        if review["snapshot_id"] != snapshot["snapshot_id"] or verdict.get("reopen_tasks"):
-            raise ValueError("semantic review is stale or reopens migration obligations")
-        bump_state._validate_semantic_review(state, review, approved=True, author=verdict["author"])
-    elif snapshot:
-        verdict = next((row for row in reversed(state.get("critic_verdicts", []))
-            if row.get("snapshot_id") == snapshot.get("snapshot_id")), None)
-    reviews = {row["requirement_id"]: row for row in (verdict or {}).get("review", {}).get("requirements", [])}
-    coverage = []
-    for requirement in contract.get("requirements", []):
-        groups = requirement["tasks"]
-        obligations = sorted({key for group in groups for key in contract["task_bindings"][group]["obligation_ids"]})
-        coverage.append({**deepcopy(requirement), "original_occurrence_ids": obligations,
-            "execution_groups": {key: deepcopy(contract["task_bindings"][key]) for key in groups},
-            "mapping_groups": {key: deepcopy(row) for key, row in contract["mapping"].items()
-                if set(row["original_ids"]).intersection(obligations)},
-            "machine_receipts": {key: deepcopy(snapshot.get("module_receipts", {}).get(key)) for key in groups},
-            "critic_evidence": deepcopy(reviews.get(requirement["id"]))})
-    return {"schema_version": 2, "pipeline": "bump", "migration_policy": 2, "inspection_policy": 5,
-        "run_id": state.get("run_id"), "status": "accepted" if accepted else "incomplete", "phase": state.get("phase"),
-        "main_sha": formal.get("main_sha"), "original_source": deepcopy(state.get("input_source")),
-        "project_baseline_sha256": contract.get("project_baseline_sha256"),
-        "baseline_ref": deepcopy(contract.get("baseline_ref")),
-        "original_index_ref": deepcopy(contract.get("original_index_ref")),
-        "original_index_sha256": contract.get("original_index_sha256"),
-        "mapping_sha256": contract.get("mapping_sha256"), "contract_sha256": contract.get("sha256"),
-        "project_verification": deepcopy(snapshot.get("project_verification")),
-        "coverage": coverage, "machine_review": deepcopy(snapshot), "critic_verdict": deepcopy(verdict),
-        "machine_review_scope": "accepted exact revision" if accepted else "historical recorded evidence only",
-        "semantic_equivalence_proved": False,
-        "qualification": (
-            "Every selected original declaration occurrence is covered, including clean modules with no model repair task. "
-            "Native checks compile complete target module contexts, bind local type/value identity or explicitly declared "
-            "correspondence, and enforce per-original no-new-trust. Theorem proof bodies may change. "
-            "Recursive equality of upstream library definitions is not checked; compatibility of the pinned upgraded "
-            "imports is an explicit assumption. Declared correspondence artifacts and compilation do not prove mathematical "
-            "equivalence: the independent critic separately judges fidelity to frozen original source. Original axioms and "
-            "holes are inherited, not newly proved. Excluded files are byte-preserved, not migrated or kernel-verified."
-        )}
 
 
 @contextmanager

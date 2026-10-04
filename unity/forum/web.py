@@ -91,7 +91,7 @@ def _load_config() -> dict:
 
 def _icrl_visible() -> bool:
     """ICRL is not part of the prove or solve coordination workspaces."""
-    if _autoformalize_command() or _formalize_command():
+    if _autoformalize_command() or _formalize_command() or _bump_command():
         return False
     try:
         return json.loads((ROOT_DIR / "state.json").read_text()).get("command") not in {"prove", "solve"}
@@ -146,7 +146,70 @@ def _formalize_history_exists() -> bool:
     return (_formalize_forum() / "formalize-state.json").exists()
 
 
+def _bump_command(*, active: bool = False) -> bool:
+    """Keep migration discussions and state in Bump's own workspace."""
+    try:
+        state = json.loads((ROOT_DIR / "state.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    if state.get("command") != "bump":
+        return False
+    if active:
+        try:
+            state = json.loads((_bump_unity() / "state.json").read_text())
+        except (OSError, json.JSONDecodeError):
+            pass
+    return not active or state.get("phase") != "done"
+
+
+def _bump_unity() -> Path:
+    """Follow only this source project's exactly bound Bump target."""
+    pointer = ROOT_DIR / "bump" / "active.json"
+    if not pointer.exists():
+        return ROOT_DIR
+    try:
+        active = json.loads(pointer.read_text())
+        source = ROOT_DIR.resolve().parent
+        run_id = active["run_id"]
+        if not isinstance(run_id, str) or not re.fullmatch(r"bump-[0-9a-f]{12}", run_id):
+            raise ValueError("invalid Bump workspace identity")
+        expected = source / ".unity" / "bump" / run_id / "target"
+        if (active.get("project_root") != str(source)
+                or active.get("source_root", str(source)) != str(source)
+                or active.get("target_path") != str(expected)
+                or expected.resolve() != expected):
+            raise ValueError("Bump target pointer differs from its source project")
+        unity = expected / ".unity"
+        if unity.is_symlink():
+            raise ValueError("Bump target state must not redirect to another workspace")
+        origin = json.loads((unity / "bump-origin.json").read_text())
+        if any(origin.get(key) != value for key, value in (
+                ("project_root", str(source)), ("run_id", run_id), ("target_path", str(expected)))):
+            raise ValueError("Bump target origin differs from its active pointer")
+        return unity
+    except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise ValueError("Bump workspace pointer or origin is incomplete") from exc
+
+
+def _bump_forum() -> Path:
+    unity = _bump_unity()
+    return (FORUM_DIR if unity == ROOT_DIR else unity / "forum") / "bump"
+
+
+def _bump_history_exists() -> bool:
+    # A preparing or unreadable pointer is history too, never permission for
+    # the web launcher to overwrite an earlier workspace with a fresh run.
+    return ((ROOT_DIR / "bump" / "active.json").exists()
+            or (_bump_forum() / "bump-state.json").exists())
+
+
+def _workspace_unity() -> Path:
+    return _bump_unity() if _bump_command() else ROOT_DIR
+
+
 def _dashboard_dag_path() -> Path:
+    if _bump_command():
+        return _bump_forum() / "dag.json"
     return _formalize_forum() / "dag.json" if _formalize_command() else ROOT_DIR / "dag.json"
 
 
@@ -155,6 +218,8 @@ def _autoformalize_forum() -> Path:
 
 
 def _discussion_forum() -> Path:
+    if _bump_command():
+        return _bump_forum()
     if _formalize_command():
         return _formalize_forum()
     return _autoformalize_forum() if _autoformalize_command() else FORUM_DIR
@@ -200,6 +265,48 @@ def _formalize_dag() -> dict:
             "revision": task.get("revision"), "status": color,
         })
     return {"graph_kind": "formalize", "chunks": chunks}
+
+
+def _bump_dag() -> dict:
+    """Declaration repair assignments from Bump's authoritative state."""
+    from ..bump_state import assignment_view, load_state
+    state = load_state(_bump_forum())
+    chunks = []
+    for task in state.get("formal_tasks", {}).values():
+        if task.get("status") == "superseded":
+            continue
+        assignment = assignment_view(state, task["task_id"])
+        representation = task.get("representation") or {"status": "missing"}
+        verification = task.get("verification") or {"status": "pending"}
+        faithfulness = task.get("faithfulness") or {"status": "unreviewed"}
+        outputs = task.get("outputs") or []
+        statement_dependencies = task.get("statement_dependencies", [])
+        proof_dependencies = task.get("proof_dependencies", [])
+        if faithfulness["status"] == "approved" and verification["status"] == "verified":
+            color = "green"
+        elif faithfulness["status"] == "changes_requested" or task.get("status") == "blocked":
+            color = "red"
+        elif task.get("status") == "candidate_pending" or representation["status"] == "adopted":
+            color = "blue"
+        else:
+            color = "yellow" if assignment.get("status") == "assigned" else "grey"
+        chunks.append({
+            "id": task["task_id"], "title": task.get("title") or task["task_id"],
+            "type": task.get("predicted_kind") or "unknown",
+            "summary": task.get("informal_statement", ""),
+            "informal_proof": task.get("informal_proof"),
+            "source_components": task.get("source_components", []),
+            "anchor_ids": task.get("anchor_ids", []),
+            "requirement_ids": task.get("requirement_ids", []),
+            "statement_dependencies": statement_dependencies,
+            "proof_dependencies": proof_dependencies,
+            "dependencies": sorted(set(statement_dependencies) | set(proof_dependencies)),
+            "outputs": outputs, "declarations": [row["declaration"] for row in outputs],
+            "assignment": assignment, "representation": representation,
+            "verification": verification, "faithfulness": faithfulness,
+            "revision": task.get("revision"), "status": color,
+        })
+    return {"graph_kind": "bump", "chunks": chunks}
 
 
 def _autoformalize_dag() -> dict:
@@ -519,6 +626,8 @@ def get_tag(name: str):
 
 @app.get("/api/dag")
 def get_dag():
+    if _bump_command():
+        return JSONResponse(_bump_dag())
     if _formalize_command():
         return JSONResponse(_formalize_dag())
     if _autoformalize_command():
@@ -715,18 +824,35 @@ def get_formalize_metrics():
     return read_metrics(_formalize_forum(), ROOT_DIR.parent)
 
 
+@app.get("/api/bump-state")
+def get_bump_state():
+    if not _bump_command():
+        return {}
+    from ..bump_state import load_state
+    return load_state(_bump_forum())
+
+
+@app.get("/api/bump-metrics")
+def get_bump_metrics():
+    if not _bump_command():
+        return {}
+    from .bump_server import read_metrics
+    return read_metrics(_bump_forum(), _bump_unity().parent)
+
+
 @app.get("/api/artifacts")
 def api_artifacts(limit: int = 200):
     """Recent immutable run artifacts and aggregate stored-byte telemetry."""
-    records = artifact_store.list_artifacts(ROOT_DIR / "artifacts", limit=limit)
-    return {"artifacts": records, **artifact_store.artifact_stats(ROOT_DIR / "artifacts")}
+    directory = _workspace_unity() / "artifacts"
+    records = artifact_store.list_artifacts(directory, limit=limit)
+    return {"artifacts": records, **artifact_store.artifact_stats(directory)}
 
 
 @app.get("/api/artifacts/{artifact_id}/download")
 def api_artifact_download(artifact_id: str):
     """Download exact artifact bytes without routing them through model context."""
     try:
-        payload = artifact_store.artifact_bytes(ROOT_DIR / "artifacts", artifact_id)
+        payload = artifact_store.artifact_bytes(_workspace_unity() / "artifacts", artifact_id)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
     return Response(
@@ -745,7 +871,7 @@ def api_artifact_get(
     """Return one bounded page for the web artifact viewer."""
     try:
         return artifact_store.read_artifact(
-            ROOT_DIR / "artifacts", artifact_id, offset=offset, limit=limit
+            _workspace_unity() / "artifacts", artifact_id, offset=offset, limit=limit
         )
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=404)
@@ -763,11 +889,11 @@ def _agent_statuses(chunks: dict) -> list:
     running = _current_run()["running"]
     phase = None
     try:
-        phase = json.loads((ROOT_DIR / "state.json").read_text()).get("phase")
+        phase = json.loads((_workspace_unity() / "state.json").read_text()).get("phase")
     except Exception:
         pass
     last_tool: dict = {}
-    tf = ROOT_DIR / "logs" / "tools.jsonl"
+    tf = _workspace_unity() / "logs" / "tools.jsonl"
     if tf.exists():
         for line in tf.read_text(errors="replace").splitlines()[-400:]:
             try:
@@ -796,6 +922,20 @@ def _agent_statuses(chunks: dict) -> list:
     elif active_command == "solve":
         solve = _load_solve_state(FORUM_DIR)
         for strategy in solve.get("strategies", {}).values():
+            if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+                claims[strategy["owner"]] = {
+                    "chunk": strategy.get("target", ""),
+                    "strategy": strategy.get("description", ""),
+                }
+                for assistant in strategy.get("assistants", []):
+                    claims[assistant] = {
+                        "chunk": strategy.get("target", ""),
+                        "strategy": "assisting: " + strategy.get("description", ""),
+                    }
+    elif _bump_command(active=True):
+        from ..bump_state import load_state
+        state = load_state(_bump_forum())
+        for strategy in state.get("strategies", {}).values():
             if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
                 claims[strategy["owner"]] = {
                     "chunk": strategy.get("target", ""),
@@ -1427,7 +1567,7 @@ function updateHeaderLegend(data) {
   const el = document.getElementById('hlegend');
   const legend = data.graph_kind === 'informal_tasks'
     ? [['green','Resolved','#2e7d32'], ['yellow','Claimed','#7c5cbf'], ['grey','Open','#d97706'], ['red','Blocked','#c62828']]
-    : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind)
+    : (['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) || data.graph_kind === 'bump')
     ? [['green','Verified + faithful','#2e7d32'], ['yellow','In progress','#7c5cbf'], ['grey','Unstarted','#d97706'], ['red','Needs attention','#c62828']]
     : LEGEND;
   if (el) el.innerHTML = legend.map(([k, label, col]) =>
@@ -1513,7 +1653,7 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
-  if (['formalize', 'autoformalize', 'solve_formalization'].includes(graphKind)) {
+  if (['formalize', 'autoformalize', 'solve_formalization'].includes(graphKind) || graphKind === 'bump') {
     const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
     const assignment = c.assignment || {};
     document.getElementById('info-content').innerHTML =
@@ -1568,8 +1708,8 @@ async function loadDag(forceRebuild) {
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  document.getElementById('dag-title').textContent = data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
-  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
+  document.getElementById('dag-title').textContent = data.graph_kind === 'bump' ? 'Declaration repair DAG' : data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
+  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>(['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) || data.graph_kind === 'bump') ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
   if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
   updateHeaderLegend(data);
@@ -1762,6 +1902,8 @@ def _safe_unity_path(rel: str) -> Path:
 
 
 def _forum_nonempty() -> bool:
+    if _bump_command() and _bump_history_exists():
+        return True
     if _formalize_command() and _formalize_history_exists():
         return True
     for tp in _discussion_forum().glob("*.json"):
@@ -1823,6 +1965,7 @@ def api_project():
     return {"name": _project_root().name,
             "continue": _forum_nonempty(),
             "formalize_continue": _formalize_history_exists(),
+            "bump_continue": _bump_history_exists(),
             "has_dag": dag.exists(), "chunks": chunk_ids,
             "active_metric": _active_metric(),
             "commands": _COMMANDS,
@@ -2182,7 +2325,7 @@ def _chunk_for_decl(name: str) -> dict | None:
         chunks = json.loads(_dashboard_dag_path().read_text()).get("chunks", [])
     except (OSError, json.JSONDecodeError):
         return None
-    if _formalize_command():
+    if _formalize_command() or _bump_command():
         for chunk in chunks:
             if chunk.get("status") == "superseded":
                 continue
@@ -2290,7 +2433,7 @@ def api_run_status():
     phase = None
     if st["running"]:
         try:
-            phase = json.loads((ROOT_DIR / "state.json").read_text()).get("phase")
+            phase = json.loads((_workspace_unity() / "state.json").read_text()).get("phase")
         except (OSError, json.JSONDecodeError):
             pass
     return {"running": st["running"], "command": st.get("command"),
@@ -2324,7 +2467,8 @@ def api_run_start(payload: dict = Body(...)):
         argv += ["--targets", ", ".join(t.strip() for t in targets.splitlines() if t.strip())]
     cont = payload.get("continue")
     if cont is None:
-        cont = _formalize_history_exists() if command == "formalize" else _forum_nonempty()
+        cont = (_bump_history_exists() if command == "bump" else
+                _formalize_history_exists() if command == "formalize" else _forum_nonempty())
     if cont:
         argv.append("--continue")
 
@@ -2362,10 +2506,18 @@ def api_run_stop(payload: dict = Body(default={})):
         if st.get("command") == "formalize":
             from ..formalize_jobs import terminate
             terminate(_project_root())
+        elif st.get("command") == "bump":
+            from ..bump_jobs import terminate
+            unity = _bump_unity()
+            (unity / "stop-requested").write_text(str(time.time()))
+            terminate(unity.parent)
         return {"ok": True, "stopping": True}
     if st.get("command") == "formalize":
         from ..formalize_jobs import terminate
         terminate(_project_root())
+    elif st.get("command") == "bump":
+        from ..bump_jobs import terminate
+        terminate(_bump_unity().parent)
     pid = st["pid"]
     try:
         pgid = os.getpgid(pid)
@@ -2676,6 +2828,8 @@ async function loadOverview() {
       ? await Promise.all([J('/api/autoformalize-state'), J('/api/autoformalize-metrics')])
       : r.command === 'formalize'
       ? await Promise.all([J('/api/formalize-state'), J('/api/formalize-metrics')])
+      : r.command === 'bump'
+      ? await Promise.all([J('/api/bump-state'), J('/api/bump-metrics')])
       : [{}, {}];
     const solveDag = r.command === 'solve' ? await J('/api/dag') : {};
     const solveTaskViews = Object.fromEntries((solveDag.chunks || []).map(x => [x.id, x]));
@@ -2772,7 +2926,7 @@ async function loadOverview() {
         '<div class="item"><b>' + (sm.worker_turns || 0) + '</b> worker turns · ' + (sm.worker_seconds || 0) + ' agent-seconds</div>' +
         '<div class="item"><b>$' + Number(sm.cost_usd || 0).toFixed(4) + '</b> recorded cost' + (sm.time_to_first_candidate_seconds == null ? '' : ' · first candidate ' + sm.time_to_first_candidate_seconds + 's') + '</div></section></div>';
     }
-    if (af.run_id && ['formalize', 'autoformalize'].includes(r.command)) {
+    if (af.run_id && (['formalize', 'autoformalize'].includes(r.command) || r.command === 'bump')) {
       const source = af.input_source || {}, formal = af.formalization || {},
         tasks = Object.values(af.formal_tasks || {}).filter(x => x.status !== 'superseded'),
         candidates = Object.values(af.formal_candidates || {}),
@@ -2781,10 +2935,10 @@ async function loadOverview() {
         obstacles = Object.values(af.obstacles || {}).filter(x => x.status === 'open');
       h += '<div class="sechead">' + esc(r.command) + ' workspace<span class="r">phase ' + esc(af.phase || 'chunking') + ' · revision ' + (af.revision || 0) + '</span></div>';
       if (af.final_report) h += '<div class="item">' + (af.final_report.status === 'accepted' ? 'accepted snapshot report' : 'incomplete run report') + artifactButton(af.final_report.artifact_id) + '</div>';
-      h += '<div class="grid"><section><h2>immutable supplied source</h2><div class="item mono">' + esc(source.candidate_id || '') + '</div>' + artifactButton(source.artifact_id) +
+      h += '<div class="grid"><section><h2>' + (r.command === 'bump' ? 'original project obligations' : 'immutable supplied source') + '</h2><div class="item mono">' + esc(source.candidate_id || '') + '</div>' + artifactButton(source.artifact_id) +
         (source.source_refs || []).map(x => '<div class="item"><b>' + esc(x.ref_id) + '</b><div class="who">' + esc(x.path) + ' · ' + esc((x.sha256 || '').slice(0,12)) + '</div>' + artifactButton(x.artifact_id) + '</div>').join('') +
-        '<div class="item"><b>Lean formalization</b><span class="badge ' + (formal.status === 'accepted' ? 'ok' : 'pending') + '">' + esc(formal.status || 'waiting') + '</span><div class="who mono">main ' + esc((formal.main_sha || '').slice(0,12)) + '</div></div></section>';
-      h += '<section><h2>informal source nodes</h2>' + (tasks.length ? tasks.map(x => {
+        '<div class="item"><b>' + (r.command === 'bump' ? 'Lean migration' : 'Lean formalization') + '</b><span class="badge ' + (formal.status === 'accepted' ? 'ok' : 'pending') + '">' + esc(formal.status || 'waiting') + '</span><div class="who mono">main ' + esc((formal.main_sha || '').slice(0,12)) + '</div></div></section>';
+      h += '<section><h2>' + (r.command === 'bump' ? 'declaration repair tasks' : 'informal source nodes') + '</h2>' + (r.command === 'bump' ? '<div class="sub">Integrated repairs are provisional until the complete selected project passes native verification and independent review.</div>' : '') + (tasks.length ? tasks.map(x => {
         const representation = (x.representation || {}).status || 'missing',
           verification = (x.verification || {}).status || 'pending',
           faithfulness = (x.faithfulness || {}).status || 'unreviewed',
@@ -3157,7 +3311,7 @@ let RUN_CMD = null;
 function openRunModal(cmd) {
   RUN_CMD = cmd;
   $('rm-title').textContent = 'run: unity ' + cmd;
-  const hasHistory = cmd === 'formalize' ? PROJECT.formalize_continue : PROJECT['continue'];
+  const hasHistory = cmd === 'bump' ? PROJECT.bump_continue : cmd === 'formalize' ? PROJECT.formalize_continue : PROJECT['continue'];
   $('rm-continue').checked = hasHistory;
   $('rm-continue-note').textContent = hasHistory ? '(auto-detected: saved run history)' : '(fresh run: no saved history)';
   const spec = PROJECT.commands[cmd];

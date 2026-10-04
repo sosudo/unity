@@ -86,7 +86,8 @@ class FormalizeWebTests(unittest.TestCase):
                 self.assertEqual(web._load_thread("scope")["title"], command)
                 self.assertFalse(web._icrl_visible())
         self.set_command("bump")
-        self.assertTrue(web._icrl_visible())
+        # Bump now has its own structured Forum; Formalize's routing is unchanged.
+        self.assertFalse(web._icrl_visible())
 
     def test_formalize_dag_keeps_evidence_and_final_graph(self):
         tasks = {

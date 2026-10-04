@@ -2,7 +2,7 @@
 
 Bump worktrees intentionally share ``.lake/packages`` with the main checkout.
 That makes dependency caches fast, but it also means commands such as
-``lake clean`` mutate every worker's environment. Bump workers receive a small
+``lake clean`` mutate every worker's environment. Bumprs receive a small
 ``lake`` shim in ``PATH`` which enters here. Safe diagnostics remain available,
 while destructive workspace operations are controller-only and long-running
 Lean processes are registered for cancellation.
@@ -94,7 +94,6 @@ def run(
         owner=str(env.get("UNITY_AGENT_NAME") or "bump-worker"),
         task_id=str(env.get("UNITY_BUMP_TASK_ID") or ""),
         serialize_build=serialize,
-        env=dict(env),
         **({"passthrough_stdio": True} if interactive else {}),
     )
     if completed.stdout:

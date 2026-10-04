@@ -112,6 +112,12 @@ def errors(policy: dict, baseline_layout: dict | None = None) -> list[str]:
 
 def mode(baseline: dict | None) -> str:
     """Older baselines are all-project; invalid present policies never downgrade."""
+    if (baseline or {}).get("policy") == "migration-v1":
+        from .bump_migration import baseline_errors
+        issues = baseline_errors(baseline)
+        if issues:
+            raise ValueError("; ".join(issues))
+        return baseline["project_scope"]
     if ((baseline or {}).get("version") == 2
             or (baseline or {}).get("project_scope") == "changes"
             or (baseline or {}).get("layout", {}).get("project_scope") == "changes"
@@ -209,10 +215,10 @@ def require_writable_paths(baseline: dict, paths) -> None:
     this cheap guard does not manufacture ownership from directory prefixes.
     """
     if baseline.get("policy") == "migration-v1":
-        original_paths = {row["path"] for row in baseline.get("compiler_modules", {}).values()}
+        selected = set(baseline["migration"]["selected_modules"].values())
         for path in paths:
-            if path not in original_paths:
-                raise ValueError("migration may only edit inventoried original modules: " + str(path))
+            if not _path(path) or (path in baseline["files"] and path not in selected):
+                raise ValueError("source is outside the original migration scope: " + str(path))
         return
     selected_mode = mode(baseline)
     if selected_mode == "all":

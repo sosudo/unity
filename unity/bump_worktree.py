@@ -5,7 +5,6 @@ Completed worktrees are retained as evidence; explicit cleanup is a user action.
 """
 
 from pathlib import Path
-import hashlib
 import uuid
 
 from . import worktree as _shared
@@ -15,27 +14,21 @@ link_runtime_state = _shared.link_runtime_state
 symlink_lake_cache = _shared.symlink_lake_cache
 
 
-def _name(name: str, project_path: Path | None = None) -> str:
-    # Fresh migrations are worktrees of the same original Git repository, so
-    # their branches share one namespace even though their source roots differ.
-    # Bind branches and worker paths to the canonical private target, not merely
-    # the roster name. Existing targets retain a stable name when continued.
-    run = (hashlib.sha256(str(Path(project_path).resolve()).encode()).hexdigest()[:16] + "-"
-           if project_path is not None else "")
-    return "bump-" + run + name
+def _name(name: str) -> str:
+    return "bump-" + name
 
 
-def agent_branch(name: str, project_path: Path | None = None) -> str:
-    return _shared.agent_branch(_name(name, project_path))
+def agent_branch(name: str) -> str:
+    return _shared.agent_branch(_name(name))
 
 
 def agent_worktree(project_path: Path, name: str) -> Path:
-    return _shared.agent_worktree(project_path, _name(name, project_path))
+    return _shared.agent_worktree(project_path, _name(name))
 
 
 def create_worktree(name: str, project_path: Path) -> Path:
     path = agent_worktree(project_path, name)
-    branch = agent_branch(name, project_path)
+    branch = agent_branch(name)
     if path.exists() or path.is_symlink() or _shared._git(
         project_path, "show-ref", "--verify", "--quiet", "refs/heads/" + branch,
     ).returncode == 0:
@@ -49,12 +42,12 @@ def create_worktree(name: str, project_path: Path) -> Path:
 
 def verify_candidate_commit(project_path, name, commit_sha, *, allow_unchanged=False):
     return _shared.verify_candidate_commit(
-        project_path, _name(name, project_path), commit_sha, allow_unchanged=allow_unchanged)
+        project_path, _name(name), commit_sha, allow_unchanged=allow_unchanged)
 
 
 def force_sync_from_main(project_path, name):
     # Callers must checkpoint the exact owned tree before requesting this.
-    return _shared.force_sync_from_main(project_path, _name(name, project_path))
+    return _shared.force_sync_from_main(project_path, _name(name))
 
 
 def cleanup_worktree(name, worktree_path, project_path):

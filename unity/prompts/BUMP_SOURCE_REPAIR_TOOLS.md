@@ -24,3 +24,6 @@ for targeted source and prerequisite detail. Read the original sources listed in
 
 No formal candidate finalization or source rewriting belongs to this role. Keep detailed search output
 in artifacts, and leave existing worktree proof files unchanged.
+The source is the immutable original Lean project. No diagnosis or proposal can waive original
+selected meanings, definition behavior or per-declaration trust. A required mathematical change is a
+blocker for user direction, not permission to replace the migration's frozen obligation ledger.

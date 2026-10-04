@@ -5,9 +5,7 @@ backend modules are not used or configured by this pipeline.
 """
 
 import asyncio
-import json
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -15,57 +13,9 @@ from rich.console import Console
 
 from . import library
 from .bump_spawn import bump_mcp_with_runtime_env, spawn
-from .bump_provider import BumpTransportRetriesExhausted
-from .orchestrator import load_prompt, mark_done, mark_phase, resume_point, toposort
+from .orchestrator import load_prompt, mark_done, mark_phase, resume_point, stop_requested, toposort
 
 _console = Console()
-
-
-def stop_requested(cwd) -> bool:
-    """Honor target-local and identity-bound original-project stop requests.
-
-    A private migration owns its runtime state, while ``unity stop`` is normally
-    issued in the unchanged original checkout. Never follow an arbitrary path
-    from an origin record; malformed or mismatched identities stop fail-closed.
-    """
-    from .config import find_unity_dir
-
-    unity = find_unity_dir(Path(cwd))
-    if unity is None:
-        return False
-    unity = unity.resolve()
-    if (unity / "stop-requested").exists():
-        return True
-    origin = unity / "bump-origin.json"
-    if not origin.exists() and not origin.is_symlink():
-        return False
-    try:
-        if origin.is_symlink():
-            return True
-        record = json.loads(origin.read_text())
-        if set(record) != {"project_root", "run_id", "target_path"}:
-            return True
-        run_id = record["run_id"]
-        if not isinstance(run_id, str) or not re.fullmatch(r"bump-[A-Za-z0-9_-]+", run_id):
-            return True
-        original, target = Path(record["project_root"]), Path(record["target_path"])
-        if (not original.is_absolute() or not target.is_absolute()
-                or original.resolve(strict=True) != original
-                or target.resolve(strict=True) != target
-                or target != original / ".unity" / "bump" / run_id / "target"
-                or unity.parent != target):
-            return True
-        active_path = original / ".unity" / "bump" / "active.json"
-        if active_path.is_symlink():
-            return True
-        active = json.loads(active_path.read_text())
-        if (not isinstance(active, dict)
-                or any(active.get(key) != value for key, value in record.items())
-                or active.get("status") not in {"ready", "preparing"}):
-            return True
-        return (original / ".unity" / "stop-requested").exists()
-    except (OSError, ValueError, TypeError, RuntimeError):
-        return True
 
 
 def load_role_prompt(name: str) -> str:
@@ -82,6 +32,7 @@ def build_bump_mcp(paths, profile: str) -> dict:
     keep working, while the implementation and advertised tools are bump-only.
     """
     servers = {
+        "lean-lsp": {"command": "uvx", "args": ["lean-lsp-mcp"]},
         "unity-forum": {
             "command": sys.executable,
             "args": [
@@ -92,11 +43,6 @@ def build_bump_mcp(paths, profile: str) -> dict:
             ],
         },
     }
-    # Critics consume already-bound machine evidence. Do not expose external
-    # services that can rebuild, edit, or submit proof work from the review view.
-    if profile == "critic":
-        return bump_mcp_with_runtime_env(servers, os.environ)
-    servers["lean-lsp"] = {"command": "uvx", "args": ["lean-lsp-mcp"]}
     axle_key = os.getenv("AXLE_API_KEY")
     if axle_key:
         servers["axle"] = {
@@ -143,21 +89,6 @@ async def dispatch(
     on_normal_completion=None, env_overrides=None,
 ):
     """Launch bump agents with its own backend and compact Forum state."""
-    agents = list(agents)
-    phase = (log_context or {}).get("phase")
-    forum_args = mcp.get("unity-forum", {}).get("args", [])
-    forum_phase = (forum_args[forum_args.index("--profile") + 1]
-                   if "--profile" in forum_args and forum_args.index("--profile") + 1 < len(forum_args)
-                   else None)
-    env_phase = (env_overrides or {}).get("UNITY_BUMP_PROFILE")
-    phases = {value for value in (phase, forum_phase, env_phase) if value is not None}
-    if "critic" in phases:
-        if mcp_profile != "bump" or phases != {"critic"} or forum_phase != "critic":
-            raise ValueError("Bump critic requires a consistent snapshot-bound critic profile")
-        if any(agent.backend != "codex" for agent in agents):
-            raise ValueError("Bump critic requires the verified read-only Codex backend")
-        if set(mcp) != {"unity-forum"}:
-            raise ValueError("Bump critic may use only the snapshot-bound Forum tools")
     def agent_cwd(agent):
         return cwd[agent.name] if isinstance(cwd, dict) else cwd
 
@@ -219,17 +150,6 @@ async def dispatch(
 
     results = await asyncio.gather(*(spawn_one(agent) for agent in agents), return_exceptions=True)
     for agent, result in zip(agents, results):
-        if isinstance(result, asyncio.CancelledError):
-            raise result
-        if isinstance(result, BumpTransportRetriesExhausted):
-            # Keep transport exhaustion distinct from a missing critic verdict
-            # so the command can try another already-configured eligible critic.
-            raise result
-        if isinstance(result, BaseException):
-            # Operational failure is not an ordinary missing verdict. Preserve
-            # the cause and stop instead of spending another critic attempt.
-            raise RuntimeError(
-                f"Bump {forum_phase or phase or 'phase'} agent {agent.name} failed "
-                f"({type(result).__name__}); pipeline stopped. See run diagnostics."
-            ) from result
+        if isinstance(result, Exception):
+            _console.print(f"[red]agent {agent.name} failed: {result!r}[/red]")
     return results

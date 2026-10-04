@@ -4,9 +4,8 @@ import base64
 from copy import deepcopy
 import json
 import unittest
-from unittest.mock import patch
 
-from tests import test_bump_worktree_preservation as preservation
+import test_bump_worktree_preservation as preservation
 from unity import artifacts, bump_representation, bump_state
 from unity.forum import bump_server
 
@@ -146,10 +145,14 @@ class BumpCheckpointIgnoreTests(unittest.TestCase):
         previous = deepcopy(current["formal_tasks"]["sharpness"])
         bump_server._record_worktree_assignment("Ada", "sharpness", previous["revision"], current)
         self.private_changes()
-        # Isolate the already-verified retirement branch. This is not evidence
-        # for native migration acceptance; the checkpoint and reset are real.
-        with patch.object(bump_server, "_completed_migration_assignment", return_value=previous):
-            result = bump_server.prepare_formal_worktree("Ada", "sharpness", "next")
+        # A sibling repair can clear this declaration before its worker stops.
+        # Completion here is diagnostic bookkeeping, not native acceptance.
+        with bump_state.transaction(self.forum) as state:
+            state["formal_tasks"]["sharpness"]["migration"] = {
+                "kind": "declaration", "original_ids": ["sharpness"],
+                "path": "Sharpness.lean", "module": "Sharpness",
+            }
+        result = bump_server.prepare_formal_worktree("Ada", "sharpness", "next")
         self.assertTrue(result["ok"], result)
         self.assert_checkpoint(result["parked_checkpoint"])
         self.assertEqual(self.git(self.tree, "rev-parse", "HEAD"), self.main)

@@ -36,11 +36,11 @@ from . import server as discussion
 
 FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
-PROFILE = "formalizing"
-PROFILES = {"formalizing", "critic", "retrospective"}
+PROFILE = "chunking"
+PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair", "representation_review"}
 
 
-def configure(forum_dir: Path, project_root: Path, profile: str = "formalizing") -> None:
+def configure(forum_dir: Path, project_root: Path, profile: str = "chunking") -> None:
     global FORUM_DIR, PROJECT_ROOT, PROFILE
     if profile not in PROFILES:
         raise ValueError(f"unknown bump Forum profile '{profile}'")
@@ -253,143 +253,9 @@ def _submit_formal_commit(
     return result
 
 
-_STATUS_INLINE_BYTES = 32_000
-
-
-def _status_fields(record: dict | None, names: tuple[str, ...]) -> dict:
-    """Select exact scalar metadata, never recursively copy native evidence."""
-    if not isinstance(record, dict):
-        return {}
-    return {name: record[name] for name in names if name in record
-            and (record[name] is None or type(record[name]) in (str, int, float, bool))}
-
-
-def _status_page(rows: list, offset: int, limit: int, summarize) -> tuple[list, dict]:
-    selected = rows[offset:offset + limit]
-    end = offset + len(selected)
-    return ([summarize(row) for row in selected],
-            {"offset": offset, "limit": limit, "total": len(rows), "returned": len(selected),
-             "next_offset": end if end < len(rows) else None})
-
-
-def _status_view(state: dict, offset: int, limit: int) -> dict:
-    formal = state.get("formalization") or {}
-    contract = formal.get("contract") or {}
-    baseline = state.get("project_baseline") or {}
-    source = state.get("input_source") or {}
-    snapshot = formal.get("review_snapshot") or {}
-    bindings = contract.get("bindings") or {}
-    requirements = formal.get("requirements") or []
-    tasks = state.get("formal_tasks") or {}
-    candidates = state.get("formal_candidates") or {}
-    strategies = state.get("strategies") or {}
-    verdicts = state.get("critic_verdicts") or []
-    source_refs = source.get("source_refs") or []
-
-    def task_row(pair):
-        key, task = pair
-        row = _status_fields(task, ("status", "revision", "migration_module", "migration_attempts",
-            "migration_max_attempts", "accepted_candidate", "lean_file", "spec_sha256",
-            "diagnostic_status", "diagnostic_generation", "diagnostic_source_sha256"))
-        outputs = bindings.get(key, [])
-        row.update(task_id=key, binding_count=len(outputs), binding_sha256=bump_state.digest(outputs),
-            output_count=len(task.get("outputs") or []),
-            representation=_status_fields(task.get("representation"), ("status", "candidate_id", "source")),
-            verification=_status_fields(task.get("verification"), ("status", "candidate_id", "artifact_id")),
-            faithfulness=_status_fields(task.get("faithfulness"), ("status", "verdict_id")))
-        return row
-
-    def candidate_row(pair):
-        key, candidate = pair
-        verification = candidate.get("verification") or {}
-        return {"candidate_id": key, **_status_fields(candidate, (
-            "task_id", "strategy_id", "author", "status", "stage", "commit_sha", "base_sha",
-            "diff_sha256", "task_revision", "formalization_revision", "artifact_id")),
-            "output_count": len(candidate.get("outputs") or []),
-            "verification": _status_fields(verification, (
-                "status", "passed", "artifact_id", "contract_sha256", "policy_sha256")),
-            "verification_artifact": _status_fields(verification.get("verification_artifact"),
-                                                     ("artifact_id", "sha256")),
-            "proposed_contract_ref": _status_fields(verification.get("proposed_contract_ref"),
-                ("contract_sha256", "artifact_id", "artifact_sha256"))}
-
-    task_rows, task_page = _status_page(sorted(tasks.items()), offset, limit, task_row)
-    candidate_rows, candidate_page = _status_page(sorted(candidates.items()), offset, limit, candidate_row)
-    strategy_rows, strategy_page = _status_page(sorted(strategies.items()), offset, limit,
-        lambda pair: {"strategy_id": pair[0], **_status_fields(pair[1], (
-            "phase", "phase_revision", "task_revision", "target", "status", "owner", "creator"))})
-    refs, source_page = _status_page(sorted(source_refs, key=lambda row: row["ref_id"]), offset, limit,
-        lambda row: _status_fields(row, ("ref_id", "kind", "path", "sha256", "artifact_id", "bytes")))
-    review_rows, review_page = _status_page(verdicts, offset, limit,
-        lambda row: _status_fields(row, ("verdict_id", "verdict", "author", "snapshot_id",
-            "snapshot_sha256", "requirements_sha256", "main_sha", "artifact_id", "timestamp")))
-    snapshot_view = _status_fields(snapshot, ("snapshot_id", "artifact_id", "passed", "main_sha",
-        "contract_sha256", "spec_sha256", "project_baseline_sha256", "formalization_revision"))
-    if snapshot:
-        snapshot_view["snapshot_sha256"] = bump_state._report_digest(snapshot)
-    formal_view = _status_fields(formal, ("revision", "status", "main_sha", "solution_candidate",
-        "solution_sha256", "pending_verdict_id", "accepted_verdict_id", "machine_review_failure"))
-    formal_view.update(requirement_count=len(requirements),
-        migration_global_blocker=state.get("migration_global_blocker"),
-        requirements_sha256=bump_state._report_digest(requirements),
-        contract=_status_fields(contract, ("sha256", "artifact_id", "version", "migration_policy",
-            "migration_scope_policy", "migration_occurrence_policy", "inspection_policy", "spec_sha256")),
-        review_snapshot=snapshot_view)
-    for field in ("pending_verdict_id", "accepted_verdict_id"):
-        verdict = next((row for row in verdicts if row.get("verdict_id") == formal.get(field)), None)
-        formal_view[field.removesuffix("_id") + "_reference"] = _status_fields(verdict, (
-            "verdict_id", "verdict", "author", "snapshot_id", "snapshot_sha256",
-            "requirements_sha256", "main_sha", "artifact_id"))
-    baseline_view = _status_fields(baseline, ("sha256", "version", "policy", "scope_policy",
-        "occurrence_policy", "branch", "head"))
-    baseline_view.update(module_count=len(baseline.get("compiler_modules") or {}),
-        declaration_occurrence_count=len(baseline.get("declarations") or {}),
-        original_report_count=len(baseline.get("original_reports") or {}),
-        migration=_status_fields(baseline.get("migration"),
-            ("identity", "source_commit", "source_hash", "original_version", "target_version")))
-    return {"view": "bump_status_v1", "authoritative_state_unchanged": True,
-        "native_evidence_inlined": False,
-        **_status_fields(state, ("schema_version", "run_id", "pipeline", "phase", "revision", "problem_sha256")),
-        "formalization": formal_view, "project_baseline": baseline_view,
-        "input_source": {**_status_fields(source, ("kind", "candidate_id", "sha256")), "source_refs": refs},
-        "formal_tasks": {row["task_id"]: row for row in task_rows},
-        "formal_candidates": {row["candidate_id"]: row for row in candidate_rows},
-        "strategies": {row["strategy_id"]: row for row in strategy_rows}, "critic_verdicts": review_rows,
-        "final_report": _status_fields(state.get("final_report"),
-            ("artifact_id", "sha256", "status", "run_id", "snapshot_id", "verdict_id", "main_sha")),
-        "pages": {"formal_tasks": task_page, "formal_candidates": candidate_page,
-                  "strategies": strategy_page, "source_refs": source_page, "critic_verdicts": review_page},
-        "detail_access": {
-            "paging": "Call bump_status(offset=next_offset, limit=limit) for each unfinished collection; compare run_id and revision between pages.",
-            "requirements": "bump_requirements(offset, limit): exact complete requirement ledger; continue until next_offset is null.",
-            "tasks": "bump_task(task_id): exact bindings, dependencies, candidates and retained evidence, with artifact-backed large details.",
-            "native_evidence": "input_source.source_refs include exact immutable original native/source artifact IDs; use artifact_info and bounded artifact_read.",
-            "machine_review": "formalization.review_snapshot identifies the current snapshot and its exact retained artifact.",
-            "acceptance": "This status is a metadata view, not an independent validation or new acceptance verdict."}}
-
-
-def bump_status(offset: int = 0, limit: int = 20) -> dict:
-    """Read bounded exact status/identities and explicit pages, never native ASTs.
-
-    Full authoritative evidence remains in state and immutable artifacts. Read
-    all bump_requirements pages for coverage, bump_task for exact task details,
-    and artifact_info/artifact_read for the referenced native/review evidence.
-    """
-    if type(offset) is not int or offset < 0:
-        raise ValueError("offset must be a nonnegative integer")
-    if type(limit) is not int or not 1 <= limit <= 100:
-        raise ValueError("limit must be from 1 through 100")
-    view = _status_view(bump_state.load_state(FORUM_DIR), offset, limit)
-    text = json.dumps(view, sort_keys=True, separators=(",", ":"))
-    compacted = artifacts.compact_text(_artifacts_dir(), text, kind="bump_detail", producer="Unity",
-        source="status", threshold=_STATUS_INLINE_BYTES)
-    if isinstance(compacted, str):
-        return view
-    # Exact metadata is retained, not truncated. Native ASTs never enter it.
-    return {"view": "bump_status_v1", "native_evidence_inlined": False,
-        "status_page_artifact": _status_fields(compacted, ("artifact_id", "sha256", "bytes", "lines")),
-        "offset": offset, "limit": limit,
-        "detail_access": "This exact status page exceeded the inline cap. Use artifact_info and bounded artifact_read on status_page_artifact, then follow its explicit next_offset values."}
+def bump_status() -> dict:
+    """Return exact authoritative state for the current bump run."""
+    return bump_state.load_state(FORUM_DIR)
 
 
 def read_metrics(forum_dir: Path, project_root: Path) -> dict:
@@ -581,18 +447,13 @@ def _verified_dependency_outputs(state: dict, task_ids: set[str]) -> list[dict]:
                 or not bump_state.candidate_is_current(state, candidate)
                 or receipt.get("status") != "passed" or not outputs or not contract):
             continue
-        if contract.get("version") in {3, 4}:
-            from ..bump_contract import output_fingerprints
-            try:
-                expected = output_fingerprints(contract, task_id, outputs)
-            except (ValueError, KeyError, TypeError):
-                continue
+        if contract.get("version") == 3:
+            targets = contract.get("targets", {})
             if (contract.get("bindings", {}).get(task_id) != outputs
                     or candidate.get("outputs") != outputs
-                    or any(not fingerprint or receipt.get("verified_targets", {}).get(key) != fingerprint
-                           for key, fingerprint in expected.items())
-                    or (contract.get("migration_policy") in {1, 2}
-                        and receipt.get("verified_targets") != expected)):
+                    or any(not targets.get(row["declaration"], {}).get("fingerprint")
+                           or receipt.get("verified_targets", {}).get(row["declaration"])
+                           != targets[row["declaration"]]["fingerprint"] for row in outputs)):
                 continue
         elif receipt.get("contract_sha256") != contract.get("sha256"):
             revalidation = task.get("revalidation") or {}
@@ -648,7 +509,7 @@ def verification_blockers(state: dict, task_id: str = "") -> list[dict]:
     """Last checked candidate failures, never future global completion conditions."""
     formal = state.get("formalization", {})
     contract = formal.get("contract") or {}
-    if contract.get("version") not in {3, 4}:
+    if contract.get("version") != 3:
         return []
     rows = []
     # Keep exact rejection evidence only for the current task/contract/main.
@@ -682,14 +543,6 @@ def verification_blockers(state: dict, task_id: str = "") -> list[dict]:
 
 def global_completion_requirements(state: dict) -> list[dict]:
     contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("migration_policy") == 2:
-        return [{"scope": "global_completion", "code": "migration_all_originals_review",
-                 "message": "All original module/declaration obligations require current compilation, "
-                            "machine correspondence/trust checks and independent semantic review, "
-                            "including groups without active compiler repairs.",
-                 "obligation_count": len(contract.get("obligation_ids", [])),
-                 "mapping_sha256": contract.get("mapping_sha256"),
-                 "original_index_ref": contract.get("original_index_ref")}]
     if contract.get("version") != 3:
         return []
     completed = {key for key, task in state.get("formal_tasks", {}).items()
@@ -702,10 +555,18 @@ def task_readiness(state: dict, task_id: str) -> dict:
     """Expose the actual graph without interpreting free-text obstacle reports."""
     task = state.get("formal_tasks", {}).get(task_id, {})
     def dependencies(kind):
-        return [{"task_id": key,
-                 "interface_available": bump_state.interface_available(state, key),
-                 "proof_complete": state.get("formal_tasks", {}).get(key, {}).get("status") == "complete"}
-                for key in task.get(kind, task.get("dependencies", []) if kind == "statement_dependencies" else [])]
+        results = []
+        for key in task.get(kind, task.get("dependencies", []) if kind == "statement_dependencies" else []):
+            dependency = state.get("formal_tasks", {}).get(key, {})
+            complete = dependency.get("status") == "complete"
+            row = {"task_id": key, "interface_available": bump_state.interface_available(state, key)}
+            if dependency.get("migration"):
+                row.update(repair_integrated=complete,
+                           native_preservation_accepted=state.get("formalization", {}).get("status") == "accepted")
+            else:
+                row["proof_complete"] = complete
+            results.append(row)
+        return results
     return {"runnable": bump_state.task_ready(state, task),
             "statement_dependencies": dependencies("statement_dependencies"),
             "proof_dependencies": dependencies("proof_dependencies")}
@@ -729,6 +590,17 @@ def bump_requirements(offset: int = 0, limit: int = 20) -> str:
     scope = spec.get("scope", {})
     scope_ids = set(scope.get("targets", [])) | set(scope.get("references", []))
     scope_ids.update(key for item in scope.get("excluded", []) for key in item.get("anchor_ids", []))
+    contract = formal.get("contract") or {}
+    page_ids = {row["id"] for row in rows[offset:end]}
+    migration_occurrences = {key: {"original_id": key, **value}
+                            for key, value in contract.get("migration_correspondences", {}).items()
+                            if "requirement-" + key in page_ids}
+    migration_commands = {}
+    if contract.get("migration_policy") == 1:
+        from ..bump_planner import empty_module_commands
+        commands = empty_module_commands(contract["project_baseline"]["migration"]["original_index"])
+        migration_commands = {key: {"command_obligation": key, **value} for key, value in commands.items()
+                              if "requirement-" + key in page_ids}
     return _detail({
         "run_id": state.get("run_id"), "revision": state.get("revision"),
         "formalization_revision": formal.get("revision"),
@@ -740,6 +612,8 @@ def bump_requirements(offset: int = 0, limit: int = 20) -> str:
         "total": len(rows), "offset": offset,
         "next_offset": end if end < len(rows) else None,
         "requirements": rows[offset:end],
+        **({"migration_occurrences": migration_occurrences} if migration_occurrences else {}),
+        **({"migration_empty_module_commands": migration_commands} if migration_commands else {}),
         "remaining_global_requirements": global_completion_requirements(state) if offset == 0 else [],
         **_requirement_spec(state, rows[offset:end]),
     }, "requirements")
@@ -750,13 +624,6 @@ def bump_task(task_id: str) -> str:
     state = bump_state.load_state(FORUM_DIR)
     tasks = state.get("formal_tasks", {})
     task = tasks.get(task_id) or state.get("retired_tasks", {}).get(task_id)
-    contract = state["formalization"].get("contract") or {}
-    if task is None and contract.get("migration_policy") == 2:
-        group = contract.get("task_bindings", {}).get(task_id)
-        if group:
-            task = {"task_id": task_id, "status": "coverage_only", "binding": group,
-                    "outputs": contract.get("bindings", {}).get(task_id, []),
-                    "acceptance": "No task completion is inferred from compilation or absence of diagnostics."}
     if task is None:
         raise ValueError(f"unknown task '{task_id}'")
     requirements = [
@@ -814,33 +681,6 @@ def bump_task(task_id: str) -> str:
     }, task_id)
 
 
-def bump_migration_plan(offset: int = 0, limit: int = 20) -> str:
-    """Read bounded migration coverage/routing; never treat compilation as acceptance."""
-    if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
-        raise ValueError("migration page requires nonnegative offset and limit from 1 through 100")
-    state = bump_state.load_state(FORUM_DIR)
-    contract = state["formalization"].get("contract") or {}
-    if contract.get("migration_policy") != 2:
-        raise ValueError("diagnostic migration plans require migration policy 2")
-    plan = state.get("migration_plan") or {}
-    groups = sorted(contract.get("task_bindings", {}).items())
-    end = min(len(groups), offset + limit)
-    return _detail({"revision": state["revision"], "contract_sha256": contract["sha256"],
-        "original_index_ref": contract.get("original_index_ref"), "baseline_ref": contract.get("baseline_ref"),
-        "mapping_sha256": contract.get("mapping_sha256"), "generation": plan.get("generation"),
-        "source_sha256": plan.get("source_sha256"), "diagnostic_artifact": plan.get("diagnostic_artifact"),
-        "total_groups": len(groups), "offset": offset, "next_offset": end if end < len(groups) else None,
-        "groups": [{"task_id": key, "binding": group,
-                    "active_repair": key in state["formal_tasks"],
-                    "routing": plan.get("tasks", {}).get(key),
-                    "mappings": {name: row for name, row in contract.get("mapping", {}).items()
-                                 if set(row.get("original_ids", [])) & set(group["obligation_ids"])}}
-                   for key, group in groups[offset:end]],
-        "unmapped_diagnostic_ids": plan.get("unmapped_diagnostic_ids", []),
-        "notice": "Active repair groups are not the acceptance ledger. Review all original obligations and exact mappings."},
-        "migration-plan")
-
-
 def bump_brief(author: str, task_id: str = "") -> str:
     """Return bounded task-focused state; global review uses the paged ledger."""
     author = _author(author)
@@ -865,6 +705,19 @@ def bump_brief(author: str, task_id: str = "") -> str:
         f"Global source issues not resolved: {len(issues)}; "
         f"pending replan requests: {len(queued)}",
     ]
+    from ..bump_migration import is_migration
+    if is_migration(formal.get("contract") or {}):
+        lines.extend([
+            "Migration assignments are declaration repairs, including mutual declaration groups "
+            "and separately identified command errors.",
+            "Completed repair tasks have integrated patches. Native preservation and no-new-trust "
+            "verification remain pending until the final selected-source review.",
+            "Independent tasks can share a file in private worktrees; Unity serializes integration. "
+            "Submit your declaration repair while unrelated declarations remain broken.",
+            "The final critic reviews every original occurrence via bump_requirements, including "
+            "those with no repair task. To reopen one, supply its original_id in reopen_tasks; "
+            "the controller creates a declaration assignment without inventing a module task.",
+        ])
     focus_id = next(iter(focus)) if len(focus) == 1 else ""
     blockers = verification_blockers(state, focus_id)
     preflight = bump_state.submission_blockers(state, focus_id) if focus_id else []
@@ -939,10 +792,6 @@ def bump_brief(author: str, task_id: str = "") -> str:
             task = tasks[target]
             lines.append(f"- {target} [{task.get('status')}]: {task.get('title') or task.get('lean_decl')} "
                          f"{task.get('description', '')[:220]}")
-            if migration_focus := task.get("migration_focus"):
-                lines.append(f"  Private declaration focus: {migration_focus.get('subtask_id') or 'finalize complete module'}; "
-                             "checkpoint with refine_migration(checkpoint_subtask_id=..., checkpoint_summary=...). "
-                             "Checkpointed chunks are not accepted outputs; submit only the complete module.")
         lines.append("Exact requirements, source citations and evidence: bump_task(task_id).")
         owned_files = [(path, row) for path, row in bump_files.reservations(state).items()
                        if focus.intersection({row["owner_task"], *row["shared_with"]})]
@@ -1338,7 +1187,7 @@ def _snapshot_finding_files(author: str, files: list[str], target: str) -> tuple
     expected = f"worktree {tree}\0"
     registered = _git(_root(), "worktree", "list", "--porcelain", "-z").stdout
     if not any(record.startswith(expected)
-               and f"branch refs/heads/{worktree.agent_branch(author, project_path=_root())}" in record.split("\0")
+               and f"branch refs/heads/{worktree.agent_branch(author)}" in record.split("\0")
                for record in registered.split("\0\0")):
         raise ValueError(f"no registered private worktree for '{author}'")
     # Anchor traversal at the trusted main root. Even swapping a parent for a
@@ -1474,9 +1323,9 @@ def finalize_formalization(
     Unchanged complete work submits the existing commit for re-verification.
     An unchanged, already-adopted representation returns its existing acceptance.
 
-    This is deliberately not a build assertion.  The bump controller applies
-    the exact resulting commit to main and performs the sole authoritative full
-    build and declaration review there.
+    The Bump controller checks and integrates the exact resulting commit.
+    Declaration repairs may integrate provisionally while other errors remain;
+    final migration acceptance requires native selected-source verification.
     """
     author = _author(author)
     if stage not in {"representation", "complete"}:
@@ -1495,8 +1344,8 @@ def finalize_formalization(
         if task.get("status") != "pending":
             raise ValueError(f"formalization task is {task.get('status')}, not finalizable")
         if ((state['formalization'].get('contract') or {}).get('version') == 3
-                and (state['formalization'].get('contract') or {}).get('migration_policy') != 1
-                and not (outputs or task.get('outputs'))):
+                and not (outputs or task.get('outputs'))
+                and task.get("migration", {}).get("kind") != "command"):
             raise ValueError("a first candidate requires its declaration/file outputs")
         strategy = state.get("strategies", {}).get(strategy_id)
         if (
@@ -1695,11 +1544,6 @@ def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
                                state: dict, *, pending: bool = False,
                                repair_handoff: dict | None = None) -> dict:
     assignment = {"task_id": task_id, "task_revision": revision, "pending": pending}
-    task = state.get("formal_tasks", {}).get(task_id, {})
-    if task.get("task_input_sha256"):
-        assignment["task_input_sha256"] = task["task_input_sha256"]
-    if task.get("migration_focus"):
-        assignment["migration_subtask_id"] = task["migration_focus"]["subtask_id"]
     if repair_handoff:
         assignment["repair_handoff"] = repair_handoff
     path = _worktree_assignment_path(author, state)
@@ -1708,26 +1552,6 @@ def _record_worktree_assignment(author: str, task_id: str, revision: int | None,
     if not pending:
         state.setdefault("worker_tasks", {})[bump_state.author_key(author)] = task_id
     return assignment
-
-
-def record_migration_focus_assignment(author: str, task_id: str, expected_task_revision: int) -> dict:
-    """Persist initial private focus after dispatch, without touching source bytes.
-
-    Controller-only: begin_migration_attempt establishes the focus after the
-    worktree is prepared. Recheck its identity under the usual ownership locks.
-    """
-    author = _author(author)
-    with _merge_lock(), _finalization_lock(author):
-        current = bump_state.load_state(FORUM_DIR)
-        task = current.get("formal_tasks", {}).get(task_id, {})
-        focus = task.get("migration_focus") or {}
-        if (task.get("revision") != expected_task_revision
-                or bump_state.author_key(focus.get("author")) != bump_state.author_key(author)
-                or focus.get("task_input_sha256") != task.get("task_input_sha256")
-                or not focus.get("subtask_id")
-                or current.get("worker_tasks", {}).get(bump_state.author_key(author)) != task_id):
-            raise ValueError("migration focus assignment changed; work preserved")
-        return _record_worktree_assignment(author, task_id, task["revision"], current)
 
 
 def _saved_task_checkpoint(author: str, task_id: str, state: dict) -> dict | None:
@@ -1774,22 +1598,15 @@ def _checkpoint_task_worktree(tree: Path, author: str, task_id: str, task_revisi
         _artifacts_dir(), json.dumps({"files": files}), kind="bump_private_files",
         producer=author, metadata={"task_id": task_id, "task_revision": task_revision},
     ) if files else None
-    # Update tracked files, including tracked-but-ignored edits and deletions.
-    # Add new files separately, respecting ignore rules.
-    for listing, staging in (
-        (("--cached",), ("--update",)),
-        (("--others", "--exclude-standard"), ()),
-    ):
-        names = _git(
-            tree, "ls-files", *listing, "-z",
-            "--", ".", ":(exclude).unity", ":(exclude).lake",
-        ).stdout.split("\0")
+    # Tracked files can live below ignored parents. Updating those tracked
+    # paths is valid, while adding the same explicit paths as new files is not.
+    # Keep nonignored new files separate so no force-add exposes private state.
+    for listing, staging in (("--cached", "--update"), ("--others", "--all")):
+        names = _git(tree, "ls-files", listing, "--exclude-standard", "-z",
+                     "--", ".", ":(exclude).unity", ":(exclude).lake").stdout.split("\0")
         names = sorted({name for name in names if name})
         for start in range(0, len(names), 256):
-            _git(
-                tree, "--literal-pathspecs", "add", *staging,
-                "--", *names[start:start + 256],
-            )
+            _git(tree, "--literal-pathspecs", "add", staging, "--", *names[start:start + 256])
     staged = _git(tree, "diff", "--cached", "--quiet", check=False)
     if staged.returncode not in {0, 1}:
         raise ValueError("Cannot inspect checkpoint index; work preserved")
@@ -1901,43 +1718,6 @@ def _finish_repair_handoff(state: dict, author: str, handoff: dict) -> None:
     )
 
 
-def _completed_migration_assignment(state: dict, task_id: str) -> dict | None:
-    """Recognize exact successful retirement, never every absent/retired task."""
-    from ..bump_contract import migration_group_mapping_content, policy_hash
-    contract = state["formalization"].get("contract") or {}
-    plan = state.get("migration_plan") or {}
-    retired = state.get("retired_tasks", {}).get(task_id, {})
-    if (not bump_state._migration_v2(contract) or task_id in state.get("formal_tasks", {})
-            or retired.get("retired_reason") != "diagnostic_refresh" or retired.get("status") != "complete"
-            or retired.get("faithfulness", {}).get("status") == "changes_requested"
-            or retired.get("machine_repair", {}).get("status") == "required"
-            or state.get("migration_plan_main_sha") != state["formalization"].get("main_sha")
-            or retired.get("migration_module") not in plan.get("compiled_modules", [])):
-        return None
-    proof = retired.get("migration_retirement")
-    if not proof:
-        proof = bump_state._migration_retirement_receipt(state, retired, plan)
-        if proof:
-            retired["migration_retirement"] = proof
-    candidate = state.get("formal_candidates", {}).get(retired.get("accepted_candidate"), {})
-    verification = candidate.get("verification") or {}
-    source = bump_state.formal_source(state)
-    if (not proof or proof.get("version") != 1 or proof.get("task_id") != task_id
-            or proof.get("task_revision") != retired.get("revision")
-            or proof.get("candidate_id") != candidate.get("candidate_id")
-            or proof.get("original_index_sha256") != contract.get("original_index_sha256")
-            or proof.get("mapping_content_sha256") != bump_state.digest(migration_group_mapping_content(contract, task_id))
-            or candidate.get("status") != "merged" or candidate.get("task_id") != task_id
-            or candidate.get("task_revision") != retired.get("revision")
-            or candidate.get("stage", "complete") != "complete"
-            or candidate.get("solution_candidate") != source.get("candidate_id")
-            or candidate.get("solution_sha256") != source.get("sha256")
-            or verification.get("status") != "passed" or verification.get("policy_sha256") != policy_hash()
-            or verification.get("contract_sha256") != proof.get("verified_contract_sha256")):
-        return None
-    return retired
-
-
 def prepare_formal_worktree(
     author: str,
     previous_task: str = "",
@@ -2036,7 +1816,7 @@ def prepare_formal_worktree(
             # its already-integrated representation again. Never erase edits.
             main_sha = _accepted_formal_main(state)
             if (not result.get("checkpoint_restored")
-                    and (formal.get("contract") or {}).get("version") in {3, 4} and main_sha
+                    and (formal.get("contract") or {}).get("version") == 3 and main_sha
                     and not _git(tree, "status", "--porcelain", "--untracked-files=no").stdout.strip()):
                 merged = _git(tree, "merge", "--no-edit", "--no-autostash", "--no-overwrite-ignore",
                               main_sha, check=False)
@@ -2049,9 +1829,6 @@ def prepare_formal_worktree(
                                        repair_handoff=handoff if not handoff_finished else None)
             return result
         previous = state.get("formal_tasks", {}).get(previous_task, {})
-        completed_retirement = _completed_migration_assignment(state, previous_task)
-        if completed_retirement:
-            previous = completed_retirement
         # A refinement can introduce a missing interface and block every former
         # assignment. An unclaimed attempt can help that prerequisite after its
         # private work has been saved.
@@ -2078,8 +1855,12 @@ def prepare_formal_worktree(
             return _sync_blocked("main_changed", "Main differs from the accepted formalization revision.")
         if previous.get("status") == "complete":
             checkpoint = None
-            if completed_retirement:
-                checkpoint = _checkpoint_task_worktree(tree, author, previous_task, previous_revision)
+            if previous.get("migration"):
+                # Another declaration's merge can clear this task's diagnostics
+                # while its stopped worker still has useful private edits.
+                checkpoint = _checkpoint_task_worktree(
+                    tree, author, previous_task, previous_revision,
+                )
                 state.setdefault("worktree_checkpoints", {}).setdefault(identity, {})[previous_task] = checkpoint
             result = _reset_formal_assignment(
                 tree, author, next_task, target_task.get("revision"), state, main_sha,
@@ -2196,50 +1977,6 @@ def refine_chunks(author: str, expected_revision: int,
         return result
 
 
-def refine_migration(author: str, task_id: str, expected_revision: int, subtasks: list[dict] | None = None,
-                     dependencies: list[str] | None = None,
-                     mapping_proposal: dict | None = None, reason: str = "",
-                     checkpoint_subtask_id: str = "", checkpoint_summary: str = "") -> dict:
-    """Partition diagnosed repairs or propose correspondences without changing coverage.
-
-    Keep exact original_ids/diagnostic_ids across the subtask partition and retain
-    module dependencies. Mapping proposals require controller adoption and do not
-    change source, permissions, attempts, receipts or semantic acceptance.
-    To advance private declaration focus, omit subtasks/dependencies/mapping and
-    pass checkpoint_subtask_id plus checkpoint_summary. This saves private work
-    and returns next_chunk without publishing a partial module or charging an attempt.
-    """
-    author = _author(author)
-    with _merge_lock(), _finalization_lock(author):
-        if checkpoint_subtask_id:
-            if subtasks is not None or dependencies is not None or mapping_proposal is not None:
-                raise ValueError("a private chunk checkpoint cannot also change the partition or mapping")
-            current = bump_state.load_state(FORUM_DIR)
-            task = current.get("formal_tasks", {}).get(task_id, {})
-            focus = task.get("migration_focus") or {}
-            if (current["revision"] != expected_revision or focus.get("subtask_id") != checkpoint_subtask_id
-                    or bump_state.author_key(focus.get("author")) != bump_state.author_key(author)
-                    or has_pending_formal_candidate(current, author)):
-                raise ValueError("private migration chunk focus changed; work preserved")
-            tree = worktree.agent_worktree(_root(), author)
-            if not tree.is_dir():
-                raise ValueError("private migration checkpoint requires the owned worktree")
-            checkpoint = _checkpoint_task_worktree(tree, author, task_id, task.get("revision"))
-            result = bump_state.checkpoint_migration_chunk(FORUM_DIR, author, task_id, checkpoint_subtask_id,
-                expected_revision=expected_revision, checkpoint=checkpoint, summary=checkpoint_summary)
-            refreshed = bump_state.load_state(FORUM_DIR)
-            _record_worktree_assignment(author, task_id, result["task"]["revision"], refreshed)
-            return result
-        if subtasks is None:
-            raise ValueError("migration refinement requires subtasks or an explicit private checkpoint")
-        result = bump_state.refine_migration(FORUM_DIR, author, task_id,
-            expected_revision=expected_revision, subtasks=subtasks, dependencies=dependencies,
-            mapping_proposal=mapping_proposal, reason=reason)
-        refreshed = bump_state.load_state(FORUM_DIR)
-        _record_worktree_assignment(author, task_id, result["task"]["revision"], refreshed)
-        return result
-
-
 def report_source_issue(
     author: str, anchor_ids: list[str], description: str,
     task_ids: list[str] | None = None,
@@ -2328,8 +2065,7 @@ def submit_formalization_verdict(
 ) -> dict:
     """Submit snapshot-bound semantic evidence. Approval requires every requirement to pass.
 
-    Read bump_status() for current snapshot/verdict bindings; read all pages of
-    bump_requirements() for the exact immutable requirements ledger.
+    Read bump_status() for the current snapshot_id and immutable requirements.
     Free-text evidence is optional context, never a substitute for structured review.
     Approval remains pending until the controller verifies that source bytes are unchanged.
     Optional representation_repairs route focused v3 lean_reopen work; they never approve outputs.
@@ -2351,7 +2087,7 @@ def submit_formalization_verdict(
 
 COMMON = (
     bump_status, bump_metrics, bump_brief,
-    bump_task, bump_requirements, bump_migration_plan, read_finding,
+    bump_task, bump_requirements, read_finding,
     forum_post, forum_read, artifact_info, artifact_read,
 )
 COORDINATION = (
@@ -2377,11 +2113,16 @@ def validate_chunks() -> dict:
 
 
 PROFILE_TOOLS = {
+    "chunking": COMMON + SOURCE_FEEDBACK + (validate_chunks,),
     "formalizing": COMMON + COORDINATION + (
-        finalize_formalization, emit_formalization_candidate, sync_from_main, refine_migration,
+        finalize_formalization, emit_formalization_candidate, sync_from_main, request_rechunk,
+        report_source_issue, submit_source_repair, refine_chunks,
+        reserve_files,
     ),
-    "critic": COMMON + (publish_finding, report_obstacle, submit_formalization_verdict),
+    "critic": COMMON + SOURCE_FEEDBACK + (request_rechunk, submit_formalization_verdict),
     "retrospective": COMMON,
+    "source_repair": COMMON + SOURCE_FEEDBACK + (submit_source_diagnosis,),
+    "representation_review": COMMON + (submit_representation_review,),
 }
 
 

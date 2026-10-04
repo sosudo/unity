@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import re
+import tempfile
 import time
 import uuid
 from contextlib import contextmanager
@@ -19,7 +20,6 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Iterator, TypedDict
 
-from . import bump_json
 from .bump_review import RepresentationRepairRequest, SemanticReview
 from .bump_spec import (
     digest, informal_interpretation_hash, normalize_informal_nodes, normalize_outputs,
@@ -27,7 +27,7 @@ from .bump_spec import (
 )
 
 
-SCHEMA_VERSION = 9
+SCHEMA_VERSION = 7
 PHASES = {"chunking", "formalizing", "critic", "complete"}
 STRATEGY_PHASES = {"formalizing"}
 STRATEGY_STATUSES = {"registered", "claimed", "paused", "incorrect", "succeeded", "cancelled"}
@@ -77,12 +77,6 @@ def _default_state() -> dict:
         "questions": {},
         "solution_candidates": {},
         "formal_tasks": {},
-        "migration_plan": None,
-        "migration_plan_main_sha": "",
-        "migration_refresh_required": False,
-        "migration_budgets": {},
-        "migration_mapping_proposals": {},
-        "migration_global_blocker": None,
         "task_yields": {},
         "worker_tasks": {},
         "worktree_checkpoints": {},
@@ -109,10 +103,8 @@ def _read_unlocked(forum_dir: Path) -> dict:
         return _default_state()
     try:
         state = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("Bump state is unreadable; preserve it and recover explicitly") from exc
-    if not isinstance(state, dict):
-        raise ValueError("Bump state must be an object; no counters were reset")
+    except (OSError, json.JSONDecodeError):
+        return _default_state()
     base = _default_state()
     base.update(state)
     for key in (
@@ -121,7 +113,6 @@ def _read_unlocked(forum_dir: Path) -> dict:
         "review_snapshots", "representation_reviews", "file_reservations",
         "source_issues", "source_repairs", "replan_requests",
         "retired_tasks", "task_yields", "worker_tasks", "worktree_checkpoints", "manifest_repairs",
-        "migration_budgets", "migration_mapping_proposals",
     ):
         if not isinstance(base.get(key), dict):
             base[key] = {}
@@ -173,7 +164,15 @@ def _write_unlocked(forum_dir: Path, state: dict) -> None:
     forum_dir = Path(forum_dir)
     forum_dir.mkdir(parents=True, exist_ok=True)
     state["schema_version"] = SCHEMA_VERSION
-    bump_json.atomic_dump(state_path(forum_dir), state)
+    payload = json.dumps(state, indent=2, sort_keys=True) + "\n"
+    fd, temporary = tempfile.mkstemp(prefix=".bump-state-", suffix=".json", dir=forum_dir)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(payload)
+            handle.flush()
+        Path(temporary).replace(state_path(forum_dir))
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 @contextmanager
@@ -184,9 +183,9 @@ def transaction(forum_dir: Path) -> Iterator[dict]:
         fcntl.flock(lock, fcntl.LOCK_EX)
         try:
             state = _read_unlocked(forum_dir)
-            before = bump_json.mutation_digest(state)
+            before = json.dumps(state, sort_keys=True)
             yield state
-            if bump_json.mutation_digest(state) != before:
+            if json.dumps(state, sort_keys=True) != before:
                 state["revision"] = int(state.get("revision", 0)) + 1
                 _write_unlocked(forum_dir, state)
         finally:
@@ -249,10 +248,6 @@ def source_reference_ids(state: dict) -> set[str]:
 def candidate_is_current(state: dict, candidate: dict) -> bool:
     task = state.get("formal_tasks", {}).get(candidate.get("task_id"), {})
     source = formal_source(state)
-    if (_migration_v2(state.get("formalization", {}).get("contract") or {})
-            and task.get("task_input_sha256") is not None
-            and candidate.get("task_input_sha256") != task["task_input_sha256"]):
-        return False  # Legacy queued bytes need a fresh submission, not inferred currency.
     return bool(task and type(task.get("revision")) is int and task["revision"] > 0
                 and candidate.get("task_revision") == task["revision"]
                 and candidate.get("solution_candidate") == source.get("candidate_id")
@@ -500,8 +495,7 @@ def repair_digest(state: dict) -> str:
 
 
 def initialize_source(forum_dir: Path, problem_sha256: str, main_sha: str,
-                      source: dict, *, reset: bool = False, project_baseline: dict | None = None,
-                      return_state: bool = True) -> dict | None:
+                      source: dict, *, reset: bool = False, project_baseline: dict | None = None) -> dict:
     """Bind supplied documents and start at chunking, without an English review gate."""
     if not _ARTIFACT_SHA_RE.fullmatch(problem_sha256):
         raise ValueError("problem_sha256 must be a full SHA-256")
@@ -548,7 +542,7 @@ def initialize_source(forum_dir: Path, problem_sha256: str, main_sha: str,
             raise ValueError("supplied source changed since this bump run began; start a fresh run")
         elif project_baseline is not None and state.get("project_baseline") != project_baseline:
             raise ValueError("continuation cannot replace the original project baseline")
-    return load_state(forum_dir) if return_state else None
+    return load_state(forum_dir)
 
 
 def set_phase(forum_dir: Path, phase: str, *, reason: str = "") -> dict:
@@ -624,9 +618,6 @@ def register_strategy(
             "created_at": time.time(),
             "updated_at": time.time(),
         }
-        focus = state["formal_tasks"].get(target, {}).get("migration_focus")
-        if focus:
-            strategy["migration_subtask_id"] = focus["subtask_id"]
         state["strategies"][strategy_id] = strategy
         _event(state, "strategy_registered", strategy_id=strategy_id, author=author,
                phase=phase, target=target)
@@ -1245,8 +1236,7 @@ def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: di
 def initialize_informal_plan(forum_dir: Path, dag: dict, *, main_sha: str, contract: dict,
                              attempt_id: str | None = None,
                              expected_revision: int | None = None,
-                             plan_artifact: str | None = None,
-                             return_state: bool = True) -> dict | None:
+                             plan_artifact: str | None = None) -> dict:
     """Publish a checked plan and its attempt outcome in one transaction."""
     with transaction(forum_dir) as state:
         if expected_revision is not None and state["revision"] != expected_revision:
@@ -1259,690 +1249,124 @@ def initialize_informal_plan(forum_dir: Path, dag: dict, *, main_sha: str, contr
         prepared.pop("chunking_failure", None)
         state.clear()
         state.update(prepared)
-    return load_state(forum_dir) if return_state else None
+    return load_state(forum_dir)
 
 
-def seed_migration_tasks(forum_dir: Path, modules: dict, original_reports: dict, *,
-                         return_state: bool = True) -> dict | None:
-    """Attach controller-owned compiler inventory to the ported task graph."""
-    limit = int(os.getenv("MAX_ATTEMPTS") or "5")
-    if limit < 1:
-        raise ValueError("MAX_ATTEMPTS must be a positive finite integer")
+def _migration_plan(state: dict, dag: dict, *, main_sha: str, contract: dict,
+                    refresh: bool) -> dict:
+    """Bind compiler declarations to the inherited task and candidate lifecycle.
+
+    A completed repair task is provisional until the final native review. The
+    complete original obligation ledger stays in the contract and requirements.
+    """
+    from .bump_migration import is_migration
+    if not is_migration(contract):
+        raise ValueError("compiler plans require a migration contract")
+    if refresh and state.get("phase") != "formalizing":
+        raise ValueError("compiler refresh requires an active migration")
+    rows = dag.get("chunks", [])
+    metadata = {}
+    plain = deepcopy(dag)
+    for row in plain.get("chunks", []):
+        key = row.get("id", row.get("task_id"))
+        migration = row.pop("migration", None)
+        if (not isinstance(migration, dict)
+                or migration.get("kind") not in {"declaration", "mutual", "command"}
+                or not isinstance(migration.get("original_ids"), list)
+                or any(not isinstance(value, str) or not value for value in migration["original_ids"])
+                or len(set(migration["original_ids"])) != len(migration["original_ids"])):
+            raise ValueError("compiler task requires original declaration identities")
+        if migration["kind"] != "command" and not migration["original_ids"]:
+            raise ValueError("declaration repair cannot omit its original identities")
+        from .bump_files import normalize_paths
+        path = normalize_paths([migration.get("path")])[0]
+        if not path.endswith(".lean") or not isinstance(migration.get("module"), str):
+            raise ValueError("compiler task requires its original Lean source module")
+        metadata[key] = {"migration": migration,
+                         **{field: row.pop(field) for field in
+                            ("lean_file", "lean_decl", "outputs", "migration_native_status")
+                            if field in row}}
+    active = dag.get("compiler_tasks", [row.get("id", row.get("task_id")) for row in rows])
+    if (not isinstance(active, list) or len(active) != len(set(active))
+            or any(key not in metadata for key in active)):
+        raise ValueError("compiler task list must name current declaration tasks")
+    before = state.get("formal_tasks", {})
+    staged = deepcopy(state)
+    staged["phase"] = "chunking"
+    prepared = prepare_informal_plan(staged, plain, main_sha=main_sha, contract=contract)
+    active = set(active)
+    active.update(key for key, task in before.items() if task.get("migration", {}).get("critic_reopen")
+                  and task.get("status") != "complete")
+    reopened, resolved = [], []
+    for key, task in prepared["formal_tasks"].items():
+        info = metadata[key]
+        prior = before.get(key, {})
+        previous_identity = prior.get("migration")
+        if previous_identity and any(previous_identity.get(field) != info["migration"].get(field)
+                                     for field in ("original_ids", "module", "path", "kind")):
+            raise ValueError("compiler refresh cannot replace a declaration task's original identity")
+        task["migration"] = deepcopy(info["migration"])
+        task["migration_native_status"] = "pending"
+        if not prior:
+            task["outputs"] = normalize_outputs(info.get("outputs", []))
+            task["lean_file"] = info.get("lean_file", info["migration"]["path"])
+            task["lean_decl"] = info.get("lean_decl", "")
+        if key in active and prior.get("status") == "complete":
+            task.update(status="pending", accepted_candidate=None,
+                        revision=prior.get("revision", 0) + 1,
+                        verification={"status": "pending", "native_pending": True},
+                        representation={"status": "missing", "candidate_id": None})
+            reopened.append(key)
+        elif key not in active and task.get("status") != "complete":
+            # A prerequisite repair can remove another declaration's diagnostic.
+            # This records repair progress, never a native verification receipt.
+            task.update(status="complete", accepted_candidate=None,
+                        verification={"status": "provisional", "mode": "diagnostic_clear",
+                                      "native_pending": True, "main_sha": main_sha})
+            resolved.append(key)
+    for row in prepared.get("formal_candidates", {}).values():
+        if (row.get("status") in {"submitted", "merging"}
+                and (row.get("task_id") in resolved or not candidate_is_current(prepared, row))):
+            row.update(status="superseded", supersession_reason="compiler diagnostics refreshed")
+    for row in prepared.get("strategies", {}).values():
+        if row.get("target") in {*reopened, *resolved} and row.get("status") in _ACTIVE_STRATEGIES:
+            row.update(status="cancelled", cancellation_reason="compiler diagnostics refreshed")
+    # Several independent declaration tasks can repair the same source file.
+    # The existing merge lock, not worker dispatch, serializes their integration.
+    by_file = {}
+    for key, task in prepared["formal_tasks"].items():
+        by_file.setdefault(task["migration"]["path"], []).append(key)
+    reservations = prepared.setdefault("file_reservations", {})
+    for path, keys in by_file.items():
+        keys = sorted(keys)
+        reservations[path] = {"owner_task": keys[0], "shared_with": keys[1:]}
+    prepared["formalization"]["compiler_tasks"] = sorted(active)
+    _event(prepared, "migration_diagnostics_refreshed" if refresh else "migration_plan_initialized",
+           task_ids=sorted(prepared["formal_tasks"]), compiler_tasks=sorted(active),
+           reopened_tasks=reopened, resolved_tasks=resolved, main_sha=main_sha)
+    return prepared
+
+
+def initialize_migration_plan(forum_dir: Path, dag: dict, *, main_sha: str, contract: dict) -> dict:
+    """Publish actual declaration assignments, including a clean empty queue."""
     with transaction(forum_dir) as state:
-        contract = state["formalization"]["contract"]
-        if (contract.get("migration_policy") != 1 or contract.get("migration_occurrence_policy") != 1
-                or set(modules) != set(state["formal_tasks"])):
-            raise ValueError("migration task graph differs from the fixed module inventory")
-        baseline = contract.get("project_baseline") or {}
-        if baseline.get("policy") == "migration-v1":
-            from .bump_project import baseline_is_valid
-            from .bump_contract import _migration_bindings
-            if (not baseline_is_valid(baseline) or contract.get("migration_scope_policy") != 1
-                    or modules != baseline["compiler_modules"]
-                    or original_reports != baseline["original_reports"]):
-                raise ValueError("migration task graph differs from the sealed scope and native original evidence")
-            bindings, targets = _migration_bindings(baseline)
-            if contract.get("bindings") != bindings or contract.get("targets") != targets:
-                raise ValueError("migration seeding requires all exact original declaration occurrences")
-        if set(original_reports) != set(modules) or state["formal_candidates"]:
-            raise ValueError("migration seeding requires complete original evidence and no candidates")
-        for name, module in modules.items():
-            task = state["formal_tasks"][name]
-            if "migration_module" in task:
-                raise ValueError("migration tasks have already been seeded")
-            outputs = normalize_outputs(contract["bindings"][name])
-            if any(row["file"] != module["path"] for row in outputs):
-                raise ValueError("original output belongs to a different module")
-            task.update(migration_module=name, lean_file=module["path"], outputs=outputs,
-                        migration_attempts=0, migration_max_attempts=limit,
-                        dependencies=sorted(set(module["imports"]) & set(modules)),
-                        representation={"status": "adopted", "source": "original_inventory"})
-            state["file_reservations"][module["path"]] = {"owner_task": name, "shared_with": []}
-        _event(state, "migration_inventory_seeded", modules=sorted(modules), attempt_limit=limit)
-    return load_state(forum_dir) if return_state else None
+        if state.get("phase") != "chunking":
+            raise ValueError("initial compiler plan requires chunking phase")
+        prepared = _migration_plan(state, dag, main_sha=main_sha, contract=contract, refresh=False)
+        state.clear()
+        state.update(prepared)
+    return load_state(forum_dir)
 
 
-def _migration_v2(contract: dict) -> bool:
-    return contract.get("version") == 4 and contract.get("migration_policy") == 2
-
-
-def _migration_task_universe(state: dict) -> dict:
-    contract = state.get("formalization", {}).get("contract") or {}
-    if not _migration_v2(contract):
-        return state["formal_tasks"]
-    # Requirements cover clean original groups too. Their source components
-    # come from the sealed all-original ledger, never the active repair subset.
-    return {key: {**group, "task_id": key, "source_components": sorted({ref
-                for requirement in contract["requirements"] if key in requirement["tasks"]
-                for ref in requirement["source_components"]})}
-            for key, group in contract.get("task_bindings", {}).items()}
-
-
-def _migration_budget_keys(task: dict) -> list[str]:
-    # The module key also protects empty/import-only groups and prevents a
-    # refinement from refreshing attempts by renaming declaration subtasks.
-    return ["module:" + task["migration_module"], *task.get("original_occurrence_ids", [])]
-
-
-def _migration_budget(state: dict, task: dict) -> tuple[int, int]:
-    rows = [state["migration_budgets"][key] for key in _migration_budget_keys(task)]
-    return max(row["attempts"] for row in rows), min(row["limit"] for row in rows)
-
-
-def migration_task_input_sha256(contract: dict, plan: dict, task_id: str) -> str | None:
-    """Stable local dispatch identity; full current receipts remain authoritative."""
-    from .bump_contract import migration_group_mapping_content
-    context = plan.get("group_contexts", {}).get(task_id)
-    if context is None:
-        return None  # Old plans cannot manufacture a task-local observation.
-    if (not isinstance(context, dict) or not _ARTIFACT_SHA_RE.fullmatch(str(context.get("sha256", "")))
-            or context.get("original_index_sha256") != contract.get("original_index_sha256")):
-        raise ValueError("migration dispatch context differs from the sealed original ledger")
-    mapping_groups = {task_id, *[row["module"] for row in context.get("import_closure", [])
-                                 if row["module"] in contract["task_bindings"]]}
-    return digest({"version": 1, "compile_context_sha256": context["sha256"],
-                   "scope_sha256": contract.get("scope_sha256"),
-                   "mapping_context": {key: migration_group_mapping_content(contract, key)
-                                       for key in sorted(mapping_groups)}})
-
-
-def _remap_migration_subtasks(previous: dict, prior_plan: dict, plan: dict, fallback: list[dict]) -> list[dict]:
-    """Retain an explicit partition across evidence-only diagnostic ID changes."""
-    if not previous.get("refinement_history"):
-        return deepcopy(fallback)
-    before, after = prior_plan.get("diagnostic_content_keys", {}), plan.get("diagnostic_content_keys", {})
-    current = {after[key]: key for key in plan["tasks"][previous["task_id"]]["diagnostic_ids"] if key in after}
-    rows = deepcopy(previous.get("declaration_subtasks", []))
-    try:
-        for row in rows:
-            row["diagnostic_ids"] = [current[before[key]] for key in row["diagnostic_ids"]]
-    except KeyError:
-        return deepcopy(fallback)
-    if {key for row in rows for key in row["diagnostic_ids"]} != set(plan["tasks"][previous["task_id"]]["diagnostic_ids"]):
-        return deepcopy(fallback)
-    return rows
-
-
-def next_migration_chunk(state: dict, task_id: str) -> dict | None:
-    """Next dependency-ordered private work label, never partial publication."""
-    task = state.get("formal_tasks", {}).get(task_id, {})
-    rows = {row["id"]: row for row in task.get("declaration_subtasks", [])}
-    if not rows:
-        return None
-    progress = task.get("migration_chunks", {})
-    complete = {key for key, row in progress.items() if row.get("status") == "checkpointed"
-                and row.get("task_input_sha256") == task.get("task_input_sha256")}
-    # Undiagnosed declarations are context, not extra assignments. A diagnosed
-    # declaration's undiagnosed prerequisites are read in the same focused turn.
-    required = {key for key, row in rows.items() if row.get("diagnostic_ids")}
-    if not required:
-        required = set(rows) if task.get("diagnostic_kind") in {"semantic", "machine"} else set()
-    ready = [row for key, row in rows.items() if key in required - complete
-             and not (set(row.get("dependencies", [])) & required - complete)]
-    return deepcopy(min(ready, key=lambda row: row["id"])) if ready else None
-
-
-def migration_candidate_context_current(state: dict, candidate: dict) -> bool:
-    """Fresh complete publication readiness; strict native checks still follow."""
-    contract = state.get("formalization", {}).get("contract") or {}
-    if not _migration_v2(contract):
-        return candidate_is_current(state, candidate)
-    plan = state.get("migration_plan") or {}
-    task = state.get("formal_tasks", {}).get(candidate.get("task_id"), {})
-    row = plan.get("tasks", {}).get(task.get("task_id"), {})
-    group = contract.get("task_bindings", {}).get(task.get("task_id"), {})
-    header = plan.get("target_imports", {}).get("modules", {}).get(task.get("migration_module"), {})
-    header_repair = bool(plan.get("version") == 2 and task.get("header_repair_only")
-        and row.get("header_repair_only") and row.get("diagnostic_ids")
-        and plan.get("dependency_provenance", {}).get(task.get("migration_module")) == "original_fallback"
-        and header.get("status") == "unavailable" and header.get("unavailable_reason") in {"header_syntax", "missing_import"}
-        and len(group.get("files", [])) == 1 and candidate.get("changed_paths") == group["files"]
-        and not candidate.get("deleted_paths") and candidate.get("stage", "complete") == "complete")
-    return bool(candidate_is_current(state, candidate)
-                and state.get("migration_plan_main_sha") == state["formalization"].get("main_sha")
-                and task.get("diagnostic_generation") == plan.get("generation")
-                and not state.get("migration_refresh_required") and not state.get("migration_global_blocker")
-                and not plan.get("unmapped_diagnostic_ids")
-                and not any(row.get("status") == "proposed" for row in state.get("migration_mapping_proposals", {}).values())
-                and candidate.get("outputs") == contract.get("bindings", {}).get(task.get("task_id"))
-                and (header_repair or all(interface_available(state, dep) for dep in task.get("dependencies", []))))
-
-
-def checkpoint_migration_chunk(forum_dir: Path, author: str, task_id: str, subtask_id: str, *,
-                               expected_revision: int, checkpoint: dict, summary: str = "") -> dict:
-    """Advance private work focus without a candidate, receipt or budget charge."""
+def refresh_migration_plan(forum_dir: Path, dag: dict, *, main_sha: str, contract: dict) -> dict:
+    """Refresh declaration diagnostics after a serialized controller integration."""
     with transaction(forum_dir) as state:
-        task = state["formal_tasks"].get(task_id, {})
-        focus = task.get("migration_focus") or {}
-        if (state["revision"] != expected_revision or state["phase"] != "formalizing"
-                or not _migration_v2(state["formalization"].get("contract") or {})
-                or task.get("status") != "pending" or focus.get("subtask_id") != subtask_id
-                or author_key(focus.get("author")) != author_key(author)
-                or focus.get("task_input_sha256") != task.get("task_input_sha256")
-                or checkpoint.get("task_id") != task_id or checkpoint.get("task_revision") != task.get("revision")
-                or author_key(checkpoint.get("author")) != author_key(author)
-                or not any(row.get("target") == task_id and strategy_is_current(state, row)
-                           and row.get("status") == "claimed" and participates(row, author)
-                           for row in state["strategies"].values())):
-            raise ValueError("private migration checkpoint is stale or not owned by the focused worker")
-        task.setdefault("migration_chunks", {})[subtask_id] = {
-            "status": "checkpointed", "task_input_sha256": task.get("task_input_sha256"),
-            "author": author, "checkpoint": deepcopy(checkpoint),
-            "summary": _text(summary, "checkpoint summary", required=False),
-            "not_an_acceptance_check": True}
-        state.setdefault("worktree_checkpoints", {}).setdefault(author_key(author), {})[task_id] = deepcopy(checkpoint)
-        chunk = next_migration_chunk(state, task_id)
-        task["migration_focus"] = {**focus, "subtask_id": chunk["id"] if chunk else "", "status": "working" if chunk else "finalize_module"}
-        for row in state["strategies"].values():
-            if row.get("target") == task_id and participates(row, author) and strategy_is_current(state, row):
-                row["migration_subtask_id"] = chunk["id"] if chunk else ""
-        _event(state, "migration_chunk_checkpointed", task_id=task_id, author=author,
-               subtask_id=subtask_id, next_subtask_id=chunk["id"] if chunk else "")
-        return {"task": deepcopy(task), "checkpoint": deepcopy(checkpoint), "next_chunk": chunk,
-                "next_action": "continue_private_chunk" if chunk else "verify_and_finalize_complete_module",
-                "not_an_acceptance_check": True}
-
-
-def _migration_retirement_receipt(state: dict, task: dict, plan: dict) -> dict | None:
-    """Record exact successful provenance for safe worktree reassignment only."""
-    contract = state["formalization"]["contract"]
-    candidate = state["formal_candidates"].get(task.get("accepted_candidate"), {})
-    if (task.get("status") != "complete" or candidate.get("status") != "merged"
-            or candidate.get("task_id") != task["task_id"]
-            or candidate.get("task_revision") != task.get("revision")
-            or candidate.get("stage", "complete") != "complete"
-            or task.get("faithfulness", {}).get("status") == "changes_requested"
-            or task.get("machine_repair", {}).get("status") == "required"):
-        return None
-    try:
-        _require_migration_receipt(task, contract, candidate.get("verification") or {})
-    except ValueError:
-        return None  # Unverifiable legacy provenance stays preserved, not reassigned.
-    from .bump_contract import migration_group_mapping_content
-    return {"version": 1, "task_id": task["task_id"], "task_revision": task["revision"],
-            "candidate_id": candidate["candidate_id"], "original_index_sha256": contract["original_index_sha256"],
-            "mapping_content_sha256": digest(migration_group_mapping_content(contract, task["task_id"])),
-            "retired_generation": plan["generation"], "verified_contract_sha256": contract["sha256"]}
-
-
-def _publish_migration_plan(state: dict, plan: dict, *, main_sha: str) -> None:
-    """Controller-only routing publication; compiled is not semantic acceptance."""
-    contract = state["formalization"]["contract"]
-    if plan.get("task_bindings") != contract.get("task_bindings"):
-        raise ValueError("diagnostic execution groups differ from the sealed migration ledger")
-    prior = state.get("migration_plan") or {}
-    if prior and plan["generation"] <= prior["generation"]:
-        raise ValueError("diagnostic generation must advance without resetting history")
-    limit = int(os.getenv("MAX_ATTEMPTS") or "5")
-    if limit < 1:
-        raise ValueError("MAX_ATTEMPTS must be a positive finite integer")
-    old, tasks = state["formal_tasks"], {}
-    for key, group in plan["task_bindings"].items():
-        if len(group["modules"]) != 1 or len(group["files"]) != 1:
-            raise ValueError("migration execution groups require one module and one writable file")
-        module, filename = group["modules"][0], group["files"][0]
-        for budget_key in ["module:" + module, *group["obligation_ids"]]:
-            state["migration_budgets"].setdefault(budget_key, {"attempts": 0, "limit": limit})
-        owner = state["file_reservations"].get(filename)
-        if owner and (owner.get("owner_task") != key or owner.get("shared_with")):
-            raise ValueError("migration groups cannot share or widen a writable file")
-        state["file_reservations"][filename] = {"owner_task": key, "shared_with": []}
-    for key, row in plan["tasks"].items():
-        previous = old.get(key) or state["retired_tasks"].get(key) or {}
-        group = plan["task_bindings"][key]
-        outputs = normalize_outputs(contract.get("bindings", {}).get(key, []))
-        task_input = migration_task_input_sha256(contract, plan, key)
-        unchanged = bool(task_input and previous.get("task_input_sha256") == task_input and key in old)
-        task = {**deepcopy(previous), "task_id": key, "migration_module": row["migration_module"],
-                "lean_file": row["lean_file"], "outputs": outputs,
-                "original_occurrence_ids": list(group["obligation_ids"]),
-                "dependencies": list(row["dependencies"]),
-                "declaration_subtasks": deepcopy(row["declaration_subtasks"]),
-                "diagnostic_ids": list(row["diagnostic_ids"]), "diagnostic_status": row["status"],
-                "blocked_by": list(row.get("blocked_by", [])),
-                "diagnostic_generation": plan["generation"],
-                "diagnostic_source_sha256": plan["source_sha256"],
-                "diagnostic_artifact": deepcopy(plan.get("diagnostic_artifact")),
-                "status": "pending", "revision": previous.get("revision", 0) + 1,
-                "accepted_candidate": None, "execution_unit": "module", "single_writer": True,
-                "representation": {"status": "adopted", "source": "original_inventory"},
-                "verification": {"status": "pending", "candidate_id": None},
-                "faithfulness": {"status": "unreviewed", "verdict_id": None}}
-        if task_input:
-            task["task_input_sha256"] = task_input
-            task["compile_input_sha256"] = plan["group_contexts"][key]["sha256"]
-        if unchanged:
-            for field in ("revision", "status", "accepted_candidate", "verification", "faithfulness"):
-                if field in previous:
-                    task[field] = deepcopy(previous[field])
-            task["declaration_subtasks"] = _remap_migration_subtasks(previous, prior, plan, row["declaration_subtasks"])
-        else:
-            task.pop("migration_focus", None)
-            task.pop("migration_chunks", None)
-            for candidate in state["formal_candidates"].values():
-                if candidate.get("task_id") == key and candidate.get("status") == "submitted":
-                    candidate.update(status="superseded", superseded_reason="migration_local_input_changed")
-        task["header_repair_only"] = bool(row.get("header_repair_only"))
-        requirements = [item for item in contract["requirements"] if key in item["tasks"]]
-        task["description"] = "Repair current diagnostics in " + row["migration_module"]
-        task["source_components"] = sorted({ref for item in requirements for ref in item["source_components"]})
-        if previous.get("faithfulness", {}).get("status") == "changes_requested":
-            task["faithfulness"] = deepcopy(previous["faithfulness"])
-        task["migration_attempts"], task["migration_max_attempts"] = _migration_budget(state, task)
-        tasks[key] = task
-    # Preserve work/candidate/claim history. A controller compilation observation
-    # retires a routing item; it never manufactures a merged native receipt.
-    for key, task in old.items():
-        if key not in tasks:
-            if (task.get("faithfulness", {}).get("status") == "changes_requested"
-                    or task.get("machine_repair", {}).get("status") == "required"):
-                # A clean compiler cannot discharge semantic or native
-                # correspondence/trust failures from the final review.
-                tasks[key] = {**deepcopy(task), "status": "pending", "diagnostic_status": "repair",
-                    "diagnostic_generation": plan["generation"], "diagnostic_source_sha256": plan["source_sha256"],
-                    "diagnostic_artifact": deepcopy(plan.get("diagnostic_artifact")),
-                    "dependencies": list(plan["dependencies"].get(key, [])),
-                    "blocked_by": [dependency for dependency in plan["dependencies"].get(key, [])
-                                   if dependency not in plan["compiled_modules"]],
-                    "header_repair_only": False, "revision": task["revision"] + 1}
-                refreshed_input = migration_task_input_sha256(contract, plan, key)
-                if refreshed_input and task.get("task_input_sha256") == refreshed_input:
-                    tasks[key]["revision"] = task["revision"]
-                    tasks[key]["status"] = task["status"]
-                else:
-                    tasks[key].pop("migration_focus", None)
-                    tasks[key].pop("migration_chunks", None)
-                    for candidate in state["formal_candidates"].values():
-                        if candidate.get("task_id") == key and candidate.get("status") == "submitted":
-                            candidate.update(status="superseded", superseded_reason="migration_local_input_changed")
-                if refreshed_input:
-                    tasks[key]["task_input_sha256"] = refreshed_input
-                    tasks[key]["compile_input_sha256"] = plan["group_contexts"][key]["sha256"]
-            else:
-                state["retired_tasks"][key] = {**deepcopy(task), "retired_reason": "diagnostic_refresh",
-                    "retired_generation": plan["generation"]}
-                retirement = _migration_retirement_receipt(state, task, plan)
-                if retirement:
-                    state["retired_tasks"][key]["migration_retirement"] = retirement
-    state["formal_tasks"] = tasks
-    state["migration_plan"] = deepcopy(plan)
-    state["migration_plan_main_sha"] = main_sha
-    state["migration_refresh_required"] = False
-    _invalidate_review(state)
-    _event(state, "migration_diagnostics_refreshed", generation=plan["generation"],
-           source_sha256=plan["source_sha256"], plan_sha256=plan["plan_sha256"],
-           active_groups=sorted(tasks), compiled_modules=plan["compiled_modules"])
-
-
-def initialize_migration_plan(forum_dir: Path, index: dict, plan: dict, *, contract: dict,
-                              source: dict, main_sha: str, return_state: bool = False) -> dict | None:
-    """Initialize compact policy-2 routing independently of paper chunking."""
-    from .bump_planner import validate_repair_plan
-    validate_repair_plan(index, plan)
-    if (not _migration_v2(contract) or contract.get("sha256") != _contract_digest(contract)
-            or not _FULL_SHA_RE.fullmatch(main_sha)
-            or contract.get("solution_candidate") != source.get("candidate_id")
-            or contract.get("solution_sha256") != source.get("sha256")):
-        raise ValueError("migration initialization requires the exact sealed contract and source")
-    with transaction(forum_dir) as state:
-        if (formal_source(state) != source or state["formal_tasks"] or state["formal_candidates"]
-                or state.get("migration_plan") is not None):
-            raise ValueError("migration initialization requires a fresh initialized original source")
-        if contract.get("original_index_sha256") != index["index_sha256"]:
-            raise ValueError("migration initialization changed the original index")
-        state["formalization"].update(revision=1, status="active", contract=deepcopy(contract),
-            main_sha=main_sha, solution_candidate=source["candidate_id"], solution_sha256=source["sha256"],
-            requirements=deepcopy(contract["requirements"]), spec=deepcopy(contract["spec"]),
-            source_obligations=list(contract["obligation_ids"]))
-        state["phase"] = "formalizing"
-        _publish_migration_plan(state, plan, main_sha=main_sha)
-    return load_state(forum_dir) if return_state else None
-
-
-def refresh_migration_plan(forum_dir: Path, index: dict, plan: dict, *, expected_revision: int,
-                           expected_main_sha: str, return_state: bool = False) -> dict | bool | None:
-    """Publish a new controller diagnostic snapshot only against its read state."""
-    from .bump_planner import validate_repair_plan
-    validate_repair_plan(index, plan)
-    with transaction(forum_dir) as state:
-        if (state["revision"] != expected_revision
-                or state["formalization"].get("main_sha") != expected_main_sha):
-            return False
-        contract = state["formalization"].get("contract") or {}
-        if (not _migration_v2(contract) or state["phase"] != "formalizing"
-                or any(row.get("status") == "merging" for row in state["formal_candidates"].values())
-                or plan["original_index_sha256"] != (state.get("migration_plan") or {}).get("original_index_sha256")):
-            raise ValueError("migration refresh has a changed original ledger or an in-flight merge")
-        _publish_migration_plan(state, plan, main_sha=expected_main_sha)
-    return load_state(forum_dir) if return_state else None
-
-
-def refine_migration(forum_dir: Path, author: str, task_id: str, *, expected_revision: int,
-                     subtasks: list[dict], dependencies: list[str] | None = None,
-                     mapping_proposal: dict | None = None, reason: str = "") -> dict:
-    """Refine diagnosed work only; never change immutable obligations or acceptance."""
-    from .bump_contract import validate_mapping_v2
-    from .bump_inventory import load_original_index
-    with transaction(forum_dir) as state:
-        if state["revision"] != expected_revision:
-            raise ValueError("migration refinement is stale; refresh the task")
-        contract = state["formalization"].get("contract") or {}
-        task = state["formal_tasks"].get(task_id)
-        if (not _migration_v2(contract) or state["phase"] != "formalizing" or not task
-                or task.get("status") != "pending" or not author_key(author)
-                or any(row.get("task_id") == task_id and row.get("status") in {"submitted", "merging"}
-                       for row in state["formal_candidates"].values())):
-            raise ValueError("migration refinement requires an available diagnosed execution group")
-        if not any(row.get("target") == task_id and strategy_is_current(state, row)
-                   and row.get("status") == "claimed" and participates(row, author)
-                   for row in state["strategies"].values()):
-            raise ValueError("migration refinement requires a claimed strategy for this group")
-        if not isinstance(subtasks, list) or not subtasks or len(subtasks) > 512:
-            raise ValueError("migration refinement requires a bounded nonempty subtask partition")
-        originals = set(task["original_occurrence_ids"])
-        expected_diagnostics = set(task["diagnostic_ids"])
-        ids, diagnostics, represented = set(), [], []
-        for row in subtasks:
-            if (not isinstance(row, dict) or set(row) != {"id", "kind", "original_ids", "diagnostic_ids", "dependencies"}
-                    or not isinstance(row["id"], str) or not row["id"] or len(row["id"]) > 200
-                    or row["id"] in ids or row["kind"] not in {"declaration", "module", "syntax", "import"}):
-                raise ValueError("migration refinement has an invalid subtask shape")
-            ids.add(row["id"])
-            for field in ("original_ids", "diagnostic_ids", "dependencies"):
-                if (not isinstance(row[field], list) or any(not isinstance(item, str) for item in row[field])
-                        or len(row[field]) != len(set(row[field]))):
-                    raise ValueError("migration refinement requires unique reference lists")
-            if set(row["original_ids"]) - originals or set(row["diagnostic_ids"]) - expected_diagnostics:
-                raise ValueError("migration refinement cannot invent originals or diagnostics")
-            represented.extend(row["original_ids"])
-            diagnostics.extend(row["diagnostic_ids"])
-        if (set(represented) != originals or len(represented) != len(set(represented))
-                or set(diagnostics) != expected_diagnostics or len(diagnostics) != len(set(diagnostics))):
-            raise ValueError("migration refinement must partition every current diagnostic and original repair obligation")
-        graph = {row["id"]: set(row["dependencies"]) for row in subtasks}
-        if any(deps - ids or key in deps for key, deps in graph.items()):
-            raise ValueError("migration refinement has an unknown or self dependency")
-        index = load_original_index(Path(contract["artifact_root"]), contract["original_index_ref"])
-        if (index["index_sha256"] != contract["original_index_sha256"]
-                or originals != set(index["modules"][task["migration_module"]]["occurrence_ids"])):
-            raise ValueError("migration refinement changed its sealed original occurrence inventory")
-        owners = {key: row["id"] for row in subtasks for key in row["original_ids"]}
-        for row in subtasks:
-            required = {owners[dependency] for key in row["original_ids"]
-                        for dependency in index["occurrences"][key]["dependencies"]
-                        if dependency in owners and owners[dependency] != row["id"]}
-            if required - graph[row["id"]]:
-                raise ValueError("migration refinement drops an original declaration dependency")
-        # Preserving every original edge and requiring an acyclic quotient also
-        # prevents splitting a mutually dependent original component.
-        remaining = dict(graph)
-        while remaining:
-            ready = {key for key, deps in remaining.items() if not deps}
-            if not ready:
-                raise ValueError("migration refinement has a dependency cycle")
-            remaining = {key: deps - ready for key, deps in remaining.items() if key not in ready}
-        if dependencies is not None and dependencies != task["dependencies"]:
-            raise ValueError("module import dependencies cannot be weakened by a repair proposal")
-        if mapping_proposal is not None:
-            validate_mapping_v2(contract, mapping_proposal, contract["task_bindings"])
-            proposal_id = digest(mapping_proposal)
-            state["migration_mapping_proposals"][proposal_id] = {
-                "proposal_id": proposal_id, "author": author, "task_id": task_id,
-                "status": "proposed", "mapping": deepcopy(mapping_proposal),
-                "source_sha256": task["diagnostic_source_sha256"], "contract_sha256": contract["sha256"],
-                "main_sha": state["formalization"]["main_sha"]}
-        task.setdefault("refinement_history", []).append({"revision": task["revision"],
-            "subtasks_sha256": digest(task["declaration_subtasks"]), "author": author,
-            "reason": _text(reason, "reason", required=False)})
-        task["declaration_subtasks"] = deepcopy(subtasks)
-        task["revision"] += 1
-        previous_focus = task.pop("migration_focus", None)
-        task.pop("migration_chunks", None)
-        next_chunk = next_migration_chunk(state, task_id)
-        if (previous_focus and author_key(previous_focus.get("author")) == author_key(author) and next_chunk):
-            task["migration_focus"] = {**previous_focus, "subtask_id": next_chunk["id"],
-                                       "task_input_sha256": task.get("task_input_sha256"), "status": "working"}
-        # Keep the claimed strategy current for its own explicitly requested
-        # refinement; other stale workers must reacquire this revision.
-        for row in state["strategies"].values():
-            if row.get("target") == task_id and participates(row, author):
-                row["task_revision"] = task["revision"]
-                if task.get("migration_focus"):
-                    row["migration_subtask_id"] = task["migration_focus"]["subtask_id"]
-        _invalidate_review(state)
-        _event(state, "migration_refined", task_id=task_id, author=author,
-               task_revision=task["revision"], subtask_count=len(subtasks))
-    return {"task": deepcopy(task), "next_chunk": deepcopy(next_chunk)}
-
-
-def resolve_migration_mapping(forum_dir: Path, proposal_id: str, *, expected_revision: int,
-                              proposed_contract: dict | None = None, reason: str = "") -> bool:
-    """Controller CAS for a checked correspondence proposal, never a semantic verdict."""
-    from .bump_contract import validate_mapping_v2
-    with transaction(forum_dir) as state:
-        if state["revision"] != expected_revision:
-            return False
-        proposal = state["migration_mapping_proposals"].get(proposal_id)
-        contract = state["formalization"].get("contract") or {}
-        if (not _migration_v2(contract) or state["phase"] != "formalizing" or not proposal
-                or proposal.get("status") != "proposed"
-                or any(row.get("status") == "merging" for row in state["formal_candidates"].values())):
-            raise ValueError("mapping publication requires a current proposal and no active merge")
-        if proposed_contract is None:
-            proposal.update(status="rejected", reason=_text(reason, "reason", required=True))
-        else:
-            if (proposal["contract_sha256"] != contract["sha256"]
-                    or proposal["main_sha"] != state["formalization"]["main_sha"]
-                    or proposal["source_sha256"] != (state.get("migration_plan") or {}).get("source_sha256")):
-                raise ValueError("mapping proposal no longer matches the current source/contract")
-            if (not _migration_v2(proposed_contract)
-                    or proposed_contract.get("sha256") != _contract_digest(proposed_contract)
-                    or proposed_contract.get("mapping") != proposal["mapping"]):
-                raise ValueError("mapping publication requires the checked exact proposal")
-            mutable = {"mapping", "mapping_sha256", "bindings", "adopted_outputs", "sha256"}
-            if ({key: value for key, value in contract.items() if key not in mutable}
-                    != {key: value for key, value in proposed_contract.items() if key not in mutable}):
-                raise ValueError("mapping publication cannot replace source, scope, obligations, groups or environment")
-            validate_mapping_v2(proposed_contract, proposal["mapping"], proposed_contract["task_bindings"])
-            from .bump_contract import migration_group_mapping_content
-            affected = {key for key in contract["task_bindings"]
-                        if migration_group_mapping_content(contract, key)
-                        != migration_group_mapping_content(proposed_contract, key)}
-            dependencies = (state.get("migration_plan") or {}).get("dependencies", {})
-            while True:
-                expanded = affected | {key for key, deps in dependencies.items() if affected.intersection(deps)}
-                if expanded == affected:
-                    break
-                affected = expanded
-            state["formalization"]["contract"] = deepcopy(proposed_contract)
-            state["formalization"]["revision"] += 1
-            for key, task in state["formal_tasks"].items():
-                if key in affected:
-                    task.update(revision=task["revision"] + 1, status="pending", accepted_candidate=None,
-                        outputs=deepcopy(proposed_contract["bindings"][key]),
-                        verification={"status": "pending"}, faithfulness={"status": "unreviewed"})
-                    task.pop("migration_focus", None)
-                    task.pop("migration_chunks", None)
-                task_input = migration_task_input_sha256(proposed_contract, state.get("migration_plan") or {}, key)
-                if task_input:
-                    task["task_input_sha256"] = task_input
-            for candidate in state["formal_candidates"].values():
-                if candidate.get("status") == "submitted" and candidate.get("task_id") in affected:
-                    candidate["status"] = "superseded"
-            state["migration_refresh_required"] = True
-            proposal.update(status="adopted", adopted_contract_sha256=proposed_contract["sha256"])
-            _invalidate_review(state)
-        _event(state, "migration_mapping_resolved", proposal_id=proposal_id, status=proposal["status"])
-    return True
-
-
-def _reopen_migration_groups(state: dict, task_ids: list[str], *, evidence_id: str,
-                             kind: str) -> None:
-    """Create repair routing from exact checked group IDs, not diagnostic prose."""
-    contract, plan = state["formalization"]["contract"], state["migration_plan"]
-    universe = _migration_task_universe(state)
-    if (not _migration_v2(contract) or kind not in {"semantic", "machine"}
-            or not task_ids or len(task_ids) != len(set(task_ids)) or set(task_ids) - set(universe)):
-        raise ValueError("migration reopening requires exact original execution-group IDs")
-    for task_id in task_ids:
-        if kind == "semantic" and task_id in state["formal_tasks"]:
-            continue  # The critic flow below invalidates its existing task.
-        group = contract["task_bindings"][task_id]
-        previous = state["formal_tasks"].get(task_id) or state["retired_tasks"].get(task_id) or {}
-        diagnostic_id = kind + ":" + evidence_id + ":" + task_id
-        task = {**deepcopy(previous), "task_id": task_id,
-            "migration_module": group["modules"][0], "lean_file": group["files"][0],
-            "original_occurrence_ids": list(group["obligation_ids"]),
-            "outputs": deepcopy(contract["bindings"][task_id]),
-            "source_components": universe[task_id]["source_components"],
-            "description": "Repair checked " + kind + " failure in " + task_id,
-            "dependencies": list(plan["dependencies"][task_id]),
-            "status": "pending", "revision": previous.get("revision", 0) + 1,
-            "diagnostic_status": "repair", "diagnostic_kind": kind,
-            "diagnostic_generation": plan["generation"], "diagnostic_source_sha256": plan["source_sha256"],
-            "diagnostic_ids": [diagnostic_id], "single_writer": True, "execution_unit": "module",
-            "declaration_subtasks": [{"id": diagnostic_id, "kind": "module",
-                "original_ids": list(group["obligation_ids"]), "diagnostic_ids": [diagnostic_id],
-                "dependencies": []}],
-            "accepted_candidate": None, "representation": {"status": "adopted", "source": "original_inventory"},
-            "verification": {"status": "pending"}, "faithfulness": {"status": "unreviewed"}}
-        if kind == "machine":
-            task["machine_repair"] = {"status": "required", "snapshot_id": evidence_id}
-        task["migration_attempts"], task["migration_max_attempts"] = _migration_budget(state, task)
-        task_input = migration_task_input_sha256(contract, plan, task_id)
-        if task_input:
-            task["task_input_sha256"] = task_input
-        task.pop("migration_focus", None)
-        task.pop("migration_chunks", None)
-        state["formal_tasks"][task_id] = task
-
-
-def _require_migration_receipt(task: dict, contract: dict, verification: dict) -> None:
-    if _migration_v2(contract):
-        from .bump_contract import require_migration_receipt_v2
-        require_migration_receipt_v2(task, contract, verification)
-        return
-    from .bump_contract import policy_hash, output_fingerprints
-    receipt = verification.get("module_receipt", {})
-    expected = output_fingerprints(contract, task["task_id"], task.get("outputs", []))
-    if (verification.get("status") != "passed" or verification.get("policy_sha256") != policy_hash()
-            or receipt.get("passed") is not True or receipt.get("module") != task.get("migration_module")
-            or receipt.get("policy_sha256") != policy_hash() or receipt.get("occurrence_policy") != 1
-            or receipt.get("verified_targets") != expected
-            or verification.get("verified_targets") != expected):
-        raise ValueError("migration completion requires exact module and original-meaning receipts")
-    baseline = contract.get("project_baseline") or {}
-    if baseline.get("policy") == "migration-v1":
-        scope_sha = baseline.get("migration", {}).get("scope", {}).get("sha256")
-        if (baseline.get("version") != 5 or baseline.get("scope_policy") != 1
-                or baseline.get("occurrence_policy") != 1
-                or contract.get("migration_occurrence_policy") != 1
-                or contract.get("migration_scope_policy") != 1
-                or not isinstance(scope_sha, str) or not _ARTIFACT_SHA_RE.fullmatch(scope_sha)
-                or receipt.get("scope_sha256") != scope_sha):
-            raise ValueError("migration module receipt is not bound to the sealed verification scope")
-        original = baseline.get("original_reports", {}).get(task["migration_module"], {})
-        if (receipt.get("original_evidence") != original.get("evidence_sha256")
-                or not original.get("evidence_sha256")
-                or any(not isinstance(receipt.get(key), str) or not _ARTIFACT_SHA_RE.fullmatch(receipt[key])
-                       for key in ("source_sha256", "original_evidence", "current_evidence", "comparison_sha256"))
-                or receipt["source_sha256"] != verification.get("source_identity", {}).get("source_sha256")
-                or not receipt.get("compiled_receipt")
-                or receipt["compiled_receipt"] != verification.get("compiled_receipt")):
-            raise ValueError("migration module receipt is not bound to original and compiled target evidence")
-
-
-def _invalidate_migration_dependents(state: dict, task_id: str) -> None:
-    affected = {task_id}
-    while True:
-        expanded = affected | {key for key, row in state["formal_tasks"].items()
-                               if affected.intersection(row.get("dependencies", []))}
-        if expanded == affected:
-            break
-        affected = expanded
-    for key in sorted(affected - {task_id}):
-        row = state["formal_tasks"][key]
-        row.update(status="pending", accepted_candidate=None,
-                   verification={"status": "pending"}, faithfulness={"status": "unreviewed"})
-        row["revision"] += 1
-        row.pop("migration_diagnostics", None)
-    _event(state, "migration_dependents_invalidated", task_id=task_id,
-           task_ids=sorted(affected - {task_id}))
-
-
-def record_migration_diagnostic(forum_dir: Path, task_id: str, diagnostic: dict, *,
-                                expected_revision: int | None = None) -> bool:
-    with transaction(forum_dir) as state:
-        if expected_revision is not None and expected_revision != state["revision"]:
-            return False
-        task = state["formal_tasks"][task_id]
-        if not task.get("migration_module"):
-            raise ValueError("not a migration task")
-        # The controller archived the full check before this CAS. Project only
-        # an exact, sealed current proposal; legacy/unexpected evidence stays full.
-        stored = _project_migration_verification(
-            diagnostic, state.get("formalization", {}).get("contract") or {})
-        task["migration_diagnostics"] = deepcopy(stored)
-        task["migration_check"] = deepcopy(stored)
-    return True
-
-
-def begin_migration_attempt(forum_dir: Path, task_id: str, author: str, *, subtask_id: str = "") -> dict:
-    """Charge only actual dispatches; resume, merges and telemetry never reset this."""
-    with transaction(forum_dir) as state:
-        task = state["formal_tasks"][task_id]
-        if (not task_ready(state, task) or not task.get("migration_module")
-                or task.get("migration_attempts", 0) >= task.get("migration_max_attempts", 5)):
-            raise ValueError("migration task is unavailable or its persistent budget is exhausted")
-        if subtask_id:
-            chunk = next_migration_chunk(state, task_id)
-            if chunk is None or chunk["id"] != subtask_id:
-                raise ValueError("migration chunk is not the current dependency-ordered private focus")
-        task["migration_attempts"] += 1
-        if _migration_v2(state["formalization"].get("contract") or {}):
-            for key in _migration_budget_keys(task):
-                row = state["migration_budgets"][key]
-                if row["attempts"] >= row["limit"]:
-                    raise ValueError("migration obligation budget is exhausted")
-                row["attempts"] += 1
-            task["migration_attempts"], task["migration_max_attempts"] = _migration_budget(state, task)
-        if subtask_id:
-            task["migration_focus"] = {"subtask_id": subtask_id, "author": author,
-                "task_input_sha256": task.get("task_input_sha256"), "attempt": task["migration_attempts"],
-                "status": "working"}
-        _event(state, "migration_attempt_started", task_id=task_id, author=author,
-               attempt=task["migration_attempts"])
-        return deepcopy(task)
-
-
-def record_migration_module_check(forum_dir: Path, task_id: str, verification: dict, *,
-                                  main_sha: str, build: dict | None = None,
-                                  expected_revision: int | None = None) -> dict | bool:
-    """Publish a real no-edit controller check through the same merge evidence gate."""
-    with transaction(forum_dir) as state:
-        if expected_revision is not None and expected_revision != state["revision"]:
-            return False
-        task = state["formal_tasks"][task_id]
-        contract = state["formalization"]["contract"]
-        _require_migration_receipt(task, contract, verification)
-        if (state["phase"] != "formalizing" or task["status"] != "pending"
-                or main_sha != state["formalization"]["main_sha"]
-                or verification.get("contract_sha256") != contract["sha256"]
-                or not all(interface_available(state, dep) for dep in task.get("dependencies", []))):
-            raise ValueError("controller module check is stale or out of frontier order")
-        identifier = _id("build")
-        candidate = {"candidate_id": identifier, "task_id": task_id, "strategy_id": None,
-                     "author": "Unity", "origin": "controller_build", "commit_sha": main_sha,
-                     "base_main_sha": main_sha, "diff_sha256": hashlib.sha256(b"").hexdigest(),
-                     "solution_candidate": state["formalization"]["solution_candidate"],
-                     "solution_sha256": state["formalization"]["solution_sha256"],
-                     "formalization_revision": state["formalization"]["revision"],
-                     "task_revision": task["revision"], "stage": "complete",
-                     "outputs": deepcopy(task["outputs"]), "changed_paths": [], "deleted_paths": [],
-                     "obsolete_files": [], "status": "merging", "created_at": time.time()}
-        state["formal_candidates"][identifier] = candidate
-    return finish_formal_merge(forum_dir, identifier, success=True, main_sha=main_sha,
-                               verification=verification, build=build)
+        if state.get("formalization", {}).get("main_sha") != main_sha:
+            raise ValueError("compiler refresh no longer matches integrated main")
+        prepared = _migration_plan(state, dag, main_sha=main_sha, contract=contract, refresh=True)
+        state.clear()
+        state.update(prepared)
+    return load_state(forum_dir)
 
 
 class ChunkReplacement(TypedDict):
@@ -1970,13 +1394,12 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
             or not isinstance(resolutions, list) or not (upserts or replacements or reopens or resolutions)):
         raise ValueError("refinement requires nonempty changes")
     with transaction(forum_dir) as state:
-        if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") in {1, 2}:
-            raise ValueError("migration obligations are fixed by the original compiler inventory")
         if type(expected_revision) is not int or expected_revision != state["revision"]:
             return {"status": "conflict", "revision": state["revision"]}
         if state["phase"] != "formalizing" or (state["formalization"].get("contract") or {}).get("version") != 3:
             raise ValueError("refinement requires an active informal formalization plan")
         formal, tasks = state["formalization"], state["formal_tasks"]
+        previous_tasks = deepcopy(tasks)
         if any(row.get("status") == "merging" for row in state["formal_candidates"].values()):
             raise ValueError("cannot refine while an exact candidate is integrating")
         node_fields = {"id", "task_id", "title", "predicted_kind", "informal_statement", "informal_proof",
@@ -2095,6 +1518,9 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
         formal.update(requirements=requirements, spec=spec)
         formal["contract"].update(requirements=deepcopy(requirements), spec=deepcopy(spec),
                                   spec_sha256=digest(spec), obligation_ids=sorted(tasks))
+        from .bump_migration import is_migration, refine
+        if is_migration(formal["contract"]):
+            refine(state, changes, previous_tasks=previous_tasks)
         for evidence_field, kind in (("external_declarations", "library"),
                                      ("prerequisite_declarations", "declaration")):
             names = {row["resolution"]["declaration"] for row in spec["prerequisites"]
@@ -2306,7 +1732,7 @@ def submission_blockers(state: dict, task_id: str, stage: str = "complete", *,
     from .bump_contract import output_manifest_blockers, prerequisite_blockers
 
     contract = state.get("formalization", {}).get("contract") or {}
-    if contract.get("version") not in {3, 4}:
+    if contract.get("version") != 3:
         return []
     tasks = state.get("formal_tasks", {})
     if task_id not in tasks or stage not in {"representation", "complete"}:
@@ -2315,10 +1741,11 @@ def submission_blockers(state: dict, task_id: str, stage: str = "complete", *,
     if stage == "complete":
         completed.add(task_id)
     proposed = outputs if outputs is not None else tasks[task_id].get("outputs", [])
-    if contract.get("migration_policy") in {1, 2} and stage != "complete":
-        raise ValueError("migration only accepts complete module candidates")
-    return (output_manifest_blockers(contract, task_ids=set(tasks), task_id=task_id,
-                                     proposed_outputs=proposed)
+    from .bump_migration import is_migration
+    command_only = (is_migration(contract) and tasks[task_id].get("migration", {}).get("kind") == "command"
+                    and not proposed and not contract.get("bindings", {}).get(task_id))
+    return (([] if command_only else output_manifest_blockers(
+                contract, task_ids=set(tasks), task_id=task_id, proposed_outputs=proposed))
             + prerequisite_blockers(contract, completed=completed,
                                     final=bool(tasks) and completed == set(tasks)))
 
@@ -2561,19 +1988,7 @@ def ready_formal_tasks(state: dict) -> list[dict]:
 
 
 def interface_available(state: dict, task: dict | str) -> bool:
-    contract = state.get("formalization", {}).get("contract") or {}
-    if _migration_v2(contract):
-        key = task if isinstance(task, str) else task.get("task_id")
-        row = state.get("formal_tasks", {}).get(key)
-        if row is not None:
-            return row.get("status") == "complete"
-        group = contract.get("task_bindings", {}).get(key, {})
-        plan = state.get("migration_plan") or {}
-        return bool(group and state.get("migration_plan_main_sha") == state["formalization"].get("main_sha")
-                    and set(group.get("modules", [])) <= set(plan.get("compiled_modules", [])))
     task = state.get("formal_tasks", {}).get(task, {}) if isinstance(task, str) else task
-    if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 1:
-        return bool(task and task.get("status") == "complete")
     adopted = bool(task and (task.get("status") == "complete"
                             or task.get("representation", {}).get("status") == "adopted"))
     if not adopted or (state.get("formalization", {}).get("contract") or {}).get("representation_review_policy") != 1:
@@ -2587,19 +2002,14 @@ def task_ready(state: dict, task: dict | str) -> bool:
     if (not task or task.get("status") != "pending"
             or source_issues_blocking_task(state, task["task_id"])):
         return False
-    if _migration_v2(state.get("formalization", {}).get("contract") or {}):
-        plan = state.get("migration_plan") or {}
-        return bool((task.get("diagnostic_status") == "repair" or task.get("header_repair_only"))
-                    and state.get("migration_plan_main_sha") == state["formalization"].get("main_sha")
-                    and not plan.get("unmapped_diagnostic_ids")
-                    and not state.get("migration_refresh_required")
-                    and not state.get("migration_global_blocker")
-                    and not any(row.get("status") == "proposed" for row in state.get("migration_mapping_proposals", {}).values())
-                    and task.get("diagnostic_generation") == plan.get("generation")
-                    and (task.get("header_repair_only")
-                         or all(interface_available(state, dep) for dep in task.get("dependencies", []))))
-    if (state.get("formalization", {}).get("contract") or {}).get("migration_policy") == 1:
-        return all(interface_available(state, dep) for dep in task.get("dependencies", []))
+    if task.get("migration"):
+        # Original declarations already have an interface; dependency readiness
+        # here means their required repairs have integrated into current main.
+        dependencies = (set(task.get("dependencies", []))
+                        | set(task.get("statement_dependencies", []))
+                        | set(task.get("proof_dependencies", [])))
+        return all(state["formal_tasks"].get(key, {}).get("status") == "complete"
+                   for key in dependencies)
     if task.get("representation", {}).get("status") == "adopted" and not interface_available(state, task):
         return False
     if "statement_dependencies" in task:
@@ -2683,11 +2093,9 @@ def _rejection_identity(state: dict, author: str, task_id: str) -> str | None:
 
 def _attempt_progress(state: dict, author: str, task_id: str) -> str:
     from .bump_files import reservations
-    from .bump_contract import output_target_key, output_fingerprints
     from .bump_representation import snapshot as representation_snapshot
     tasks = state.get("formal_tasks", {})
-    contract = state.get("formalization", {}).get("contract") or {}
-    targets = contract.get("targets", {})
+    targets = (state.get("formalization", {}).get("contract") or {}).get("targets", {})
     relevant = _task_dependencies(state, task_id) | {task_id}
     source = formal_source(state)
     rejection = state.get("formal_candidates", {}).get(_rejection_identity(state, author, task_id), {})
@@ -2721,11 +2129,10 @@ def _attempt_progress(state: dict, author: str, task_id: str) -> str:
             # adopted task-local semantic identities, not candidate metadata.
             "representation": {
                 "status": tasks.get(key, {}).get("representation", {}).get("status"),
-                "targets": (output_fingerprints(contract, key) if _migration_v2(contract) else {
-                    output_target_key(contract, key, output["declaration"]): targets.get(
-                        output_target_key(contract, key, output["declaration"]), {}).get("fingerprint")
+                "targets": {
+                    output["declaration"]: targets.get(output["declaration"], {}).get("fingerprint")
                     for output in tasks.get(key, {}).get("outputs", [])
-                }),
+                },
             },
             "complete": tasks.get(key, {}).get("status") == "complete",
             "critic_feedback": tasks.get(key, {}).get("faithfulness", {}).get("feedback_sha256"),
@@ -2973,10 +2380,8 @@ def submit_formal_candidate(
             raise ValueError("formal task is unknown or already complete")
         bindings = normalized_outputs if normalized_outputs is not None else deepcopy(task.get("outputs", []))
         contract = state["formalization"].get("contract") or {}
-        if contract.get("migration_policy") in {1, 2}:
-            if stage != "complete" or bindings != contract.get("bindings", {}).get(task_id):
-                raise ValueError("migration requires complete candidates with the fixed original outputs")
-        elif contract.get("version") == 3 and not bindings:
+        if (contract.get("version") == 3 and not bindings
+                and task.get("migration", {}).get("kind") != "command"):
             raise ValueError("a first candidate requires its declaration/file outputs")
         strategy = state["strategies"].get(strategy_id)
         if (
@@ -3015,7 +2420,7 @@ def submit_formal_candidate(
                     "next_action": "Accepted state changed after preflight; refresh and retry the preserved source."}
         if supersedes and supersedes not in state["formal_candidates"]:
             raise ValueError(f"unknown superseded candidate '{supersedes}'")
-        if contract.get("version") in {3, 4}:
+        if contract.get("version") == 3:
             blockers = submission_blockers(state, task_id, stage, outputs=bindings)
             if blockers:
                 repair = _record_manifest_repair(state, task_id, blockers, origin="preflight")
@@ -3126,8 +2531,6 @@ def submit_formal_candidate(
             "status": "submitted",
             "created_at": time.time(),
         }
-        if _migration_v2(contract) and task.get("task_input_sha256"):
-            candidate["task_input_sha256"] = task["task_input_sha256"]
         state["formal_candidates"][candidate_id] = candidate
         _clear_manifest_repairs(state, task_id)
         bump_files.record_candidate_reservations(state, candidate)
@@ -3157,36 +2560,6 @@ def begin_formal_merge(forum_dir: Path, candidate_id: str) -> dict:
         _event(state, "formal_candidate_merging", candidate_id=candidate_id,
                task_id=candidate["task_id"])
     return {"candidate": candidate}
-
-
-def _project_migration_verification(verification: dict, current_contract: dict, *,
-                                    sealed_contract_checked: bool = False) -> dict:
-    """Retain an exact proposal through its immutable verification artifact.
-
-    This only reduces redundant history after the controller has stored the
-    full verification. It does not change verification, merge or resume gates.
-    Legacy records and unexpected proposals retain all their original fields.
-    """
-    proposed = verification.get("proposed_contract")
-    artifact = verification.get("verification_artifact")
-    if (current_contract.get("migration_policy") not in {1, 2}
-            or not isinstance(proposed, dict) or proposed != current_contract
-            or "proposed_contract_ref" in verification
-            or verification.get("contract_sha256") != current_contract.get("sha256")
-            or not isinstance(artifact, dict) or set(artifact) != {"artifact_id", "sha256"}
-            or not re.fullmatch(r"artifact-[0-9a-f]{12}", str(artifact.get("artifact_id") or ""))
-            or artifact.get("artifact_id") != verification.get("artifact_id")
-            or not _ARTIFACT_SHA_RE.fullmatch(str(artifact.get("sha256") or ""))
-            or not _ARTIFACT_SHA_RE.fullmatch(str(current_contract.get("sha256") or ""))):
-        return verification
-    if not sealed_contract_checked and current_contract["sha256"] != _contract_digest(current_contract):
-        return verification
-    result = {key: value for key, value in verification.items() if key != "proposed_contract"}
-    result["proposed_contract_ref"] = {
-        "contract_sha256": current_contract["sha256"],
-        "artifact_id": artifact["artifact_id"], "artifact_sha256": artifact["sha256"],
-    }
-    return result
 
 
 def finish_formal_merge(
@@ -3227,13 +2600,12 @@ def finish_formal_merge(
             from .bump_contract import policy_hash
             if verification.get("policy_sha256") != policy_hash():
                 raise ValueError("successful merge requires verification under the current policy")
-            if _migration_v2(current_contract):
-                if contract != current_contract or candidate.get("stage") != "complete":
-                    raise ValueError("migration repair cannot replace the sealed correspondence contract")
-                if candidate.get("outputs") != contract.get("bindings", {}).get(task["task_id"]):
-                    raise ValueError("migration repair changed its complete execution-group outputs")
-                _require_migration_receipt(task, contract, verification)
             incremental = current_contract.get("version") == 3
+            from .bump_migration import is_migration
+            provisional = is_migration(current_contract) and verification.get("mode") == "diagnostic_repair"
+            if provisional and (verification.get("native_pending") is not True
+                                or candidate.get("stage", "complete") != "complete"):
+                raise ValueError("declaration repair must explicitly retain pending native verification")
             if incremental:
                 from .bump_contract import adopted_output_records
                 if adopted_output_records(contract) != adopted_output_records(
@@ -3248,7 +2620,6 @@ def finish_formal_merge(
                         or contract.get("project_baseline") != current_contract.get("project_baseline")
                         or contract.get("fingerprint_version", 1) != current_contract.get("fingerprint_version", 1)
                         or contract.get("representation_review_policy") != current_contract.get("representation_review_policy")
-                        or contract.get("migration_occurrence_policy") != current_contract.get("migration_occurrence_policy")
                         or contract.get("obligation_ids") != current_contract.get("obligation_ids")):
                     raise ValueError("candidate contract extension changed the bound source plan or environment")
                 for name, target in current_contract.get("targets", {}).items():
@@ -3260,23 +2631,14 @@ def finish_formal_merge(
                     if contract.get("bindings", {}).get(key) != bindings:
                         raise ValueError("candidate contract extension changed an adopted binding")
                 bindings = normalize_outputs(contract.get("bindings", {}).get(task["task_id"], []))
-                if (not bindings and contract.get("migration_policy") != 1) or bindings != candidate["outputs"]:
+                if ((not bindings and task.get("migration", {}).get("kind") != "command")
+                        or bindings != candidate["outputs"]):
                     raise ValueError("candidate outputs differ from the verified task binding")
-                if contract.get("migration_policy") == 1:
-                    if contract != current_contract:
-                        raise ValueError("migration merge cannot change its sealed occurrence contract")
-                    _require_migration_receipt(task, contract, verification)
-                if candidate.get("stage", "complete") == "complete":
-                    from .bump_contract import output_fingerprints
-                    expected = output_fingerprints(contract, task["task_id"], bindings)
+                if candidate.get("stage", "complete") == "complete" and not provisional:
+                    expected = {row["declaration"]: contract["targets"][row["declaration"]]["fingerprint"] for row in bindings}
                     if any(verification.get("verified_targets", {}).get(key) != value for key, value in expected.items()):
                         raise ValueError("complete candidate requires exact task-local kernel receipts")
-                # A migration contract is fixed and was just compared exactly
-                # with this transaction's private loaded contract. Retain that
-                # state-owned object instead of copying its entire baseline.
-                # Extensible contracts still publish a detached copy.
-                if contract.get("migration_policy") != 1:
-                    state["formalization"]["contract"] = deepcopy(contract)
+                state["formalization"]["contract"] = deepcopy(contract)
             candidate["status"] = "merged"
             candidate["main_sha"] = main_sha.casefold()
             representation_only = candidate.get("stage", "complete") == "representation"
@@ -3287,17 +2649,15 @@ def finish_formal_merge(
                 task["lean_decl"] = task["outputs"][0]["declaration"]
                 task["lean_file"] = task["outputs"][0]["file"]
             task["representation"] = {"status": "adopted", "candidate_id": candidate_id}
-            task["verification"] = {"status": "pending" if representation_only else "verified",
+            task["verification"] = {"status": "provisional" if provisional else "pending" if representation_only else "verified",
                                     "candidate_id": None if representation_only else candidate_id,
                                     "verified_targets": deepcopy(verification.get("verified_targets", {}))}
+            if provisional:
+                task["verification"].update(mode="diagnostic_repair", native_pending=True)
+                task["migration_native_status"] = "pending"
+                task["migration"].pop("critic_reopen", None)
             task["faithfulness"] = {"status": "unreviewed", "verdict_id": None}
-            if _migration_v2(contract):
-                task.pop("machine_repair", None)
-            if contract.get("migration_policy") in {1, 2} and candidate.get("changed_paths"):
-                _invalidate_migration_dependents(state, task["task_id"])
             state["formalization"]["main_sha"] = main_sha.casefold()
-            if _migration_v2(contract):
-                state["migration_refresh_required"] = True
             from .bump_representation import queue_representation_review
             queue_representation_review(state, task["task_id"])
             _invalidate_review(state)
@@ -3343,13 +2703,6 @@ def finish_formal_merge(
                     strategy["status"] = strategy.pop("paused_from", "registered")
             _event(state, "formal_candidate_failed", candidate_id=candidate_id,
                    task_id=task["task_id"], error=error[:1000])
-        # All success checks above run on the full proposal. The exact full
-        # verification remains available in the controller-created artifact;
-        # history need not duplicate the immutable baseline once per candidate.
-        candidate["verification"] = _project_migration_verification(
-            candidate["verification"], state["formalization"].get("contract") or {},
-            sealed_contract_checked=success and (state["formalization"].get("contract") or {}).get("version") in {3, 4},
-        )
     return {"candidate": candidate, "task": task}
 
 
@@ -3368,15 +2721,9 @@ def defer_formal_merge(forum_dir: Path, candidate_id: str, reason: str = "") -> 
 
 def all_formal_tasks_complete(state: dict) -> bool:
     tasks = state.get("formal_tasks", {})
-    if _migration_v2(state.get("formalization", {}).get("contract") or {}):
-        plan = state.get("migration_plan") or {}
-        return bool(plan and state.get("migration_plan_main_sha") == state["formalization"].get("main_sha")
-                    and not plan.get("unmapped_diagnostic_ids")
-                    and not state.get("migration_refresh_required")
-                    and not state.get("migration_global_blocker")
-                    and not any(row.get("status") == "proposed" for row in state.get("migration_mapping_proposals", {}).values())
-                    and all(task.get("status") == "complete" for task in tasks.values()))
-    return bool(tasks) and all(task.get("status") == "complete" for task in tasks.values())
+    from .bump_migration import is_migration
+    return (bool(tasks) or is_migration(state.get("formalization", {}).get("contract") or {})) and all(
+        task.get("status") == "complete" for task in tasks.values())
 
 
 def record_round_end(forum_dir: Path, *, blocked_launches: dict,
@@ -3438,12 +2785,11 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
     from .bump_representation import snapshot as representation_snapshot
     formal = state["formalization"]
     contract = formal.get("contract")
+    from .bump_migration import is_migration, validate_native_snapshot
+    migration = is_migration(contract or {})
     if not isinstance(contract, dict) or not formal.get("requirements"):
         raise ValueError("formalization is missing its immutable contract or requirements; re-chunk it")
-    if contract.get("migration_policy") in {1, 2}:
-        from .bump_contract import validate_migration_snapshot
-        validate_migration_snapshot(state, report)
-    if not _migration_v2(contract) and (require_passed or state.get("project_baseline") is not None):
+    if require_passed or state.get("project_baseline") is not None:
         from .bump_contract import _baseline_matches
         if (not _baseline_matches(state, contract)
                 or report.get("project_baseline_sha256") != contract["project_baseline"]["sha256"]):
@@ -3462,7 +2808,7 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
                     or coverage.get("contexts") != sorted(set(coverage["verification_modules"].values()))):
                 raise ValueError("review snapshot must bind current change-focused module contexts")
     if "requirements" in contract:
-        if _validate_requirements(contract["requirements"], _migration_task_universe(state), source_refs(state)) != formal["requirements"]:
+        if _validate_requirements(contract["requirements"], state["formal_tasks"], source_refs(state)) != formal["requirements"]:
             raise ValueError("requirements ledger differs from the frozen formalization contract")
     if not isinstance(report, dict) or not isinstance(report.get("snapshot_id"), str) or not report["snapshot_id"].strip():
         raise ValueError("review requires a controller-verified snapshot_id")
@@ -3496,7 +2842,7 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
             raise ValueError(f"{field} prerequisite evidence differs from the frozen contract")
     if require_passed and (pending_replan(state) or open_source_issues(state)):
         raise ValueError("review cannot approve pending replanning or unresolved source issues")
-    if require_passed and any(not interface_available(state, task) for task in state["formal_tasks"].values()):
+    if require_passed and not migration and any(not interface_available(state, task) for task in state["formal_tasks"].values()):
         raise ValueError("review cannot approve unreviewed or rejected representations")
     solution_id = formal.get("solution_candidate")
     source = formal_source(state)
@@ -3513,21 +2859,21 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
     accepted = {task_id: task.get("accepted_candidate") for task_id, task in tasks.items()}
     if report.get("accepted_candidates") != accepted:
         raise ValueError("review snapshot has stale accepted candidates")
-    from .bump_contract import output_target_key, output_fingerprints, declaration_occurrences, snapshot_declarations
-    expected_declarations = (snapshot_declarations(contract) if _migration_v2(contract) else
-                            {output_target_key(contract, task_id, row["declaration"]): task_id
-                              for task_id, task in tasks.items() for row in task.get("outputs", [])}
-                             if contract.get("version") == 3 else
+    expected_declarations = ({row["declaration"]: task_id for task_id, task in tasks.items()
+                              for row in task.get("outputs", [])} if contract.get("version") == 3 else
                              {task["lean_decl"]: task_id for task_id, task in tasks.items()})
     if report.get("declarations") != expected_declarations:
         raise ValueError("review snapshot declarations do not match the formal tasks")
-    if set(contract.get("targets", {})) != set(expected_declarations):
+    if not migration and set(contract.get("targets", {})) != set(expected_declarations):
         raise ValueError("formalization contract does not match the formal tasks")
-    if (contract.get("migration_policy") in {1, 2}
-            and report.get("declaration_occurrences") != declaration_occurrences(contract)):
-        raise ValueError("review snapshot lost module-local declaration occurrence metadata")
     if require_passed and not all_formal_tasks_complete(state):
         raise ValueError("review requires all formal tasks to be complete")
+    if migration:
+        # Provisional declaration merges are never final native evidence. The
+        # final review must independently cover every original obligation.
+        if require_passed:
+            validate_native_snapshot(state, report)
+        return
     for task_id, candidate_id in accepted.items():
         if candidate_id is None and not require_passed:
             continue
@@ -3535,12 +2881,11 @@ def _validate_snapshot_binding(state: dict, report: dict, *, require_passed: boo
         if (candidate.get("status") != "merged" or candidate.get("task_id") != task_id
                 or not candidate_is_current(state, candidate)):
             raise ValueError("review snapshot requires current merged candidates for every task")
-        if contract.get("version") in {3, 4}:
-            expected = output_fingerprints(contract, task_id, tasks[task_id].get("outputs", []))
+        if contract.get("version") == 3:
+            expected = {row["declaration"]: contract["targets"][row["declaration"]]["fingerprint"]
+                        for row in tasks[task_id].get("outputs", [])}
             receipt = candidate.get("verification", {})
-            if contract.get("migration_policy") in {1, 2}:
-                _require_migration_receipt(tasks[task_id], contract, receipt)
-            if ((not expected and contract.get("migration_policy") not in {1, 2}) or receipt.get("status") != "passed"
+            if (not expected or receipt.get("status") != "passed"
                     or candidate.get("stage", "complete") != "complete"
                     or any(receipt.get("verified_targets", {}).get(key) != value for key, value in expected.items())):
                 raise ValueError("review requires exact task-local kernel verification receipts")
@@ -3562,12 +2907,6 @@ def record_review_snapshot(forum_dir: Path, report: dict) -> dict:
         current = state["formalization"].get("contract") or {}
         recorded_extension = (proposed is not None and current == proposed
                               and state["review_snapshots"].get(report.get("snapshot_id")) == report)
-        if proposed is not None and _migration_v2(current):
-            if proposed != current or base_contract_sha256 != current.get("sha256"):
-                raise ValueError("final migration evidence cannot replace the sealed correspondence contract")
-            # Policy-2 contract publication is a separate controller operation;
-            # final checks only attest the exact already sealed contract.
-            recorded_extension = True
         if proposed is not None and not recorded_extension:
             if (report.get("passed") is not True or current.get("version") != 3
                     or not isinstance(proposed, dict) or proposed.get("version") != 3
@@ -3576,13 +2915,9 @@ def record_review_snapshot(forum_dir: Path, report: dict) -> dict:
                     or report.get("contract_sha256") != proposed.get("sha256")):
                 raise ValueError("final contract evidence has a stale or invalid controller binding")
             for field in ("solution_candidate", "solution_sha256", "environment", "requirements",
-                          "spec", "spec_sha256", "bindings", "obligation_ids", "project_baseline",
-                          "migration_policy", "migration_scope_policy", "migration_occurrence_policy",
-                          "inspection_policy", "fingerprint_version"):
+                          "spec", "spec_sha256", "bindings", "obligation_ids", "project_baseline"):
                 if proposed.get(field) != current.get(field):
                     raise ValueError("final evidence cannot change source, environment or adopted bindings")
-            if current.get("migration_policy") == 1 and proposed != current:
-                raise ValueError("final migration evidence cannot change its sealed occurrence contract")
             from .bump_contract import adopted_output_records
             if adopted_output_records(proposed) != adopted_output_records(current):
                 raise ValueError("final evidence cannot change controller-adopted output provenance")
@@ -3621,21 +2956,6 @@ def reopen_after_machine_failure(forum_dir: Path, report: dict) -> dict:
         if existing is not None and existing != report:
             raise ValueError("snapshot_id already identifies a different immutable report")
         state["review_snapshots"][report["snapshot_id"]] = report
-        contract = state["formalization"].get("contract") or {}
-        if _migration_v2(contract):
-            failed_groups = report.get("failed_group_ids")
-            if (not isinstance(failed_groups, list)
-                    or any(not isinstance(key, str) for key in failed_groups)
-                    or len(failed_groups) != len(set(failed_groups))
-                    or set(failed_groups) - set(contract["task_bindings"])
-                    or type(report.get("global_blocker")) is not bool):
-                raise ValueError("failed migration review requires explicit group or global failure classification")
-            if failed_groups:
-                _reopen_migration_groups(state, failed_groups,
-                    evidence_id=report["snapshot_id"], kind="machine")
-            if report["global_blocker"] or not failed_groups:
-                state["migration_global_blocker"] = {"kind": "unattributed_machine_failure",
-                    "snapshot_id": report["snapshot_id"], "artifact_id": report.get("artifact_id")}
         for task in state["formal_tasks"].values():
             candidate_id = task.get("accepted_candidate")
             if candidate_id in state["formal_candidates"]:
@@ -3702,6 +3022,175 @@ def _validate_new_repair_steps(review: dict) -> None:
             raise ValueError("only failed requirement reviews may supply repair_steps")
 
 
+def _migration_requirement_outputs(state: dict, requirement: dict) -> set[str] | None:
+    """Resolve a review row against original occurrences, not repair-queue size."""
+    from .bump_migration import is_migration
+    contract = state["formalization"]["contract"]
+    if not is_migration(contract):
+        return None
+    original_index = contract["project_baseline"]["migration"]["original_index"]
+    index = original_index["occurrences"]
+    ids = [key for key in index if requirement["id"] == "requirement-" + key]
+    if not ids:
+        from .bump_planner import empty_module_commands
+        from .bump_migration import validate_native_snapshot
+        commands = empty_module_commands(original_index)
+        matches = [key for key in commands if requirement["id"] == "requirement-" + key]
+        if len(matches) != 1:
+            raise ValueError("migration requirement lacks its exact original occurrence or empty-module command")
+        key, command = matches[0], commands[matches[0]]
+        # This exception is only for an original module whose native inventory
+        # contains zero declarations, not a way to waive declaration coverage.
+        if any(row["module"] == command["module"] for row in index.values()):
+            raise ValueError("empty-module command requirement contains original declarations")
+        source_refs = [row["ref_id"] for row in formal_source(state)["source_refs"]
+                       if row.get("path") == ".unity/source/project/" + command["path"]
+                       and row.get("sha256") == command["source_sha256"]]
+        anchors = [row for row in state["formalization"]["spec"]["anchors"]
+                   if row["id"] == "anchor-" + key]
+        if (len(source_refs) != 1 or requirement.get("source_components") != source_refs
+                or requirement.get("anchor_ids") != ["anchor-" + key]
+                or len(anchors) != 1 or anchors[0].get("source_ref") != source_refs[0]):
+            raise ValueError("empty-module command requirement changed its sealed source anchor")
+        snapshot = state["formalization"]["review_snapshot"]
+        review = snapshot.get("migration_review", {})
+        if (snapshot.get("passed") is not True or review.get("native_complete") is not True
+                or review.get("empty_module_commands") != commands):
+            raise ValueError("empty-module command review requires complete native module coverage")
+        validate_native_snapshot(state, snapshot)
+        return set()
+    if len(ids) != 1:
+        raise ValueError("migration requirement lacks its exact original occurrence")
+    review = state["formalization"]["review_snapshot"].get("migration_review", {})
+    declarations = review.get("occurrence_declarations", {})
+    expected = {key: row["declaration"] for key, row in contract["migration_correspondences"].items()}
+    if declarations != expected:
+        raise ValueError("migration snapshot declarations differ from original correspondences")
+    return {declarations[key] for key in ids}
+
+
+def _materialize_migration_reopen(state: dict, requested: list[str]) -> tuple[list[str], dict[str, list[str]]]:
+    """Give a critic an assignment for any original declaration, including clean ones.
+
+    Only controller-owned original IDs and the existing explicit refinement
+    ownership are used. This creates declaration/SCC tasks, never module tasks.
+    """
+    from .bump_migration import is_migration
+    formal, tasks = state["formalization"], state["formal_tasks"]
+    contract = formal["contract"]
+    if not is_migration(contract):
+        return requested, {key: [key] for key in requested}
+    from .bump_planner import _components, empty_module_commands
+    original_index = contract["project_baseline"]["migration"]["original_index"]
+    index = original_index["occurrences"]
+    commands = empty_module_commands(original_index)
+    groups = {key: group for group in _components(index) for key in group}
+    requirements = deepcopy(formal["requirements"])
+    original_obligations = _source_obligations(requirements, formal["spec"])
+    mapping, created = {}, set()
+    for key in requested:
+        if key in tasks:
+            mapping[key] = [key]
+            continue
+        if key in commands:
+            command = commands[key]
+            line_lengths = original_index["modules"][command["module"]]["line_lengths"]
+            owned = sorted(task_id for task_id, task in tasks.items()
+                           if (task.get("migration", {}).get("command_obligation") == key
+                               and task["migration"].get("kind") == "command"
+                               and task["migration"].get("original_ids") == []
+                               and task["migration"].get("module") == command["module"]
+                               and task["migration"].get("path") == command["path"]
+                               and type(task["migration"].get("command_line")) is int
+                               and 1 <= task["migration"]["command_line"] <= len(line_lengths)))
+            if not owned:
+                raise ValueError("empty-module command reopen requires an existing bounded command task; "
+                                 "explicit source location/refinement is required")
+            mapping[key] = owned
+            continue
+        if key not in index:
+            raise ValueError("unknown reopen tasks: " + key)
+        owned = sorted(task_id for task_id, task in tasks.items()
+                       if key in task.get("migration", {}).get("original_ids", []))
+        if owned:
+            mapping[key] = owned
+            continue
+        ids = groups[key]
+        task_id = ids[0] if len(ids) == 1 else "decl-" + digest(ids)
+        if task_id in state.get("retired_tasks", {}):
+            task_id = "critic-" + digest([ids, formal["review_snapshot"]["snapshot_id"]])
+        related = [row for row in requirements if row["id"] in {"requirement-" + item for item in ids}]
+        if len(related) != len(ids):
+            raise ValueError("critic reopen cannot omit original declaration requirements")
+        for row in related:
+            row["tasks"] = sorted(set(row["tasks"]) | {task_id})
+        modules = {index[item]["module"] for item in ids}
+        paths = {index[item]["path"] for item in ids}
+        if len(modules) != 1 or len(paths) != 1:
+            raise ValueError("a mutual declaration group cannot cross source modules")
+        path, module = next(iter(paths)), next(iter(modules))
+        outputs = []
+        for item in ids:
+            correspondence = contract["migration_correspondences"][item]
+            locations = [name for name, owner in contract["project_baseline"]["layout"]["modules"].items()
+                         if owner == correspondence["module"]]
+            if len(locations) != 1:
+                raise ValueError("critic reopen requires an exact current declaration source")
+            output = {"declaration": correspondence["declaration"], "file": locations[0]}
+            if output not in outputs:
+                outputs.append(output)
+        node = {"id": task_id, "task_id": task_id,
+                "title": "Review original " + ", ".join(index[item]["display_name"] for item in ids),
+                "predicted_kind": index[ids[0]]["kind"] if len(ids) == 1 else "mutual",
+                "informal_statement": "Preserve the original declaration meanings and trust in this migration.",
+                "informal_proof": None, "statement_dependencies": [], "proof_dependencies": [],
+                "source_components": sorted({ref for row in related for ref in row["source_components"]}),
+                "anchor_ids": sorted({anchor for row in related for anchor in row["anchor_ids"]}),
+                "requirement_ids": sorted(row["id"] for row in related),
+                "proposed_formal_statement": None, "proposed_formal_strategy": None}
+        task = normalize_informal_nodes({**tasks, task_id: node}, requirements, formal["spec"], formal_source(state))[task_id]
+        task.update(description=task["informal_statement"], revision=1, status="pending", accepted_candidate=None,
+                    outputs=outputs, lean_file=path, lean_decl=outputs[0]["declaration"] if len(outputs) == 1 else "",
+                    representation={"status": "missing", "candidate_id": None},
+                    verification={"status": "pending", "native_pending": True},
+                    faithfulness={"status": "unreviewed", "verdict_id": None}, migration_native_status="pending",
+                    migration={"original_ids": ids, "path": path, "module": module,
+                               "kind": "declaration" if len(ids) == 1 else "mutual", "critic_reopen": True,
+                               "original_ranges": [index[item].get("range") for item in ids], "diagnostic_ids": []})
+        task["interpretation_sha256"] = informal_interpretation_hash(task)
+        tasks[task_id] = task
+        created.add(task_id)
+        owner = state.setdefault("file_reservations", {}).setdefault(path, {"owner_task": task_id, "shared_with": []})
+        if owner["owner_task"] != task_id:
+            owner["shared_with"] = sorted(set(owner["shared_with"]) | {task_id})
+        mapping[key] = [task_id]
+    owners = {}
+    for key, task in tasks.items():
+        for original in task.get("migration", {}).get("original_ids", []):
+            owners.setdefault(original, set()).add(key)
+    for key, task in tasks.items():
+        ids = set(task.get("migration", {}).get("original_ids", []))
+        pending = [dependency for item in ids for dependency in index[item].get("dependencies", [])]
+        seen, dependencies = set(ids), set(task.get("proof_dependencies", []))
+        while pending:
+            original = pending.pop()
+            if original in seen:
+                continue
+            seen.add(original)
+            relevant = owners.get(original, set()) - {key}
+            dependencies.update(relevant if key in created else relevant & created)
+            pending.extend(index[original].get("dependencies", []))
+        task["proof_dependencies"] = sorted(dependencies)
+        task["dependencies"] = sorted(set(task.get("statement_dependencies", [])) | dependencies)
+        task["interpretation_sha256"] = informal_interpretation_hash(task)
+    if _source_obligations(requirements, formal["spec"]) != original_obligations:
+        raise ValueError("critic reopen changed immutable original requirements")
+    formal["requirements"] = requirements
+    contract.update(requirements=deepcopy(requirements), obligation_ids=sorted(tasks))
+    contract["sha256"] = _contract_digest(contract)
+    return sorted({item for values in mapping.values() for item in values}), mapping
+
+
 def submit_critic_verdict(
     forum_dir: Path,
     author: str,
@@ -3729,8 +3218,6 @@ def submit_critic_verdict(
     with transaction(forum_dir) as state:
         if state["phase"] != "critic" or state["formalization"].get("status") != "review":
             raise ValueError("critic verdicts are only accepted during critic")
-        if repairs and (state["formalization"].get("contract") or {}).get("migration_policy") in {1, 2}:
-            raise ValueError("migration reviews cannot rewrite original representation obligations")
         report = _current_snapshot(state, review["snapshot_id"], require_passed=verdict == "approved")
         _validate_semantic_review(state, review, approved=verdict == "approved", author=author)
         task_ids = list(dict.fromkeys(reopen_tasks or []))
@@ -3745,7 +3232,15 @@ def submit_critic_verdict(
         if verdict == "lean_reopen":
             if not task_ids:
                 raise ValueError("lean_reopen requires at least one formal task")
-            unknown = [item for item in task_ids if item not in _migration_task_universe(state)]
+            from .bump_migration import is_migration
+            migration = is_migration(state["formalization"].get("contract"))
+            original = (state["formalization"]["contract"]["project_baseline"]["migration"]["original_index"]["occurrences"]
+                        if migration else {})
+            from .bump_planner import empty_module_commands
+            commands = (empty_module_commands(state["formalization"]["contract"]["project_baseline"]["migration"]["original_index"])
+                        if migration else {})
+            unknown = [item for item in task_ids if item not in state["formal_tasks"]
+                       and item not in original and item not in commands]
             if unknown:
                 raise ValueError("unknown reopen tasks: " + ", ".join(unknown))
         item = {
@@ -3769,8 +3264,17 @@ def submit_critic_verdict(
             state["formalization"]["status"] = "approval_pending"
             state["formalization"]["pending_verdict_id"] = item["verdict_id"]
         elif verdict == "lean_reopen":
-            if _migration_v2(state["formalization"].get("contract") or {}):
-                _reopen_migration_groups(state, task_ids, evidence_id=item["verdict_id"], kind="semantic")
+            original_requests = [key for key in task_ids if key in original]
+            command_requests = [key for key in task_ids if key in commands]
+            task_ids, reopen_mapping = _materialize_migration_reopen(state, task_ids)
+            item["reopen_tasks"] = task_ids
+            if original_requests:
+                item["original_reopen_occurrences"] = original_requests
+            if command_requests:
+                item["original_reopen_commands"] = command_requests
+            if repairs:
+                repairs = [{**row, "task_id": key} for row in repairs for key in reopen_mapping[row["task_id"]]]
+                item["representation_repairs"] = repairs
             for entry in review["repair_reviews"]:
                 if entry["status"] != "fail":
                     continue
@@ -3806,6 +3310,8 @@ def submit_critic_verdict(
                 if accepted in state["formal_candidates"] and not incremental:
                     state["formal_candidates"][accepted]["status"] = "superseded"
                 task["status"] = "pending"
+                if task.get("migration"):
+                    task["migration"]["critic_reopen"] = True
                 if not incremental:
                     task["accepted_candidate"] = None
                 task["faithfulness"] = {"status": "changes_requested", "verdict_id": item["verdict_id"],
@@ -3832,39 +3338,6 @@ def submit_critic_verdict(
     return {"verdict": item, "state": load_state(forum_dir)}
 
 
-def _critic_obligations_match(state: dict) -> bool:
-    formal = state["formalization"]
-    contract = formal.get("contract") or {}
-    frozen = formal.get("source_obligations")
-    if _migration_v2(contract):
-        return (isinstance(frozen, list) and frozen == contract.get("obligation_ids")
-                and formal.get("requirements") == contract.get("requirements")
-                and formal.get("spec") == contract.get("spec"))
-    return not frozen or _source_obligations(formal.get("requirements", []), formal.get("spec") or {}) == frozen
-
-
-def _critic_task_universe(state: dict) -> dict:
-    contract = state["formalization"].get("contract") or {}
-    if not _migration_v2(contract):
-        return state.get("formal_tasks", {})
-    dependencies = (state.get("migration_plan") or {}).get("dependencies", {})
-    return {key: {"task_id": key, "dependencies": list(dependencies.get(key, [])),
-                  **deepcopy(state.get("formal_tasks", {}).get(key, {}))}
-            for key in contract["task_bindings"]}
-
-
-def _snapshot_reviewed_groups(state: dict, snapshot: dict) -> set[str]:
-    contract = state["formalization"].get("contract") or {}
-    if not _migration_v2(contract):
-        return set(snapshot.get("task_statuses", {}))
-    if snapshot.get("original_index_sha256") != contract.get("original_index_sha256"):
-        return set()
-    # Snapshot-bound all-original evidence includes clean/empty modules that
-    # are deliberately absent from the active repair queue.
-    return (set(snapshot.get("module_receipts", {}))
-            | set(snapshot.get("declarations", {}).values())) & set(contract["task_bindings"])
-
-
 def critic_feedback_for_task(state: dict, task_id: str) -> dict:
     """Return historical repair guidance, never a live failure or acceptance gate.
 
@@ -3874,20 +3347,19 @@ def critic_feedback_for_task(state: dict, task_id: str) -> dict:
     ordinary proof, manifest and graph refinements remain in the same epoch.
     """
     result = {"direct": [], "upstream": []}
-    active_tasks = state.get("formal_tasks", {})
-    tasks = _critic_task_universe(state)
+    tasks = state.get("formal_tasks", {})
     formal = state.get("formalization", {})
     source = formal_source(state)
-    if (task_id not in active_tasks or state.get("phase") == "chunking" or pending_replan(state)
+    if (task_id not in tasks or state.get("phase") == "chunking" or pending_replan(state)
             or (state.get("replan") or {}).get("status") == "chunking"
             or not source or formal.get("solution_candidate") != source.get("candidate_id")
             or formal.get("solution_sha256") != source.get("sha256")):
         return result
     requirements = {row["id"]: row for row in formal.get("requirements", [])}
     spec = formal.get("spec") or {}
-    if not _critic_obligations_match(state):
+    frozen = formal.get("source_obligations")
+    if frozen and _source_obligations(list(requirements.values()), spec) != frozen:
         return result
-    contract = formal.get("contract") or {}
     retired = state.get("retired_tasks", {})
 
     def successors(origin: str, visiting: frozenset[str] = frozenset()) -> set[str]:
@@ -3924,8 +3396,7 @@ def critic_feedback_for_task(state: dict, task_id: str) -> dict:
                 or verdict.get("main_sha") != snapshot.get("main_sha")
                 or snapshot.get("solution_candidate") != source["candidate_id"]
                 or snapshot.get("solution_sha256") != source["sha256"]
-                or (not _migration_v2(contract) and snapshot.get("formalization_revision") != formal.get("revision"))
-                or (_migration_v2(contract) and snapshot.get("original_index_sha256") != contract.get("original_index_sha256"))
+                or snapshot.get("formalization_revision") != formal.get("revision")
                 or verdict.get("verdict") not in {"approved", "lean_reopen"}):
             continue
         try:
@@ -3956,7 +3427,12 @@ def critic_feedback_for_task(state: dict, task_id: str) -> dict:
             original_targets, repair_targets = set(), set()
             for origin in verdict.get("reopen_tasks", []):
                 mapped = successors(origin) & supporting_tasks
-                if origin in _snapshot_reviewed_groups(state, snapshot) and mapped:
+                original_reopened = set(verdict.get("original_reopen_occurrences", []))
+                native_originals = set(snapshot.get("migration_review", {}).get("original_occurrences", []))
+                new_original_task = bool(original_reopened <= native_originals and any(
+                    original_reopened.intersection(tasks[key].get("migration", {}).get("original_ids", []))
+                    for key in mapped))
+                if (origin in snapshot.get("task_statuses", {}) or new_original_task) and mapped:
                     original_targets.add(origin)
                     repair_targets.update(mapped)
             if task_id in repair_targets:
@@ -3965,13 +3441,6 @@ def critic_feedback_for_task(state: dict, task_id: str) -> dict:
                 scope = "upstream"
             else:
                 continue  # Shared requirements alone do not reassign another task's repair.
-            mapping_changed = False
-            if _migration_v2(contract):
-                from .bump_contract import migration_group_mapping_content
-                recorded = snapshot.get("group_mapping_content_sha256")
-                mapping_changed = (any(recorded.get(key) != digest(migration_group_mapping_content(contract, key))
-                                       for key in supporting_tasks) if isinstance(recorded, dict)
-                                   else snapshot.get("mapping_sha256") != contract.get("mapping_sha256"))
             result[scope].append({
                 "task_ids": sorted(repair_targets), "origin_task_ids": sorted(original_targets),
                 "requirement_task_ids": sorted(requirement_tasks), "requirement_id": requirement_id,
@@ -3985,7 +3454,7 @@ def critic_feedback_for_task(state: dict, task_id: str) -> dict:
                 "summary": verdict.get("summary", ""), "evidence": verdict.get("evidence", ""),
                 "scope_rationale": review["scope_rationale"], "scope": scope, "historical": True,
                 "mapping_changed": (verdict.get("requirements_sha256") != _report_digest(formal.get("requirements", []))
-                                    or snapshot.get("spec_sha256") != digest(spec) or mapping_changed),
+                                    or snapshot.get("spec_sha256") != digest(spec)),
                 "shared_guidance": len(requirement_tasks) > 1 or len(repair_targets) > 1,
                 "lineage_inherited": bool(repair_targets - original_targets),
                 "dependency_provider_task_ids": sorted(repair_targets - requirement_tasks),
@@ -3996,8 +3465,6 @@ def critic_feedback_for_task(state: dict, task_id: str) -> dict:
 
 
 def _validate_semantic_review(state: dict, review: dict, *, approved: bool, author: str = "") -> None:
-    from .bump_contract import resolve_review_declarations, output_target_key
-    contract = state["formalization"]["contract"]
     ledger = {item["id"]: item for item in state["formalization"]["requirements"]}
     seen = set()
     declarations = state["formalization"]["review_snapshot"]["declarations"]
@@ -4038,32 +3505,22 @@ def _validate_semantic_review(state: dict, review: dict, *, approved: bool, auth
         refs = entry["declarations"]
         if len(refs) != len(set(refs)):
             raise ValueError("requirement review has duplicate declaration references")
-        refs = resolve_review_declarations(contract, ledger[requirement_id]["tasks"], refs)
+        original_outputs = _migration_requirement_outputs(state, ledger[requirement_id])
         for declaration in refs:
+            if original_outputs is not None:
+                if declaration not in original_outputs:
+                    raise ValueError(f"declaration '{declaration}' is unrelated to original requirement '{requirement_id}'")
+                continue
             if declaration not in declarations:
                 raise ValueError(f"unknown reviewed declaration '{declaration}'")
             if declarations[declaration] not in ledger[requirement_id]["tasks"]:
                 raise ValueError(f"declaration '{declaration}' is unrelated to requirement '{requirement_id}'")
-        ledger_outputs = (contract.get("bindings", {}) if _migration_v2(contract) else
-                          {key: row.get("outputs", []) for key, row in state["formal_tasks"].items()})
-        if _migration_v2(contract):
-            from .bump_contract import output_fingerprints
-            fixed_outputs = {key for task_id in ledger[requirement_id]["tasks"]
-                             for key in output_fingerprints(contract, task_id)}
-        else:
-            fixed_outputs = {output_target_key(contract, task_id, row["declaration"])
-                             for task_id in ledger[requirement_id]["tasks"]
-                             for row in ledger_outputs.get(task_id, [])}
-        empty_migration_module = (
-            state["formalization"]["contract"].get("migration_policy") in {1, 2}
-            and not fixed_outputs
-            and all((task_id in contract.get("task_bindings", {}) if _migration_v2(contract)
-                     else state["formal_tasks"][task_id].get("migration_module"))
-                    for task_id in ledger[requirement_id]["tasks"]))
-        if approved and (entry["status"] != "pass" or (not refs and not empty_migration_module)):
+        if approved and (entry["status"] != "pass" or (not refs and original_outputs != set())):
             raise ValueError("approval requires every requirement to pass with declaration references")
-        if approved and state["formalization"]["contract"].get("version") in {3, 4}:
-            expected_outputs = fixed_outputs
+        if approved and state["formalization"]["contract"].get("version") == 3:
+            expected_outputs = (original_outputs if original_outputs is not None else
+                                {row["declaration"] for task_id in ledger[requirement_id]["tasks"]
+                                 for row in state["formal_tasks"][task_id].get("outputs", [])})
             if set(refs) != expected_outputs:
                 raise ValueError("approval must review every adopted output, including definitions, for the requirement")
     if approved and seen != set(ledger):

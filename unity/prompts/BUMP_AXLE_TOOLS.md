@@ -18,7 +18,8 @@ Use the tool's exposed MCP schema; do not guess argument names. Capabilities:
 - `merge`, `rename`, and `normalize` — manipulate Lean source.
 - `theorem2lemma`, `theorem2sorry`, `have2lemma`, `have2sorry`, and `sorry2lemma` — declaration
   transformations for scratch work and diagnosis. Never submit generated `sorry` placeholders as
-  complete proofs; a representation-stage candidate may contain theorem proof holes only.
+  migration repairs in any stage. Bump does not permit new theorem holes even for representation
+  candidates; inherited original trust may not expand or spread.
 - `list_environments` — inspect available external toolchains.
 - `share_url` and `read_share_url` — exchange Axle artifacts.
 
@@ -39,7 +40,7 @@ local project with targeted diagnostics, then use `finalize_formalization`; do n
 project-wide build or duplicate a successful unchanged check. Unity's main verification remains
 authoritative. Apply only relevant source edits and preserve protected statements and definitions.
 
-Respect phase boundaries: chunking produces an informal source-linked DAG, not Lean scaffolds;
-its tool access does not require API searches, proof checks, or compilation. Bumprs create the
-Lean representations and proofs. Critics remain read-only and reuse current verification records unless
+Respect phase boundaries: chunking revises the compiler-driven declaration DAG, not Lean scaffolds;
+its tool access does not require API searches, proof checks, or compilation. Migration workers repair
+assigned declarations. Critics remain read-only and reuse current verification records unless
 there is a concrete reason for another check.

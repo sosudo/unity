@@ -8,6 +8,7 @@ subprocess); other servers get a one-shot stdio client.
 
 import json
 import os
+import re
 from pathlib import Path
 
 import asyncclick as click
@@ -85,6 +86,33 @@ def _autoformalize_shared_paths(paths) -> tuple[Path, Path]:
 def _formalize_shared_paths(paths) -> tuple[Path, Path]:
     shared_unity = paths.unity.resolve()
     return shared_unity / "forum" / "formalize", shared_unity.parent
+
+
+def _bump_shared_paths(paths) -> tuple[Path, Path]:
+    """Resolve Bump's own forum from main or a linked agent worktree."""
+    shared_unity = paths.unity.resolve()
+    pointer = shared_unity / "bump" / "active.json"
+    if pointer.exists():
+        try:
+            active = json.loads(pointer.read_text())
+            source = shared_unity.parent
+            run_id = active["run_id"]
+            if not isinstance(run_id, str) or not re.fullmatch(r"bump-[0-9a-f]{12}", run_id):
+                raise ValueError("invalid Bump workspace identity")
+            target = source / ".unity" / "bump" / run_id / "target"
+            if (active.get("project_root") != str(source)
+                    or active.get("source_root", str(source)) != str(source)
+                    or active.get("target_path") != str(target)
+                    or target.resolve() != target or (target / ".unity").is_symlink()):
+                raise ValueError("Bump pointer does not name its owned target")
+            origin = json.loads((target / ".unity" / "bump-origin.json").read_text())
+            if any(origin.get(key) != value for key, value in (
+                    ("project_root", str(source)), ("run_id", run_id), ("target_path", str(target)))):
+                raise ValueError("Bump origin does not match its active pointer")
+            shared_unity = target / ".unity"
+        except (OSError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("Bump pointer or origin is incomplete") from exc
+    return shared_unity / "forum" / "bump", shared_unity.parent
 
 
 async def _call_autoformalize_stdio(paths, server, spec, tool, kwargs):
@@ -176,12 +204,29 @@ async def mcp(server, tool, args, args_file):
         run_state = json.loads((paths.unity / "state.json").read_text())
     except (OSError, json.JSONDecodeError):
         run_state = {}
+    if run_state.get("command") == "bump":
+        from ..config import Paths
+        _, shared_root = _bump_shared_paths(paths)
+        if shared_root != paths.unity.resolve().parent:
+            paths = Paths.from_unity_dir(shared_root / ".unity")
+            try:
+                target_state = json.loads((paths.unity / "state.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+            else:
+                if target_state.get("command") != "bump":
+                    raise click.ClickException("owned Bump target has an incompatible command state")
+                run_state = target_state
     active_bump = run_state.get("command") == "bump" and run_state.get("phase") != "done"
-    bump_profile = os.getenv("UNITY_BUMP_PROFILE", "").strip() or run_state.get("phase", "formalizing")
+    bump_profile = run_state.get("phase", "chunking")
     if active_bump:
         from ..forum import bump_server
+        override = os.getenv("UNITY_BUMP_PROFILE", "").strip()
+        if override and override not in bump_server.PROFILES:
+            raise click.ClickException(f"unknown bump tool profile '{override}'")
+        bump_profile = override or bump_profile
         if bump_profile not in bump_server.PROFILES:
-            raise click.ClickException(f"unknown bump tool profile '{bump_profile}'")
+            bump_profile = "chunking"
     active_formalize = run_state.get("command") == "formalize" and run_state.get("phase") != "done"
     formalize_profile = run_state.get("phase", "chunking")
     if active_formalize:
@@ -221,8 +266,8 @@ async def mcp(server, tool, args, args_file):
     diagnostic_note = ""
     if server in ("unity-forum", "forum") and active_bump:
         from ..forum import bump_server
-        shared_unity = paths.unity.resolve()
-        bump_server.configure(shared_unity / "forum" / "bump", shared_unity.parent, bump_profile)
+        shared_forum, shared_root = _bump_shared_paths(paths)
+        bump_server.configure(shared_forum, shared_root, bump_profile)
         client = Client(bump_server.build_server(bump_profile))
     elif server in ("unity-forum", "forum") and active_formalize:
         from ..forum import formalize_server
@@ -254,9 +299,9 @@ async def mcp(server, tool, args, args_file):
         if active_bump:
             from dataclasses import replace
             from ..bump_orchestrator import build_bump_mcp
-            shared_unity = paths.unity.resolve()
-            specs = build_bump_mcp(replace(paths, forum=shared_unity / "forum" / "bump",
-                                          project_root=shared_unity.parent), bump_profile)
+            shared_forum, shared_root = _bump_shared_paths(paths)
+            specs = build_bump_mcp(
+                replace(paths, forum=shared_forum, project_root=shared_root), bump_profile)
         elif active_formalize:
             from dataclasses import replace
             from ..formalize_orchestrator import build_formalize_mcp
