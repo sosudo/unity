@@ -116,11 +116,19 @@ class BumpCommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.prepare.assert_not_called()
 
-    async def test_single_author_fails_before_environment_preparation(self):
+    async def test_single_primary_can_enter_environment_preparation_and_runtime(self):
         self.roster.agents = [SimpleNamespace(name="Ada")]
+        self.roster.primary = self.roster.agents[0]
+        result = await self.invoke("v4.34.1")
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.prepare.assert_called_once()
+        self.run.assert_awaited_once_with(self.target, self.roster, max_attempts=command._attempt_limit())
+        self.assertIn("primary migration review passed", result.output)
+
+    async def test_empty_roster_still_fails_before_preparation(self):
+        self.roster.agents = []
         result = await self.invoke("v4.34.1")
         self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("at least two agents", result.output)
         self.prepare.assert_not_called()
         self.run.assert_not_awaited()
 

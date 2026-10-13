@@ -77,9 +77,9 @@ class BumpPromptContractTests(unittest.TestCase):
             self.assertIn(value, preparing)
         self.assertIn("scope-only request may use `files=[]`", self.tools())
 
-    def test_critic_can_request_precise_new_tasks_but_cannot_self_approve(self):
+    def test_primary_critic_can_request_precise_new_tasks_and_must_check_current_evidence(self):
         text = self.phase("CRITIC")
-        for value in ("Do not edit sources", "independent", "actual source/configuration/dependency diff",
+        for value in ("Do not edit sources", "configured primary", "actual source/configuration/dependency diff",
                       "request_review_repair", "returned task IDs", "reopen_task_ids",
                       "identical current passed snapshot", "Never approve with queued review issues"):
             self.assertIn(value, text)
@@ -87,6 +87,26 @@ class BumpPromptContractTests(unittest.TestCase):
             names = {tool.__name__ for tool in tools}
             self.assertEqual("request_review_repair" in names, role == "critic")
             self.assertEqual("submit_migration_verdict" in names, role == "critic")
+
+    def test_roster_has_no_reserved_reviewer_or_contributor_exclusion(self):
+        for role in ("REPAIRING", "FORMALIZING", "SOURCE_REPAIR"):
+            self.assertIn("All configured agents participate in repairs, including the primary", self.phase(role))
+        for role in ("CRITIC", "REPRESENTATION_REVIEW"):
+            text = self.phase(role)
+            for value in ("configured primary", "temporary read-only phase, not a separate roster role",
+                          "Prior contributions do not disqualify you", "including your own"):
+                self.assertIn(value, text)
+        self.assertIn("Only the configured primary during the critic phase", self.tools())
+        self.assertIn("prior contributions do not disqualify the primary", self.tools())
+        readme = (PROMPTS.parents[1] / "README.md").read_text()
+        bump_readme = readme.split("### Bump\n", 1)[1].split("### Optimize\n", 1)[0]
+        self.assertIn("A single-agent roster is supported", bump_readme)
+        for text in (self.tools(), bump_readme, *(path.read_text() for path in (PROMPTS / "bump").glob("*.md"))):
+            for value in ("reserved for independent review", "Configure at least two agents",
+                          "independent critic", "independent review", "independent diff review",
+                          "independent of contributors", "contributor self-review is prohibited",
+                          "never approve your own migration edits"):
+                self.assertNotIn(value, text)
 
     def test_source_holes_and_semantic_review_not_claimed_as_kernel_equivalence(self):
         critic = self.phase("CRITIC")

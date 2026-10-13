@@ -275,21 +275,38 @@ class VerificationTests(unittest.TestCase):
         identity = {"main_sha": "head", "scope": self.scope}
         identity["sha256"] = v.digest(identity)
         snapshot = {"snapshot_id": "s", "passed": True, "main_sha": "head", "scope": self.scope,
+                    "authors": ["Writer"],
                     "source_identity": identity, "checked_files": ["Example.lean"], "hole_audit": {"passed": True, "issues": []},
                     "patch_replay": {"passed": True}, "issues": [], "builds": [{"fresh_project": {"fresh": True},
                         "passed": True, "completed": True, "returncode": 0, "source_stable": True, "errors": []}]}
         snapshot["sha256"] = v.digest(snapshot)
         state = {"phase": "complete", "main_sha": "head", "candidates": {"c": {"status": "merged", "author": "Writer"}},
+                 "review": {"reviewer": "Writer"},
                  "workflow_changes": [{"problem": "race", "change": "serialize", "result": "passed"}]}
-        verdict = {"verdict": "approved", "author": "Critic", "snapshot_id": "s", "snapshot_sha256": snapshot["sha256"]}
+        verdict = {"verdict": "approved", "author": "Writer", "snapshot_id": "s", "snapshot_sha256": snapshot["sha256"]}
         return state, snapshot, verdict
 
-    def test_critic_must_be_independent_and_snapshot_bound(self):
+    def test_primary_contributor_review_is_accepted_and_snapshot_bound(self):
         state, snapshot, verdict = self.report_fixture()
         self.assertEqual(v.completion_report(state, snapshot, verdict)["status"], "accepted")
-        for key, value in (("author", "Writer"), ("snapshot_sha256", "stale"), ("verdict", "rejected")):
+        for key, value in (("author", "Other"), ("snapshot_id", "other"),
+                           ("snapshot_sha256", "stale"), ("verdict", "rejected")):
             with self.subTest(key=key), self.assertRaises(ValueError):
                 v.completion_report(state, snapshot, {**verdict, key: value})
+
+    def test_report_requires_controller_assigned_primary_not_verdict_author(self):
+        for reviewer in (None, "", "Other"):
+            state, snapshot, verdict = self.report_fixture()
+            state["review"] = {} if reviewer is None else {"reviewer": reviewer}
+            with self.subTest(reviewer=reviewer), self.assertRaisesRegex(ValueError, "primary review"):
+                v.completion_report(state, snapshot, verdict)
+
+    def test_primary_approval_does_not_bypass_reopened_tasks(self):
+        for field in ("reopen_task_ids", "reopen_tasks"):
+            state, snapshot, verdict = self.report_fixture()
+            verdict[field] = ["task"]
+            with self.subTest(field=field), self.assertRaisesRegex(ValueError, "primary review"):
+                v.completion_report(state, snapshot, verdict)
 
     def test_mutated_passed_snapshot_rejected(self):
         state, snapshot, verdict = self.report_fixture()

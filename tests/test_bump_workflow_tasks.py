@@ -41,6 +41,19 @@ def prepare_task(tmp_path):
     return root, directory, tid
 
 
+def prepare_environment_task(tmp_path):
+    root, directory = setup_state(tmp_path)
+    write_source(root, "A.lean", "def foo := missing\n")
+    inventory = tasks.scan_sources(root, ["A.lean"])
+    environment = {"path": None, "severity": "error", "kind": "environment",
+                   "message": "error: missing imported module"}
+    state = tasks.refresh(directory, inventory, [environment], main_sha="base", config_revision=0)
+    tid = next(iter(state["tasks"]))
+    with tasks.transaction(directory) as state:
+        state["tasks"][tid]["files"] = ["lean-toolchain", "lakefile.lean", "lake-manifest.json"]
+    return directory, inventory, tid, environment
+
+
 def git(root, *args):
     result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
@@ -211,6 +224,127 @@ class WorkflowTaskTests(unittest.TestCase):
         tasks.refresh(directory, tasks.scan_sources(root, ["A.lean"]), [diagnostic()], main_sha="base", config_revision=0)
         with self.raises(ValueError, match="budget"): tasks.claim(directory, "Bob", tid, max_attempts=1)
 
+    def test_authoritative_build_retires_exhausted_environment_task_without_resetting_history(self):
+        directory, inventory, tid, environment = prepare_environment_task(self.tmp_path)
+        for _ in range(5):
+            tasks.claim(directory, "Alice", tid)
+            tasks.release(directory, "Alice", tid, "worker closed")
+        before = tasks.load(directory)
+        state = tasks.refresh(directory, inventory, [diagnostic()], main_sha="new-main", config_revision=0,
+                              reconcile_environment=True)
+        self.assertEqual(state["tasks"][tid], {**before["tasks"][tid], "status": "complete"})
+        self.assertEqual(state["tasks"][tid]["attempts"], 5)
+        self.assertEqual(state["tasks"][tid]["diagnostics"], [environment])
+        self.assertEqual(state["events"][:-1], before["events"])
+        self.assertEqual(state["events"][-1]["kind"], "configuration_resolved")
+        self.assertEqual(state["events"][-1]["main_sha"], "new-main")
+        self.assertEqual(state["events"][-1]["config_revision"], 0)
+        repair = next(key for key, task in state["tasks"].items() if task["kind"] == "repair")
+        self.assertEqual(tasks.claim(directory, "Bob", repair)["status"], "running")
+        state = tasks.refresh(directory, inventory, [diagnostic()], main_sha="new-main", config_revision=0,
+                              reconcile_environment=True)
+        self.assertEqual(sum(event["kind"] == "configuration_resolved" for event in state["events"]), 1)
+
+    def test_environment_retirement_requires_explicit_authoritative_reconciliation(self):
+        directory, inventory, tid, _ = prepare_environment_task(self.tmp_path)
+        for flags in ({}, {"reconcile_environment": False}):
+            with self.subTest(flags=flags):
+                state = tasks.refresh(directory, inventory, [diagnostic()], main_sha="base",
+                                      config_revision=0, **flags)
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+                self.assertFalse(state["events"])
+
+    def test_remaining_pathless_errors_block_environment_retirement(self):
+        directory, inventory, tid, environment = prepare_environment_task(self.tmp_path)
+        for error in (environment, {**environment, "kind": "import"},
+                      {"severity": "error", "message": "unlocated compiler failure"}):
+            with self.subTest(error=error):
+                state = tasks.refresh(directory, inventory, [diagnostic(), error], main_sha="base",
+                                      config_revision=0, reconcile_environment=True)
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+                self.assertFalse(state["events"])
+
+    def test_pathless_warning_does_not_block_environment_retirement(self):
+        directory, inventory, tid, environment = prepare_environment_task(self.tmp_path)
+        state = tasks.refresh(directory, inventory, [diagnostic(), {**environment, "severity": "warning"}],
+                              main_sha="base", config_revision=0, reconcile_environment=True)
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+
+    def test_environment_error_reappearing_reopens_task_without_new_budget(self):
+        directory, inventory, tid, environment = prepare_environment_task(self.tmp_path)
+        tasks.claim(directory, "Alice", tid)
+        tasks.release(directory, "Alice", tid, "worker closed")
+        tasks.refresh(directory, inventory, [diagnostic()], main_sha="base", config_revision=0,
+                      reconcile_environment=True)
+        state = tasks.refresh(directory, inventory, [environment], main_sha="base", config_revision=0,
+                              reconcile_environment=True)
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        self.assertEqual(state["tasks"][tid]["attempts"], 1)
+        self.assertEqual(state["tasks"][tid]["diagnostics"], [environment])
+        self.assertEqual(sum(event["kind"] == "configuration_resolved" for event in state["events"]), 1)
+
+    def test_environment_retirement_excludes_explicit_and_unmapped_configuration_tasks(self):
+        directory, inventory, tid, environment = prepare_environment_task(self.tmp_path)
+        original = tasks.load(directory)["tasks"][tid]
+        cases = (
+            ("configuration-1", [environment], False),
+            ("command-arbitrary", [environment], False),
+            (tid, [], False),
+            (tid, [{**environment, "kind": "import"}], False),
+            (tid, [{**environment, "path": "A.lean"}], False),
+            (tid, [{**environment, "severity": "warning"}], False),
+            (tid, [environment], True),
+        )
+        for task_id, diagnostics, explicit in cases:
+            with self.subTest(task_id=task_id, diagnostics=diagnostics, explicit=explicit):
+                with tasks.transaction(directory) as state:
+                    state["tasks"] = {task_id: {**original, "task_id": task_id, "diagnostics": diagnostics}}
+                    state["config_requests"] = {task_id: {"status": "scheduled"}} if explicit else {}
+                state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                                      reconcile_environment=True)
+                self.assertEqual(state["tasks"][task_id]["status"], "pending")
+                self.assertFalse(state["events"])
+
+    def test_environment_retirement_keeps_audit_critic_and_grouped_review_tasks(self):
+        directory, inventory, tid, _ = prepare_environment_task(self.tmp_path)
+        markers = ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback")
+        for marker in markers:
+            with self.subTest(marker=marker):
+                with tasks.transaction(directory) as state:
+                    for key in markers: state["tasks"][tid].pop(key, None)
+                    state["tasks"][tid][marker] = "independent repair requirement"
+                state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                                      reconcile_environment=True)
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+                self.assertFalse(state["events"])
+
+    def test_environment_retirement_waits_for_worker_lease_and_candidate_closure(self):
+        directory, inventory, tid, _ = prepare_environment_task(self.tmp_path)
+        cases = (
+            ("running", None, {}, {}), ("submitted", None, {}, {}),
+            ("merging", None, {}, {}), ("grouped", None, {}, {}),
+            ("pending", "Alice", {}, {}),
+            ("pending", None, {"other.lean": {"task_id": tid}}, {}),
+            ("pending", None, {"lean-toolchain": {"task_id": "other-task"}}, {}),
+            ("pending", None, {}, {"c": {"task_id": tid, "status": "submitted"}}),
+            ("pending", None, {}, {"c": {"task_id": tid, "status": "merging"}}),
+        )
+        for status, owner, leases, candidates in cases:
+            with self.subTest(status=status, owner=owner, leases=leases, candidates=candidates):
+                with tasks.transaction(directory) as state:
+                    state["tasks"][tid].update(status=status, owner=owner)
+                    state.update(leases=leases, candidates=candidates)
+                state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                                      reconcile_environment=True)
+                self.assertEqual(state["tasks"][tid]["status"], status)
+                self.assertFalse(state["events"])
+        with tasks.transaction(directory) as state:
+            state["tasks"][tid].update(status="pending", owner=None)
+            state.update(leases={}, candidates={"c": {"task_id": tid, "status": "rejected"}})
+        state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                              reconcile_environment=True)
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+
     def test_reject_path_escape_and_internal_paths(self):
         tmp_path = self.tmp_path
         root, _ = setup_state(tmp_path)
@@ -244,21 +378,77 @@ class WorkflowTaskTests(unittest.TestCase):
         row = forum.record_workflow_change("Alice", "single declaration", "shared API", "build log", "group module", "build passed")
         assert tasks.load(directory)["workflow_changes"] == [row]
 
-    def test_critic_is_current_independent_and_precise(self):
+    def test_primary_review_is_current_and_precise_even_for_contributor(self):
         tmp_path = self.tmp_path
         root, directory, tid = prepare_task(tmp_path)
         forum.configure(directory, root, "critic")
         with tasks.transaction(directory) as state:
-            state["review"] = {"snapshot": {"snapshot_id": "snapshot", "main_sha": "base", "config_revision": 0}}
+            state["review"] = {"reviewer": "Alice", "snapshot": {
+                "snapshot_id": "snapshot", "main_sha": "base", "config_revision": 0}}
             state["candidates"]["c"] = {"author": "Alice", "status": "merged"}
-        with self.raises(ValueError, match="independent"):
-            forum.submit_migration_verdict("Alice", "snapshot", True, "looks good")
+        with self.raises(ValueError, match="primary"):
+            forum.submit_migration_verdict("Bob", "snapshot", True, "looks good")
         with self.raises(ValueError, match="stale"):
-            forum.submit_migration_verdict("Bob", "old", True, "looks good")
+            forum.submit_migration_verdict("Alice", "old", True, "looks good")
         with self.raises(ValueError, match="precise"):
-            forum.submit_migration_verdict("Bob", "snapshot", False, "needs work")
-        row = forum.submit_migration_verdict("Bob", "snapshot", False, "fix the reported declaration", [tid])
+            forum.submit_migration_verdict("Alice", "snapshot", False, "needs work")
+        row = forum.submit_migration_verdict("Alice", "snapshot", False, "fix the reported declaration", [tid])
         assert row["reopen_task_ids"] == [tid]
+
+    def test_primary_contributor_can_approve_passed_snapshot(self):
+        root, directory, _ = prepare_task(self.tmp_path)
+        forum.configure(directory, root, "critic")
+        snapshot = {"snapshot_id": "snapshot", "main_sha": "base", "config_revision": 0,
+                    "passed": True, "authors": ["Alice"]}
+        snapshot["sha256"] = tasks.digest(snapshot)
+        with tasks.transaction(directory) as state:
+            state["review"] = {"reviewer": "Alice", "snapshot": snapshot}
+            state["candidates"]["c"] = {"author": "Alice", "status": "merged"}
+        with patch.dict(os.environ, {"UNITY_AGENT_NAME": "Alice"}):
+            verdict = forum.submit_migration_verdict("Alice", "snapshot", True, "Checked current diff and evidence")
+        self.assertTrue(verdict["approved"])
+        self.assertEqual(verdict["snapshot_sha256"], snapshot["sha256"])
+
+    def test_review_tools_require_assigned_primary_and_bound_worker(self):
+        root, directory, _ = prepare_task(self.tmp_path)
+        forum.configure(directory, root, "critic")
+        with tasks.transaction(directory) as state:
+            state["review"] = {"reviewer": "Alice", "snapshot": {
+                "snapshot_id": "snapshot", "main_sha": "base", "config_revision": 0}}
+        calls = ((forum.submit_migration_verdict, (True, "Checked current evidence")),
+                 (forum.request_review_repair, ([], ["A.lean"], "Repair the identified API")))
+        before = tasks.load(directory)
+        with patch.dict(os.environ, {"UNITY_AGENT_NAME": "Bob"}):
+            for function, arguments in calls:
+                with self.subTest(tool=function.__name__), self.raises(ValueError, match="bound worker"):
+                    function("Alice", "snapshot", *arguments)
+                with self.subTest(tool=function.__name__), self.raises(ValueError, match="primary"):
+                    function("Bob", "snapshot", *arguments)
+        self.assertEqual(tasks.load(directory), before)
+        with tasks.transaction(directory) as state:
+            state["review"].pop("reviewer")
+        before = tasks.load(directory)
+        for function, arguments in calls:
+            with self.subTest(tool=function.__name__), self.raises(ValueError, match="primary"):
+                function("Alice", "snapshot", *arguments)
+        self.assertEqual(tasks.load(directory), before)
+
+    def test_primary_review_tools_still_reject_stale_snapshot_and_configuration(self):
+        root, directory, _ = prepare_task(self.tmp_path)
+        forum.configure(directory, root, "critic")
+        with tasks.transaction(directory) as state:
+            state["review"] = {"reviewer": "Alice", "snapshot": {
+                "snapshot_id": "snapshot", "main_sha": "base", "config_revision": 0}}
+        calls = ((forum.submit_migration_verdict, (True, "Checked current evidence")),
+                 (forum.request_review_repair, ([], ["A.lean"], "Repair the identified API")))
+        for function, arguments in calls:
+            with self.subTest(tool=function.__name__), self.raises(ValueError, match="stale"):
+                function("Alice", "old", *arguments)
+        with tasks.transaction(directory) as state:
+            state["config"]["revision"] = 1
+        for function, arguments in calls:
+            with self.subTest(tool=function.__name__), self.raises(ValueError, match="current source/configuration"):
+                function("Alice", "snapshot", *arguments)
 
     def test_submission_commits_only_worker_and_preserves_main(self):
         tmp_path = self.tmp_path
@@ -389,7 +579,9 @@ class WorkflowTaskTests(unittest.TestCase):
         tasks.refresh(directory, tasks.scan_sources(root, ["A.lean"]), [], main_sha="base", config_revision=0,
                        checked_files=["A.lean"])
         with tasks.transaction(directory) as state:
-            state["review"] = {"snapshot": {"snapshot_id": "review", "main_sha": "base", "config_revision": 0}}
+            state["review"] = {"reviewer": "Bob", "snapshot": {
+                "snapshot_id": "review", "main_sha": "base", "config_revision": 0}}
+            state["candidates"]["primary-contribution"] = {"author": "Bob", "status": "merged"}
         before = tasks.load(directory)["review"]["snapshot"]
         forum.configure(directory, root, "critic")
         chunk = next(iter(tasks.load(directory)["chunks"]))
@@ -409,7 +601,8 @@ class WorkflowTaskTests(unittest.TestCase):
         tasks.release(directory, "Alice", tid, "closed")
         with tasks.transaction(directory) as state:
             state["tasks"][tid]["status"] = "complete"
-            state["review"] = {"snapshot": {"snapshot_id": "review", "main_sha": "base", "config_revision": 0}}
+            state["review"] = {"reviewer": "Bob", "snapshot": {
+                "snapshot_id": "review", "main_sha": "base", "config_revision": 0}}
         forum.configure(directory, root, "critic")
         chunk_ids = tasks.load(directory)["tasks"][tid]["chunk_ids"]
         result = forum.request_review_repair("Bob", "review", chunk_ids, [], "Review found an incomplete repair")

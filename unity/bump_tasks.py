@@ -227,8 +227,11 @@ def _task(task_id: str, kind: str, chunks: list[str], files: list[str]) -> dict:
 
 
 def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
-            config_revision: int, checked_files=(), complete: bool = False) -> dict:
+            config_revision: int, checked_files=(), complete: bool = False,
+            reconcile_environment: bool = False) -> dict:
     rows = deepcopy(diagnostics.get("diagnostics", []) if isinstance(diagnostics, dict) else diagnostics)
+    environment_clear = reconcile_environment and not any(
+        d.get("severity", "error") == "error" and not d.get("path") for d in rows)
     with transaction(forum_dir) as state:
         if state["config"]["revision"] != config_revision:
             raise ValueError("diagnostics use a stale configuration")
@@ -284,6 +287,26 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
                 if (not review_repair and task["files"] and set(task["files"]) <= checked
                         and not set(task["files"]) & failures):
                     task["status"] = "complete"
+                elif (environment_clear and not review_repair and task["status"] != "complete"
+                        and task["kind"] == "configuration" and tid not in state.get("config_requests", {})
+                        and task.get("diagnostics") and all(
+                            d.get("severity", "error") == "error" and not d.get("path")
+                            and d.get("kind") == "environment"
+                            and tid == "command-" + digest([d.get("path"), d["kind"]])[:16]
+                            for d in task["diagnostics"])
+                        and task.get("owner") is None
+                        and not any(lease.get("task_id") == tid or path in task["files"]
+                                    for path, lease in state["leases"].items())
+                        and not any(candidate.get("task_id") == tid
+                                    and candidate.get("status") in {"submitted", "merging"}
+                                    for candidate in state["candidates"].values())):
+                    # Only an authoritative project build can retire an obsolete
+                    # environment diagnostic; compiled-file lists cannot cover
+                    # lean-toolchain or lake-manifest.json. Keep its retry history.
+                    task["status"] = "complete"
+                    _event(state, "configuration_resolved", "controller", task_id=tid,
+                           reason="Authoritative project build has no pathless error diagnostics",
+                           main_sha=main_sha, config_revision=config_revision)
             if task["kind"] not in {"repair", "command"}: continue
             modules = {p.removesuffix(".lean").replace("/", "."): p for p in state["files"]}
             imported = {modules[m] for p in task["files"] for m in state["files"].get(p, {}).get("imports", []) if m in modules}

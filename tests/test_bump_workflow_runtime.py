@@ -67,9 +67,130 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "kind": "declaration", "message": "unknown identifier in " + path}
 
     def build_result(self, diagnostics, checked=()):
-        return {"passed": not diagnostics, "completed": True, "returncode": int(bool(diagnostics)),
+        return {"passed": not diagnostics, "completed": not diagnostics, "returncode": int(bool(diagnostics)),
                 "source_stable": True, "diagnostics": diagnostics, "errors": diagnostics,
                 "checked_files": list(checked), "unmapped": []}
+
+    def exhausted_configuration_task(self):
+        error = {"path": None, "line": None, "severity": "error", "kind": "environment",
+                 "message": "error: A.lean: bad import 'Old.Module'"}
+        self.controller.refresh(self.build_result([error]))
+        state = self.controller.state()
+        tid = next(tid for tid, task in state["tasks"].items() if task["kind"] == "configuration")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid].update(attempts=5, files=["lean-toolchain", "lakefile.lean", "lake-manifest.json"])
+        return tid
+
+    def authoritative_build_result(self):
+        state = self.controller.state()
+        result = self.build_result([self.error("A.lean"), self.error("B.lean")])
+        result.update(config_revision=state["config"]["revision"],
+                      command=["lake", *state["config"].get("lake_args", ()), "--rehash", "build"],
+                      source_identity={"main_sha": self.git(self.root, "rev-parse", "HEAD"),
+                                       "scope": deepcopy(state["config"]["scope"]),
+                                       "lake_args": list(state["config"].get("lake_args", ()))})
+        return result
+
+    async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
+        tid = self.exhausted_configuration_task()
+        self.controller.max_attempts = 5
+        result = self.authoritative_build_result()
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["completed"])
+        self.assertEqual(result["returncode"], 1)
+        self.controller.refresh(result, authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertEqual(state["tasks"][tid]["attempts"], 5)
+        self.assertEqual(state["phase"], "preparing")  # no evaluation-success promotion
+        self.assertTrue(any(t["kind"] == "repair" and t["status"] == "pending"
+                            for t in state["tasks"].values()))
+        with patch.object(self.controller, "worker", new=AsyncMock()) as worker:
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice", "Bob"})
+            records = list(self.controller.workers.values())
+            for record in records:
+                self.assertEqual(self.controller.state()["tasks"][record["task_id"]]["kind"], "repair")
+            await asyncio.gather(*(record["task"] for record in records))
+            self.assertEqual(worker.await_count, 2)
+            await self.controller.reap_workers()
+
+    async def test_environment_reconciliation_rejects_partial_stale_or_unstable_builds(self):
+        tid = self.exhausted_configuration_task()
+        good = self.authoritative_build_result()
+        cases = {
+            "unmarked_stream_or_review": (good, False),
+            "unstable": ({**good, "source_stable": False}, True),
+            "missing_stability": ({k: v for k, v in good.items() if k != "source_stable"}, True),
+            "missing_identity": ({k: v for k, v in good.items() if k != "source_identity"}, True),
+            "missing_revision": ({k: v for k, v in good.items() if k != "config_revision"}, True),
+            "stale_revision": ({**good, "config_revision": -1}, True),
+            "stale_head": ({**good, "source_identity": {**good["source_identity"], "main_sha": "old"}}, True),
+            "stale_scope": ({**good, "source_identity": {**good["source_identity"], "scope": {}}}, True),
+            "stale_lake_args": ({**good, "source_identity": {**good["source_identity"], "lake_args": ["-Kold=true"]}}, True),
+            "partial_command": ({**good, "command": [*good["command"], "+A"]}, True),
+            "missing_command": ({k: v for k, v in good.items() if k != "command"}, True),
+            "interrupted": ({**good, "returncode": -15}, True),
+            "missing_returncode": ({k: v for k, v in good.items() if k != "returncode"}, True),
+            "invalid_returncode": ({**good, "returncode": True}, True),
+        }
+        for label, (result, authoritative) in cases.items():
+            with self.subTest(label=label):
+                self.controller.refresh(result, authoritative_full_build=authoritative)
+                state = self.controller.state()
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+                self.assertEqual(state["tasks"][tid]["attempts"], 5)
+
+    async def test_build_captures_configuration_revision_before_await(self):
+        result = self.authoritative_build_result()
+        result.pop("config_revision")
+        started_revision = self.controller.state()["config"]["revision"]
+        async def finish_build(_execute):
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["config"]["revision"] += 1
+            return result
+        with patch.object(self.controller, "checked_job", side_effect=finish_build):
+            actual = await self.controller.build()
+        self.assertEqual(actual["config_revision"], started_revision)
+        self.assertNotEqual(actual["config_revision"], self.controller.state()["config"]["revision"])
+
+    async def test_initial_full_build_reconciles_exhausted_configuration_before_dispatch(self):
+        tid = self.exhausted_configuration_task()
+        result = self.authoritative_build_result()
+        async def worker(*args):
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][tid]["status"], "complete")
+            self.assertEqual(state["tasks"][tid]["attempts"], 5)
+            (self.paths.unity / "stop-requested").touch()
+        with patch.object(self.controller, "prepare", new=AsyncMock()), \
+                patch.object(self.controller, "build", new=AsyncMock(return_value=result)), \
+                patch.object(self.controller, "worker", side_effect=worker) as launched:
+            self.assertFalse(await self.controller.run())
+        self.assertEqual({call.args[0].name for call in launched.await_args_list}, {"Alice", "Bob"})
+
+    async def test_scope_change_full_build_reconciles_exhausted_configuration(self):
+        tid = self.exhausted_configuration_task()
+        (self.paths.unity / "bump").mkdir(parents=True, exist_ok=True)
+        changed_scope = {**self.scope, "default_modules": {"A": "A.lean"}}
+        result = self.authoritative_build_result()
+        result["config_revision"] += 1
+        result["source_identity"]["scope"] = changed_scope
+        with patch.object(self.controller, "discover_scope", return_value=changed_scope), \
+                patch.object(self.controller, "build", new=AsyncMock(return_value=result)):
+            self.assertFalse(await self.controller.review())
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "complete")
+
+    async def test_post_integration_full_build_reconciles_exhausted_configuration(self):
+        tid, candidate, worker = self.submit()
+        config_tid = self.exhausted_configuration_task()
+        self.active_worker(tid, worker)
+        async def rebuilt():
+            return self.authoritative_build_result()
+        with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+                patch.object(bump_verification, "build", return_value=self.build_result([], checked=["A.lean"])), \
+                patch.object(self.controller, "build", side_effect=rebuilt):
+            self.assertTrue(await self.controller.integrate_ready())
+        self.assertEqual(self.controller.state()["tasks"][config_tid]["status"], "complete")
 
     def submit(self):
         state = self.controller.state()
@@ -166,10 +287,7 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.controller.recover_integration()
         self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
 
-    async def test_exact_snapshot_independent_review_and_unlimited_attempt_setting(self):
-        self.controller.max_attempts = float("inf")
-        with bump_tasks.transaction(self.paths.forum) as state:
-            state["candidates"]["writer-history"] = {"author": "Alice", "status": "merged"}
+    def passed_snapshot(self):
         identity = {"main_sha": self.base, "scope": self.scope, "files": {}}
         identity["sha256"] = bump_verification.digest(identity)
         build = self.build_result([], checked=["A.lean", "B.lean"])
@@ -180,6 +298,24 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             "builds": [build],
             "hole_audit": {"passed": True, "issues": []}, "patch_replay": {"passed": True}}
         snapshot["sha256"] = bump_verification.digest(snapshot)
+        return snapshot
+
+    async def test_every_roster_agent_including_last_can_receive_repairs(self):
+        with patch.object(self.controller, "worker", new=AsyncMock()) as worker:
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice", "Bob"})
+            await asyncio.gather(*(record["task"] for record in self.controller.workers.values()))
+            self.assertEqual({call.args[0].name for call in worker.await_args_list}, {"Alice", "Bob"})
+            self.assertEqual({call.args[3] for call in worker.await_args_list}, {"repairing"})
+            await self.controller.reap_workers()
+        self.assertFalse(self.controller.state()["leases"])
+
+    async def test_exact_snapshot_primary_review_allows_contributors_and_unlimited_attempt_setting(self):
+        self.controller.max_attempts = float("inf")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            for author in ("Alice", "Bob"):
+                state["candidates"][author + "-history"] = {"author": author, "status": "merged"}
+        snapshot = self.passed_snapshot()
         seen = []
         async def critic(agent, task_id, tree, profile, interrupt):
             seen.append((agent.name, profile))
@@ -189,11 +325,138 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(bump_verification, "source_identity", return_value=snapshot["source_identity"]), \
                 patch.object(self.controller, "worker", side_effect=critic):
             self.assertTrue(await self.controller.review())
-        self.assertEqual(seen, [("Bob", "critic")])
+        self.assertEqual(seen, [("Alice", "critic")])
         state = self.controller.state()
         self.assertEqual(state["phase"], "complete")
+        self.assertEqual(state["review"]["reviewer"], "Alice")
         self.assertEqual(state["review"]["verdict"]["snapshot_sha256"], snapshot["sha256"])
         self.assertTrue(state["final_report"])
+
+    async def test_configured_primary_reviews_regardless_of_roster_order(self):
+        alice, bob = self.roster.agents
+        charlie = SimpleNamespace(name="Charlie")
+        snapshot = self.passed_snapshot()
+        for agents in ([alice, bob], [bob, alice], [alice, bob, charlie]):
+            with self.subTest(order=[agent.name for agent in agents]):
+                roster = SimpleNamespace(agents=agents, primary=bob)
+                controller = bump_workflow.Controller(self.paths, roster, max_attempts=2)
+                seen = []
+                async def critic(agent, task_id, tree, profile, interrupt):
+                    seen.append(agent.name)
+                    forum.configure(self.paths.forum, self.root, "critic")
+                    forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], True,
+                                                   "offline configured-primary review")
+                with patch.object(bump_verification, "verify_final", return_value=deepcopy(snapshot)), \
+                        patch.object(bump_verification, "source_identity", return_value=snapshot["source_identity"]), \
+                        patch.object(controller, "worker", side_effect=critic):
+                    self.assertTrue(await controller.review())
+                self.assertEqual(seen, ["Bob"])
+                self.assertEqual(controller.state()["review"]["reviewer"], "Bob")
+
+    async def test_child_recursion_keeps_same_roster_and_primary_review_contract(self):
+        from unity import bump_recursive
+        child_root = self.temp / "child"
+        child_root.mkdir()
+        child_paths = bump_workflow.paths_for(child_root)
+        bump_tasks.initialize(child_paths.forum, child_root, run_id="child-test", base_sha=self.base,
+                              version="v4.34.1", config={"scope": self.scope})
+        with bump_tasks.transaction(child_paths.forum) as state:
+            state["candidates"]["primary-contribution"] = {"author": "Alice", "status": "merged"}
+        setup = {"phase": "ready", "pending_tasks": [], "dependencies": {}}
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["setup"] = setup
+        snapshot = self.passed_snapshot()
+        ancestors = (("offline-child", "v4.34.1"),)
+        receipts, seen = [], []
+        async def child_run(paths, roster, **options):
+            self.assertIs(paths, child_paths)
+            self.assertIs(roster, self.roster)
+            self.assertIs(roster.primary, self.roster.primary)
+            self.assertIs(options["agent_locks"], self.controller.agent_locks)
+            self.assertEqual(options["ancestors"], ancestors)
+            self.assertEqual(options["max_attempts"], self.controller.max_attempts)
+            self.assertIs(options["setup"], setup)
+            child_controller = bump_workflow.Controller(paths, roster,
+                max_attempts=options["max_attempts"], agent_locks=options["agent_locks"])
+            return await child_controller.review()
+        async def dispatch(paths, environment, *, migrate_child, **options):
+            self.assertIs(paths, self.paths)
+            receipts.append(await migrate_child(child_paths, setup, ancestors=ancestors))
+            return False
+        async def critic(controller, agent, task_id, tree, profile, interrupt):
+            seen.append((agent.name, profile))
+            forum.configure(controller.paths.forum, controller.paths.project_root, profile)
+            forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], True,
+                                           "offline child primary review")
+        with patch.object(bump_recursive, "run_children", side_effect=dispatch), \
+                patch.object(bump_workflow, "run", side_effect=child_run), \
+                patch.object(self.controller, "commit_setup"), \
+                patch.object(bump_workflow, "task_worktree", return_value=child_root), \
+                patch.object(bump_workflow.Controller, "worker", new=critic), \
+                patch.object(bump_verification, "verify_final", return_value=snapshot), \
+                patch.object(bump_verification, "source_identity", return_value=snapshot["source_identity"]):
+            await asyncio.wait_for(self.controller.prepare(), timeout=5)
+        self.assertEqual(seen, [("Alice", "critic")])
+        self.assertEqual(receipts, [{"build_passed": True, "review_approved": True,
+                                    "verified_commit": self.base, "snapshot_id": snapshot["snapshot_id"]}])
+        child = bump_tasks.load(child_paths.forum)
+        self.assertEqual(child["phase"], "complete")
+        self.assertEqual(child["review"]["reviewer"], self.roster.primary.name)
+
+    async def test_primary_review_exhaustion_never_falls_back_to_another_agent(self):
+        snapshot = self.passed_snapshot()
+        with patch.object(bump_verification, "verify_final", return_value=snapshot), \
+                patch.object(self.controller, "worker", new=AsyncMock()) as worker:
+            with self.assertRaisesRegex(ValueError, "attempts ended"):
+                await self.controller.review()
+        self.assertEqual([call.args[0].name for call in worker.await_args_list], ["Alice", "Alice"])
+        self.assertNotEqual(self.controller.state()["phase"], "complete")
+        self.assertNotIn("final_report", self.controller.state())
+
+    async def test_singleton_primary_can_repair_and_review(self):
+        alice = self.roster.primary
+        roster = SimpleNamespace(agents=[alice], primary=alice)
+        controller = bump_workflow.Controller(self.paths, roster, max_attempts=2)
+        snapshot = self.passed_snapshot()
+        seen = []
+        async def worker(agent, task_id, tree, profile, interrupt):
+            seen.append((agent.name, profile))
+            if profile == "critic":
+                forum.configure(self.paths.forum, self.root, "critic")
+                forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], True,
+                                               "offline singleton-primary review")
+        with patch.object(controller, "worker", side_effect=worker), \
+                patch.object(bump_verification, "verify_final", return_value=snapshot), \
+                patch.object(bump_verification, "source_identity", return_value=snapshot["source_identity"]):
+            controller.launch_ready()
+            self.assertEqual(set(controller.workers), {"Alice"})
+            await controller.workers["Alice"]["task"]
+            await controller.reap_workers()
+            self.assertTrue(await controller.review())
+        self.assertEqual(seen, [("Alice", "repairing"), ("Alice", "critic")])
+
+    async def test_primary_review_rejection_reopens_only_named_task(self):
+        snapshot = self.passed_snapshot()
+        tasks = self.controller.state()["tasks"]
+        target = next(tid for tid, task in tasks.items() if task["files"] == ["A.lean"])
+        sibling = next(tid for tid, task in tasks.items() if task["files"] == ["B.lean"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            for task in state["tasks"].values():
+                task["status"] = "complete"
+            state["candidates"]["primary-contribution"] = {"author": "Alice", "status": "merged"}
+        async def critic(agent, *args):
+            self.assertEqual(agent.name, "Alice")
+            forum.configure(self.paths.forum, self.root, "critic")
+            forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], False,
+                                           "offline targeted repair finding", [target])
+        with patch.object(bump_verification, "verify_final", return_value=snapshot), \
+                patch.object(self.controller, "worker", side_effect=critic):
+            self.assertFalse(await self.controller.review())
+        state = self.controller.state()
+        self.assertEqual(state["phase"], "repairing")
+        self.assertEqual(state["tasks"][target]["status"], "pending")
+        self.assertEqual(state["tasks"][sibling]["status"], "complete")
+        self.assertNotIn("final_report", state)
 
     async def test_review_detects_source_change_after_critic(self):
         snapshot = {"snapshot_id": "offline-snapshot", "main_sha": self.base, "config_revision": 0,
@@ -279,3 +542,4 @@ class CompilerFixtureTests(unittest.IsolatedAsyncioTestCase):
             report = bump_verification.completion_report(state)
             self.assertEqual(report["status"], "accepted")
             self.assertEqual([role for _, role in called], ["repairing", "critic"])
+            self.assertEqual([author for author, _ in called], [roster.primary.name, roster.primary.name])

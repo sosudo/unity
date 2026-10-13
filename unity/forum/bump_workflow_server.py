@@ -307,9 +307,8 @@ def request_review_repair(author: str, snapshot_id: str, chunk_ids: list[str], f
             raise ValueError("critic snapshot is stale")
         if snapshot.get("main_sha") != state["main_sha"] or snapshot.get("config_revision") != state["config"]["revision"]:
             raise ValueError("critic snapshot does not bind current source/configuration")
-        contributors = {c["author"].casefold() for c in state["candidates"].values() if c["status"] == "merged"}
-        contributors.update(a.casefold() for a in snapshot.get("authors", []))
-        if author.casefold() in contributors: raise ValueError("critic must be independent of migration contributors")
+        if not review.get("reviewer") or author != review["reviewer"]:
+            raise ValueError("migration review requires the controller-assigned primary")
         members = sorted(set(chunk_ids))
         if not set(members) <= state["chunks"].keys(): raise ValueError("unknown review chunk")
         paths = sorted({tasks.relative_path(path) for path in files} | {state["chunks"][cid]["path"] for cid in members})
@@ -349,9 +348,8 @@ def submit_migration_verdict(author: str, snapshot_id: str, approved: bool, reas
             raise ValueError("critic snapshot is stale")
         if snapshot.get("main_sha") != state["main_sha"] or snapshot.get("config_revision") != state["config"]["revision"]:
             raise ValueError("critic snapshot does not bind current source/configuration")
-        contributors = {c["author"].casefold() for c in state["candidates"].values() if c["status"] == "merged"}
-        contributors.update(a.casefold() for a in snapshot.get("authors", []))
-        if author.casefold() in contributors: raise ValueError("critic must be independent of migration contributors")
+        if not review.get("reviewer") or author != review["reviewer"]:
+            raise ValueError("migration review requires the controller-assigned primary")
         queued = {tid for tid, task in state["tasks"].items() if task.get("review_snapshot_id") == snapshot_id
                   and task["status"] not in {"complete", "grouped"}}
         if queued and (approved or not queued <= set(reopen)):

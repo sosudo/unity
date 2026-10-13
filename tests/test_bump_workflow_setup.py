@@ -573,7 +573,7 @@ class RecursiveWorkflowTests(SetupFixture):
             return {"build_passed": True, "review_approved": False,
                     "verified_commit": self.git("rev-parse", "HEAD", root=paths.project_root)}
         with patch.object(setup, "prepare_environment", return_value={"phase": "ready", "schema": deps.SCHEMA}), \
-             self.assertRaisesRegex(ValueError, "independent review"):
+                self.assertRaisesRegex(ValueError, "primary review"):
             asyncio.run(recursive.run_children(self.paths, environment, migrate_child=migrate))
         self.assertFalse((self.root / "vendor/dep").exists())
         registry = json.loads((self.paths.unity / "bump/dependencies.json").read_text())

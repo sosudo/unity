@@ -122,7 +122,7 @@ async def run_children(parent_paths: Paths, environment: dict, *, migrate_child,
                 if (not isinstance(result, dict) or result.get("build_passed") is not True
                         or result.get("review_approved") is not True or not result.get("verified_commit")):
                     task["status"] = "blocked"
-                    raise dependencies.DependencyError("dependency migration lacks a successful build and independent review")
+                    raise dependencies.DependencyError("dependency migration lacks a successful build and primary review")
                 task["verification"] = result
                 task["status"] = "verified"
                 dependencies._write_json(_registry_path(parent_paths), registry)

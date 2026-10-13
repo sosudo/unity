@@ -157,11 +157,8 @@ class Controller:
         self.initial_build = None
         self.build_cancel = Event()
         self.diagnostics_queue = asyncio.Queue()
-        # Reserve an actual independent reviewer, not a contributor wearing a
-        # different role label. A one-agent roster cannot meet this contract.
-        if len(roster.agents) < 2:
-            raise ValueError("Bump requires a writer and an independent reviewer")
-        self.writers = roster.agents[:-1]
+        # All agents repair; the configured primary takes the final review turn.
+        self.writers = roster.agents
 
     def state(self):
         from . import bump_tasks
@@ -187,13 +184,30 @@ class Controller:
         return bump_setup.discover_scope(root, modules=config.get("modules", ()),
             project_scope=config.get("project_scope", "build"), lake_args=config.get("lake_args", ()))
 
-    def refresh(self, result):
+    def refresh(self, result, *, authoritative_full_build=False):
         from . import bump_tasks
         state = self.state()
+        main_sha = git(self.paths.project_root, "rev-parse", "HEAD")
+        identity = result.get("source_identity") or {}
+        returncode = result.get("returncode")
+        # Only a finished full-project build can resolve pathless blockers.
+        # `completed` means `passed` in build results: declaration failures must
+        # not prevent environment reconciliation. Streams/review aggregates opt out.
+        reconcile_environment = (
+            authoritative_full_build
+            and type(returncode) is int and returncode >= 0
+            and result.get("source_stable") is True
+            and result.get("config_revision") == state["config"]["revision"]
+            and identity.get("main_sha") == main_sha == state["main_sha"]
+            and identity.get("scope") == state["config"].get("scope", {})
+            and identity.get("lake_args") == list(state["config"].get("lake_args", ()))
+            and result.get("command") == ["lake", *state["config"].get("lake_args", ()), "--rehash", "build"]
+        )
         bump_tasks.refresh(self.paths.forum, self.inventory(state), result.get("diagnostics", []),
-                           main_sha=git(self.paths.project_root, "rev-parse", "HEAD"),
+                           main_sha=main_sha,
                            config_revision=state["config"]["revision"],
-                           checked_files=result.get("checked_files", ()), complete=False)
+                           checked_files=result.get("checked_files", ()), complete=False,
+                           reconcile_environment=reconcile_environment)
         with bump_tasks.transaction(self.paths.forum) as state:
             # Large compiler output belongs in artifacts, not duplicated task state.
             state["last_build"] = {key: value for key, value in result.items()
@@ -213,7 +227,8 @@ class Controller:
                 return bump_verification.build(self.paths.project_root, modules=modules,
                     lake_args=state["config"].get("lake_args", ()), scope=state["config"].get("scope"),
                     on_output=on_output if stream else None)
-        return await self.checked_job(execute)
+        result = await self.checked_job(execute)
+        return {**result, "config_revision": state["config"]["revision"]}
 
     async def checked_job(self, function, *args, **kwargs):
         """Stop markers remain observable during captured builds/integration."""
@@ -241,12 +256,13 @@ class Controller:
         tools_prompt = prompt_root / "BUMP_WORKFLOW_TOOLS.md"
         if tools_prompt.exists():
             system += "\n\n" + tools_prompt.read_text()
-        system += "\nYou are " + agent.name + ". Team: " + ", ".join(a.name for a in self.roster.agents)
+        system += ("\nYou are " + agent.name + ". Team: " + ", ".join(a.name for a in self.roster.agents)
+                   + ". Primary: " + self.roster.primary.name + ".")
         instruction = (f"Your task is {task_id}. Read bump_task and bump_brief, communicate useful findings, "
                        "and work only on leased files. Submit a repair or yield with a concrete blocker. "
                        "Do not run Unity internals, edit controller state, or invoke another pipeline.")
         if profile == "critic":
-            instruction = "Independently review the current snapshot and full migration diff; submit_migration_verdict."
+            instruction = "As primary, review the current snapshot and full migration diff; submit_migration_verdict."
         async with self.agent_locks[agent.name]:
             return await spawn(agent, system, instruction, tree,
                 mcp_servers(self.paths, profile), own_process_group=True,
@@ -662,7 +678,7 @@ class Controller:
             if reconcile:
                 if result["accepted"] and configuration:
                     await self.prepare()
-                self.refresh(await self.build())
+                self.refresh(await self.build(), authoritative_full_build=True)
             return True
         return False
 
@@ -683,14 +699,14 @@ class Controller:
                 current["setup"] = setup
                 current["review"] = {}
             write_json(self.paths.unity / "bump" / "setup.json", setup)
-            self.refresh(await self.build())
+            self.refresh(await self.build(), authoritative_full_build=True)
             return False
         snapshot = await self.checked_job(bump_verification.verify_final, self.paths.project_root,
             base_sha=state["base_sha"], scope=state["config"]["scope"],
             lake_args=state["config"].get("lake_args", ()), artifacts_dir=self.paths.artifacts,
             config_revision=state["config"]["revision"])
         with bump_tasks.transaction(self.paths.forum) as current:
-            current["review"] = {"snapshot": snapshot, "verdicts": []}
+            current["review"] = {"snapshot": snapshot, "reviewer": self.roster.primary.name, "verdicts": []}
         if not snapshot.get("passed"):
             repairable = self.queue_audit_repairs(snapshot.get("issues", []))
             if any(row.get("severity") == "error" for row in snapshot.get("diagnostics", [])):
@@ -699,52 +715,48 @@ class Controller:
             if repairable:
                 return False
             raise ValueError("Final Bump verification did not pass; inspect stored build/audit evidence")
-        authors = {row["author"].casefold() for row in state["candidates"].values() if row.get("status") == "merged"}
-        critics = [agent for agent in self.roster.agents if agent.name.casefold() not in authors]
-        if not critics:
-            raise ValueError("No independent critic remains; migration is built but unreviewed")
+        agent = self.roster.primary
         phase(self.paths, "critic")
-        for agent in critics:
-            attempt = 0
-            while attempt < self.max_attempts:
-                attempt += 1
-                if stopped(self.paths):
-                    return False
-                tree = task_worktree(self.paths, agent.name + "-critic", "critic")
-                interrupt = asyncio.Event()
-                worker = asyncio.create_task(self.worker(agent, "critic", tree, "critic", interrupt))
-                try:
-                    while not worker.done():
-                        if stopped(self.paths):
-                            return False
-                        await asyncio.sleep(0.1)
-                    await worker
-                finally:
-                    await stop_worker(worker, interrupt)
-                current = self.state()
-                verdict = current.get("review", {}).get("verdict")
-                if not verdict:
-                    continue
-                if verdict.get("approved"):
-                    identity = await asyncio.to_thread(bump_verification.source_identity, self.paths.project_root,
-                        lake_args=current["config"].get("lake_args", ()), scope=current["config"]["scope"])
-                    if identity != snapshot["source_identity"]:
-                        raise ValueError("Sources/configuration changed during critic review")
-                    prospective = {**current, "phase": "complete"}
-                    receipt = bump_verification.persist_report(self.paths, prospective, snapshot, verdict, accepted=True)
-                    with bump_tasks.transaction(self.paths.forum) as accepted:
-                        accepted["phase"] = "complete"
-                        accepted["final_report"] = receipt["artifacts"]
-                    phase(self.paths, "complete")
-                    return True
-                if verdict.get("reopen_task_ids"):
-                    with bump_tasks.transaction(self.paths.forum) as changed:
-                        for key in verdict["reopen_task_ids"]:
-                            changed["tasks"][key]["status"] = "pending"
-                            changed["tasks"][key]["critic_feedback"] = verdict
-                    phase(self.paths, "repairing")
-                    return False
-                raise ValueError("Independent migration review requested changes; inspect verdict")
+        attempt = 0
+        while attempt < self.max_attempts:
+            attempt += 1
+            if stopped(self.paths):
+                return False
+            tree = task_worktree(self.paths, agent.name + "-critic", "critic")
+            interrupt = asyncio.Event()
+            worker = asyncio.create_task(self.worker(agent, "critic", tree, "critic", interrupt))
+            try:
+                while not worker.done():
+                    if stopped(self.paths):
+                        return False
+                    await asyncio.sleep(0.1)
+                await worker
+            finally:
+                await stop_worker(worker, interrupt)
+            current = self.state()
+            verdict = current.get("review", {}).get("verdict")
+            if not verdict:
+                continue
+            if verdict.get("approved"):
+                identity = await asyncio.to_thread(bump_verification.source_identity, self.paths.project_root,
+                    lake_args=current["config"].get("lake_args", ()), scope=current["config"]["scope"])
+                if identity != snapshot["source_identity"]:
+                    raise ValueError("Sources/configuration changed during critic review")
+                prospective = {**current, "phase": "complete"}
+                receipt = bump_verification.persist_report(self.paths, prospective, snapshot, verdict, accepted=True)
+                with bump_tasks.transaction(self.paths.forum) as accepted:
+                    accepted["phase"] = "complete"
+                    accepted["final_report"] = receipt["artifacts"]
+                phase(self.paths, "complete")
+                return True
+            if verdict.get("reopen_task_ids"):
+                with bump_tasks.transaction(self.paths.forum) as changed:
+                    for key in verdict["reopen_task_ids"]:
+                        changed["tasks"][key]["status"] = "pending"
+                        changed["tasks"][key]["critic_feedback"] = verdict
+                phase(self.paths, "repairing")
+                return False
+            raise ValueError("Primary migration review requested changes; inspect verdict")
         raise ValueError("Critic attempts ended without acceptance")
 
     def queue_audit_repairs(self, issues):
@@ -800,7 +812,7 @@ class Controller:
                     self.launch_ready()
                 await self.reap_workers()
                 await asyncio.sleep(0.1)
-            self.refresh(await self.initial_build)
+            self.refresh(await self.initial_build, authoritative_full_build=True)
             self.initial_build = None
             while not stopped(self.paths):
                 await self.reap_workers()

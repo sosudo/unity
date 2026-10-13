@@ -106,11 +106,14 @@ class WorkflowRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("prepare", events)
             events.append("build")
             return self.successful_build()
+        def refresh(result, *, authoritative_full_build=False):
+            self.assertTrue(authoritative_full_build)
+            events.append("refresh")
         with patch.object(self.controller, "integrate", side_effect=integrate), \
              patch.object(self.controller, "reap_workers", new=AsyncMock()), \
              patch.object(self.controller, "prepare", side_effect=prepare), \
              patch.object(self.controller, "build", side_effect=build), \
-             patch.object(self.controller, "refresh", side_effect=lambda _: events.append("refresh")):
+             patch.object(self.controller, "refresh", side_effect=refresh):
             self.assertTrue(await self.controller.integrate_ready(reconcile=True))
         self.assertEqual(events, ["integrate", "prepare", "build", "refresh"])
 

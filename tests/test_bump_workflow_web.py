@@ -92,16 +92,20 @@ class CompilerBumpWebTests(unittest.TestCase):
         self.assertNotIn("faithfulness", node)
         self.assertEqual(bump_tasks.load(self.forum), before)
 
-    def test_review_counter_requires_same_main_config_and_verdict_snapshot(self):
+    def test_review_counter_requires_primary_and_same_main_config_snapshot(self):
         state = bump_tasks.load(self.forum)
         state["phase"] = "complete"
-        state["review"] = {"snapshot": {"snapshot_id": "s", "sha256": "hash", "main_sha": "base",
+        state["candidates"]["primary-contribution"] = {"status": "merged", "author": "Alice"}
+        state["review"] = {"reviewer": "Alice", "snapshot": {"snapshot_id": "s", "sha256": "hash", "main_sha": "base",
             "config_revision": 0, "passed": True},
-            "verdict": {"snapshot_id": "s", "snapshot_sha256": "hash", "approved": True, "author": "Bob"}}
+            "verdict": {"snapshot_id": "s", "snapshot_sha256": "hash", "approved": True, "author": "Alice"}}
         self.assertEqual(web._compiler_bump_metrics(state)["acceptance"], "recorded_complete")
         for mutation in (lambda s: s.update(main_sha="new"),
                          lambda s: s["config"].update(revision=1),
-                         lambda s: s["review"]["verdict"].update(snapshot_sha256="other")):
+                         lambda s: s["review"]["verdict"].update(snapshot_sha256="other"),
+                         lambda s: s["review"]["verdict"].update(author="Bob"),
+                         lambda s: s["review"].pop("reviewer"),
+                         lambda s: s["review"].update(reviewer="")):
             changed = deepcopy(state)
             mutation(changed)
             self.assertEqual(web._compiler_bump_metrics(changed)["acceptance"], "provisional")
@@ -168,6 +172,11 @@ class CompilerBumpWebTests(unittest.TestCase):
     def test_frontend_separates_compiler_from_legacy_formalization_rendering(self):
         self.assertIn("af.schema === 'compiler-migration-v2'", web.APP_HTML)
         self.assertIn("Bump compiler workflow", web.APP_HTML)
+        compiler_panel = web.APP_HTML.split("Bump compiler workflow", 1)[1].split(
+            "else if (af.run_id", 1)[0]
+        self.assertIn("final project build and primary review", compiler_panel)
+        self.assertIn("final build & primary review", compiler_panel)
+        self.assertNotIn("independent", compiler_panel)
         self.assertIn("else if (af.run_id && (['formalize', 'autoformalize']", web.APP_HTML)
         self.assertIn("graphSchema === 'compiler-migration-v2'", web.DAG_HTML)
         self.assertIn("scheduling dependencies", web.DAG_HTML)

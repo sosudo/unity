@@ -621,8 +621,6 @@ async def _run_bump(source_paths, continue_, version=None, dependency_pins=None,
         names = [agent.name.strip().casefold() for agent in roster.agents]
         if not names or any(not name for name in names) or len(names) != len(set(names)):
             raise click.ClickException("bump agent names must be nonempty and unique ignoring case")
-        if len(names) < 2:
-            raise click.ClickException("bump requires at least two agents for independent migration review")
         if continue_:
             paths = bump_setup.resume(source_paths, version, dependency_pins,
                                       project_scope=project_scope, modules=modules, lake_args=lake_args)
@@ -644,7 +642,7 @@ async def _run_bump(source_paths, continue_, version=None, dependency_pins=None,
         bump_setup._json(source_paths.unity / "state.json",
                              {"command": "bump", "phase": "done" if final_state["phase"] == "complete" else final_state["phase"]})
         if final_state["phase"] == "complete":
-            click.echo("bump complete: required target builds and independent migration review passed")
+            click.echo("bump complete: required target builds and primary migration review passed")
         else:
             click.echo("bump stopped: partial work and exact verification evidence retained")
     except BaseException:

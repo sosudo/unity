@@ -2,7 +2,7 @@
 
 This module deliberately does not import the old native preservation contract.
 Compilation is machine evidence; whether an API/proof edit is reasonable remains
-an independent review of the actual diff, not a cross-version AST equality test.
+the primary's review of the actual diff, not a cross-version AST equality test.
 """
 from __future__ import annotations
 
@@ -428,7 +428,7 @@ def verify_final(root: Path, *, base_sha: str, scope: dict, lake_args=(), artifa
               "passed": not issues, "issues": issues, "builds": builds, "hole_audit": audit,
               "patch_replay": replay, "checked_files": sorted(checked),
               "diagnostics": [row for item in builds for row in item["diagnostics"]],
-              "qualification": "Target compilation and source/patch evidence; independent critic judges the diff, not AST equivalence."}
+              "qualification": "Target compilation and source/patch evidence; the primary reviews the diff, not AST equivalence."}
     result["sha256"] = digest(result)
     return result
 
@@ -512,13 +512,12 @@ def completion_report(state: dict, snapshot: dict | None = None, verdict=None) -
             raise ValueError("accepted migration snapshot is not current main")
         if state.get("config") is not None and snapshot.get("config_revision") != state["config"].get("revision"):
             raise ValueError("accepted migration snapshot is not current configuration")
-        authors = {str(c.get("author", c.get("owner", ""))).casefold() for c in state.get("candidates", {}).values() if c.get("status") in {"merged", "accepted"}}
-        authors.update(str(author).casefold() for author in snapshot.get("authors", []))
         if (not verdict or verdict.get("verdict") != "approved" or not verdict.get("author")
-                or verdict["author"].casefold() in authors or verdict.get("snapshot_id") != snapshot.get("snapshot_id")
+                or not review.get("reviewer") or verdict["author"] != review["reviewer"]
+                or verdict.get("snapshot_id") != snapshot.get("snapshot_id")
                 or verdict.get("snapshot_sha256") != snapshot.get("sha256")
                 or verdict.get("reopen_task_ids") or verdict.get("reopen_tasks")):
-            raise ValueError("accepted migration requires independent review bound to the identical snapshot")
+            raise ValueError("accepted migration requires primary review bound to the identical snapshot")
     return {"schema_version": 1, "pipeline": "bump", "run_id": state.get("run_id"),
             "status": "accepted" if accepted else "incomplete", "phase": state.get("phase"),
             "project_changes": {"base_sha": state.get("base_sha", snapshot.get("base_sha")),
@@ -530,7 +529,7 @@ def completion_report(state: dict, snapshot: dict | None = None, verdict=None) -
                 "not_checked": ["cross-version semantic equivalence", "whole transitive axiom certification", "interactive UI behavior"]},
             "workflow_changes": deepcopy(state.get("workflow_changes", [])),
             "snapshot_id": snapshot.get("snapshot_id"), "snapshot_sha256": snapshot.get("sha256"),
-            "qualification": "Compilation is machine evidence. Diff reasonableness is an independent critic judgment. Inherited holes are not newly proved."}
+            "qualification": "Compilation is machine evidence. Diff reasonableness is the primary's review judgment. Inherited holes are not newly proved."}
 
 
 def persist_report(paths, state: dict, snapshot=None, verdict=None, *, accepted=None) -> dict:

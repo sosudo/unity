@@ -236,7 +236,8 @@ def _compiler_bump_metrics(state: dict) -> dict:
     snapshot, verdict = review.get("snapshot", {}), review.get("verdict", {})
     current = bool(snapshot and snapshot.get("main_sha") == state.get("main_sha")
                    and snapshot.get("config_revision") == state.get("config", {}).get("revision"))
-    verdict_current = bool(current and verdict
+    verdict_current = bool(current and verdict and review.get("reviewer")
+                           and verdict.get("author") == review["reviewer"]
                            and verdict.get("snapshot_id") == snapshot.get("snapshot_id")
                            and verdict.get("snapshot_sha256") == snapshot.get("sha256"))
     return {"schema": state["schema"], "phase": state.get("phase"), "revision": state.get("revision"),
@@ -1789,7 +1790,7 @@ function showPanel(id) {
       + field('kind', c.type)
       + field('source', c.lean_file + (c.lean_decl_lines?.[0] ? ':' + c.lean_decl_lines.join('–') : ''))
       + field('compiler observation', c.compiler_status)
-      + field('acceptance', c.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot' : c.acceptance === 'outside_scope' ? 'Outside current build scope' : 'Provisional: final build and independent review still required')
+      + field('acceptance', c.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot' : c.acceptance === 'outside_scope' ? 'Outside current build scope' : 'Provisional: final build and primary review still required')
       + field('group', c.group_id)
       + field('assignments', (assignment.tasks || []).map(t => t.task_id + ' · ' + t.status + ' · attempt ' + (t.attempts || 0)).join('; ') || 'none')
       + field('owners', (assignment.owners || []).join(', ') || 'none')
@@ -3107,7 +3108,7 @@ async function loadOverview() {
         strategies = Object.values(af.strategies || {}).filter(x => x.status === 'active'),
         requests = Object.values(af.config_requests || {});
       h += '<div class="sechead">Bump compiler workflow<span class="r">phase ' + esc(af.phase) + ' · revision ' + esc(af.revision) + '</span></div>';
-      h += '<div class="item">' + (afm.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot; dashboard reads stored evidence.' : 'Integrated repairs and clean chunks are provisional until the final project build and independent critic review.') + '</div>';
+      h += '<div class="item">' + (afm.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot; dashboard reads stored evidence.' : 'Integrated repairs and clean chunks are provisional until the final project build and primary review.') + '</div>';
       h += '<div class="grid"><section><h2>current configuration</h2><div class="item">Lean ' + esc(af.target_version) + '<div class="who mono">main ' + esc((af.main_sha || '').slice(0,12)) + ' · config revision ' + esc(config.revision) + '</div><div class="who">Lake options: ' + ((config.lake_args || []).map(esc).join(' ') || 'none') + '</div></div>' +
         '<div class="item">' + chunks.length + ' declaration / command chunks<div class="who">' + esc(countText(afm.chunks)) + '</div></div>' +
         '<div class="item">' + esc(countText(afm.tasks)) + '<div class="who">' + esc(afm.writer_leases || 0) + ' exclusive file writer leases</div></div></section>';
@@ -3115,7 +3116,7 @@ async function loadOverview() {
         '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div class="who">' + esc(x.kind) + ' · owner ' + esc(x.owner || 'none') + ' · attempt ' + esc(x.attempts || 0) + '</div><div>' + (x.files || []).map(esc).join(', ') + '</div><div class="who">chunks: ' + (x.chunk_ids || []).map(esc).join(', ') + '</div><div class="who">scheduling dependencies: ' + ((x.dependencies || []).map(esc).join(', ') || 'none') + '</div></div>').join('') : '<div class="empty">no repair assignments yet</div>') + '</section>';
       h += '<section><h2>repair candidates</h2>' + (candidates.length ? candidates.slice(-8).reverse().map(x =>
         '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div class="who">' + esc(x.author) + ' · ' + esc(x.task_id) + ' · ' + esc((x.commit_sha || '').slice(0,12)) + '</div><div>' + esc(x.notes || x.error || '') + '</div>' + artifactButton((x.artifact || {}).artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
-      h += '<section><h2>final build & independent review</h2><div class="item">' + (snapshot.snapshot_id ? esc(snapshot.snapshot_id) : 'not checked yet') + '<div class="who">build / audit: ' + (snapshot.passed ? 'passed' : 'not passed') + ' · snapshot ' + ((afm.review || {}).current ? 'current' : 'missing or stale') + '</div><div class="who">critic: ' + esc(verdict.author || 'none') + ' · ' + (verdict.approved ? 'approved' : verdict.snapshot_id ? 'changes requested' : 'not reviewed') + ' · verdict ' + ((afm.review || {}).verdict_current ? 'current' : 'missing or stale') + '</div><div>' + esc(verdict.reasoning || '') + '</div></div>' +
+      h += '<section><h2>final build & primary review</h2><div class="item">' + (snapshot.snapshot_id ? esc(snapshot.snapshot_id) : 'not checked yet') + '<div class="who">build / audit: ' + (snapshot.passed ? 'passed' : 'not passed') + ' · snapshot ' + ((afm.review || {}).current ? 'current' : 'missing or stale') + '</div><div class="who">critic: ' + esc(verdict.author || 'none') + ' · ' + (verdict.approved ? 'approved' : verdict.snapshot_id ? 'changes requested' : 'not reviewed') + ' · verdict ' + ((afm.review || {}).verdict_current ? 'current' : 'missing or stale') + '</div><div>' + esc(verdict.reasoning || '') + '</div></div>' +
         Object.entries(af.final_report || {}).map(([kind, record]) => '<div class="item">' + esc(kind) + artifactButton(record.artifact_id) + '</div>').join('') + '</section>';
       h += '<section><h2>coordination</h2>' + strategies.map(x => '<div class="item"><b>' + esc(x.title || x.strategy_id) + '</b><div>' + esc(x.description) + '</div><div class="who">' + esc(x.task_id) + ' · owner ' + esc(x.owner || 'none') + ' · assistants ' + (x.assistants || []).map(esc).join(', ') + '</div></div>').join('') +
         (af.events || []).slice(-8).reverse().map(x => '<div class="item"><b>' + esc(x.kind) + '</b><div>' + esc(x.content || x.reason || '') + '</div><div class="who">' + esc(x.author || '') + '</div></div>').join('') + '</section>';
