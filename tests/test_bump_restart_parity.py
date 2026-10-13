@@ -27,8 +27,25 @@ def semantic_source(function):
     return ast.dump(normalized_tree(inspect.getsource(function)), include_attributes=False)
 
 
+def ordinary_worker_tree(tree):
+    """Ignore only Bump's explicit fatal cleanup rethrow, not ordinary handling."""
+    class RemoveFatalCleanupRethrow(ast.NodeTransformer):
+        def visit_Try(self, node):
+            self.generic_visit(node)
+            node.handlers = [handler for handler in node.handlers if not (
+                isinstance(handler.type, ast.Name)
+                and handler.type.id == 'SpawnCleanupError'
+                and handler.name is None
+                and len(handler.body) == 1
+                and isinstance(handler.body[0], ast.Raise)
+                and handler.body[0].exc is None
+                and handler.body[0].cause is None)]
+            return node
+    return RemoveFatalCleanupRethrow().visit(tree)
+
+
 def worker_exit_blocks(module):
-    tree = normalized_tree(inspect.getsource(module.run_formalizing_runtime))
+    tree = ordinary_worker_tree(normalized_tree(inspect.getsource(module.run_formalizing_runtime)))
     expected = ast.dump(ast.parse("for name, running in list(tasks.items()):\n    pass").body[0].target)
     blocks = [node for node in ast.walk(tree) if isinstance(node, ast.For)
               and ast.dump(node.target) == expected
@@ -67,8 +84,10 @@ class BumpRestartParityTests(unittest.TestCase):
 
     def test_retry_decisions_and_backoff_remain_copied_from_formalize(self):
         self.assertEqual(bump_spawn._PERMANENT, formalize_spawn._PERMANENT)
-        for name in ("_max_retries", "_retry_sleep", "_give_up", "_idle_guard",
-                     "_terminate_process_group"):
+        # Bump's process terminator now additionally observes bounded actual
+        # closure before reporting/accounting; test_bump_spawn_cleanup exercises
+        # that Bump-only guard. Transport retry decisions/backoff remain identical.
+        for name in ("_max_retries", "_retry_sleep", "_give_up", "_idle_guard"):
             with self.subTest(function=name):
                 self.assertEqual(semantic_source(getattr(bump_spawn, name)),
                                  semantic_source(getattr(formalize_spawn, name)))
@@ -84,6 +103,18 @@ class BumpRestartParityTests(unittest.TestCase):
         # worker and lets ordinary eligibility reschedule it. A successful empty
         # turn still records a yield through the unchanged Formalize path.
         self.assertEqual(worker_exit_blocks(bump_runtime), worker_exit_blocks(formalize_runtime))
+
+    def test_cleanup_abort_normalization_ignores_only_the_explicit_fatal_reraise(self):
+        def normalized_handler(handler):
+            tree = ast.parse('try:\n    work()\n' + handler + '\nexcept Exception:\n    ordinary_failure()')
+            return ast.dump(ordinary_worker_tree(tree), include_attributes=False)
+        self.assertNotIn('SpawnCleanupError', normalized_handler('except SpawnCleanupError:\n    raise'))
+        for handler in ('except SpawnCleanupError as error:\n    raise',
+                        'except SpawnCleanupError:\n    raise error',
+                        'except SpawnCleanupError:\n    log()\n    raise',
+                        'except OtherCleanupError:\n    raise'):
+            with self.subTest(handler=handler):
+                self.assertIn('CleanupError', normalized_handler(handler))
 
     def test_removed_transport_quarantine_cannot_reappear(self):
         source = Path(bump_runtime.__file__).read_text()

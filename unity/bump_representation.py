@@ -315,7 +315,7 @@ async def representation_review_turn(agent, roster, paths, task_id: str,
     from . import bump_worktree as worktree
     from .bump_orchestrator import _preamble, build_bump_mcp, stop_requested
     from .bump_runtime import _agent_runtime_env, _formal_worktree
-    from .bump_spawn import spawn
+    from .bump_spawn import SpawnCleanupError, spawn
 
     if stop_requested(paths.project_root):
         return {"status": "stopped"}
@@ -361,6 +361,9 @@ async def representation_review_turn(agent, roster, paths, task_id: str,
     except asyncio.CancelledError:
         error = "representation review interrupted"
         interrupted = True
+        raise
+    except SpawnCleanupError as exc:
+        error = f"{type(exc).__name__}: {exc}"
         raise
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"

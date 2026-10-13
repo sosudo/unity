@@ -270,10 +270,12 @@ class MigrationBaselineTests(unittest.TestCase):
                         migration.require_inputs(root / "target", value)
 
 
-def migration_contract(value):
+def migration_contract(value, *, assignments=None):
+    assignments = assignments or {}
     return migration.seal({"version": 3, "migration_policy": 1, "project_baseline": value,
         "bindings": {}, "targets": {}, "adopted_outputs": {},
-        "requirements": [{"id": "requirement-" + key, "anchor_ids": ["anchor-" + key]}
+        "requirements": [{"id": "requirement-" + key, "anchor_ids": ["anchor-" + key],
+                          "tasks": list(assignments.get(key, []))}
                          for key in value["migration"]["original_index"]["occurrences"]],
         "migration_correspondences": {key: {"module": row["module"],
             "declaration": row["display_name"], "name_ast": row["name_ast"]}
@@ -430,10 +432,11 @@ class DeclarationRepairProgressTests(unittest.TestCase):
 class DeclarationAssignmentBoundaryTests(unittest.TestCase):
     def refinement(self, rows):
         value = baseline(rows=rows)
-        contract = migration_contract(value)
         keys = sorted(value["migration"]["original_index"]["occurrences"])
+        contract = migration_contract(value, assignments={key: ["group"] for key in keys})
         previous = {key: {"task_id": key, "migration": {"kind": "declaration",
-            "original_ids": [key], "path": "Fixture.lean", "module": "Fixture"}} for key in keys}
+            "original_ids": [key], "path": "Fixture.lean", "module": "Fixture"},
+            "requirement_ids": ["requirement-" + key]} for key in keys}
         state = {"formalization": {"contract": contract, "requirements": contract["requirements"]},
                  "formal_tasks": {"group": {"task_id": "group",
                      "requirement_ids": ["requirement-" + key for key in keys]}}}
@@ -443,10 +446,11 @@ class DeclarationAssignmentBoundaryTests(unittest.TestCase):
 
     def test_refinement_cannot_turn_unrelated_same_file_declarations_into_mutual_group(self):
         value = baseline(rows=[declaration("Example", "first"), declaration("Example", "second")])
-        contract = migration_contract(value)
         keys = sorted(value["migration"]["original_index"]["occurrences"])
+        contract = migration_contract(value, assignments={key: ["whole-module"] for key in keys})
         previous = {key: {"task_id": key, "migration": {"kind": "declaration",
-            "original_ids": [key], "path": "Fixture.lean", "module": "Fixture"}} for key in keys}
+            "original_ids": [key], "path": "Fixture.lean", "module": "Fixture"},
+            "requirement_ids": ["requirement-" + key]} for key in keys}
         state = {"formalization": {"contract": contract, "requirements": contract["requirements"]},
                  "formal_tasks": {"whole-module": {"task_id": "whole-module",
                      "requirement_ids": ["requirement-" + key for key in keys]}}}

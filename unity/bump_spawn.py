@@ -7,11 +7,13 @@ helpers are independent copies, not the solve/prove launch implementation.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import signal
 import sys
 import tempfile
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 
@@ -26,6 +28,10 @@ CompletionCallback = Callable[[str | None], Awaitable[str | None]]
 
 class _UnsuccessfulTurnError(RuntimeError):
     """A terminal session failure, not a transient transport exception to retry."""
+
+
+class SpawnCleanupError(RuntimeError):
+    """Owned execution could not be closed; never reschedule it as a retry."""
 
 
 class _CompletionCallbackError(Exception):
@@ -107,6 +113,8 @@ _BUMP_MCP_ENV_KEYS = (
     "UNITY_BUMP_PROJECT_ROOT",
     "UNITY_BUMP_TASK_ID",
     "UNITY_BUMP_PROFILE",
+    "UNITY_BUMP_WORKFLOW",
+    "UNITY_BUMP_LAKE_ARGS",
     "UNITY_BUMP_DRAFT_PATH",
     "UNITY_AGENT_NAME",
     "TMPDIR",
@@ -183,19 +191,26 @@ def _bump_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[st
     is scoped to the pipeline API already delegated to this worker, not to an
     arbitrary server or any tools it might advertise in a future release.
     """
-    from .forum.bump_server import PROFILE_TOOLS
+    forum_args = mcp_servers.get("unity-forum", {}).get("args", [])
+    workflow = len(forum_args) >= 2 and forum_args[:2] == ["-m", "unity.forum.bump_workflow_server"]
+    # The legacy module is also a supported state-dispatching facade. Its two
+    # new-only phases expose the workflow catalog even through that transport.
+    if workflow or phase in {"preparing", "repairing"}:
+        from .forum.bump_workflow_server import PROFILE_TOOLS
+    else:
+        from .forum.bump_server import PROFILE_TOOLS
 
     if phase not in PROFILE_TOOLS:
         raise ValueError(f"unknown bump MCP phase {phase!r}")
     catalogs = {
         "unity-forum": tuple(tool.__name__ for tool in PROFILE_TOOLS[phase]),
         "lean-lsp": _BUMP_LEAN_INSPECTION_TOOLS
-            + (("lean_multi_attempt",) if phase == "formalizing" else ()),
+            + (("lean_multi_attempt",) if phase in {"formalizing", "repairing"} else ()),
         "axle": _BUMP_AXLE_INSPECTION_TOOLS
-            + (_BUMP_AXLE_PROOF_TOOLS if phase == "formalizing" else ()),
+            + (_BUMP_AXLE_PROOF_TOOLS if phase in {"formalizing", "repairing"} else ()),
         "aristotle": _BUMP_ARISTOTLE_INSPECTION_TOOLS
             + (("aristotle_submit", "aristotle_result", "aristotle_cancel")
-               if phase == "formalizing" else ()),
+               if phase in {"formalizing", "repairing"} else ()),
     }
     # lean_build is intentionally not authorized: workers must not initiate the
     # controller's project-wide build through either native MCP or the bridge.
@@ -213,7 +228,8 @@ def _bump_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[st
             trusted = (
                 cfg.get("command") == sys.executable
                 and isinstance(args, list) and len(args) == 8
-                and args[:3] == ["-m", "unity.forum.bump_server", "--forum-dir"]
+                and args[:3] == ["-m", "unity.forum.bump_workflow_server" if workflow
+                                else "unity.forum.bump_server", "--forum-dir"]
                 and args[4] == "--project-root" and args[6:] == ["--profile", phase]
             )
         else:
@@ -295,31 +311,185 @@ def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tup
     pid_file = directory / f"{label}-group.pid"
     wrapper.write_text(
         f"#!{sys.executable}\n"
-        "import os, sys\n"
+        "import os, sys, json, pathlib, subprocess, time, uuid\n"
         "os.setsid()\n"
-        f"open({str(pid_file)!r}, 'w').write(str(os.getpid()))\n"
+        f"breadcrumb = pathlib.Path({str(pid_file.with_suffix('.receipt'))!r})\n"
+        "breadcrumb.unlink(missing_ok=True)\n"
+        f"pid_path = pathlib.Path({str(pid_file)!r})\n"
+        "pid_pending = pid_path.with_suffix('.pid.tmp')\n"
+        "pid_pending.write_text(str(os.getpid()))\n"
+        "os.replace(pid_pending, pid_path)\n"
+        "receipt_dir = os.environ.get('UNITY_BUMP_PROCESS_RECEIPTS')\n"
+        "if receipt_dir:\n"
+        "    destination = pathlib.Path(receipt_dir)\n"
+        "    if not destination.is_absolute() or destination.resolve() != destination:\n"
+        "        raise RuntimeError('owned process receipts need an exact absolute directory')\n"
+        "    destination.mkdir(parents=True, exist_ok=True)\n"
+        "    pid = os.getpid()\n"
+        "    ticks = None\n"
+        "    if sys.platform.startswith('linux'):\n"
+        "        ticks = int(pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])\n"
+        "        birth = None\n"
+        "    else:\n"
+        "        birth = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, check=True).stdout.strip()\n"
+        "        if not birth:\n"
+        "            raise RuntimeError('owned process birth observation unavailable')\n"
+        f"    receipt = dict(schema_version=1, pid=pid, pgid=os.getpgrp(), sid=os.getsid(0), start_ticks=ticks, birth=birth, cwd=os.getcwd(), executable={str(executable)!r}, created_at=time.time())\n"
+        "    receipt_path = destination / (str(pid) + '-' + uuid.uuid4().hex + '.json')\n"
+        "    with os.fdopen(os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as handle:\n"
+        "        json.dump(receipt, handle, sort_keys=True)\n"
+        "        handle.flush()\n"
+        "        os.fsync(handle.fileno())\n"
+        "    pending = breadcrumb.with_suffix('.receipt.tmp')\n"
+        "    pending.write_text(str(receipt_path))\n"
+        "    os.replace(pending, breadcrumb)\n"
         f"os.execv({str(executable)!r}, [{str(executable)!r}, *sys.argv[1:]])\n"
     )
     wrapper.chmod(0o700)
     return wrapper, pid_file
 
 
-async def _terminate_process_group(pid_file: Path | None) -> None:
+def _record_process_group_closed(pid_file: Path, pgid: int) -> None:
+    """Retain immutable birth evidence and append closure only after observation."""
+    breadcrumb = pid_file.with_suffix(".receipt")
+    if not breadcrumb.exists():
+        return  # Older/non-workflow spawns did not request persistent receipts.
+    path = Path(breadcrumb.read_text().strip())
+    if not path.is_absolute() or path.resolve() != path or not path.is_file():
+        raise RuntimeError("owned process receipt path changed")
+    data = path.read_bytes()
+    receipt = json.loads(data)
+    if receipt.get("pgid") != pgid or receipt.get("pid") != pgid or receipt.get("sid") != pgid:
+        raise RuntimeError("owned process receipt identity mismatch")
+    closed = path.with_suffix(".closed.json")
+    value = {"receipt_sha256": hashlib.sha256(data).hexdigest(), "pgid": pgid,
+             "closed_at": time.time(), "group_empty": True}
+    try:
+        fd = os.open(closed, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        prior = json.loads(closed.read_text())
+        if prior.get("receipt_sha256") != value["receipt_sha256"] or not prior.get("group_empty"):
+            raise RuntimeError("owned process closure receipt mismatch")
+        return
+    with os.fdopen(fd, "w") as handle:
+        json.dump(value, handle, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+_PROCESS_GROUP_CLOSE_TIMEOUT = 1.0
+_PROCESS_GROUP_POLL_SECONDS = 0.01
+
+
+def _process_group_alive(pgid: int) -> bool:
+    """Observe running group members; zombies are closed, not retained work."""
+    proc = Path('/proc')
+    if sys.platform.startswith('linux') and proc.is_dir():
+        for directory in proc.iterdir():
+            if not directory.name.isdecimal():
+                continue
+            try:
+                fields = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except PermissionError:
+                # Inaccessible unrelated processes must not obscure our group.
+                try:
+                    if os.getpgid(int(directory.name)) != pgid:
+                        continue
+                except ProcessLookupError:
+                    continue
+                raise
+            if int(fields[2]) == pgid and fields[0] not in {'Z', 'X'}:
+                return True
+        return False
+    # POSIX hosts without procfs still need an observed non-zombie drain.
+    import subprocess
+    result = subprocess.run(['ps', '-e', '-o', 'pgid=,stat='],
+                            capture_output=True, text=True, check=True, timeout=0.25)
+    return any(int(fields[0]) == pgid and fields[1][0] not in {'Z', 'X'}
+               for line in result.stdout.splitlines() if len(fields := line.split()) >= 2)
+
+
+def _process_group_births(pgid: int) -> set[tuple[int, int]] | None:
+    """Linux birth anchors keep delayed signals off a reused numeric PGID."""
+    if not sys.platform.startswith('linux'):
+        return None
+    members = set()
+    for directory in Path('/proc').iterdir():
+        if not directory.name.isdecimal():
+            continue
+        try:
+            fields = (directory / 'stat').read_text().rsplit(')', 1)[1].split()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except PermissionError:
+            try:
+                if os.getpgid(int(directory.name)) != pgid:
+                    continue
+            except ProcessLookupError:
+                continue
+            raise
+        if int(fields[2]) == pgid and fields[0] not in {'Z', 'X'}:
+            members.add((int(directory.name), int(fields[19])))
+    return members
+
+
+def _capture_process_group_births(pid_file: Path | None):
+    if pid_file is None or os.name != 'posix':
+        return None
+    try:
+        return _process_group_births(int(pid_file.read_text().strip()))
+    except FileNotFoundError:
+        return None
+    except Exception as exc:
+        raise SpawnCleanupError('owned process group birth could not be verified') from exc
+
+
+async def _terminate_process_group(pid_file: Path | None, *, captured_births=None) -> None:
+    try:
+        await _terminate_process_group_checked(pid_file, captured_births=captured_births)
+    except Exception as exc:
+        raise SpawnCleanupError('owned process group closure could not be verified') from exc
+
+
+async def _terminate_process_group_checked(pid_file: Path | None, *, captured_births=None) -> None:
     if pid_file is None or os.name != "posix":
         return
     try:
         pgid = int(pid_file.read_text().strip())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return
+    if pgid <= 1 or pgid == os.getpgrp():
+        raise RuntimeError('refusing to terminate an unowned process group')
+    anchors = (_process_group_births(pgid) if captured_births is None
+               else set(captured_births))
     for sig, delay in ((signal.SIGTERM, 0.25), (signal.SIGKILL, 0.0)):
+        members = _process_group_births(pgid)
+        if anchors is not None and members is not None:
+            if not anchors.intersection(members):
+                if members:
+                    raise RuntimeError('process group birth identity changed during cleanup')
+                break
+            # New children belong to this still-birth-anchored live group.
+            anchors.update(members)
+        if not _process_group_alive(pgid):
+            break
         try:
             os.killpg(pgid, sig)
         except ProcessLookupError:
             break
-        except PermissionError:
-            break
         if delay:
             await asyncio.sleep(delay)
+    # Signal delivery is asynchronous, including SIGKILL. Do not publish spawn
+    # completion or allow replacement until actual owned work has stopped.
+    deadline = asyncio.get_running_loop().time() + _PROCESS_GROUP_CLOSE_TIMEOUT
+    while _process_group_alive(pgid):
+        if asyncio.get_running_loop().time() >= deadline:
+            # Retain the breadcrumb if closure cannot be certified.
+            raise TimeoutError('owned process group did not stop after termination')
+        await asyncio.sleep(_PROCESS_GROUP_POLL_SECONDS)
+    _record_process_group_closed(pid_file, pgid)
     pid_file.unlink(missing_ok=True)
 
 
@@ -715,6 +885,14 @@ _BUMP_CODEX_MCP_NOTE = (
 
 
 def _codex_mcp_note(profile: str, phase: str | None = None) -> str:
+    if phase in {"preparing", "repairing", "critic", "retrospective"}:
+        return (
+            "\n\nUse your phase's advertised Bump Forum tools. If native tools are unavailable, "
+            "use `unity mcp unity-forum <tool> '<json-args>'`. Read bump_brief and bump_task; "
+            "submit changed code with submit_repair and review with submit_migration_verdict. "
+            "Do not import Unity internals or write controller state. A transport denial is a "
+            "configuration blocker, not permission to bypass tool permissions."
+        )
     if phase == "chunking":
         return (
             "\n\nCHUNKING MCP TOOLS: Use only the chunking tools described in your role prompt. "
@@ -732,10 +910,57 @@ def _codex_mcp_note(profile: str, phase: str | None = None) -> str:
 _CODEX_INTERRUPT_REQUEST_TIMEOUT = 10.0
 _CODEX_INTERRUPT_DRAIN_TIMEOUT = 20.0
 _CODEX_CLOSE_TIMEOUT = 15.0
+_CODEX_CANCELLED_CLOSE_TIMEOUT = 0.25
+_CODEX_NOTIFICATION_DRAIN_TIMEOUT = 1.0
+
+
+async def _drain_spawn_cleanup(cleanup) -> None:
+    """Finish mandatory cleanup before cancellation/accounting can escape."""
+    task = asyncio.create_task(cleanup)
+    interrupted = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            interrupted = True
+    # A closure failure takes precedence over cancellation: otherwise the
+    # controller could regard retained execution as a cancelled/eligible worker.
+    task.result()
+    if interrupted:
+        raise asyncio.CancelledError
+
+
+async def _close_codex_bounded(codex) -> None:
+    # Already-cancelled workers must not start another full 15s close wait:
+    # the controller's hard cancellation drain is only 10s. Still start SDK
+    # close so its transport/router can wake registered notification queues.
+    current = asyncio.current_task()
+    timeout = (_CODEX_CANCELLED_CLOSE_TIMEOUT if current and current.cancelling()
+               else _CODEX_CLOSE_TIMEOUT)
+    try:
+        await asyncio.wait_for(codex.close(), timeout=timeout)
+    except (asyncio.TimeoutError, Exception):
+        pass
+
+
+async def _cleanup_codex_attempt(codex, interrupt_task, pid_file) -> None:
+    births = None
+    try:
+        births = _capture_process_group_births(pid_file)
+        if interrupt_task is not None:
+            interrupt_task.cancel()
+            await asyncio.gather(interrupt_task, return_exceptions=True)
+        # Leave slow close cancellable. Shield only mandatory group cleanup,
+        # so a cancelled worker cannot retain its server or delay the controller
+        # by another full close timeout.
+        await _close_codex_bounded(codex)
+    finally:
+        await _drain_spawn_cleanup(_terminate_process_group(pid_file, captured_births=births))
 
 
 async def _codex_notifications(
-    handle, codex, idle_timeout: float, stream_started: asyncio.Event
+    handle, codex, idle_timeout: float, stream_started: asyncio.Event,
+    pid_file: Path | None = None,
 ):
     """Yield Codex notifications without cancelling its blocking queue waiter.
 
@@ -765,14 +990,41 @@ async def _codex_notifications(
             pending = None
             yield note
     finally:
-        if pending is not None and not pending.done():
-            try:
-                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-            except (asyncio.TimeoutError, Exception):
-                pass
-        if pending is not None:
-            await asyncio.gather(pending, return_exceptions=True)
-        await stream.aclose()
+        aborting = pending is not None and not pending.done()
+        births = None
+        try:
+            if aborting:
+                births = _capture_process_group_births(pid_file)
+                await _close_codex_bounded(codex)
+        finally:
+            async def drain_stream() -> None:
+                failure = None
+                try:
+                    if aborting:
+                        # Terminate owned transport/children before draining the
+                        # SDK's shielded, thread-backed Queue.get waiter. Never
+                        # unregister its queue while that read is still blocked.
+                        await _terminate_process_group(pid_file, captured_births=births)
+                except SpawnCleanupError as exc:
+                    failure = exc
+                if pending is not None:
+                    done, _ = await asyncio.wait(
+                        {pending}, timeout=_CODEX_NOTIFICATION_DRAIN_TIMEOUT,
+                    )
+                    if not done:
+                        # Keep the queue registered and its reader intact. A
+                        # retained transport is fatal, not an unbounded cleanup
+                        # wait or permission to replace this worker.
+                        pending.add_done_callback(
+                            lambda task: None if task.cancelled() else task.exception()
+                        )
+                        raise SpawnCleanupError('Codex notification reader did not drain') from failure
+                    await asyncio.gather(pending, return_exceptions=True)
+                await stream.aclose()
+                if failure is not None:
+                    raise failure
+
+            await _drain_spawn_cleanup(drain_stream())
 
 
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
@@ -929,7 +1181,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 successful = False
                 failure_detail = ""
                 async for note in _codex_notifications(
-                    handle, codex, idle_timeout, stream_started
+                    handle, codex, idle_timeout, stream_started, pid_file
                 ):
                     _log(agent.name, note, cwd)
                     if _stop_requested(cwd):
@@ -982,6 +1234,8 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             raise
         except _CompletionCallbackError as exc:
             raise exc.error
+        except SpawnCleanupError:
+            raise
         except _UnsuccessfulTurnError:
             raise
         except Exception as e:
@@ -994,15 +1248,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             await asyncio.sleep(wait)
         finally:
             turn_finished.set()
-            if interrupt_task is not None:
-                interrupt_task.cancel()
-                await asyncio.gather(interrupt_task, return_exceptions=True)
-            # close() can hang after an aborted turn; don't let cleanup wedge the agent.
-            try:
-                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            await _terminate_process_group(pid_file)
+            await _cleanup_codex_attempt(codex, interrupt_task, pid_file)
 
 
 async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
@@ -1029,6 +1275,11 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
     ) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
+    pid_file = None
+    if own_process_group and os.name == "posix":
+        group_dir = Path(tempfile.mkdtemp(prefix="unity-antigravity-group-"))
+        wrapped, pid_file = _process_group_wrapper(Path(agy), group_dir, "antigravity")
+        cmd[0] = str(wrapped)
     if roots:
         # AG has no per-session editor/path hook. Its native terminal sandbox is
         # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
@@ -1053,7 +1304,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
             env=_agent_env(agent, env_overrides=env_overrides),
-            start_new_session=own_process_group and os.name == "posix")
+            start_new_session=False)  # The wrapper records birth immediately after setsid.
 
         async def _lines():
             while True:
@@ -1134,14 +1385,12 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
             _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
             await asyncio.sleep(wait)
         finally:
-            if proc.returncode is None:
-                if own_process_group and os.name == "posix":
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
+            try:
+                if pid_file is not None:
+                    await _drain_spawn_cleanup(_terminate_process_group(pid_file))
+                elif proc.returncode is None:
                     proc.kill()
+            finally:
                 await proc.wait()
 
 
@@ -1225,6 +1474,7 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
     t0 = time.monotonic()
+    cleanup_failed = False
     try:
         if _stop_requested(cwd):
             return None
@@ -1233,7 +1483,7 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             env_overrides = {**(env_overrides or {}), "UNITY_BUMP_PROFILE": phase}
         # Other bump phases keep their own prompts, without proof-development catalogs.
         if (mcp_profile == "bump"
-                and (env_overrides or {}).get("UNITY_BUMP_PROFILE", phase) == "formalizing"):
+                and (env_overrides or {}).get("UNITY_BUMP_PROFILE", phase) in {"formalizing", "repairing"}):
             system_prompt += "\n\n" + _bump_external_tools_prompt(mcp_servers)
         if mcp_profile == "bump":
             worker_env = dict(os.environ)
@@ -1253,5 +1503,9 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
         elif agent.backend == "antigravity":
             kwargs["mcp_profile"] = mcp_profile
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
+    except SpawnCleanupError:
+        cleanup_failed = True
+        raise
     finally:
-        _write_run_log(agent, cwd, time.monotonic() - t0, log_context)
+        if not cleanup_failed:
+            _write_run_log(agent, cwd, time.monotonic() - t0, log_context)

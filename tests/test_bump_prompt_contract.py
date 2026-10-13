@@ -1,4 +1,4 @@
-"""Bump prompt/tool repair contracts, without model or Lean calls."""
+"""Compiler-driven Bump prompt contracts; no model, provider or Lean calls."""
 
 import asyncio
 import inspect
@@ -6,122 +6,104 @@ from pathlib import Path
 import re
 import unittest
 
-from unity.forum import bump_server as server
+from unity.forum import bump_workflow_server as server
 
 
 PROMPTS = Path(__file__).resolve().parents[1] / "unity/prompts"
+ROLES = ("PREPARING", "REPAIRING", "CRITIC", "RETROSPECTIVE")
 
 
 class BumpPromptContractTests(unittest.TestCase):
     def phase(self, name):
         return (PROMPTS / "bump" / f"{name}.md").read_text()
 
-    def tools(self, name):
-        return (PROMPTS / f"BUMP_{name}_TOOLS.md").read_text()
+    def tools(self):
+        return (PROMPTS / "BUMP_WORKFLOW_TOOLS.md").read_text()
 
-    def test_critic_catalog_matches_actual_optional_repair_signature(self):
-        text = self.tools("CRITIC")
-        match = re.search(r"`submit_formalization_verdict\(([^)]*)\)`", text)
-        self.assertIsNotNone(match)
-        documented = [part.strip() for part in match.group(1).split(",")]
-        parameters = inspect.signature(server.submit_formalization_verdict).parameters
-        self.assertEqual([part.rstrip("?") for part in documented], list(parameters))
-        for part in documented:
-            parameter = parameters[part.rstrip("?")]
-            self.assertEqual(part.endswith("?"), parameter.default is not inspect.Parameter.empty)
-        self.assertIsNone(parameters["representation_repairs"].default)
+    def test_every_current_phase_has_prompt_and_exact_registered_catalog(self):
+        self.assertEqual(set(server.PROFILES), {name.lower() for name in ROLES})
+        for role in ROLES:
+            self.assertTrue(self.phase(role).strip())
+            actual = {tool.name for tool in asyncio.run(server.build_server(role.lower()).list_tools())}
+            expected = {tool.__name__ for tool in server.PROFILE_TOOLS[role.lower()]}
+            self.assertEqual(actual, expected)
 
-    def test_controller_repair_permission_is_not_an_agent_tool(self):
-        for profile in ("formalizing", "critic"):
-            with self.subTest(profile=profile):
-                names = {tool.name for tool in asyncio.run(server.build_server(profile).list_tools())}
-                self.assertNotIn("prepare_formal_worktree", names)
-                self.assertNotIn("begin_manifest_repair_attempt", names)
-                self.assertNotIn("repair_available_to", names)
-                self.assertTrue({"bump_task", "bump_brief"}.issubset(names))
-                for unavailable in ("submit_solution_candidate", "reopen_solving", "propose_source_fix"):
-                    self.assertNotIn(unavailable, names)
+    def test_tools_document_all_advertised_names_and_no_nonexistent_calls(self):
+        names = {tool.__name__ for tools in server.PROFILE_TOOLS.values() for tool in tools}
+        for name in names:
+            self.assertRegex(self.tools(), r"\b" + re.escape(name) + r"\b")
+        for text in (self.tools(), *(self.phase(role) for role in ROLES)):
+            for name in re.findall(r"`([a-z_]+)\(", text):
+                self.assertIn(name, names)
 
-    def test_focused_repair_prompts_preserve_source_and_acceptance_boundaries(self):
-        formal = self.phase("FORMALIZING")
-        catalog = self.tools("FORMALIZING")
-        for text in (formal, catalog):
-            for required in ("manifest_repairs", "output_manifest", "reopen_representations",
-                             "cleared", "independent", "source"):
-                self.assertIn(required, text)
-        self.assertIn("Finalization checks current submission blockers before staging or committing", formal)
-        self.assertIn("not a submitted candidate", formal)
-        self.assertIn("There is no generated solution paper or informal-solving phase", formal)
-        self.assertIn("Do not edit the supplied source", formal)
-        self.assertIn("submit_source_repair", formal)
-        self.assertIn("Original source bytes remain unchanged", formal)
-        self.assertIn("Submission preflight runs before staging/committing", catalog)
-        self.assertIn("not an accepted proof or a semantic approval", catalog)
+    def test_documented_full_signatures_follow_current_forum(self):
+        for name in ("request_repair_scope", "request_configuration_change", "submit_repair",
+                     "record_workflow_change", "request_review_repair", "submit_migration_verdict"):
+            match = re.search(r"`" + name + r"\(([^)]*)\)`", self.tools())
+            self.assertIsNotNone(match)
+            documented = [part.strip().rstrip("?") for part in match.group(1).split(",")]
+            self.assertEqual(documented, list(inspect.signature(getattr(server, name)).parameters))
 
-    def test_critic_requests_do_not_replace_independent_source_repair_review(self):
+    def test_controller_actions_are_not_worker_tools(self):
+        forbidden = {"prepare_formal_worktree", "persist_report", "runtime_advance",
+                     "finalize_formalization", "submit_formalization_verdict", "validate_chunks",
+                     "submit_solution_candidate", "reopen_solving", "propose_source_fix"}
+        for tools in server.PROFILE_TOOLS.values():
+            self.assertFalse(forbidden.intersection(tool.__name__ for tool in tools))
+
+    def test_new_prompts_do_not_instruct_legacy_ledger_or_another_pipeline(self):
+        forbidden = ("output_manifest", "manifest_repairs", "reopen_representations", "repair_reviews",
+                     "submit_source_repair", "submit_formalization_verdict", "solve_task(", "solve_brief(",
+                     "Original source bytes remain unchanged", "Do not edit the supplied source")
+        for text in (self.tools(), *(self.phase(role) for role in ROLES)):
+            for value in forbidden:
+                self.assertNotIn(value, text)
+
+    def test_repair_prompt_tracks_all_declarations_and_incremental_progress(self):
+        text = self.phase("REPAIRING")
+        for value in ("Every source declaration", "including declarations that already compile",
+                      "Only chunks needing work", "leased files", "one active production writer",
+                      "multi-declaration", "submit_repair", "unrelated declaration", "failed import"):
+            self.assertIn(value, text)
+
+    def test_configuration_and_dependency_resolution_are_controller_owned(self):
+        for role in ("PREPARING", "REPAIRING"):
+            text = self.phase(role)
+            self.assertIn("request_configuration_change", text)
+            self.assertIn("lake update", text)
+        preparing = self.phase("PREPARING")
+        for value in ("actual Lean/Lake executables", "recursively migrate dependencies", "vendor/",
+                      "license and provenance", "need not be recursively changed", "supplemental modules"):
+            self.assertIn(value, preparing)
+        self.assertIn("scope-only request may use `files=[]`", self.tools())
+
+    def test_critic_can_request_precise_new_tasks_but_cannot_self_approve(self):
+        text = self.phase("CRITIC")
+        for value in ("Do not edit sources", "independent", "actual source/configuration/dependency diff",
+                      "request_review_repair", "returned task IDs", "reopen_task_ids",
+                      "identical current passed snapshot", "Never approve with queued review issues"):
+            self.assertIn(value, text)
+        for role, tools in server.PROFILE_TOOLS.items():
+            names = {tool.__name__ for tool in tools}
+            self.assertEqual("request_review_repair" in names, role == "critic")
+            self.assertEqual("submit_migration_verdict" in names, role == "critic")
+
+    def test_source_holes_and_semantic_review_not_claimed_as_kernel_equivalence(self):
         critic = self.phase("CRITIC")
-        catalog = self.tools("CRITIC")
-        for text in (critic, catalog):
-            for required in ("representation_repairs", "reopen_tasks", "lean_reopen",
-                             "output_manifest", "representation", "reason", "independent"):
-                self.assertIn(required, text)
-        self.assertIn("every adopted", catalog)
-        self.assertIn("repair_reviews", catalog)
-        self.assertIn("Do not edit Lean/source during review", critic)
-        self.assertIn("or review a correction you just", critic)
-        self.assertNotIn("Leave `repair_reviews` empty", critic)
-        self.assertNotIn("empty `repair_reviews`", catalog)
+        for value in ("do not mechanically certify cross-version semantic equivalence",
+                      "Existing holes and axioms", "new holes", "failed modules",
+                      "warnings", "unperformed checks"):
+            self.assertIn(value, critic)
+        self.assertIn("not a fresh formalization", self.phase("REPAIRING"))
 
-    def test_no_solve_only_tool_in_changed_prompt_catalogs(self):
-        for role in ("FORMALIZING", "CRITIC"):
-            for text in (self.phase(role), self.tools(role)):
-                with self.subTest(role=role, prefix=text[:60]):
-                    for unavailable in ("solve_task(", "solve_brief(", "solve_status(",
-                                        "reopen_solving", "propose_source_fix", "submit_solution_candidate"):
-                        self.assertNotIn(unavailable, text)
-                    self.assertNotIn("accepted paper candidate", text)
-
-    def test_critic_documents_nested_repair_step_contract(self):
-        critic = self.phase("CRITIC")
-        catalog = self.tools("CRITIC")
-        for text in (critic, catalog):
-            with self.subTest(prefix=text[:60]):
-                self.assertIn("repair_steps", text)
-                self.assertRegex(text, r"1(?:--|–)8 nonblank")
-                self.assertIn("1000 characters", text)
-                self.assertIn("not_checked", text)
-                self.assertIn("invent", text.lower())
-                self.assertIn("source obligation", text)
-        self.assertIn("Legacy reviews that predate this field", critic)
-        self.assertIn('"repair_steps": []', critic)
-        self.assertRegex(critic, r'"status": "fail"[\s\S]*?"repair_steps": \[')
-        self.assertIn("concrete missing\nconstruction or proof obligation", critic)
-        self.assertIn("defaults to `[]` only for legacy reviews", catalog)
-        self.assertRegex(catalog, r'"status": "fail"[\s\S]*?"repair_steps": \[')
-
-    def test_bumpr_consumes_critic_feedback_without_self_approval(self):
-        formal = self.phase("FORMALIZING")
-        catalog = self.tools("FORMALIZING")
-        for text in (formal, catalog):
-            with self.subTest(prefix=text[:60]):
-                self.assertIn("critic_feedback", text)
-                self.assertIn("direct", text)
-                self.assertIn("upstream", text)
-                self.assertIn("repair_steps", text)
-                self.assertIn("provenance", text)
-                self.assertIn("revalidate", text)
-                self.assertIn("Compilation", text)
-                self.assertIn("independent critic", text)
-                self.assertIn("notes", text)
-        self.assertIn("map every applicable repair", formal)
-        self.assertIn("actual declaration(s), dependency resolution(s)", formal)
-        self.assertIn("candidate-rejection blocker", formal)
-        self.assertIn("do not wait indefinitely", formal)
-        self.assertIn("do not resolve the critic's semantic finding", formal)
-        self.assertIn("map every\n  applicable `repair_steps` item", catalog)
-        self.assertIn("verdict/snapshot/reviewed-main provenance", catalog)
-        self.assertIn("concrete candidate-rejection blocker", catalog)
-        self.assertIn("resubmit promptly", catalog)
+    def test_separate_project_and_workflow_records_remain_evidence_backed(self):
+        for role in ROLES:
+            text = self.phase(role)
+            self.assertTrue("record_workflow_change" in text or "workflow-change" in text)
+        retrospective = self.phase("RETROSPECTIVE")
+        for value in ("two records separate", "concrete problem/evidence", "observed result",
+                      "Do not reopen", "do not invent success"):
+            self.assertIn(value, retrospective)
 
 
 if __name__ == "__main__":

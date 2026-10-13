@@ -37,17 +37,23 @@ from . import server as discussion
 FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
 PROFILE = "chunking"
-PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair", "representation_review"}
+PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair", "representation_review", "preparing", "repairing"}
+_COMPILER_WORKFLOW = False
 
 
 def configure(forum_dir: Path, project_root: Path, profile: str = "chunking") -> None:
-    global FORUM_DIR, PROJECT_ROOT, PROFILE
+    global FORUM_DIR, PROJECT_ROOT, PROFILE, _COMPILER_WORKFLOW
     if profile not in PROFILES:
         raise ValueError(f"unknown bump Forum profile '{profile}'")
     FORUM_DIR = Path(forum_dir)
     PROJECT_ROOT = Path(project_root).resolve()
     PROFILE = profile
     FORUM_DIR.mkdir(parents=True, exist_ok=True)
+    from .. import bump_tasks
+    _COMPILER_WORKFLOW = (FORUM_DIR / bump_tasks.STATE_FILE).exists()
+    if _COMPILER_WORKFLOW:
+        from . import bump_workflow_server
+        bump_workflow_server.configure(FORUM_DIR, PROJECT_ROOT, profile)
     discussion.FORUM_DIR = FORUM_DIR
     discussion.PROJECT_ROOT = PROJECT_ROOT
     discussion.ICRL_ENABLED = False
@@ -2130,6 +2136,11 @@ def build_server(profile: str) -> FastMCP:
     """Expose only the independent bump tools required by this phase."""
     if profile not in PROFILES:
         raise ValueError(f"Unknown bump MCP profile: {profile}")
+    if _COMPILER_WORKFLOW:
+        from . import bump_workflow_server
+        return bump_workflow_server.build_server(profile)
+    if profile not in PROFILE_TOOLS:
+        raise ValueError("compiler Bump profile requires compiler-migration-v2 state")
     server = FastMCP(f"unity-bump-forum-{profile}")
     for tool in PROFILE_TOOLS[profile]:
         server.tool(tool)

@@ -92,6 +92,23 @@ class PlannerTests(unittest.TestCase):
         self.assertNotIn(old["id"], refreshed["compiler_tasks"])
         self.assertEqual(len(nodes), 2)
 
+    def test_refresh_rejects_metadata_loss_instead_of_dropping_prior_task(self):
+        plan = bump_planner.plan_repairs(self.index, diagnostics(1), self.source)
+        original = plan["chunks"][0]
+        for metadata in (None, {}, []):
+            with self.subTest(metadata=metadata):
+                task = deepcopy(original)
+                task["status"] = "complete"
+                if metadata is None:
+                    task.pop("migration")
+                else:
+                    task["migration"] = metadata
+                prior = {"formal_tasks": {task["id"]: task}}
+                saved = deepcopy(prior)
+                with self.assertRaisesRegex(ValueError, "missing its identity"):
+                    bump_planner.plan_repairs(self.index, diagnostics(passed=True), self.source, prior)
+                self.assertEqual(prior, saved)
+
     def test_refined_declaration_owner_is_not_replaced_by_retired_parent(self):
         plan = bump_planner.plan_repairs(self.index, diagnostics(1), self.source)
         parent = plan["chunks"][0]

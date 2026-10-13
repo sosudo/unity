@@ -10,7 +10,7 @@ Use the tool's exposed MCP schema; do not guess argument names. Capabilities:
 - `check` — check supplied Lean code and inspect messages; prefer over `lean_run_code` and
   equivalent `lean_diagnostic_messages` checks when the necessary source context is available.
 - `verify_proof` — validate a proof against its statement; prefer over `lean_verify` where the
-  requested check is equivalent. Unity's local contract/axiom checks remain authoritative.
+  requested check is equivalent. Unity's current target builds and source audit remain authoritative.
 - `highlight` — retrieve semantic highlighting.
 - `extract_decls` — inspect declarations and dependencies in a file.
 - `repair_proofs` and `simplify_theorems` — repair or simplify proofs.
@@ -18,8 +18,7 @@ Use the tool's exposed MCP schema; do not guess argument names. Capabilities:
 - `merge`, `rename`, and `normalize` — manipulate Lean source.
 - `theorem2lemma`, `theorem2sorry`, `have2lemma`, `have2sorry`, and `sorry2lemma` — declaration
   transformations for scratch work and diagnosis. Never submit generated `sorry` placeholders as
-  migration repairs in any stage. Bump does not permit new theorem holes even for representation
-  candidates; inherited original trust may not expand or spread.
+  migration repairs. Existing holes must be reported as unfinished work, not new proofs.
 - `list_environments` — inspect available external toolchains.
 - `share_url` and `read_share_url` — exchange Axle artifacts.
 
@@ -36,11 +35,10 @@ Use native MCP when exposed; otherwise use `unity mcp axle <tool> '<json-args>'`
 arguments. Reuse environment/documentation findings; do not rediscover them for every check.
 
 External success does not replace local validation. Check returned proof/import edits in the actual
-local project with targeted diagnostics, then use `finalize_formalization`; do not run a worker
+local project with targeted diagnostics, then use `submit_repair`; do not run a worker
 project-wide build or duplicate a successful unchanged check. Unity's main verification remains
-authoritative. Apply only relevant source edits and preserve protected statements and definitions.
+authoritative. Apply only relevant source edits within your granted file leases; do not weaken claims.
 
-Respect phase boundaries: chunking revises the compiler-driven declaration DAG, not Lean scaffolds;
-its tool access does not require API searches, proof checks, or compilation. Migration workers repair
-assigned declarations. Critics remain read-only and reuse current verification records unless
-there is a concrete reason for another check.
+Preparing agents investigate configuration/dependency/scope work; repairing agents repair their
+assigned declaration or module/API groups. Critics remain read-only and reuse current verification
+records unless there is a concrete reason for another check.

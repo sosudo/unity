@@ -58,9 +58,10 @@ class InstalledDeclarationIntegrationTests(unittest.TestCase):
         self.assertEqual(len(planned["formalization"]["requirements"]), 3)
         return broken, planned
 
-    def submit(self, author, declaration, updated):
+    def submit(self, author, declaration, updated, *, task_id=None):
         current = state.load_state(self.paths.forum)
-        task = next(row for row in current["formal_tasks"].values() if row["lean_decl"] == declaration)
+        task = (current["formal_tasks"][task_id] if task_id else
+                next(row for row in current["formal_tasks"].values() if row["lean_decl"] == declaration))
         tree = server.worktree.create_worktree(author, self.target)
         prepared = server.prepare_formal_worktree(author, next_task=task["task_id"],
                                                   expected_revision=current["formalization"]["revision"])
@@ -114,6 +115,222 @@ class InstalledDeclarationIntegrationTests(unittest.TestCase):
                     "argument_rationale": "The original computation and dependency are unchanged.",
                     "repair_steps": [],
                 } for row in requirements], "repair_reviews": []}
+
+    def test_migration_plan_writer_rechunks_after_partial_merge_without_losing_progress(self):
+        broken, _ = self.install_target_errors()
+        candidate = self.submit("Ada", "first", broken.replace(": Nat := True", ": Nat := 1"))
+        result, partial = self.integrate(candidate)
+        self.assertNotEqual(result["build"]["returncode"], 0)
+        completed_id = candidate["task_id"]
+        pending_id = next(key for key, row in partial["formal_tasks"].items()
+                          if row["lean_decl"] == "second")
+        self.assertEqual(partial["formal_tasks"][pending_id]["status"], "pending")
+        original_baseline = deepcopy(partial["project_baseline"])
+        original_obligations = deepcopy(partial["formalization"]["source_obligations"])
+        original_correspondences = deepcopy(
+            partial["formalization"]["contract"]["migration_correspondences"])
+        original_source = deepcopy(state.formal_source(partial))
+        original_tasks = deepcopy(partial["formal_tasks"])
+        original_candidate = deepcopy(partial["formal_candidates"][candidate["candidate_id"]])
+        main_sha = partial["formalization"]["main_sha"]
+
+        request = state.request_rechunk(self.paths.forum, "Ada", "Replan the remaining repair.", [pending_id])
+        state.begin_replan(self.paths.forum, request["request_id"])
+        interrupted = state.begin_chunking_attempt(self.paths.forum, original_source["candidate_id"], "Ada")
+        # A prior controller exit can leave an allocated attempt unfinished.
+        # Continuing must retain it as failed, not reset the attempt budget.
+        attempt = state.begin_chunking_attempt(self.paths.forum, original_source["candidate_id"], "Ada")
+        chunking = state.load_state(self.paths.forum)
+        self.assertEqual(attempt["attempt"], interrupted["attempt"] + 1)
+        recovered = next(row for row in chunking["chunking_attempts"]
+                         if row["attempt_id"] == interrupted["attempt_id"])
+        self.assertEqual(recovered["status"], "failed")
+        self.assertEqual(recovered["reason"], "chunking process ended before recording an outcome")
+        plan_path = runtime.write_formalization_plan(self.paths, state.formal_source(chunking))
+        plan = json.loads(plan_path.read_text())
+        self.assertEqual(plan["project_baseline"]["migration"]["original_index"],
+                         original_baseline["migration"]["original_index"])
+        self.assertEqual(plan["replan"]["previous_tasks"], original_tasks)
+        self.assertEqual(plan["solution_sha256"], original_source["sha256"])
+        self.assertEqual(state.load_state(self.paths.forum), chunking)
+
+        draft = runtime.seed_chunking_draft(chunking)
+        # Invalid edits still fail read-only validation; the writer does not
+        # relax the existing source-binding or frozen-obligation checks.
+        stale = deepcopy(draft)
+        stale["base_revision"] -= 1
+        wrong_source = deepcopy(draft)
+        wrong_source["solution_sha256"] = "0" * 64
+        rewritten = deepcopy(draft)
+        rewritten["requirements"] = []
+        for invalid in (stale, wrong_source, rewritten):
+            with self.subTest(invalid_fields=list(invalid)):
+                with self.assertRaises(ValueError):
+                    runtime.prepare_chunking_draft(self.paths, chunking, json.dumps(invalid).encode())
+                self.assertEqual(state.load_state(self.paths.forum), chunking)
+
+        dag, source_contract = runtime.prepare_chunking_draft(
+            self.paths, chunking, json.dumps(draft).encode())
+        self.assertEqual(state.load_state(self.paths.forum), chunking)
+        published = state.initialize_informal_plan(
+            self.paths.forum, dag, main_sha=main_sha, contract=source_contract,
+            attempt_id=attempt["attempt_id"], expected_revision=chunking["revision"])
+
+        self.assertEqual(published["phase"], "formalizing")
+        self.assertEqual(published["formalization"]["status"], "active")
+        self.assertEqual(published["project_baseline"], original_baseline)
+        self.assertEqual(published["formalization"]["contract"]["project_baseline"], original_baseline)
+        self.assertEqual(published["formalization"]["source_obligations"], original_obligations)
+        self.assertEqual(len(original_obligations["requirements"]), 3,
+                         "unchanged third declaration remains an original obligation")
+        self.assertEqual(published["formalization"]["contract"]["migration_correspondences"],
+                         original_correspondences)
+        self.assertEqual(state.formal_source(published), original_source)
+        self.assertEqual(published["formal_candidates"][candidate["candidate_id"]], original_candidate)
+        for task_id, original in original_tasks.items():
+            for field in ("migration", "migration_native_status", "status", "accepted_candidate",
+                          "outputs", "lean_decl", "lean_file", "verification", "revision"):
+                self.assertEqual(published["formal_tasks"][task_id].get(field), original.get(field),
+                                 (task_id, field))
+        self.assertEqual(published["replan"]["carried_tasks"], [completed_id])
+        self.assertEqual(published["replan"]["affected_tasks"], [])
+        self.assertEqual(published["replan_requests"][request["request_id"]]["status"], "complete")
+        recorded_attempt = next(row for row in published["chunking_attempts"]
+                                if row["attempt_id"] == attempt["attempt_id"])
+        self.assertEqual(recorded_attempt["status"], "succeeded")
+        self.assertEqual(next(row for row in published["chunking_attempts"]
+                              if row["attempt_id"] == interrupted["attempt_id"]), recovered)
+        self.assertEqual(published["formalization"]["main_sha"], main_sha)
+        self.assertEqual(self.fixture.command(self.target, ["git", "rev-parse", "HEAD"]).stdout.strip(), main_sha)
+        self.assertEqual((self.target / "Fixture.lean").read_text(), broken.replace(": Nat := True", ": Nat := 1"))
+        self.assertEqual((self.fixture.source / "Fixture.lean").read_text(), self.fixture.original)
+        self.assertIsNone(published["formalization"]["review_snapshot"])
+        self.assertTrue(published["formal_tasks"][completed_id]["verification"]["native_pending"])
+
+    def test_replan_new_original_task_binds_before_dispatch_merge_and_refresh(self):
+        broken, _ = self.install_target_errors()
+        first = self.submit("Ada", "first", broken.replace(": Nat := True", ": Nat := 1"))
+        _, partial = self.integrate(first)
+        original_baseline = deepcopy(partial["project_baseline"])
+        original_obligations = deepcopy(partial["formalization"]["source_obligations"])
+        original_source = deepcopy(state.formal_source(partial))
+        original_candidates = deepcopy(partial["formal_candidates"])
+        original_tasks = deepcopy(partial["formal_tasks"])
+        original_attempts = deepcopy(partial["chunking_attempts"])
+        main_sha = partial["formalization"]["main_sha"]
+        second_id = next(key for key, row in partial["formal_tasks"].items()
+                         if row["lean_decl"] == "second")
+        index = original_baseline["migration"]["original_index"]["occurrences"]
+        third_original_id = next(key for key, row in index.items() if row["display_name"] == "third")
+        requirement_id = "requirement-" + third_original_id
+        original_requirement = next(row for row in partial["formalization"]["requirements"]
+                                    if row["id"] == requirement_id)
+        self.assertEqual(original_requirement["tasks"], [], "third has no compiler-created repair task")
+
+        request = state.request_rechunk(self.paths.forum, "Ada", "Include the remaining original obligation.", [second_id])
+        state.begin_replan(self.paths.forum, request["request_id"])
+        attempt = state.begin_chunking_attempt(self.paths.forum, original_source["candidate_id"], "Ada")
+        chunking = state.load_state(self.paths.forum)
+        draft = runtime.seed_chunking_draft(chunking)
+        new_task_id = "replanned-third"
+        draft["requirement_tasks"][requirement_id] = [new_task_id]
+        draft["chunks"].append({
+            "id": new_task_id, "title": "Preserve third", "predicted_kind": index[third_original_id]["kind"],
+            "informal_statement": "Preserve the original third declaration, its computation and inherited trust.",
+            "informal_proof": None, "statement_dependencies": [], "proof_dependencies": [first["task_id"]],
+            "proposed_formal_statement": None, "proposed_formal_strategy": None,
+            "source_components": deepcopy(original_requirement["source_components"]),
+            "anchor_ids": deepcopy(original_requirement["anchor_ids"]), "requirement_ids": [requirement_id],
+        })
+        # Draft syntax has no implementation metadata. The controller must bind
+        # the new identity from sealed source obligations before publication.
+        self.assertNotIn("migration", draft["chunks"][-1])
+        dag, source_contract = runtime.prepare_chunking_draft(
+            self.paths, chunking, json.dumps(draft).encode())
+        self.assertEqual(state.load_state(self.paths.forum), chunking, "validation is read-only")
+        published = state.initialize_informal_plan(
+            self.paths.forum, dag, main_sha=main_sha, contract=source_contract,
+            attempt_id=attempt["attempt_id"], expected_revision=chunking["revision"])
+
+        new_task = published["formal_tasks"][new_task_id]
+        self.assertEqual(new_task["migration"]["original_ids"], [third_original_id])
+        self.assertEqual(new_task["migration"]["kind"], "declaration")
+        self.assertEqual(new_task["migration"]["module"], "Fixture")
+        self.assertEqual(new_task["migration"]["path"], "Fixture.lean")
+        self.assertEqual(new_task["migration"]["original_ranges"], [index[third_original_id]["range"]])
+        self.assertEqual(new_task["migration"]["diagnostic_ids"], [])
+        self.assertEqual(new_task["lean_file"], "Fixture.lean")
+        self.assertEqual(new_task["status"], "pending")
+        self.assertEqual(new_task["migration_native_status"], "pending")
+        self.assertEqual(new_task["outputs"], [], "identity binding must not adopt an output")
+        reservation = published["file_reservations"]["Fixture.lean"]
+        self.assertEqual({reservation["owner_task"], *reservation["shared_with"]}, set(published["formal_tasks"]))
+        self.assertEqual(reservation["owner_task"], partial["file_reservations"]["Fixture.lean"]["owner_task"])
+        self.assertEqual(published["project_baseline"], original_baseline)
+        self.assertEqual(published["formalization"]["source_obligations"], original_obligations)
+        self.assertEqual(state.formal_source(published), original_source)
+        self.assertEqual(published["formal_candidates"], original_candidates)
+        self.assertEqual(published["chunking_attempts"][:len(original_attempts)], original_attempts)
+        for task_id, previous in original_tasks.items():
+            for field in ("migration", "migration_native_status", "status", "accepted_candidate",
+                          "outputs", "lean_decl", "lean_file", "verification", "revision"):
+                self.assertEqual(published["formal_tasks"][task_id].get(field), previous.get(field),
+                                 (task_id, field))
+
+        # The scripted worker changes only syntax, not the original meaning.
+        # Both insertions are strictly inside the native declaration span:
+        # wrapping the whole RHS would put ')' at its exclusive end boundary,
+        # correctly rejected as a possible adjacent source-command edit.
+        # The other declaration remains broken, so this exercises the real
+        # provisional merge-recording path rather than final acceptance.
+        updated = (self.target / "Fixture.lean").read_text().replace("first + 1", "(first) + 1")
+        third = self.submit("Cora", "third", updated, task_id=new_task_id)
+        self.assertEqual(third["base_main_sha"], main_sha)
+        result, refreshed = self.integrate(third)
+        self.assertNotEqual(result["build"]["returncode"], 0)
+        self.assertIn(new_task_id, refreshed["formal_tasks"], "compiler refresh must retain the replanned task")
+        self.assertEqual(refreshed["formal_tasks"][new_task_id]["migration"], new_task["migration"])
+        self.assertEqual(refreshed["formal_tasks"][new_task_id]["status"], "complete")
+        self.assertTrue(refreshed["formal_tasks"][new_task_id]["verification"]["native_pending"])
+        self.assertEqual(refreshed["formal_tasks"][second_id]["status"], "pending")
+        self.assertEqual(refreshed["formal_candidates"][first["candidate_id"]], original_candidates[first["candidate_id"]])
+        self.assertEqual(refreshed["formalization"]["source_obligations"], original_obligations)
+        self.assertEqual({row["id"] for row in refreshed["formalization"]["requirements"]},
+                         {row["id"] for row in partial["formalization"]["requirements"]})
+        self.assertEqual((self.fixture.source / "Fixture.lean").read_text(), self.fixture.original)
+        self.assertEqual((self.target / "Fixture.lean").read_text(), updated)
+        self.assertIsNone(refreshed["formalization"]["review_snapshot"])
+        self.assertNotEqual(refreshed["formalization"]["status"], "accepted")
+
+    def test_unrecorded_real_integration_commit_is_preserved_and_blocks_automatic_resume(self):
+        broken, _ = self.install_target_errors()
+        candidate = self.submit("Ada", "first", broken.replace(": Nat := True", ": Nat := 1"))
+        begun = state.begin_formal_merge(self.paths.forum, candidate["candidate_id"])
+        self.assertNotIn("conflict", begun)
+        merging = state.load_state(self.paths.forum)
+        recorded_main = merging["formalization"]["main_sha"]
+        with patch.object(state, "finish_formal_merge", side_effect=RuntimeError("scripted interruption after Git commit")), \
+             patch.object(bootstrap, "refresh", wraps=bootstrap.refresh) as refresh:
+            with self.assertRaisesRegex(RuntimeError, "scripted interruption after Git commit"):
+                runtime._integrate_and_record(
+                    self.paths, begun["candidate"], merging["formal_tasks"][candidate["task_id"]])
+            refresh.assert_not_called()
+        unrecorded_main = self.fixture.command(self.target, ["git", "rev-parse", "HEAD"]).stdout.strip()
+        self.assertNotEqual(unrecorded_main, recorded_main)
+        self.assertEqual(self.fixture.command(self.target, ["git", "rev-parse", "HEAD^1"]).stdout.strip(), recorded_main)
+        self.assertEqual(self.fixture.command(self.target, ["git", "status", "--porcelain", "--untracked-files=no"]).stdout.strip(), "")
+        self.assertEqual(state.load_state(self.paths.forum), merging, "failed recording must not publish partial state")
+        self.assertEqual((self.target / "Fixture.lean").read_text(), broken.replace(": Nat := True", ": Nat := 1"))
+        worker_commit = candidate["commit_sha"]
+        self.assertEqual(self.fixture.command(self.target, ["git", "cat-file", "-t", worker_commit]).stdout.strip(), "commit")
+        with patch.object(state, "finish_formal_merge", wraps=state.finish_formal_merge) as record:
+            with self.assertRaisesRegex(ValueError, "Inspect and reconcile main before resuming.*No changes were discarded"):
+                runtime.recover_interrupted_formal_merges(self.paths)
+            record.assert_not_called()
+        self.assertEqual(state.load_state(self.paths.forum), merging)
+        self.assertEqual(self.fixture.command(self.target, ["git", "rev-parse", "HEAD"]).stdout.strip(), unrecorded_main)
+        self.assertEqual(self.fixture.command(self.target, ["git", "cat-file", "-t", worker_commit]).stdout.strip(), "commit")
+        self.assertEqual((self.fixture.source / "Fixture.lean").read_text(), self.fixture.original)
 
     def test_same_file_provisional_candidates_reach_actual_native_and_critic_acceptance(self):
         broken, planned = self.install_target_errors()

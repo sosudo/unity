@@ -31,7 +31,7 @@ from . import bump_files, bump_representation
 from .bump_input import require_source_matches
 from .forum import bump_server
 from .bump_orchestrator import _preamble, load_prompt, stop_requested
-from .bump_spawn import spawn
+from .bump_spawn import SpawnCleanupError, spawn
 
 
 _console = Console()
@@ -194,7 +194,36 @@ def write_formalization_plan(paths, candidate: dict) -> Path:
     state = bump_state.load_state(paths.forum)
     baseline = ((state["formalization"].get("contract") or {}).get("project_baseline")
                 or state.get("project_baseline"))
-    if baseline:
+    from .bump_migration import is_migration
+
+    if baseline and is_migration(baseline):
+        migration = baseline["migration"]
+        plan["project_baseline"] = {
+            key: deepcopy(baseline[key])
+            for key in (
+                "sha256", "version", "policy", "project_scope",
+                "branch", "head", "target_scope", "scope",
+            )
+            if key in baseline
+        }
+        plan["project_baseline"]["migration"] = {
+            **{
+                key: deepcopy(migration[key])
+                for key in (
+                    "version", "policy", "run_id",
+                    "source_root", "original_root", "target_root",
+                    "original_commit", "target_version",
+                    "dependency_pins", "scope", "selected_modules",
+                    "excluded_files", "index_ref",
+                )
+                if key in migration
+            },
+            "original_index": deepcopy(migration["original_index"]),
+        }
+        plan["project_baseline"]["protected_modules"] = sorted(
+            set(baseline["layout"]["modules"].values())
+        )
+    elif baseline:
         # Full expression/proof-body evidence remains in controller state. The
         # chunker needs the target signatures, not every existing proof AST.
         available = set(baseline["scope"]["existing_targets"])
@@ -886,6 +915,12 @@ def _apply_formal_candidate(paths, candidate: dict, task: dict, *, timings: dict
 
 
 def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
+    # Controller schema corruption is an operational fault, not a candidate
+    # rejection. Validate before any Git application and outside rollback's
+    # candidate-error handler; existing identities are never repaired here.
+    current = bump_state.load_state(paths.forum)
+    from .bump_migration import require_task_identities
+    require_task_identities(current)
     root = paths.project_root
     # Nothing below may discard pre-existing tracked edits.
     dirty = _git(root, "status", "--porcelain", "--untracked-files=no")
@@ -897,7 +932,6 @@ def _integrate_checked(paths, candidate: dict, task: dict) -> dict:
     result = {}
     rollback_receipt = {"branch": _git(root, "symbolic-ref", "--quiet", "HEAD").stdout.strip()}
     try:
-        current = bump_state.load_state(paths.forum)
         if any(row.get("status") == "failed" and row.get("task_id") == candidate["task_id"]
                and (row.get("failure_context") or {}).get("cacheable")
                for row in current.get("formal_candidates", {}).values()):
@@ -1221,9 +1255,11 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
     """Swarm ready formal tasks and integrate immutable candidates using Forum events."""
     if stop_requested(paths.project_root):
         return bump_state.load_state(paths.forum)
-    configure_forum(paths, "formalizing")
     state = bump_state.load_state(paths.forum)
+    from .bump_migration import require_task_identities
+    require_task_identities(state)
     require_source_matches(paths, state)
+    configure_forum(paths, "formalizing")
     tools_prompt = load_prompt(f"{PIPELINE.upper()}_FORMALIZING_TOOLS")
     context = library.library_context()
     subagents = library.library_subagents()
@@ -1814,6 +1850,10 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                     ended_normally = True
                 except asyncio.CancelledError:
                     pass
+                except SpawnCleanupError:
+                    # Unclosed execution is infrastructure failure, not ordinary
+                    # provider exhaustion or a mathematical repair rejection.
+                    raise
                 except Exception as exc:
                     _console.print(f"[red]worker {name} failed: {exc!r}[/red]")
                 tasks.pop(name, None)
@@ -1993,8 +2033,13 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
                 integration.result()
             except Exception as exc:
                 _console.print(f"[red]integration ended with an error; worktrees preserved: {exc!r}[/red]")
+        cleanup_results = []
         if stopping:
-            await asyncio.gather(*stopping.values(), return_exceptions=True)
+            cleanup_results = await asyncio.gather(*stopping.values(), return_exceptions=True)
+        cleanup_results.extend(running.exception() for running in tasks.values()
+                               if running.done() and not running.cancelled())
+        cleanup_error = next((error for error in cleanup_results
+                              if isinstance(error, SpawnCleanupError)), None)
         for name, repair in manifest_attempts.items():
             bump_state.finish_manifest_repair_attempt(paths.forum, repair["repair_id"], name, "interrupted")
         await asyncio.to_thread(bump_jobs.terminate, paths.project_root)
@@ -2004,7 +2049,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             if running is not None and not running.done():
                 _console.print(f"[red]worker {agent.name} has not stopped; preserving its worktree[/red]")
                 continue
-            if (not bump_state.all_formal_tasks_complete(final_state)
+            if (cleanup_error is not None
+                    or not bump_state.all_formal_tasks_complete(final_state)
                     or final_state.get("phase") == "chunking"
                     or bump_state.pending_replan(final_state)
                     or bump_state.open_source_issues(final_state)):
@@ -2015,6 +2061,8 @@ async def run_formalizing_runtime(roster, paths, mcp: dict, base_prompt: str) ->
             tree = worktrees.get(agent.name)
             if tree is not None:
                 worktree.cleanup_worktree(agent.name, tree, paths.project_root)
+        if cleanup_error is not None:
+            raise cleanup_error
         if interrupted_during_drain:
             raise asyncio.CancelledError
 

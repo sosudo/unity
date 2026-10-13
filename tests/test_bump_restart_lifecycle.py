@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from unity import bump_contract, bump_spawn, bump_state
+from unity import bump_contract, bump_migration, bump_spawn, bump_state
 from test_bump_manifest_repair import informal_dag, machine_snapshot
 from test_bump_manifest_runtime import ManifestRuntimeSchedulingTests
 
@@ -161,7 +161,23 @@ class MigrationPlanStateTests(unittest.TestCase):
         bump_state.initialize_source(self.forum, "c" * 64, "d" * 40, self.source)
         chunks = [{"id": key, "lean_decl": key, "source_components": ["source:Example.lean"]}
                   for key in ("alpha", "beta")]
-        self.dag = informal_dag(self.source, chunks)
+        requirements = [{"id": "requirement-" + key, "statement": "Preserve original " + key,
+                         "source_components": ["source:Example.lean"], "tasks": [key],
+                         "anchor_ids": ["anchor-" + key]} for key in ("alpha", "beta")]
+        self.dag = informal_dag(self.source, chunks, requirements=requirements)
+        # Synthetic compact controller inventory for lifecycle plumbing. Native
+        # baseline validity/meaning checks are exercised by separate fixtures.
+        occurrences = {key: {"display_name": "Example." + key, "kind": "theorem",
+                             "module": "Example", "path": "Example.lean", "dependencies": [], "range": None}
+                       for key in ("alpha", "beta")}
+        index = {"occurrences": occurrences, "modules": {"Example": {
+            "path": "Example.lean", "source_sha256": "b" * 64,
+            "occurrence_ids": sorted(occurrences), "line_lengths": [20, 20]}}}
+        index["index_sha256"] = bump_state.digest(index)
+        baseline = bump_migration.seal({"version": 3, "policy": "migration-v1",
+            "project_scope": "build", "files": {"Example.lean": "b" * 64}, "environment": {},
+            "migration": {"original_index": index},
+            "layout": {"modules": {"Example.lean": "Example"}}})
         for row in self.dag["chunks"]:
             key = row["id"]
             row.update(lean_file="Example.lean", lean_decl=key,
@@ -171,6 +187,7 @@ class MigrationPlanStateTests(unittest.TestCase):
                                   "original_ranges": [], "diagnostic_ids": [key + "-error"]})
         self.dag["compiler_tasks"] = ["alpha", "beta"]
         self.contract = {"version": 3, "migration_policy": 1,
+                         "project_baseline": baseline,
                          "environment": {}, "bindings": {}, "targets": {}, "external_declarations": {},
                          "solution_candidate": self.source["candidate_id"], "solution_sha256": self.source["sha256"],
                          "requirements": deepcopy(self.dag["requirements"]), "spec": deepcopy(self.dag["spec"]),
@@ -271,7 +288,7 @@ class MigrationPlanStateTests(unittest.TestCase):
     def test_refresh_rejects_rebinding_existing_original_identity(self):
         initial = self.initialize()
         self.dag["chunks"][0]["migration"]["original_ids"] = ["other-original"]
-        with self.assertRaisesRegex(ValueError, "original identity"):
+        with self.assertRaisesRegex(ValueError, "assigned original declarations"):
             bump_state.refresh_migration_plan(self.forum, self.dag, main_sha="d" * 40,
                                               contract=initial["formalization"]["contract"])
         self.assertEqual(bump_state.load_state(self.forum), initial)
@@ -339,9 +356,6 @@ class MigrationPlanStateTests(unittest.TestCase):
         for task in state["formal_tasks"].values():
             task.update(status="complete", accepted_candidate=None,
                         verification={"status": "provisional", "native_pending": True})
-        contract = state["formalization"]["contract"]
-        contract["project_baseline"] = {"sha256": "e" * 64, "policy": "migration-v1"}
-        contract["sha256"] = bump_state._contract_digest(contract)
         snapshot = machine_snapshot(state)
         with patch.object(bump_contract, "_baseline_matches", return_value=True), \
              patch("unity.bump_migration.validate_native_snapshot", side_effect=ValueError("native review incomplete")) as native:

@@ -9,7 +9,7 @@ import os
 from . import bump_state
 from . import bump_worktree as worktree
 from .bump_orchestrator import _preamble, build_bump_mcp, load_prompt, load_role_prompt, stop_requested
-from .bump_spawn import spawn
+from .bump_spawn import SpawnCleanupError, spawn
 from .bump_representation import source_diagnosis_input
 
 
@@ -65,6 +65,9 @@ async def source_repair_turn(
             error = f"{type(result).__name__}: {result}"
     except asyncio.CancelledError:
         error = "source repair interrupted"
+        raise
+    except SpawnCleanupError as exc:
+        error = f"{type(exc).__name__}: {exc}"
         raise
     except Exception as exc:
         error = f"{type(exc).__name__}: {exc}"

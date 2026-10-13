@@ -32,9 +32,9 @@ def _run(root: Path, command: list[str], *, name: str):
     return result
 
 
-def _toolchain_identity(root: Path, *, name: str) -> dict:
-    version = _run(root, ["lake", "env", "lean", "--version"], name=name).stdout.strip()
-    prefix = _run(root, ["lake", "env", "lean", "--print-prefix"], name=name).stdout.strip()
+def _toolchain_identity(root: Path, *, name: str, lake_args=()) -> dict:
+    version = _run(root, ["lake", *lake_args, "env", "lean", "--version"], name=name).stdout.strip()
+    prefix = _run(root, ["lake", *lake_args, "env", "lean", "--print-prefix"], name=name).stdout.strip()
     if not version or not prefix or not Path(prefix).is_dir():
         raise ValueError(f"could not identify the Lean toolchain for {name} inspection")
     return {"version": version, "sysroot": str(Path(prefix).resolve()),
@@ -48,6 +48,7 @@ def executable(
     name: str,
     link_args: tuple[str, ...] = (),
     timings: dict | None = None,
+    lake_args=(),
 ) -> Path:
     """Prepare an interpreter-capable native helper; optionally report timings."""
     started = time.monotonic()
@@ -59,14 +60,16 @@ def executable(
         root = Path(root).resolve()
         source = Path(source).resolve()
         source_bytes = source.read_bytes()
-        toolchain = _toolchain_identity(root, name=name)
+        from .bump_dependencies import checked_lake_args
+        lake_args = checked_lake_args(lake_args)
+        toolchain = _toolchain_identity(root, name=name, lake_args=lake_args)
         interpreter_flags = (
             ["-Wl,--whole-archive", "-lleanmanifest", "-Wl,--no-whole-archive"]
             if os.name == "nt" else ["-rdynamic"]
         )
         # Bump the recipe if the compiler invocation changes in ways not already
         # captured by its explicit arguments below.
-        recipe = {"version": 1, "link_args": list(link_args),
+        recipe = {"version": 1, "link_args": list(link_args), "lake_args": list(lake_args),
                   "interpreter_flags": interpreter_flags, "lean_flags": ["-R", "-c"]}
         key = hashlib.sha256(
             source_bytes + b"\0" + json.dumps(
@@ -99,16 +102,16 @@ def executable(
             built = staging / binary.name
             compile_started = time.monotonic()
             try:
-                _run(root, ["lake", "env", "lean", "-R", str(source.parent),
+                _run(root, ["lake", *lake_args, "env", "lean", "-R", str(source.parent),
                             "-c", str(generated_c), str(source)], name=name)
-                _run(root, ["lake", "env", "leanc", "-o", str(built), str(generated_c),
+                _run(root, ["lake", *lake_args, "env", "leanc", "-o", str(built), str(generated_c),
                             *link_args, *interpreter_flags], name=name)
             finally:
                 if timings is not None:
                     timings["compile_seconds"] = time.monotonic() - compile_started
             if not built.is_file():
                 raise ValueError(f"{name} inspector compilation produced no executable")
-            if source.read_bytes() != source_bytes or _toolchain_identity(root, name=name) != toolchain:
+            if source.read_bytes() != source_bytes or _toolchain_identity(root, name=name, lake_args=lake_args) != toolchain:
                 raise ValueError(f"{name} inspector source or toolchain changed during compilation")
             check_cache_paths()
             destination.mkdir(parents=True, exist_ok=True)

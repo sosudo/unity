@@ -55,19 +55,22 @@ def _run(root: Path, command: list[str]):
     return result
 
 
-def _executable(root: Path, *, timings: dict | None = None) -> Path:
+def _executable(root: Path, *, timings: dict | None = None, lake_args=()) -> Path:
     return bump_native.executable(
         root, Path(__file__).with_suffix(".lean"), name="workspace",
-        link_args=("-lLake",), timings=timings,
+        link_args=("-lLake",), timings=timings, lake_args=lake_args,
     )
 
 
-def discover(root: Path, files: list[str], *, executable: Path | None = None) -> dict:
+def discover(root: Path, files: list[str], *, executable: Path | None = None, lake_args=()) -> dict:
     """Map checked project-relative Lean paths using the actual Lake configuration."""
     root = Path(root).resolve()
     files = _checked_files(root, files) if files != ["--layout-only"] else files
-    executable = executable if executable is not None else _executable(root)
-    result = _run(root, ["lake", "env", str(executable), *files])
+    from .bump_dependencies import checked_lake_args
+    lake_args = checked_lake_args(lake_args)
+    executable = executable if executable is not None else _executable(root, lake_args=lake_args)
+    options = [part for arg in lake_args for part in ("--lake-option", *arg[2:].split("=", 1))]
+    result = _run(root, ["lake", *lake_args, "env", str(executable), *options, *files])
     report = _report(result, action="inspector")
     if (not isinstance(report, dict) or not isinstance(report.get("modules"), dict)
             or not isinstance(report.get("traces"), dict)
@@ -105,7 +108,7 @@ def discover(root: Path, files: list[str], *, executable: Path | None = None) ->
     return report
 
 
-def read_imports(root: Path, files: list[str], *, executable: Path | None = None) -> dict[str, list[str]]:
+def read_imports(root: Path, files: list[str], *, executable: Path | None = None, lake_args=()) -> dict[str, list[str]]:
     """Read direct module imports with Lean's header parser, never elaboration.
 
     Names use the same native spelling as ``discover()['modules']``. ``Init``
@@ -118,8 +121,10 @@ def read_imports(root: Path, files: list[str], *, executable: Path | None = None
     files = _checked_files(root, files)
     if not files:
         return {}
-    executable = executable if executable is not None else _executable(root)
-    result = _run(root, ["lake", "env", str(executable), "--imports", *files])
+    from .bump_dependencies import checked_lake_args
+    lake_args = checked_lake_args(lake_args)
+    executable = executable if executable is not None else _executable(root, lake_args=lake_args)
+    result = _run(root, ["lake", *lake_args, "env", str(executable), "--imports", *files])
     report = _report(result, action="import reader")
     imports = report.get("imports")
     if (not isinstance(imports, dict) or set(imports) != set(files)

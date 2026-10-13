@@ -12,7 +12,7 @@ from pathlib import Path
 from rich.console import Console
 
 from . import library
-from .bump_spawn import bump_mcp_with_runtime_env, spawn
+from .bump_spawn import SpawnCleanupError, bump_mcp_with_runtime_env, spawn
 from .orchestrator import load_prompt, mark_done, mark_phase, resume_point, stop_requested, toposort
 
 _console = Console()
@@ -127,6 +127,8 @@ async def dispatch(
         except Exception:
             return ""
 
+    dispatch_tasks = []
+
     async def spawn_one(agent):
         # Chunking/critic/retrospective workers use this dispatcher rather than
         # the formalizing scheduler. Their uvx children need the same scoped
@@ -140,15 +142,30 @@ async def dispatch(
                 Paths.from_unity_dir(unity.resolve()), log_context or {}, agent.name,
             )
         runtime_env.update(env_overrides or {})
-        return await spawn(
-            agent, _preamble(agent, roster) + brief(agent) + full, task,
-            agent_cwd(agent), mcp, subagents=subagents,
-            log_context=log_context, mcp_profile=mcp_profile,
-            on_normal_completion=on_normal_completion,
-            env_overrides=runtime_env,
-        )
+        try:
+            return await spawn(
+                agent, _preamble(agent, roster) + brief(agent) + full, task,
+                agent_cwd(agent), mcp, subagents=subagents,
+                log_context=log_context, mcp_profile=mcp_profile,
+                on_normal_completion=on_normal_completion,
+                env_overrides=runtime_env,
+            )
+        except SpawnCleanupError:
+            # A retained execution is fatal, not an ordinary model failure.
+            # Cancel only this dispatch's peers; gather below still drains all
+            # their owned cleanup before propagating the original failure.
+            current = asyncio.current_task()
+            for peer in dispatch_tasks:
+                if peer is not current and not peer.done():
+                    peer.cancel()
+            raise
 
-    results = await asyncio.gather(*(spawn_one(agent) for agent in agents), return_exceptions=True)
+    # Create all peer references before the first await can expose a failure.
+    dispatch_tasks = [asyncio.create_task(spawn_one(agent)) for agent in agents]
+    results = await asyncio.gather(*dispatch_tasks, return_exceptions=True)
+    for result in results:
+        if isinstance(result, SpawnCleanupError):
+            raise result
     for agent, result in zip(agents, results):
         if isinstance(result, Exception):
             _console.print(f"[red]agent {agent.name} failed: {result!r}[/red]")

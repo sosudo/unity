@@ -210,6 +210,16 @@ class InstalledLeanScopeWorkspaceTests(unittest.TestCase):
         self.assertEqual(report["libraries"], ["ActualTarget"])
         self.assertEqual(report["module_owners"]["tools/Broken.lean"]["executables"], ["OptionalTool"])
 
+    def test_native_configuration_options_match_selected_build_environment(self):
+        (self.root / "lakefile.toml").unlink()
+        self.write("lakefile.lean", 'import Lake\nopen Lake DSL\npackage scope_fixture\n'
+                   'lean_lib Selected where\n  srcDir := "src"\n'
+                   '  roots := if get_config? env == some "dev" then #[`Example] else #[`Absent]\n')
+        default = self.run_helper("src/Example.lean")
+        self.assertIn("src/Example.lean", default["unmatched"])
+        dev = self.run_helper("--lake-option", "env", "dev", "src/Example.lean")
+        self.assertEqual(dev["modules"], {"src/Example.lean": "Example"})
+
     def test_helper_compiles_and_discovers_with_already_installed_lean_428(self):
         chain = self.chain.parent / "leanprover--lean4---v4.28.0"
         if not all((chain / "bin" / name).is_file() for name in ("lean", "leanc", "lake")):

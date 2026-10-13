@@ -71,7 +71,7 @@ private def readImports (paths : List String) : IO Json := do
       issues := issues.push s!"could not read Lean import header {filename}: {error}"
   return Json.mkObj [("imports", Json.mkObj imports), ("issues", toJson issues)]
 
-private def loadRoot : IO Package := do
+private def loadRoot (lakeOpts : NameMap String := {}) : IO Package := do
   let (elan?, lean?, lake?) ← findInstall?
   let some lean := lean? | throw <| IO.userError "could not locate Lean installation"
   let some lake := lake? | throw <| IO.userError "could not locate Lake installation"
@@ -80,13 +80,13 @@ private def loadRoot : IO Package := do
     | .error message => throw <| IO.userError message
   let root ← IO.FS.realPath (← IO.currentDir)
   let some pkg ← (loadPackage {
-    lakeEnv, wsDir := root, updateToolchain := false
+    lakeEnv, lakeOpts, wsDir := root, updateToolchain := false, reconfigure := true
   }).toBaseIO
     | throw <| IO.userError "could not load the root Lake package configuration"
   return pkg
 
-private def discover (paths : List String) : IO Json := do
-  let pkg ← loadRoot
+private def discover (paths : List String) (lakeOpts : NameMap String := {}) : IO Json := do
+  let pkg ← loadRoot lakeOpts
   let layoutOnly := paths == ["--layout-only"]
   let mut paths := if layoutOnly then [] else paths
   let mut roots : Array Json := #[]
@@ -184,15 +184,23 @@ private def discover (paths : List String) : IO Json := do
 
 end UnityBumpWorkspace
 
+private def readLakeOptions : List String → NameMap String → IO (NameMap String × List String)
+  | "--lake-option" :: key :: value :: rest, options =>
+      if key.isEmpty then throw <| IO.userError "empty Lake configuration key"
+      else readLakeOptions rest (options.insert key.toName value)
+  | "--lake-option" :: _, _ => throw <| IO.userError "incomplete Lake configuration option"
+  | rest, options => pure (options, rest)
+
 def main (args : List String) : IO UInt32 := do
   try
+    let (options, args) ← readLakeOptions args {}
     let result ← match args with
       | "--imports" :: paths => UnityBumpWorkspace.readImports paths
-      | _ => UnityBumpWorkspace.discover args
+      | _ => UnityBumpWorkspace.discover args options
     IO.println result.compress
-    return if (result.getObjValAs? (Array String) "issues").toOption == some #[] then 0 else 1
+    return if (result.getObjValAs? (Array String) "issues").toOption == some #[] then (0 : UInt32) else 1
   catch error =>
     IO.println (Json.mkObj [("modules", Json.mkObj []), ("source_roots", Json.arr #[]),
       ("module_owners", Json.mkObj []), ("libraries", Json.arr #[]),
       ("unmatched", Json.arr #[]), ("issues", toJson [s!"Lake workspace discovery failed: {error}"])]).compress
-    return 1
+    return (1 : UInt32)

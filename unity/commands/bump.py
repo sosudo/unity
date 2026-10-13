@@ -1,4 +1,4 @@
-"""Compiler-driven declaration migration using Bump's own copied gate loops."""
+"""Compiler-driven migration CLI; historical helpers below are not a CLI mode."""
 
 import hashlib
 import fcntl
@@ -570,12 +570,17 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
 @click.option("--dependency", "dependency_values", multiple=True, help="Exact target dependency NAME=COMMIT or NAME=VERSION.")
 @click.option("--continue", "continue_", is_flag=True, default=False, help="Resume this saved declaration migration.")
 @click.option("--project-scope", type=click.Choice(["build", "all"]), default=None,
-              help="Original native default targets/import closure (build), or all original project modules.")
-@click.option("--architect", type=click.Choice(["auto", "off"]), default=None,
-              help="Optionally install the exact target-version LeanArchitect release.")
-async def bump(version=None, dependency_values=(), continue_=False, project_scope=None, architect=None):
+              help="Current default targets/import closure (build), or all current project modules.")
+@click.option("--module", "modules", multiple=True, help="Also check this current project module (repeatable).")
+@click.option("--lake-option", "lake_options", multiple=True, help="Consistent Lake configuration, e.g. --lake-option=-Kenv=dev.")
+@click.option("--architect", type=click.Choice(["auto", "off"]), default="off", hidden=True,
+              help="Compatibility option; automatic dependency installation is no longer supported.")
+async def bump(version=None, dependency_values=(), continue_=False, project_scope=None,
+               architect="off", modules=(), lake_options=()):
     """Migrate an existing Lean project using declaration-level compiler repairs."""
-    from .. import bump_bootstrap
+    from .. import bump_dependencies
+    if architect != "off":
+        raise click.ClickException("Bump no longer automatically installs LeanArchitect; use explicit project dependencies.")
     paths = bump_paths(load_paths())
     paths.forum.mkdir(parents=True, exist_ok=True)
     with (paths.forum / "controller.lock").open("a+") as lock:
@@ -584,53 +589,66 @@ async def bump(version=None, dependency_values=(), continue_=False, project_scop
         except BlockingIOError as exc:
             raise click.ClickException("another Bump controller is already running in this project") from exc
         try:
-            pins = bump_bootstrap.parse_dependency_pins(dependency_values)
-            await _run_bump(paths, continue_, version, pins, project_scope=project_scope, architect=architect)
+            pins = bump_dependencies.parse_dependency_pins(dependency_values)
+            lake_args = bump_dependencies.checked_lake_args(lake_options)
+            await _run_bump(paths, continue_, version, pins, project_scope=project_scope,
+                            architect=architect, modules=modules or None, lake_args=lake_args or None)
         except (OSError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
 
 
-async def _run_bump(source_paths, continue_, version=None, dependency_pins=None, *, project_scope=None, architect=None):
-    from .. import bump_bootstrap
+def _assert_resume_jobs_closed(root: Path) -> None:
+    from ..bump_processes import assert_closed
+    assert_closed(root)
+
+
+async def _run_bump(source_paths, continue_, version=None, dependency_pins=None, *, project_scope=None,
+                    architect=None, modules=None, lake_args=None):
+    from .. import bump_setup, bump_tasks, bump_workflow
+    if architect not in {None, "off"}:
+        raise click.ClickException("Bump no longer automatically installs LeanArchitect")
     max_attempts = _attempt_limit()
     saved_cwd = Path.cwd()
     paths = None
     try:
+        if not continue_ and not version:
+            raise click.ClickException("Fresh Bump requires an exact target Lean version.")
+        # A configured team exists before dependency preparation starts. This
+        # does not dispatch any model by itself.
+        roster = load_roster(source_paths.agents_yaml, use_learned_strength=False)
+        names = [agent.name.strip().casefold() for agent in roster.agents]
+        if not names or any(not name for name in names) or len(names) != len(set(names)):
+            raise click.ClickException("bump agent names must be nonempty and unique ignoring case")
+        if len(names) < 2:
+            raise click.ClickException("bump requires at least two agents for independent migration review")
         if continue_:
-            paths = bump_bootstrap.resume(source_paths, version, dependency_pins,
-                                           project_scope=project_scope, architect=architect)
+            paths = bump_setup.resume(source_paths, version, dependency_pins,
+                                      project_scope=project_scope, modules=modules, lake_args=lake_args)
+            _assert_resume_jobs_closed(paths.project_root)
         else:
-            if not version:
-                raise click.ClickException("Fresh Bump requires an exact target Lean version.")
-            bump_bootstrap._json(source_paths.unity / "state.json",
+            bump_setup._json(source_paths.unity / "state.json",
                                  {"command": "bump", "phase": "preparing"})
             (source_paths.unity / "stop-requested").unlink(missing_ok=True)
-            paths = bump_bootstrap.prepare(source_paths, version, dependency_pins or {},
-                                           project_scope=project_scope or "build", architect=architect or "auto")
+            paths = bump_setup.prepare(source_paths, version, dependency_pins or {},
+                                      project_scope=project_scope or "build", modules=modules or (), lake_args=lake_args or ())
         root = paths.project_root
         os.chdir(root)
-        roster = load_roster(paths.agents_yaml, use_learned_strength=False)
-        names = [bump_state.author_key(agent.name) for agent in roster.agents]
-        if len(names) != len(set(names)):
-            raise click.ClickException("bump agent names must be unique ignoring case")
-        if continue_:
-            bump_jobs.terminate(root)
-            recover_interrupted_formal_merges(paths)
-            bump_state.recover_source_repairs(paths.forum)
         if continue_:
             (paths.unity / "stop-requested").unlink(missing_ok=True)
         elif (source_paths.unity / "stop-requested").exists():
             (paths.unity / "stop-requested").touch()
-        bump_bootstrap._json(source_paths.unity / "state.json",
-                             {"command": "bump", "phase": bump_state.load_state(paths.forum)["phase"]})
-        await _run_migration_loop(roster, paths, max_attempts)
-        final_state = bump_state.load_state(paths.forum)
-        bump_bootstrap._json(source_paths.unity / "state.json",
+        await bump_workflow.run(paths, roster, max_attempts=max_attempts)
+        final_state = bump_tasks.load(paths.forum)
+        bump_setup._json(source_paths.unity / "state.json",
                              {"command": "bump", "phase": "done" if final_state["phase"] == "complete" else final_state["phase"]})
+        if final_state["phase"] == "complete":
+            click.echo("bump complete: required target builds and independent migration review passed")
+        else:
+            click.echo("bump stopped: partial work and exact verification evidence retained")
     except BaseException:
-        bump_bootstrap._json(source_paths.unity / "state.json", {"command": "bump", "phase": "stopped"})
+        bump_setup._json(source_paths.unity / "state.json", {"command": "bump", "phase": "stopped"})
         raise
     finally:
         os.chdir(saved_cwd)

@@ -207,31 +207,236 @@ def require_original_obligations(baseline: dict, requirements: list[dict]) -> No
             raise ValueError("migration requirement changed its immutable original occurrence anchor")
 
 
+def _identity_error(task_id: str, message: str) -> None:
+    from .bump_spec import PlanValidationError
+    raise PlanValidationError(f"chunks[{task_id}].migration", message,
+                              code="invalid_migration_identity")
+
+
+def _identity_context(baseline: dict, requirements: list[dict], tasks: dict) -> tuple[dict, dict, dict]:
+    """Read the canonical obligation ledger, never infer ownership from names."""
+    # Baseline seals/source/environment are checked by their existing gates.
+    # This task-schema check must not reserialize the full baseline every time
+    # a controller considers a merge or launches a formalization round.
+    info = baseline.get("migration") if isinstance(baseline, dict) else None
+    index = info.get("original_index") if isinstance(info, dict) else None
+    if (not isinstance(baseline, dict) or not is_migration(baseline)
+            or not isinstance(index, dict) or not isinstance(index.get("occurrences"), dict)
+            or not isinstance(index.get("modules"), dict)
+            or any(not isinstance(row, dict) or not isinstance(row.get("path"), str)
+                   or not isinstance(row.get("source_sha256"), str)
+                   or not isinstance(row.get("occurrence_ids"), list)
+                   for row in index["modules"].values())):
+        raise ValueError("migration task identities require the controller-bound original index")
+    if (not isinstance(requirements, list) or not requirements
+            or any(not isinstance(row, dict) or not isinstance(row.get("id"), str)
+                   for row in requirements)):
+        raise ValueError("migration task identities require the canonical original requirement ledger")
+    require_original_obligations(baseline, requirements)
+    if not isinstance(tasks, dict):
+        raise ValueError("migration task identities require a task mapping")
+    from .bump_planner import empty_module_commands
+    commands = empty_module_commands(index)
+    assignments = {key: set() for key in tasks}
+    for requirement in requirements:
+        owners = requirement.get("tasks")
+        if (not isinstance(owners, list)
+                or any(not isinstance(key, str) or not key for key in owners)
+                or len(owners) != len(set(owners)) or set(owners) - tasks.keys()):
+            raise ValueError("migration requirements must name distinct current task owners")
+        for key in owners:
+            assignments[key].add(requirement["id"])
+    for key, task in tasks.items():
+        if (not isinstance(key, str) or not key or key != key.strip() or not isinstance(task, dict)
+                or task.get("task_id", task.get("id")) != key
+                or ("id" in task and task["id"] != key)):
+            _identity_error(str(key), "task key and original assignment id disagree")
+        references = task.get("requirement_ids")
+        if (not isinstance(references, list)
+                or any(not isinstance(value, str) or not value for value in references)
+                or len(references) != len(set(references))
+                or set(references) != assignments[key]):
+            _identity_error(key, "requirement_ids must match the canonical requirement task assignment")
+    return index, commands, assignments
+
+
+def _checked_task_identity(task_id: str, metadata: dict, *, index: dict,
+                           commands: dict, assigned: set[str]) -> dict:
+    """Validate identity/scope only; no native or semantic acceptance is implied."""
+    if not isinstance(metadata, dict) or not metadata:
+        _identity_error(task_id, "existing migration task lacks its controller-owned identity")
+    kind, ids = metadata.get("kind"), metadata.get("original_ids")
+    if (not isinstance(kind, str) or kind not in {"declaration", "mutual", "command"}
+            or not isinstance(ids, list)
+            or any(not isinstance(key, str) or not key for key in ids)
+            or len(ids) != len(set(ids))):
+        _identity_error(task_id, "migration identity requires a kind and distinct original_ids")
+    module, path = metadata.get("module"), metadata.get("path")
+    if (not isinstance(module, str) or module not in index["modules"]
+            or path != index["modules"][module]["path"]):
+        _identity_error(task_id, "migration identity escapes its sealed original source module")
+    if kind != "command":
+        occurrences = index["occurrences"]
+        if (not ids or not set(ids) <= occurrences.keys()
+                or assigned != {"requirement-" + key for key in ids}
+                or any(not isinstance(occurrences[key], dict)
+                       or occurrences[key].get("module") != module or occurrences[key].get("path") != path
+                       for key in ids)):
+            _identity_error(task_id, "original_ids must equal the task's assigned original declarations")
+        from .bump_planner import declaration_group_kind
+        try:
+            expected_kind = declaration_group_kind(occurrences, ids)
+        except ValueError as exc:
+            _identity_error(task_id, str(exc))
+        if kind != expected_kind:
+            _identity_error(task_id, "migration kind differs from its original declaration group")
+        if "original_ranges" in metadata:
+            recorded = metadata["original_ranges"]
+            expected = [occurrences[key]["range"] for key in ids if occurrences[key].get("range")]
+            # The compiler planner retains None slots for unranged generated
+            # occurrences; refinement historically omits those slots.
+            if (not isinstance(recorded, list)
+                    or [span for span in recorded if span is not None] != expected):
+                _identity_error(task_id, "declaration ranges differ from the sealed original source identities")
+    else:
+        if ids:
+            _identity_error(task_id, "bounded source-command tasks must have empty original_ids")
+        row = index["modules"][module]
+        governed = {"requirement-" + key for key in row["occurrence_ids"]}
+        command = next((key for key, value in commands.items() if value["module"] == module), None)
+        if not governed:
+            governed = {"requirement-" + command} if command else set()
+        if (not governed or assigned != governed
+                or metadata.get("command_obligation") != command):
+            _identity_error(task_id, "source command must retain its exact original module obligations")
+        lengths, line = row.get("line_lengths", []), metadata.get("command_line")
+        if (not isinstance(lengths, list)
+                or any(type(length) is not int or length < 0 for length in lengths)
+                or type(line) is not int or not 1 <= line <= len(lengths)):
+            _identity_error(task_id, "source command requires a bounded controller-owned original line")
+        spans = metadata.get("original_ranges", [])
+        if "range" in metadata:
+            spans = [*spans, metadata["range"]] if isinstance(spans, list) else None
+        if (not isinstance(spans, list) or any(
+                not isinstance(span, dict) or span.get("start_line") != line
+                or span.get("end_line") != line
+                or type(span.get("start_line")) is not int or type(span.get("end_line")) is not int
+                or type(span.get("start_column", 0)) is not int
+                or type(span.get("end_column", lengths[line - 1])) is not int
+                or not 0 <= span.get("start_column", 0) <= span.get("end_column", lengths[line - 1])
+                <= lengths[line - 1] for span in spans)):
+            _identity_error(task_id, "source-command ranges must stay on their bounded original line")
+    return deepcopy(metadata)
+
+
+def bind_task_identities(baseline: dict, requirements: list[dict], tasks: dict, *,
+                         previous_tasks: dict, compiler_metadata: dict | None = None) -> dict:
+    """Prepare controller-owned identities without changing any task or evidence.
+
+    Only genuinely new declaration tasks may derive identities from the sealed
+    ledger. Existing missing identities require explicit recovery, not an
+    implicit repair during a replan. New commands require compiler metadata.
+    """
+    index, commands, assignments = _identity_context(baseline, requirements, tasks)
+    if not isinstance(previous_tasks, dict):
+        raise ValueError("migration identity binding requires previous task history")
+    if compiler_metadata is not None and (not isinstance(compiler_metadata, dict)
+                                         or compiler_metadata.keys() - tasks.keys()):
+        raise ValueError("compiler identities must name current migration tasks")
+    supplied = compiler_metadata or {}
+    previous_identities = {}
+    for key, task in previous_tasks.items():
+        if (not isinstance(key, str) or not key or not isinstance(task, dict)
+                or task.get("task_id", task.get("id")) != key):
+            _identity_error(str(key), "existing migration task history is malformed")
+        references = task.get("requirement_ids")
+        if (not isinstance(references, list)
+                or any(not isinstance(value, str) or not value for value in references)
+                or len(references) != len(set(references))):
+            _identity_error(key, "existing migration task lacks its original requirement assignment")
+        previous_identities[key] = _checked_task_identity(key, task.get("migration"), index=index,
+                                                         commands=commands, assigned=set(references))
+    result = {}
+    for key, task in tasks.items():
+        previous = previous_tasks.get(key)
+        if previous is not None:
+            original = _checked_task_identity(key, previous_identities[key], index=index,
+                                              commands=commands, assigned=assignments[key])
+            proposed = supplied.get(key, original)
+            proposed = _checked_task_identity(key, proposed, index=index,
+                                              commands=commands, assigned=assignments[key])
+            identity_fields = ("kind", "original_ids", "module", "path")
+            if original["kind"] == "command":
+                identity_fields += ("command_line", "command_obligation")
+            if any(original.get(field) != proposed.get(field) for field in identity_fields):
+                _identity_error(key, "compiler refresh cannot replace an existing original task identity")
+            result[key] = {**original, **proposed}
+        elif key in supplied:
+            result[key] = _checked_task_identity(key, supplied[key], index=index,
+                                                 commands=commands, assigned=assignments[key])
+        else:
+            ids = sorted(value.removeprefix("requirement-") for value in assignments[key])
+            if not ids or not set(ids) <= index["occurrences"].keys():
+                _identity_error(key, "new source-command tasks require bounded controller compiler metadata")
+            paths = {index["occurrences"][item]["path"] for item in ids}
+            modules = {index["occurrences"][item]["module"] for item in ids}
+            if len(paths) != 1 or len(modules) != 1:
+                _identity_error(key, "refine cross-file work into separate declaration tasks with dependency edges")
+            from .bump_planner import declaration_group_kind
+            try:
+                kind = declaration_group_kind(index["occurrences"], ids)
+            except ValueError as exc:
+                _identity_error(key, str(exc))
+            parents = [row for row in previous_identities.values()
+                       if set(ids).intersection(row["original_ids"])]
+            metadata = {"kind": kind, "original_ids": ids, "path": next(iter(paths)),
+                "module": next(iter(modules)),
+                "original_ranges": [deepcopy(index["occurrences"][item]["range"])
+                                    for item in ids if index["occurrences"][item].get("range")],
+                "diagnostic_ids": sorted({item for parent in parents
+                                          for item in parent.get("diagnostic_ids", [])})}
+            result[key] = _checked_task_identity(key, metadata, index=index,
+                                                 commands=commands, assigned=assignments[key])
+    return result
+
+
+def require_task_identities(state: dict) -> None:
+    """Fail closed on malformed migration tasks; do not repair retained state."""
+    formal = state.get("formalization") or {}
+    if not isinstance(formal, dict):
+        raise ValueError("migration task identities require formalization state")
+    contract = formal.get("contract") or {}
+    if not isinstance(contract, dict):
+        raise ValueError("migration task identities require a formalization contract")
+    if not is_migration(contract):
+        if (is_migration(state.get("project_baseline"))
+                or is_migration(contract.get("project_baseline"))):
+            raise ValueError("migration task identities require a migration contract")
+        return
+    baseline = contract.get("project_baseline")
+    if not isinstance(baseline, dict):
+        raise ValueError("migration task identities require the sealed original baseline")
+    requirements = formal.get("requirements", contract.get("requirements"))
+    if requirements != contract.get("requirements"):
+        raise ValueError("migration task assignments differ from their bound contract requirements")
+    tasks = state.get("formal_tasks")
+    index, commands, assignments = _identity_context(baseline, requirements, tasks)
+    for key, task in tasks.items():
+        _checked_task_identity(key, task.get("migration"), index=index,
+                               commands=commands, assigned=assignments[key])
+
+
 def refine(state: dict, changes: dict, *, previous_tasks: dict) -> None:
     """Carry original occurrence ownership through inherited explicit refinement."""
     contract = state["formalization"]["contract"]
     if not is_migration(contract):
         return
-    require_original_obligations(contract["project_baseline"], state["formalization"]["requirements"])
-    index = contract["project_baseline"]["migration"]["original_index"]["occurrences"]
-    for key, task in state["formal_tasks"].items():
-        if key in previous_tasks and previous_tasks[key].get("migration"):
-            task["migration"] = deepcopy(previous_tasks[key]["migration"])
-        else:
-            ids = set(original_ids(contract, task))
-            if not ids or not ids <= index.keys():
-                raise ValueError("refined migration task must retain explicit original declaration obligations")
-            paths = {index[item]["path"] for item in ids}
-            modules = {index[item]["module"] for item in ids}
-            if len(paths) != 1 or len(modules) != 1:
-                raise ValueError("refine cross-file work into separate declaration tasks with dependency edges")
-            parents = [row.get("migration", {}) for row in previous_tasks.values()
-                       if ids.intersection(original_ids(contract, row))]
-            from .bump_planner import declaration_group_kind
-            task["migration"] = {"kind": declaration_group_kind(index, ids),
-                "original_ids": sorted(ids), "path": next(iter(paths)), "module": next(iter(modules)),
-                "original_ranges": [index[item]["range"] for item in sorted(ids) if index[item].get("range")],
-                "diagnostic_ids": sorted({item for parent in parents for item in parent.get("diagnostic_ids", [])})}
+    identities = bind_task_identities(contract["project_baseline"],
+        state["formalization"]["requirements"], state["formal_tasks"], previous_tasks=previous_tasks)
+    # Keep the task table and task objects: callers retain references to them
+    # while completing the same atomic refinement transaction.
+    for key, metadata in identities.items():
+        state["formal_tasks"][key]["migration"] = metadata
 
 
 def prepare_contract(paths, dag: dict, *, state: dict, environment=None, main_sha=None) -> dict:

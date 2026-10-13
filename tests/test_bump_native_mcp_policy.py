@@ -14,14 +14,15 @@ import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
 from unity import bump_spawn
-from unity.forum import bump_server
+from unity.forum import bump_server, bump_workflow_server
 from unity.roster import Agent
 
 
-def servers_for(phase):
+def servers_for(phase, *, workflow=False):
     return {
         "unity-forum": {"command": sys.executable, "args": [
-            "-m", "unity.forum.bump_server", "--forum-dir", "/fixture/.unity/forum/bump",
+            "-m", "unity.forum.bump_workflow_server" if workflow else "unity.forum.bump_server",
+            "--forum-dir", "/fixture/.unity/forum/bump",
             "--project-root", "/fixture", "--profile", phase]},
         "lean-lsp": {"command": "uvx", "args": ["lean-lsp-mcp"]},
         "axle": {"command": "uvx", "args": ["--from", "axiom-axle-mcp", "axle-mcp-server"],
@@ -36,6 +37,22 @@ def agent():
 
 
 class BumpNativePolicyTests(unittest.TestCase):
+    def test_workflow_transport_authorizes_exact_new_catalog(self):
+        for phase, tools in bump_workflow_server.PROFILE_TOOLS.items():
+            with self.subTest(phase=phase):
+                policy = bump_spawn._bump_codex_tool_policy(servers_for(phase, workflow=True), phase)
+                self.assertEqual(policy["unity-forum"], tuple(tool.__name__ for tool in tools))
+                self.assertNotIn("finalize_formalization", policy["unity-forum"])
+                self.assertNotIn("validate_chunks", policy["unity-forum"])
+                self.assertEqual("request_review_repair" in policy["unity-forum"], phase == "critic")
+
+    def test_legacy_facade_new_only_profiles_use_workflow_catalog(self):
+        for phase in ("preparing", "repairing"):
+            with self.subTest(phase=phase):
+                policy = bump_spawn._bump_codex_tool_policy(servers_for(phase), phase)
+                self.assertEqual(policy["unity-forum"], tuple(
+                    tool.__name__ for tool in bump_workflow_server.PROFILE_TOOLS[phase]))
+
     def test_forum_authorization_matches_registered_phase_exactly(self):
         for phase, tools in bump_server.PROFILE_TOOLS.items():
             with self.subTest(phase=phase):
@@ -56,10 +73,11 @@ class BumpNativePolicyTests(unittest.TestCase):
                 self.assertIn("lean_diagnostic_messages", policy["lean-lsp"])
                 self.assertNotIn("lean_build", policy["lean-lsp"])
                 self.assertIn("list_environments", policy["axle"])
-                self.assertEqual("aristotle_submit" in policy["aristotle"], phase == "formalizing")
-                self.assertEqual("aristotle_result" in policy["aristotle"], phase == "formalizing")
-                self.assertEqual("repair_proofs" in policy["axle"], phase == "formalizing")
-                self.assertEqual("lean_multi_attempt" in policy["lean-lsp"], phase == "formalizing")
+                repair = phase in {"formalizing", "repairing"}
+                self.assertEqual("aristotle_submit" in policy["aristotle"], repair)
+                self.assertEqual("aristotle_result" in policy["aristotle"], repair)
+                self.assertEqual("repair_proofs" in policy["axle"], repair)
+                self.assertEqual("lean_multi_attempt" in policy["lean-lsp"], repair)
                 for name, filename in (("lean-lsp", "LEAN"), ("axle", "AXLE"), ("aristotle", "ARISTOTLE")):
                     prompt = (prompt_dir / f"BUMP_{filename}_TOOLS.md").read_text()
                     for tool in policy[name]:
@@ -202,7 +220,8 @@ class BumpShellEnvironmentTests(unittest.TestCase):
                 self.assertEqual(config["sandbox_workspace_write"]["writable_roots"], [str(worker)])
                 self.assertEqual(config["shell_environment_policy"]["set"], self.runtime(phase))
                 self.assertEqual(config["mcp_servers"]["unity-forum"]["enabled_tools"],
-                    [tool.__name__ for tool in bump_server.PROFILE_TOOLS[phase]])
+                    [tool.__name__ for tool in (bump_workflow_server.PROFILE_TOOLS[phase]
+                     if phase in {"preparing", "repairing"} else bump_server.PROFILE_TOOLS[phase])])
                 self.assertEqual(client.thread_start.call_args.kwargs["approval_mode"], "never")
                 client.close.assert_awaited_once()
 

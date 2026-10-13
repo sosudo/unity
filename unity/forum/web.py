@@ -200,7 +200,116 @@ def _bump_history_exists() -> bool:
     # A preparing or unreadable pointer is history too, never permission for
     # the web launcher to overwrite an earlier workspace with a fresh run.
     return ((ROOT_DIR / "bump" / "active.json").exists()
-            or (_bump_forum() / "bump-state.json").exists())
+            or (_bump_forum() / "bump-state.json").exists()
+            or (_bump_forum() / "bump-workflow.json").exists())
+
+
+def _compiler_bump_state() -> dict | None:
+    """Read the new Bump state without initializing or reconfiguring a server."""
+    from ..bump_tasks import STATE_FILE, load
+    forum = _bump_forum()
+    return load(forum) if (forum / STATE_FILE).exists() else None
+
+
+def _compiler_bump_workspace() -> bool:
+    # The origin is written before environment preparation / initial state.
+    # Stop requests in that window must not fall through to legacy job kills.
+    if _compiler_bump_state() is not None:
+        return True
+    try:
+        origin = json.loads((_bump_unity() / "bump-origin.json").read_text())
+    except FileNotFoundError:
+        return False
+    return origin.get("schema") == "compiler-migration-v2"
+
+
+def _compiler_bump_metrics(state: dict) -> dict:
+    """Stored counters, not native verification or a fresh acceptance audit."""
+    def counts(rows):
+        result = {}
+        for row in rows:
+            status = row.get("status", "unknown")
+            result[status] = result.get(status, 0) + 1
+        return result
+
+    review = state.get("review", {})
+    snapshot, verdict = review.get("snapshot", {}), review.get("verdict", {})
+    current = bool(snapshot and snapshot.get("main_sha") == state.get("main_sha")
+                   and snapshot.get("config_revision") == state.get("config", {}).get("revision"))
+    verdict_current = bool(current and verdict
+                           and verdict.get("snapshot_id") == snapshot.get("snapshot_id")
+                           and verdict.get("snapshot_sha256") == snapshot.get("sha256"))
+    return {"schema": state["schema"], "phase": state.get("phase"), "revision": state.get("revision"),
+            "chunks": counts(state.get("chunks", {}).values()),
+            "tasks": counts(state.get("tasks", {}).values()),
+            "candidates": counts(state.get("candidates", {}).values()),
+            "writer_leases": len(state.get("leases", {})),
+            "workflow_changes": len(state.get("workflow_changes", [])),
+            "configuration_requests": counts(state.get("config_requests", {}).values()),
+            "events": len(state.get("events", [])),
+            "review": {"snapshot_id": snapshot.get("snapshot_id"), "current": current,
+                       "passed": snapshot.get("passed", False), "verdict_current": verdict_current,
+                       "approved": bool(verdict_current and verdict.get("approved")),
+                       "author": verdict.get("author")},
+            "acceptance": "recorded_complete" if state.get("phase") == "complete"
+                and snapshot.get("passed") and verdict_current and verdict.get("approved")
+                else "provisional"}
+
+
+def _compiler_bump_dag(state: dict) -> dict:
+    """All lexical declaration chunks, with current repair assignments overlaid."""
+    tasks = {key: task for key, task in state.get("tasks", {}).items()
+             if task.get("status") not in {"grouped", "retired", "superseded"}}
+    by_chunk = {}
+    for task in tasks.values():
+        for key in task.get("chunk_ids", []):
+            by_chunk.setdefault(key, []).append(task)
+    # Tasks without a declaration (imports/configuration/dependencies) remain
+    # visible nodes so no prerequisite edges vanish from the displayed graph.
+    task_nodes = {key: [cid for cid in task.get("chunk_ids", []) if cid in state.get("chunks", {})]
+                  or ["assignment:" + key] for key, task in tasks.items()}
+    metrics = _compiler_bump_metrics(state)
+    accepted = metrics["acceptance"] == "recorded_complete"
+    nodes = []
+
+    def node(key, chunk, assignments):
+        status = chunk.get("status", "unobserved")
+        owners = sorted({t["owner"] for t in assignments if t.get("owner")})
+        dependencies = {cid for task in assignments for dep in task.get("dependencies", [])
+                        for cid in task_nodes.get(dep, []) if cid != key}
+        skipped = status in {"excluded", "skipped"}
+        if skipped:
+            color = "grey"
+        elif any(t.get("status") in {"failed", "blocked"} for t in assignments):
+            color = "red"
+        elif any(t.get("status") in {"running", "submitted", "merging"} for t in assignments):
+            color = "yellow"
+        elif status == "clean":
+            color = "green" if accepted else "blue"
+        else:
+            color = "grey"
+        return {"id": key, "title": chunk.get("name") or key, "type": chunk.get("kind", "command"),
+                "status": color, "compiler_status": status,
+                "lean_file": chunk.get("path", ""),
+                "lean_decl_lines": [chunk.get("start_line"), chunk.get("end_line")],
+                "group_id": chunk.get("group_id"), "dependencies": sorted(dependencies),
+                "declarations": [chunk["name"]] if chunk.get("name") else [],
+                "assignment": {"owners": owners, "task_ids": [t["task_id"] for t in assignments],
+                               "tasks": [{k: t.get(k) for k in ("task_id", "status", "revision", "attempts",
+                                          "files", "dependencies", "dependency_basis")} for t in assignments]},
+                "diagnostics": [d for task in assignments for d in task.get("diagnostics", [])],
+                "scope_excluded": bool(chunk.get("scope_excluded")), "after_exit": bool(chunk.get("after_exit")),
+                "acceptance": "outside_scope" if skipped else "recorded_complete" if accepted else "provisional"}
+
+    for key, chunk in state.get("chunks", {}).items():
+        nodes.append(node(key, chunk, by_chunk.get(key, [])))
+    for key, task in tasks.items():
+        if task_nodes[key] == ["assignment:" + key]:
+            nodes.append(node("assignment:" + key, {"name": key, "kind": task.get("kind"),
+                "status": "clean" if task.get("status") == "complete" else "needs_repair"}, [task]))
+    return {"graph_kind": "bump", "schema": state["schema"], "chunks": nodes,
+            "metrics": metrics, "review": state.get("review", {}),
+            "dependency_basis": "Current import and conservative source-order scheduling hints; not semantic proof dependencies"}
 
 
 def _workspace_unity() -> Path:
@@ -269,6 +378,9 @@ def _formalize_dag() -> dict:
 
 def _bump_dag() -> dict:
     """Declaration repair assignments from Bump's authoritative state."""
+    current = _compiler_bump_state()
+    if current is not None:
+        return _compiler_bump_dag(current)
     from ..bump_state import assignment_view, load_state
     state = load_state(_bump_forum())
     chunks = []
@@ -828,6 +940,9 @@ def get_formalize_metrics():
 def get_bump_state():
     if not _bump_command():
         return {}
+    current = _compiler_bump_state()
+    if current is not None:
+        return current
     from ..bump_state import load_state
     return load_state(_bump_forum())
 
@@ -836,6 +951,9 @@ def get_bump_state():
 def get_bump_metrics():
     if not _bump_command():
         return {}
+    current = _compiler_bump_state()
+    if current is not None:
+        return _compiler_bump_metrics(current)
     from .bump_server import read_metrics
     return read_metrics(_bump_forum(), _bump_unity().parent)
 
@@ -933,17 +1051,24 @@ def _agent_statuses(chunks: dict) -> list:
                         "strategy": "assisting: " + strategy.get("description", ""),
                     }
     elif _bump_command(active=True):
-        from ..bump_state import load_state
-        state = load_state(_bump_forum())
+        state = get_bump_state()
+        compiler = state.get("schema") == "compiler-migration-v2"
+        if compiler and state.get("phase") not in {"complete", "stopped"}:
+            for task in state.get("tasks", {}).values():
+                if task.get("owner") and task.get("status") in {"running", "submitted", "merging"}:
+                    claims[task["owner"]] = {"chunk": task["task_id"],
+                        "strategy": task.get("kind", "repair") + ": " + ", ".join(task.get("files", []))}
         for strategy in state.get("strategies", {}).values():
-            if strategy.get("owner") and strategy.get("status") in ("claimed", "paused"):
+            if (strategy.get("owner") and strategy.get("status") in (("active",) if compiler else ("claimed", "paused"))
+                    and (not compiler or state.get("phase") not in {"complete", "stopped"})):
+                target = strategy.get("task_id" if compiler else "target", "")
                 claims[strategy["owner"]] = {
-                    "chunk": strategy.get("target", ""),
+                    "chunk": target,
                     "strategy": strategy.get("description", ""),
                 }
                 for assistant in strategy.get("assistants", []):
                     claims[assistant] = {
-                        "chunk": strategy.get("target", ""),
+                        "chunk": target,
                         "strategy": "assisting: " + strategy.get("description", ""),
                     }
     elif _formalize_command(active=True):
@@ -1567,6 +1692,8 @@ function updateHeaderLegend(data) {
   const el = document.getElementById('hlegend');
   const legend = data.graph_kind === 'informal_tasks'
     ? [['green','Resolved','#2e7d32'], ['yellow','Claimed','#7c5cbf'], ['grey','Open','#d97706'], ['red','Blocked','#c62828']]
+    : data.graph_kind === 'bump' && data.schema === 'compiler-migration-v2'
+    ? [['green','Accepted snapshot','#2e7d32'], ['yellow','Active / provisional','#7c5cbf'], ['grey','Unobserved / outside scope','#d97706'], ['red','Needs attention','#c62828']]
     : (['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) || data.graph_kind === 'bump')
     ? [['green','Verified + faithful','#2e7d32'], ['yellow','In progress','#7c5cbf'], ['grey','Unstarted','#d97706'], ['red','Needs attention','#c62828']]
     : LEGEND;
@@ -1574,7 +1701,7 @@ function updateHeaderLegend(data) {
     '<span><span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:'+col+';margin-right:6px"></span>'+label+' '+counts[k]+'</span>').join('');
 }
 
-let cy = null, chunks = {}, graphKind = 'formalization';
+let cy = null, chunks = {}, graphKind = 'formalization', graphSchema = null;
 let nodePositions = {};  // id -> {x,y}, persisted across rebuilds
 let lastSig = '';        // sorted chunk-ids, skip rebuild when unchanged
 
@@ -1587,6 +1714,7 @@ function buildGraph(data) {
   }
   chunks = {};
   graphKind = data.graph_kind || 'formalization';
+  graphSchema = data.schema || null;
   data.chunks.forEach(c => { chunks[c.id] = c; });
   const elements = [];
   const nodeIds = new Set(data.chunks.map(c => c.id));
@@ -1653,6 +1781,24 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
+  if (graphKind === 'bump' && graphSchema === 'compiler-migration-v2') {
+    const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
+    const assignment = c.assignment || {};
+    document.getElementById('info-content').innerHTML =
+      field('declaration / command', c.title)
+      + field('kind', c.type)
+      + field('source', c.lean_file + (c.lean_decl_lines?.[0] ? ':' + c.lean_decl_lines.join('–') : ''))
+      + field('compiler observation', c.compiler_status)
+      + field('acceptance', c.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot' : c.acceptance === 'outside_scope' ? 'Outside current build scope' : 'Provisional: final build and independent review still required')
+      + field('group', c.group_id)
+      + field('assignments', (assignment.tasks || []).map(t => t.task_id + ' · ' + t.status + ' · attempt ' + (t.attempts || 0)).join('; ') || 'none')
+      + field('owners', (assignment.owners || []).join(', ') || 'none')
+      + field('scheduling dependencies', (c.dependencies || []).join(', ') || 'none')
+      + field('dependency evidence', 'Import and conservative source-order hints, not semantic proof dependencies')
+      + field('compiler feedback', (c.diagnostics || []).map(d => d.message || d.text || d.severity || '').join('\\n') || 'none');
+    document.getElementById('info-panel').classList.add('visible');
+    return;
+  }
   if (['formalize', 'autoformalize', 'solve_formalization'].includes(graphKind) || graphKind === 'bump') {
     const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
     const assignment = c.assignment || {};
@@ -1957,7 +2103,10 @@ def _current_run() -> dict:
 def api_project():
     dag = _dashboard_dag_path()
     chunk_ids = []
-    if dag.exists():
+    compiler = _compiler_bump_state() if _bump_command() else None
+    if compiler is not None:
+        chunk_ids = [chunk["id"] for chunk in _compiler_bump_dag(compiler)["chunks"]]
+    elif dag.exists():
         try:
             chunk_ids = [c.get("id") for c in json.loads(dag.read_text()).get("chunks", [])]
         except Exception:
@@ -1966,7 +2115,7 @@ def api_project():
             "continue": _forum_nonempty(),
             "formalize_continue": _formalize_history_exists(),
             "bump_continue": _bump_history_exists(),
-            "has_dag": dag.exists(), "chunks": chunk_ids,
+            "has_dag": compiler is not None or dag.exists(), "chunks": chunk_ids,
             "active_metric": _active_metric(),
             "commands": _COMMANDS,
             "metrics": sorted(p.name for p in (ROOT_DIR / "metrics").glob("*.md")) if (ROOT_DIR / "metrics").exists() else []}
@@ -2321,6 +2470,16 @@ def api_blueprint(tree: str = "main"):
 
 def _chunk_for_decl(name: str) -> dict | None:
     """Find the chunk in dag.json that covers a declaration, if any."""
+    if _bump_command():
+        compiler = _compiler_bump_state()
+        if compiler is not None:
+            matches = [c for c in compiler.get("chunks", {}).values() if c.get("name") == name]
+            # This is an exact lexical inventory name, not a kernel output binding.
+            if len(matches) == 1:
+                chunk = matches[0]
+                return {"id": chunk["chunk_id"], "title": chunk["name"], "status": chunk["status"],
+                        "source": "lexical_inventory"}
+            return None
     try:
         chunks = json.loads(_dashboard_dag_path().read_text()).get("chunks", [])
     except (OSError, json.JSONDecodeError):
@@ -2499,6 +2658,20 @@ def api_run_stop(payload: dict = Body(default={})):
     st = _current_run()
     if not st["running"]:
         return {"ok": True, "stopped": False}
+    if st.get("command") == "bump" and _compiler_bump_workspace():
+        if payload.get("mode", "safe") != "safe":
+            # webrun.json only stores a PID, not its birth/cwd/argv identity.
+            # Never feed it (or historical job records) to broad termination.
+            return JSONResponse({"ok": False, "stopped": False,
+                "error": "Compiler Bump force-stop requires fresh process ownership verification; use safe stop."},
+                status_code=409)
+        marker = _bump_unity() / "stop-requested"
+        try:
+            with marker.open("x") as handle:
+                handle.write(str(time.time()))
+        except FileExistsError:
+            pass  # Keep an earlier request and its timestamp intact.
+        return {"ok": True, "stopping": True, "mode": "native_request"}
     if payload.get("mode", "safe") == "safe":
         # Safe stop: agents end at their next stream item, remaining phases are skipped,
         # worktrees get cleaned up. Force mode (second click) kills the process group.
@@ -2926,7 +3099,29 @@ async function loadOverview() {
         '<div class="item"><b>' + (sm.worker_turns || 0) + '</b> worker turns · ' + (sm.worker_seconds || 0) + ' agent-seconds</div>' +
         '<div class="item"><b>$' + Number(sm.cost_usd || 0).toFixed(4) + '</b> recorded cost' + (sm.time_to_first_candidate_seconds == null ? '' : ' · first candidate ' + sm.time_to_first_candidate_seconds + 's') + '</div></section></div>';
     }
-    if (af.run_id && (['formalize', 'autoformalize'].includes(r.command) || r.command === 'bump')) {
+    if (af.run_id && r.command === 'bump' && af.schema === 'compiler-migration-v2') {
+      const config = af.config || {}, tasks = Object.values(af.tasks || {}),
+        candidates = Object.values(af.candidates || {}), chunks = Object.values(af.chunks || {}),
+        review = af.review || {}, snapshot = review.snapshot || {}, verdict = review.verdict || {},
+        countText = counts => Object.entries(counts || {}).map(([key, n]) => n + ' ' + key).join(' · ') || 'none',
+        strategies = Object.values(af.strategies || {}).filter(x => x.status === 'active'),
+        requests = Object.values(af.config_requests || {});
+      h += '<div class="sechead">Bump compiler workflow<span class="r">phase ' + esc(af.phase) + ' · revision ' + esc(af.revision) + '</span></div>';
+      h += '<div class="item">' + (afm.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot; dashboard reads stored evidence.' : 'Integrated repairs and clean chunks are provisional until the final project build and independent critic review.') + '</div>';
+      h += '<div class="grid"><section><h2>current configuration</h2><div class="item">Lean ' + esc(af.target_version) + '<div class="who mono">main ' + esc((af.main_sha || '').slice(0,12)) + ' · config revision ' + esc(config.revision) + '</div><div class="who">Lake options: ' + ((config.lake_args || []).map(esc).join(' ') || 'none') + '</div></div>' +
+        '<div class="item">' + chunks.length + ' declaration / command chunks<div class="who">' + esc(countText(afm.chunks)) + '</div></div>' +
+        '<div class="item">' + esc(countText(afm.tasks)) + '<div class="who">' + esc(afm.writer_leases || 0) + ' exclusive file writer leases</div></div></section>';
+      h += '<section><h2>repair assignments</h2>' + (tasks.length ? tasks.filter(x => !['grouped','retired','superseded'].includes(x.status)).map(x =>
+        '<div class="item"><b class="mono">' + esc(x.task_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div class="who">' + esc(x.kind) + ' · owner ' + esc(x.owner || 'none') + ' · attempt ' + esc(x.attempts || 0) + '</div><div>' + (x.files || []).map(esc).join(', ') + '</div><div class="who">chunks: ' + (x.chunk_ids || []).map(esc).join(', ') + '</div><div class="who">scheduling dependencies: ' + ((x.dependencies || []).map(esc).join(', ') || 'none') + '</div></div>').join('') : '<div class="empty">no repair assignments yet</div>') + '</section>';
+      h += '<section><h2>repair candidates</h2>' + (candidates.length ? candidates.slice(-8).reverse().map(x =>
+        '<div class="item"><b class="mono">' + esc(x.candidate_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div class="who">' + esc(x.author) + ' · ' + esc(x.task_id) + ' · ' + esc((x.commit_sha || '').slice(0,12)) + '</div><div>' + esc(x.notes || x.error || '') + '</div>' + artifactButton((x.artifact || {}).artifact_id) + '</div>').join('') : '<div class="empty">none submitted</div>') + '</section>';
+      h += '<section><h2>final build & independent review</h2><div class="item">' + (snapshot.snapshot_id ? esc(snapshot.snapshot_id) : 'not checked yet') + '<div class="who">build / audit: ' + (snapshot.passed ? 'passed' : 'not passed') + ' · snapshot ' + ((afm.review || {}).current ? 'current' : 'missing or stale') + '</div><div class="who">critic: ' + esc(verdict.author || 'none') + ' · ' + (verdict.approved ? 'approved' : verdict.snapshot_id ? 'changes requested' : 'not reviewed') + ' · verdict ' + ((afm.review || {}).verdict_current ? 'current' : 'missing or stale') + '</div><div>' + esc(verdict.reasoning || '') + '</div></div>' +
+        Object.entries(af.final_report || {}).map(([kind, record]) => '<div class="item">' + esc(kind) + artifactButton(record.artifact_id) + '</div>').join('') + '</section>';
+      h += '<section><h2>coordination</h2>' + strategies.map(x => '<div class="item"><b>' + esc(x.title || x.strategy_id) + '</b><div>' + esc(x.description) + '</div><div class="who">' + esc(x.task_id) + ' · owner ' + esc(x.owner || 'none') + ' · assistants ' + (x.assistants || []).map(esc).join(', ') + '</div></div>').join('') +
+        (af.events || []).slice(-8).reverse().map(x => '<div class="item"><b>' + esc(x.kind) + '</b><div>' + esc(x.content || x.reason || '') + '</div><div class="who">' + esc(x.author || '') + '</div></div>').join('') + '</section>';
+      h += '<section><h2>configuration & workflow changes</h2>' + requests.slice(-8).map(x => '<div class="item"><b>' + esc(x.request_id) + '</b><span class="badge pending">' + esc(x.status) + '</span><div>' + esc(x.reason) + '</div></div>').join('') +
+        (af.workflow_changes || []).slice(-8).map(x => '<div class="item"><b>' + esc(x.problem || '') + '</b><div>' + esc(x.revised || '') + '</div><div class="who">' + esc(x.result || '') + '</div></div>').join('') + '</section></div>';
+    } else if (af.run_id && (['formalize', 'autoformalize'].includes(r.command) || r.command === 'bump')) {
       const source = af.input_source || {}, formal = af.formalization || {},
         tasks = Object.values(af.formal_tasks || {}).filter(x => x.status !== 'superseded'),
         candidates = Object.values(af.formal_candidates || {}),

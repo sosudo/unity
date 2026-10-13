@@ -1,18 +1,5 @@
-You are the primary agent running the `unity bump` retrospective. The selected original Lean
-migration is already accepted; do not reopen it or modify target Lean or the immutable original snapshot.
+You are recording the retrospective for an accepted compiler-driven Bump migration. Do not reopen the run or edit migrated source/configuration.
 
-Start with `bump_brief`, `bump_metrics` and accepted candidate verification artifacts. Retrieve source
-passages, findings, failed strategies and critic detail only for a specific evidence question. Do not
-reread complete transcripts or inspect Unity installation internals to discover how to save lessons;
-the task supplies the library directory, run ID, report path and JSON schema.
+Read the accepted snapshot, project-change record, workflow-change record and relevant forum findings. Distill evidence-backed lessons about dependency compatibility, API/proof repairs, task grouping, file ownership, configuration/build ordering and verification. Keep the two records separate: project changes explain edits and checks; workflow changes connect original procedure to a concrete problem/evidence, revised procedure and observed result.
 
-Distill reusable, evidenced lessons: checked old/new API correspondences, compatible proof repairs,
-declaration-level dependency choices, concrete failure fixes, and collaboration improvements that
-could reduce duplicate work. Consult relevant existing library entries before extending them.
-
-Write concise Markdown additions under the supplied library directory, preserving existing useful
-content. Do not copy raw transcripts, speculative claims, secrets, benchmark-specific noise or
-unsupported conclusions. Save the supplied `.unity/forum/bump/retrospective.json` with status `written`, saved
-library paths and concrete evidence references; Unity computes their hashes. If there is no justified
-general lesson, save `no_changes` with a concrete reason. An inspected artifact or chat response is not
-a saved retrospective outcome. After saving the report, end the turn without reopening acceptance.
+Use `record_workflow_change` for structured lessons and the supplied task's exact output paths for any requested saved retrospective. Give reviewers/output files unique ownership. Do not copy raw transcripts, credentials or speculative conclusions. State no justified new lesson when appropriate; do not invent success or claim inherited holes were proved. End after recording the requested retrospective without reopening acceptance.

@@ -14,10 +14,12 @@ import signal
 import subprocess
 import time
 import uuid
+import codecs
+import selectors
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from pathlib import Path
-from threading import Event
+from threading import Event, get_ident
 
 
 class JobCancelled(ValueError):
@@ -25,6 +27,7 @@ class JobCancelled(ValueError):
 
 
 _cancellation: ContextVar[Event | None] = ContextVar("bump_job_cancellation", default=None)
+_held_build_locks: ContextVar[tuple] = ContextVar("bump_build_locks", default=())
 
 
 @contextmanager
@@ -79,6 +82,10 @@ def _jobs_dir(project_root: Path) -> Path:
 def _build_lock(project_root: Path):
     """Serialize authoritative bump builds across controller processes."""
     path = Path(project_root) / ".unity" / "forum" / "bump-build.lock"
+    identity = (str(path.resolve()), get_ident())
+    if identity in _held_build_locks.get():
+        yield
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+") as handle:
         while True:
@@ -89,10 +96,40 @@ def _build_lock(project_root: Path):
             except BlockingIOError:
                 event = _cancellation.get()
                 event.wait(0.1) if event is not None else time.sleep(0.1)
+        token = _held_build_locks.set((*_held_build_locks.get(), identity))
         try:
             yield
         finally:
+            _held_build_locks.reset(token)
             fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _stream_output(proc, callback, input_text=None):
+    """Deliver incremental stdout/stderr without blocking cancellation on a line."""
+    if input_text is not None:
+        proc.stdin.write(input_text)
+        proc.stdin.close()
+    chunks = {"stdout": [], "stderr": []}
+    decoders = {name: codecs.getincrementaldecoder("utf-8")("replace") for name in chunks}
+    with selectors.DefaultSelector() as selector:
+        for name in chunks:
+            selector.register(getattr(proc, name), selectors.EVENT_READ, name)
+        while selector.get_map():
+            check_cancelled()
+            for key, _ in selector.select(timeout=0.1):
+                payload = os.read(key.fileobj.fileno(), 65536)
+                name = key.data
+                text = decoders[name].decode(payload, final=not payload)
+                if text:
+                    chunks[name].append(text)
+                    callback(name, text)
+                if not payload:
+                    selector.unregister(key.fileobj)
+        while proc.poll() is None:
+            check_cancelled()
+            time.sleep(0.05)
+    check_cancelled()
+    return "".join(chunks["stdout"]), "".join(chunks["stderr"])
 
 
 def run(
@@ -106,24 +143,37 @@ def run(
     timings: dict | None = None,
     passthrough_stdio: bool = False,
     input: str | None = None,
+    on_output=None,
 ) -> subprocess.CompletedProcess:
     """Run a registered job; interactive LSP keeps live stdio and its client's group."""
     if passthrough_stdio and serialize_build:
         raise ValueError("an interactive server must not hold the build lock")
+    if passthrough_stdio and on_output is not None:
+        raise ValueError("interactive stdio cannot also be captured as build events")
+    if on_output is not None and input is not None:
+        raise ValueError("streamed build events do not support a buffered stdin payload")
     # Internal checks must not re-enter the worker's Lake guard while
     # holding the same build lock.
     args = list(args)
-    if args and args[0] == "lake":
-        real_lake = os.environ.get("UNITY_REAL_LAKE", "").strip()
-        if real_lake:
-            executable = Path(real_lake)
+    if args and args[0] in {"lake", "lean"}:
+        selected = ""
+        setup_path = Path(cwd or project_root) / ".unity" / "bump" / "setup.json"
+        if setup_path.is_file():
+            setup = json.loads(setup_path.read_text())
+            if setup.get("schema") == "compiler-migration-v2":
+                selected = setup.get("toolchain", {}).get(args[0], {}).get("executable", "")
+        receipt_selected = bool(selected)
+        selected = selected or (os.environ.get("UNITY_REAL_LAKE", "").strip() if args[0] == "lake" else "")
+        if selected:
+            executable = Path(selected)
             if (
                 not executable.is_absolute()
                 or not executable.is_file()
                 or not os.access(executable, os.X_OK)
             ):
-                raise ValueError("Invalid UNITY_REAL_LAKE executable")
-            args[0] = real_lake
+                raise ValueError("Invalid configured Bump toolchain executable" if receipt_selected
+                                 else "Invalid UNITY_REAL_LAKE executable")
+            args[0] = selected
     project_root = Path(project_root).resolve()
     cwd = Path(cwd or project_root).resolve()
     job_id = uuid.uuid4().hex
@@ -182,7 +232,9 @@ def run(
             temporary.write_text(json.dumps(record, sort_keys=True))
             os.replace(temporary, record_path)
             check_cancelled()  # Closes the cancellation-before-registration race.
-            if _cancellation.get() is None:
+            if on_output is not None:
+                stdout, stderr = _stream_output(proc, on_output, input)
+            elif _cancellation.get() is None:
                 stdout, stderr = proc.communicate(input=input) if input is not None else proc.communicate()
             else:
                 pending_input = input
@@ -199,6 +251,10 @@ def run(
             _cancel_process(proc, client_group=client_group)
             raise
         finally:
+            if on_output is not None:
+                for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                    if pipe is not None:
+                        pipe.close()
             record_path.unlink(missing_ok=True)
             record_path.with_suffix(".tmp").unlink(missing_ok=True)
 

@@ -125,7 +125,11 @@ def plan_repairs(index: dict, diagnostics: dict, source: dict, prior_state: dict
         if seen & failing_modules:
             blocked_modules.add(module)
     prior = (prior_state or {}).get("formal_tasks", {})
-    nodes = {key: deepcopy(row) for key, row in prior.items() if row.get("migration")}
+    for task_id, task in prior.items():
+        metadata = task.get("migration")
+        if not isinstance(metadata, dict) or not metadata:
+            raise ValueError(f"migration task {task_id!r} is missing its identity")
+    nodes = {key: deepcopy(row) for key, row in prior.items()}
     existing_owners = {}
     for task_id, node in nodes.items():
         for original_id in node["migration"]["original_ids"]:

@@ -1,17 +1,5 @@
-# Targeted representation review tools
+# Compiler-driven Bump tools
 
-Use `artifact_info` / bounded `artifact_read` for the assigned immutable review artifact.
-`bump_task(task_id)` provides current context, but submit only for the assigned input hash.
-`bump_requirements` retrieves original source anchors and requirements; `read_finding`
-retrieves advisory evidence. Findings do not override exact source or Lean definitions.
+This legacy filename is an alias for the current Bump workflow guidance. Use `bump_brief()`, `bump_status()`, `bump_task(task_id)` and the tools exposed by your current phase. The complete current catalog is `BUMP_WORKFLOW_TOOLS.md`.
 
-Call `submit_representation_review(author, task_id, review)` with:
-`{"input_sha256":"<assigned hash>","verdict":"aligned|encoding_error|source_issue|uncertain",
-"checked_anchor_ids":["<every assigned anchor ID>"],"rationale":"specific correspondence or defect",
-"evidence":"exact source passages and Lean definitions/API evidence"}`.
-
-This tool neither submits proof candidates nor grants final faithfulness approval. A stale response
-means the representation changed; do not approve the new encoding without inspecting its new input.
-Check against the immutable original Lean declaration and explicit correspondence, not a replacement
-natural-language claim. No new holes or expanded per-declaration trust are allowed, including in a
-representation stage. Final all-selected native comparison and independent critic review remain required.
+Preparing/repairing agents coordinate strategies and findings, hold exclusive active file leases, request assignment/configuration changes, and submit useful partial repairs with `submit_repair`. Critic agents are read-only and submit a snapshot-bound `submit_migration_verdict`. Record evidence-backed workflow changes separately from project changes. There is no representation-adoption phase or source-argument ledger in this workflow.

@@ -32,8 +32,8 @@ Keep the controller-owned shared `.lake/packages` cache intact. Do not run `lake
 Use a targeted `lake build <target>` only when compiled local artifacts are needed; otherwise use
 MCP diagnostics or the permitted local fallback. Reuse successful checks of unchanged source.
 
-Respect the current phase: chunking revises the compiler-driven declaration DAG; it does not create or
-validate Lean statement scaffolds. API inspection is optional, not a chunking prerequisite.
-Migration workers repair assigned declarations while preserving original meanings and trust; critics remain read-only and reuse
-current verification records unless a concrete concern
-requires another check. External success never replaces validation in the actual local project.
+Preparing agents investigate configuration/dependency/scope work. Repairing agents edit leased files,
+request larger declaration/module/API assignments when needed, and submit with `submit_repair`.
+Do not weaken claims or add proof holes to make compilation pass. Critics remain read-only and reuse
+current verification records unless a concrete concern requires another check. External success
+never replaces validation in the actual local project.

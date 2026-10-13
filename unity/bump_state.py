@@ -1130,8 +1130,47 @@ def _adopt_repairs(state, spec) -> None:
         issue.update(status="resolved", owner=None, adopted_repairs=sorted(adopted.intersection(issue["repair_ids"])))
 
 
+def _migration_task_hints_and_reservations(state: dict, previous_tasks: dict) -> None:
+    """Expose bound original files without promoting repair or trust evidence."""
+    from . import bump_files
+
+    by_file = {}
+    for key, task in state["formal_tasks"].items():
+        migration = task["migration"]
+        if key not in previous_tasks:
+            task["lean_file"] = migration["path"]
+            task["migration_native_status"] = "pending"
+        by_file.setdefault(migration["path"], set()).add(key)
+    # Several independent declarations may share their original source file.
+    # Retain existing ownership, supporting files and all reservation evidence;
+    # the existing merge lock continues to serialize their integration.
+    effective = bump_files.reservations(state)
+    reservations = deepcopy(state.get("file_reservations", {}))
+    for path, keys in by_file.items():
+        row = deepcopy(effective.get(path, {"owner_task": min(keys), "shared_with": []}))
+        row["shared_with"] = sorted((set(row["shared_with"]) | keys) - {row["owner_task"]})
+        reservations[path] = row
+    state["file_reservations"] = reservations
+
+
+def _bind_migration_tasks(state: dict, *, previous_tasks: dict,
+                          compiler_metadata: dict | None = None) -> None:
+    """Bind the private prepared task table before any plan is published."""
+    from .bump_migration import bind_task_identities
+
+    formal = state["formalization"]
+    identities = bind_task_identities(
+        formal["contract"]["project_baseline"], formal["requirements"], state["formal_tasks"],
+        previous_tasks=previous_tasks, compiler_metadata=compiler_metadata,
+    )
+    for key, migration in identities.items():
+        state["formal_tasks"][key]["migration"] = migration
+    _migration_task_hints_and_reservations(state, previous_tasks)
+
+
 def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: dict,
-                          attempt_id: str | None = None) -> dict:
+                          attempt_id: str | None = None,
+                          compiler_metadata: dict | None = None) -> dict:
     """Compute publication on a private copy; no state, artifacts or source writes."""
     state = deepcopy(state)
     if state["phase"] != "chunking":
@@ -1212,6 +1251,9 @@ def prepare_informal_plan(state: dict, dag: dict, *, main_sha: str, contract: di
         "solution_candidate": source["candidate_id"], "solution_sha256": source["sha256"],
         "main_sha": main_sha, "requirements": requirements, "spec": spec, "contract": contract,
         "source_obligations": obligations, "review_snapshot": None, "pending_verdict_id": None}
+    from .bump_migration import is_migration
+    if is_migration(contract):
+        _bind_migration_tasks(state, previous_tasks=old, compiler_metadata=compiler_metadata)
     if affected:
         affected = _invalidate_informal_tasks(state, affected, reason="informal interpretation changed")
     carried = [key for key, task in tasks.items() if task["status"] == "complete"]
@@ -1293,7 +1335,8 @@ def _migration_plan(state: dict, dag: dict, *, main_sha: str, contract: dict,
     before = state.get("formal_tasks", {})
     staged = deepcopy(state)
     staged["phase"] = "chunking"
-    prepared = prepare_informal_plan(staged, plain, main_sha=main_sha, contract=contract)
+    prepared = prepare_informal_plan(staged, plain, main_sha=main_sha, contract=contract,
+                                     compiler_metadata={key: row["migration"] for key, row in metadata.items()})
     active = set(active)
     active.update(key for key, task in before.items() if task.get("migration", {}).get("critic_reopen")
                   and task.get("status") != "complete")
@@ -1301,11 +1344,6 @@ def _migration_plan(state: dict, dag: dict, *, main_sha: str, contract: dict,
     for key, task in prepared["formal_tasks"].items():
         info = metadata[key]
         prior = before.get(key, {})
-        previous_identity = prior.get("migration")
-        if previous_identity and any(previous_identity.get(field) != info["migration"].get(field)
-                                     for field in ("original_ids", "module", "path", "kind")):
-            raise ValueError("compiler refresh cannot replace a declaration task's original identity")
-        task["migration"] = deepcopy(info["migration"])
         task["migration_native_status"] = "pending"
         if not prior:
             task["outputs"] = normalize_outputs(info.get("outputs", []))
@@ -1331,15 +1369,6 @@ def _migration_plan(state: dict, dag: dict, *, main_sha: str, contract: dict,
     for row in prepared.get("strategies", {}).values():
         if row.get("target") in {*reopened, *resolved} and row.get("status") in _ACTIVE_STRATEGIES:
             row.update(status="cancelled", cancellation_reason="compiler diagnostics refreshed")
-    # Several independent declaration tasks can repair the same source file.
-    # The existing merge lock, not worker dispatch, serializes their integration.
-    by_file = {}
-    for key, task in prepared["formal_tasks"].items():
-        by_file.setdefault(task["migration"]["path"], []).append(key)
-    reservations = prepared.setdefault("file_reservations", {})
-    for path, keys in by_file.items():
-        keys = sorted(keys)
-        reservations[path] = {"owner_task": keys[0], "shared_with": keys[1:]}
     prepared["formalization"]["compiler_tasks"] = sorted(active)
     _event(prepared, "migration_diagnostics_refreshed" if refresh else "migration_plan_initialized",
            task_ids=sorted(prepared["formal_tasks"]), compiler_tasks=sorted(active),
@@ -1398,6 +1427,8 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
             return {"status": "conflict", "revision": state["revision"]}
         if state["phase"] != "formalizing" or (state["formalization"].get("contract") or {}).get("version") != 3:
             raise ValueError("refinement requires an active informal formalization plan")
+        from .bump_migration import require_task_identities
+        require_task_identities(state)
         formal, tasks = state["formalization"], state["formal_tasks"]
         previous_tasks = deepcopy(tasks)
         if any(row.get("status") == "merging" for row in state["formal_candidates"].values()):
@@ -1521,6 +1552,7 @@ def refine_chunks(forum_dir: Path, author: str, expected_revision: int, changes:
         from .bump_migration import is_migration, refine
         if is_migration(formal["contract"]):
             refine(state, changes, previous_tasks=previous_tasks)
+            _migration_task_hints_and_reservations(state, previous_tasks)
         for evidence_field, kind in (("external_declarations", "library"),
                                      ("prerequisite_declarations", "declaration")):
             names = {row["resolution"]["declaration"] for row in spec["prerequisites"]
@@ -2546,6 +2578,8 @@ def submit_formal_candidate(
 
 def begin_formal_merge(forum_dir: Path, candidate_id: str) -> dict:
     with transaction(forum_dir) as state:
+        from .bump_migration import require_task_identities
+        require_task_identities(state)
         candidate = state["formal_candidates"].get(candidate_id)
         if not candidate:
             raise ValueError(f"unknown formal candidate '{candidate_id}'")
@@ -2578,6 +2612,8 @@ def finish_formal_merge(
     failure_context: dict | None = None,
 ) -> dict:
     with transaction(forum_dir) as state:
+        from .bump_migration import require_task_identities
+        require_task_identities(state)
         candidate = state["formal_candidates"].get(candidate_id)
         if (state["phase"] != "formalizing" or not candidate
                 or not candidate_is_current(state, candidate)):

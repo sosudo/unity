@@ -11,6 +11,7 @@ Lean processes are registered for cancellation.
 from __future__ import annotations
 
 import os
+import json
 from pathlib import Path
 import sys
 from typing import Mapping, Sequence
@@ -62,6 +63,17 @@ def run(
 ) -> int:
     """Validate and run one worker Lake command, returning its exit status."""
     env = os.environ if environ is None else environ
+    try:
+        options = json.loads(env.get("UNITY_BUMP_LAKE_ARGS", "[]"))
+        if not isinstance(options, list) or any(not isinstance(arg, str) or not arg.startswith("-K") for arg in options):
+            raise ValueError("invalid configured Lake options")
+        supplied = [arg for arg in args if arg.startswith("-K")]
+        if supplied and supplied != options:
+            raise ValueError("worker Lake options disagree with the controller configuration")
+        args = [*options, *[arg for arg in args if not arg.startswith("-K")]]
+    except (ValueError, TypeError):
+        print("error: worker must use the controller's configured Lake options", file=sys.stderr)
+        return 2
     rejected = _rejection(args)
     if rejected:
         print(f"error: {rejected}", file=sys.stderr)
@@ -86,7 +98,7 @@ def run(
     )
     # The LSP protocol is bidirectional: buffering until server exit deadlocks
     # initialization. Only serve uses live stdio; batch checks stay captured.
-    interactive = bool(args) and args[0] == "serve"
+    interactive = next((arg for arg in args if not arg.startswith("-")), None) == "serve"
     completed = bump_jobs.run(
         Path(project_root),
         [real_lake, *args],
