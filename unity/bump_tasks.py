@@ -226,9 +226,67 @@ def _task(task_id: str, kind: str, chunks: list[str], files: list[str]) -> dict:
             "dependencies": [], "status": "pending", "revision": 0, "attempts": 0, "owner": None}
 
 
+def _declaration_resolution(task: dict, inventory: dict, rows: list, build: dict) -> dict | None:
+    """Current compiler progress for an entire task, not candidate acceptance.
+
+    The controller supplies only finished, identity-bound project builds. Source
+    hashes bind the freshly scanned ranges to that build; absence of an error by
+    itself says nothing about whether Lean reached a declaration.
+    """
+    if (not build or build.get("source_stable") is not True
+            or build.get("diagnostics") != rows or build.get("unmapped")
+            or not task.get("diagnostics") or task.get("kind") != "repair"):
+        return None
+    chunks = inventory["chunks"]
+    members, files = set(task.get("chunk_ids", [])), set(task.get("files", []))
+    if not members or not files or not members <= chunks.keys():
+        return None
+    assigned = [chunks[cid] for cid in members]
+    if any(c.get("after_exit") or c.get("scope_excluded") or c.get("scope_unclassified")
+           or c.get("status") in {"excluded", "skipped"} or c.get("path") not in files
+           or type(c.get("start_line")) is not int or type(c.get("end_line")) is not int
+           or not 0 < c["start_line"] <= c["end_line"] for c in assigned):
+        return None
+    groups = {c["group_id"] for c in assigned if c.get("group_id")}
+    if any(cid not in members for cid, c in chunks.items() if c.get("group_id") in groups):
+        return None
+    # Only compiler-origin repairs qualify, never an explicit noncompiler task.
+    if any(d.get("severity", "error") != "error" or d.get("path") not in files
+           or d.get("kind") not in {None, "declaration"} for d in task["diagnostics"]):
+        return None
+    source_files = (build.get("source_identity") or {}).get("files", {})
+    if any(not inventory["files"].get(path, {}).get("sha256")
+           or inventory["files"][path]["sha256"] != source_files.get(path) for path in files):
+        return None
+    errors = [d for d in rows if d.get("severity", "error") == "error"]
+    if any(not d.get("path") for d in errors):
+        return None
+    checked, evidence = set(build.get("checked_files", [])), {}
+    for path in sorted(files):
+        located = [d for d in errors if d.get("path") == path]
+        if any(d.get("kind") == "import" or type(d.get("line")) is not int
+               or d["line"] <= 0 for d in located):
+            return None
+        if path in checked and not located:
+            evidence[path] = {"basis": "checked_file"}
+            continue
+        end = max((c["end_line"] for c in assigned if c["path"] == path), default=0)
+        first_error = min((d["line"] for d in located), default=0)
+        if not end or first_error <= end:
+            return None
+        evidence[path] = {"basis": "compiler_reached_later_error",
+                          "end_line": end, "first_error_line": first_error}
+    return evidence
+
+
 def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
             config_revision: int, checked_files=(), complete: bool = False,
-            reconcile_environment: bool = False) -> dict:
+            reconcile_environment: bool = False, declaration_build: dict | None = None) -> dict:
+    """Refresh compiler tasks; a supplied declaration build guards completion.
+
+    None retains the low-level checked-file API. Controllers pass an empty dict
+    when evidence is untrusted, so those files cannot bypass declaration guards.
+    """
     rows = deepcopy(diagnostics.get("diagnostics", []) if isinstance(diagnostics, dict) else diagnostics)
     environment_clear = reconcile_environment and not any(
         d.get("severity", "error") == "error" and not d.get("path") for d in rows)
@@ -237,7 +295,7 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
             raise ValueError("diagnostics use a stale configuration")
         old_chunks = state["chunks"]
         chunks = deepcopy(inventory["chunks"])
-        checked = set(checked_files)
+        checked = set(checked_files) if declaration_build is None or declaration_build else set()
         failures = {d.get("path") for d in rows if d.get("severity", "error") == "error"}
         for cid, row in chunks.items():
             old = old_chunks.get(cid, {})
@@ -284,7 +342,29 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
             if tid not in touched and task["status"] not in {"running", "submitted", "merging", "grouped"}:
                 review_repair = any(task.get(key) for key in (
                     "audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
-                if (not review_repair and task["files"] and set(task["files"]) <= checked
+                resolution = None
+                if (declaration_build is not None and not review_repair and task["status"] != "complete"
+                        and task.get("owner") is None
+                        and not any(lease.get("task_id") == tid or path in task["files"]
+                                    for path, lease in state["leases"].items())
+                        and not any(candidate.get("task_id") == tid
+                                    and candidate.get("status") in {"submitted", "merging"}
+                                    for candidate in state["candidates"].values())):
+                    resolution = _declaration_resolution(task, inventory, rows, declaration_build)
+                if resolution is not None:
+                    resolved = [d.get("id") or "diagnostic-" + digest(d)[:20] for d in task["diagnostics"]]
+                    task.update(status="complete", diagnostics=[])
+                    for cid in task["chunk_ids"]:
+                        chunks[cid]["status"] = "clean"
+                    _event(state, "declaration_resolved", "controller", task_id=tid,
+                           main_sha=main_sha, config_revision=config_revision,
+                           resolved_diagnostic_ids=resolved, evidence=resolution,
+                           source_sha256=declaration_build.get("source_sha256"),
+                           log_ref=deepcopy(declaration_build.get("log_ref")))
+                elif (not review_repair and task["files"] and set(task["files"]) <= checked
+                        # With authoritative declaration evidence, use the same
+                        # ownership/range guards even for fully checked files.
+                        and (declaration_build is None or task["kind"] != "repair")
                         and not set(task["files"]) & failures):
                     task["status"] = "complete"
                 elif (environment_clear and not review_repair and task["status"] != "complete"
@@ -307,6 +387,9 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
                     _event(state, "configuration_resolved", "controller", task_id=tid,
                            reason="Authoritative project build has no pathless error diagnostics",
                            main_sha=main_sha, config_revision=config_revision)
+        # Reconcile every status before rebuilding edges: task IDs/insertion
+        # order must not leave stale prerequisites after indirect repairs.
+        for tid, task in state["tasks"].items():
             if task["kind"] not in {"repair", "command"}: continue
             modules = {p.removesuffix(".lean").replace("/", "."): p for p in state["files"]}
             imported = {modules[m] for p in task["files"] for m in state["files"].get(p, {}).get("imports", []) if m in modules}

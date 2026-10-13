@@ -81,15 +81,38 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             state["tasks"][tid].update(attempts=5, files=["lean-toolchain", "lakefile.lean", "lake-manifest.json"])
         return tid
 
-    def authoritative_build_result(self):
+    def authoritative_build_result(self, diagnostics=None, checked=()):
         state = self.controller.state()
-        result = self.build_result([self.error("A.lean"), self.error("B.lean")])
+        if diagnostics is None:
+            diagnostics = [self.error("A.lean"), self.error("B.lean")]
+        result = self.build_result(diagnostics, checked=checked)
         result.update(config_revision=state["config"]["revision"],
                       command=["lake", *state["config"].get("lake_args", ()), "--rehash", "build"],
                       source_identity={"main_sha": self.git(self.root, "rev-parse", "HEAD"),
                                        "scope": deepcopy(state["config"]["scope"]),
-                                       "lake_args": list(state["config"].get("lake_args", ()))})
+                                       "lake_args": list(state["config"].get("lake_args", ())),
+                                       "files": bump_verification._files(self.root, self.scope["build_dir"])})
+        result["source_identity"]["sha256"] = bump_verification.digest(result["source_identity"])
         return result
+
+    def same_file_declaration_tasks(self, *, import_b=False):
+        """A helper failure also breaks its wrapper, before unrelated later work."""
+        prefix = "import B\n" if import_b else ""
+        (self.root / "A.lean").write_text(
+            prefix + "def a := missingA\ndef wrapper := a\ndef later := missingLater\n")
+        self.git(self.root, "add", "A.lean")
+        self.git(self.root, "commit", "-qm", "same-file declaration regression fixture")
+        self.base = self.git(self.root, "rev-parse", "HEAD")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state.update(base_sha=self.base, main_sha=self.base)
+        diagnostics = [{**self.error("A.lean"), "id": name, "line": line,
+                        "message": "fixture compiler error in " + name}
+                       for line, name in enumerate(("a", "wrapper", "later"), start=2 if import_b else 1)]
+        self.controller.refresh(self.build_result(diagnostics, checked=["B.lean"]))
+        state = self.controller.state()
+        tasks = {state["chunks"][task["chunk_ids"][0]]["name"]: tid
+                 for tid, task in state["tasks"].items() if task["files"] == ["A.lean"]}
+        return tasks, diagnostics[-1]
 
     async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
         tid = self.exhausted_configuration_task()
@@ -191,6 +214,174 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 patch.object(self.controller, "build", side_effect=rebuilt):
             self.assertTrue(await self.controller.integrate_ready())
         self.assertEqual(self.controller.state()["tasks"][config_tid]["status"], "complete")
+
+    async def test_helper_merge_retires_indirectly_fixed_wrapper_before_dispatch(self):
+        tasks, later_error = self.same_file_declaration_tasks()
+        helper, wrapper, later = (tasks[name] for name in ("a", "wrapper", "later"))
+        self.assertIn(wrapper, self.controller.state()["tasks"][later]["dependencies"])
+        bump_tasks.claim(self.paths.forum, "Alice", helper)
+        tree = self.worktree(self.paths, "Alice", helper)
+        bump_tasks.configure_assignment(self.paths.forum, "Alice", helper, tree, self.base)
+        (tree / "A.lean").write_text("def a := 1\ndef wrapper := a\ndef later := missingLater\n")
+        forum.configure(self.paths.forum, self.root)
+        candidate = forum.submit_repair("Alice", helper, "helper repair also resolves wrapper error")
+        closed = self.active_worker(helper, tree)
+
+        async def rebuilt():
+            return self.authoritative_build_result([later_error], checked=["B.lean"])
+
+        with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+                patch.object(bump_verification, "build", return_value=self.build_result([later_error])), \
+                patch.object(self.controller, "build", side_effect=rebuilt):
+            self.assertTrue(await self.controller.integrate_ready())
+        self.assertTrue(closed)
+        state = self.controller.state()
+        self.assertEqual(state["candidates"][candidate["candidate_id"]]["status"], "merged")
+        self.assertEqual(state["tasks"][helper]["status"], "complete")
+        self.assertEqual(state["tasks"][wrapper]["status"], "complete")
+        self.assertEqual(state["tasks"][wrapper]["attempts"], 0)
+        self.assertEqual(state["tasks"][wrapper]["diagnostics"], [])
+        self.assertEqual(state["tasks"][later]["status"], "pending")
+        self.assertEqual(state["tasks"][later]["dependencies"], [])
+        self.assertEqual(state["last_build"]["returncode"], 1)
+        self.assertNotIn("A.lean", state["last_build"]["checked_files"])
+        self.assertNotEqual(state["phase"], "complete")
+        with patch.object(self.controller, "worker", new=AsyncMock()) as worker:
+            self.controller.launch_ready()
+            records = list(self.controller.workers.values())
+            self.assertEqual([record["task_id"] for record in records], [later])
+            await asyncio.gather(*(record["task"] for record in records))
+            self.assertEqual(worker.await_count, 1)
+            await self.controller.reap_workers()
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][wrapper]["attempts"], 0)
+        self.assertEqual(state["tasks"][later]["attempts"], 1)
+        self.assertFalse(any(event["kind"] == "claim" and event.get("task_id") == wrapper
+                             for event in state["events"]))
+
+    async def test_declaration_reconciliation_requires_current_authoritative_build_and_file_bytes(self):
+        tasks, later_error = self.same_file_declaration_tasks()
+        wrapper = tasks["wrapper"]
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][wrapper]["attempts"] = 3
+            for cid in state["tasks"][wrapper]["chunk_ids"]:
+                state["chunk_attempts"][cid] = 3
+        good = self.authoritative_build_result([later_error], checked=["B.lean"])
+        identity = good["source_identity"]
+        cases = {
+            "unmarked_stream_or_review": (good, False),
+            "unstable": ({**good, "source_stable": False}, True),
+            "missing_stability": ({k: v for k, v in good.items() if k != "source_stable"}, True),
+            "missing_identity": ({k: v for k, v in good.items() if k != "source_identity"}, True),
+            "missing_revision": ({k: v for k, v in good.items() if k != "config_revision"}, True),
+            "stale_revision": ({**good, "config_revision": -1}, True),
+            "stale_head": ({**good, "source_identity": {**identity, "main_sha": "old"}}, True),
+            "stale_scope": ({**good, "source_identity": {**identity, "scope": {}}}, True),
+            "stale_lake_args": ({**good, "source_identity": {**identity, "lake_args": ["-Kold=true"]}}, True),
+            "partial_command": ({**good, "command": [*good["command"], "+A"]}, True),
+            "missing_command": ({k: v for k, v in good.items() if k != "command"}, True),
+            "interrupted": ({**good, "returncode": -15}, True),
+            "missing_returncode": ({k: v for k, v in good.items() if k != "returncode"}, True),
+            "invalid_returncode": ({**good, "returncode": True}, True),
+            "missing_file_hashes": ({**good, "source_identity": {**identity, "files": {}}}, True),
+            "mismatched_file_hash": ({**good, "source_identity": {
+                **identity, "files": {**identity["files"], "A.lean": "old"}}}, True),
+        }
+        for label, (result, authoritative) in cases.items():
+            claimed_checked = {**result, "diagnostics": [], "errors": [],
+                               "checked_files": ["A.lean", "B.lean"], "passed": True, "completed": True}
+            if type(result.get("returncode")) is int and result["returncode"] >= 0:
+                claimed_checked["returncode"] = 0
+            for evidence, build in (("later_error", result), ("all_checked", claimed_checked)):
+                with self.subTest(label=label, evidence=evidence):
+                    self.controller.refresh(build, authoritative_full_build=authoritative)
+                    state = self.controller.state()
+                    self.assertEqual(state["tasks"][wrapper]["status"], "pending")
+                    self.assertEqual(state["tasks"][wrapper]["attempts"], 3)
+                    self.assertTrue(state["tasks"][wrapper]["diagnostics"])
+                    self.assertTrue(all(state["chunks"][cid]["status"] != "clean"
+                                        for cid in state["tasks"][wrapper]["chunk_ids"]))
+                    self.assertIn(wrapper, state["tasks"][tasks["later"]]["dependencies"])
+                    self.assertFalse(any(event["kind"] == "declaration_resolved"
+                                         and event.get("task_id") == wrapper for event in state["events"]))
+        self.controller.refresh(good, authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][wrapper]["status"], "complete")
+        self.assertEqual(state["tasks"][wrapper]["attempts"], 3)
+        self.assertTrue(all(state["chunk_attempts"][cid] == 3 for cid in state["tasks"][wrapper]["chunk_ids"]))
+        self.assertEqual(state["tasks"][tasks["later"]]["dependencies"], [])
+
+    async def test_declaration_reconciliation_rejects_same_head_import_or_config_edits_without_probes(self):
+        tasks, later_error = self.same_file_declaration_tasks(import_b=True)
+        wrapper = tasks["wrapper"]
+        (self.root / "lakefile.toml").write_text('name = "offline_fixture"\n')
+        (self.root / "B.lean").write_text("def b := 1\n")
+        self.git(self.root, "add", "B.lean", "lakefile.toml")
+        self.git(self.root, "commit", "-qm", "import and configuration freshness fixture")
+        head = self.git(self.root, "rev-parse", "HEAD")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["main_sha"] = head
+        good = self.authoritative_build_result([later_error], checked=["B.lean"])
+        checked_good = self.authoritative_build_result([], checked=["A.lean", "B.lean"])
+        self.assertIn("lakefile.toml", good["source_identity"]["files"])
+        original_a = (self.root / "A.lean").read_bytes()
+        mutations = {"B.lean": "def b := missingNewImportDependency\n",
+                     "lakefile.toml": 'name = "changed_configuration"\n'}
+        with patch.object(bump_verification, "source_identity", side_effect=AssertionError("no source-identity probe")) as source_probe, \
+                patch.object(bump_verification, "_tool_identity", side_effect=AssertionError("no Lean/Lake version probe")) as tool_probe:
+            for path, changed in mutations.items():
+                with self.subTest(path=path):
+                    target = self.root / path
+                    original = target.read_text()
+                    try:
+                        target.write_text(changed)
+                        self.assertEqual(self.git(self.root, "rev-parse", "HEAD"), head)
+                        self.assertEqual((self.root / "A.lean").read_bytes(), original_a)
+                        self.assertTrue(good["source_stable"])
+                        for evidence, build in (("later_error", good), ("all_checked", checked_good)):
+                            with self.subTest(evidence=evidence):
+                                self.controller.refresh(build, authoritative_full_build=True)
+                                state = self.controller.state()
+                                self.assertEqual(state["tasks"][wrapper]["status"], "pending")
+                                self.assertEqual(state["tasks"][wrapper]["attempts"], 0)
+                                self.assertTrue(all(state["chunks"][cid]["status"] != "clean"
+                                                    for cid in state["tasks"][wrapper]["chunk_ids"]))
+                                self.assertIn(wrapper, state["tasks"][tasks["later"]]["dependencies"])
+                                self.assertFalse(any(event["kind"] == "declaration_resolved"
+                                                     and event.get("task_id") == wrapper for event in state["events"]))
+                    finally:
+                        target.write_text(original)
+            self.controller.refresh(checked_good, authoritative_full_build=True)
+            self.assertEqual(self.controller.state()["tasks"][wrapper]["status"], "complete")
+            source_probe.assert_not_called()
+            tool_probe.assert_not_called()
+
+    async def test_checked_build_does_not_override_declaration_owner_or_current_ranges(self):
+        tasks, _ = self.same_file_declaration_tasks()
+        wrapper = tasks["wrapper"]
+        good = self.authoritative_build_result([], checked=["A.lean", "B.lean"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][wrapper]["owner"] = "Alice"
+        self.controller.refresh(good, authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][wrapper]["status"], "pending")
+        self.assertEqual(state["tasks"][wrapper]["owner"], "Alice")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][wrapper]["owner"] = None
+        inventory = self.controller.inventory()
+        cid = self.controller.state()["tasks"][wrapper]["chunk_ids"][0]
+        missing = deepcopy(inventory)
+        del missing["chunks"][cid]
+        after_exit = deepcopy(inventory)
+        after_exit["chunks"][cid]["after_exit"] = True
+        for label, unavailable in (("missing_range", missing), ("after_exit", after_exit)):
+            with self.subTest(label=label), patch.object(self.controller, "inventory", return_value=unavailable):
+                self.controller.refresh(good, authoritative_full_build=True)
+                self.assertEqual(self.controller.state()["tasks"][wrapper]["status"], "pending")
+        self.controller.refresh(good, authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][wrapper]["status"], "complete")
+        self.assertEqual(state["tasks"][wrapper]["attempts"], 0)
 
     def submit(self):
         state = self.controller.state()

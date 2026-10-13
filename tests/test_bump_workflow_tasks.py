@@ -54,6 +54,24 @@ def prepare_environment_task(tmp_path):
     return directory, inventory, tid, environment
 
 
+def prepare_declaration_refresh(tmp_path, *, source=None, error_lines=(1, 3)):
+    root, directory = setup_state(tmp_path)
+    write_source(root, "A.lean", source or "def wrapper := helper\n\ndef later := missing\n")
+    inventory = tasks.scan_sources(root, ["A.lean"])
+    errors = [{**diagnostic(line=line), "id": f"old-{line}", "kind": "declaration"}
+              for line in error_lines]
+    state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0)
+    tid = next(key for key, task in state["tasks"].items() if errors[0] in task["diagnostics"])
+    return root, directory, inventory, tid
+
+
+def declaration_build(inventory, diagnostics, *, checked=()):
+    return {"diagnostics": diagnostics, "source_stable": True, "unmapped": [],
+            "checked_files": list(checked), "source_sha256": "build-source-hash",
+            "log_ref": {"artifact_id": "build-log"},
+            "source_identity": {"files": {path: row["sha256"] for path, row in inventory["files"].items()}}}
+
+
 def git(root, *args):
     result = subprocess.run(["git", *args], cwd=root, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
@@ -223,6 +241,235 @@ class WorkflowTaskTests(unittest.TestCase):
         tasks.release(directory, "Alice", tid, "tried")
         tasks.refresh(directory, tasks.scan_sources(root, ["A.lean"]), [diagnostic()], main_sha="base", config_revision=0)
         with self.raises(ValueError, match="budget"): tasks.claim(directory, "Bob", tid, max_attempts=1)
+
+    def test_indirect_declaration_repair_unblocks_later_task_independent_of_task_order(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        tasks.claim(directory, "Alice", tid)
+        tasks.release(directory, "Alice", tid, "worker closed")
+        with tasks.transaction(directory) as state:
+            later = next(key for key in state["tasks"] if key != tid)
+            # Serialization sorts IDs: dependency recomputation must not depend
+            # on whether a later source task sorts before its resolved blocker.
+            state["tasks"] = {"a-later": {**state["tasks"][later], "task_id": "a-later"},
+                              "z-wrapper": {**state["tasks"][tid], "task_id": "z-wrapper"}}
+        before = tasks.load(directory)
+        errors = [{**diagnostic(line=3), "id": "later", "kind": "declaration"}]
+        build = declaration_build(inventory, errors)
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              declaration_build=build)
+        wrapper = state["tasks"]["z-wrapper"]
+        self.assertEqual(wrapper["status"], "complete")
+        self.assertEqual(wrapper["diagnostics"], [])
+        self.assertEqual(wrapper["attempts"], 1)
+        self.assertEqual(state["chunk_attempts"], before["chunk_attempts"])
+        self.assertEqual(state["events"][:-1], before["events"])
+        self.assertEqual(state["tasks"]["a-later"]["dependencies"], [])
+        self.assertEqual(state["tasks"]["a-later"]["status"], "pending")
+        self.assertEqual(state["phase"], before["phase"])
+        self.assertEqual(state["chunks"][wrapper["chunk_ids"][0]]["status"], "clean")
+        event = state["events"][-1]
+        self.assertEqual(event["kind"], "declaration_resolved")
+        self.assertEqual(event["resolved_diagnostic_ids"], ["old-1"])
+        self.assertEqual(event["main_sha"], "base")
+        self.assertEqual(event["config_revision"], 0)
+        self.assertEqual(event["evidence"]["A.lean"], {
+            "basis": "compiler_reached_later_error", "end_line": 2, "first_error_line": 3})
+        self.assertEqual(event["log_ref"], build["log_ref"])
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              declaration_build=build)
+        self.assertEqual(sum(e["kind"] == "declaration_resolved" for e in state["events"]), 1)
+        self.assertEqual(tasks.claim(directory, "Bob", "a-later")["status"], "running")
+
+    def test_indirect_resolution_keeps_exhausted_budget_and_reopens_on_real_error(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        for _ in range(5):
+            tasks.claim(directory, "Alice", tid)
+            tasks.release(directory, "Alice", tid, "worker closed")
+        before = tasks.load(directory)
+        errors = [{**diagnostic(line=3), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, errors))
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertEqual(state["tasks"][tid]["attempts"], 5)
+        self.assertEqual(state["chunk_attempts"], before["chunk_attempts"])
+        errors.append({**diagnostic(), "id": "recurring", "kind": "declaration"})
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, errors))
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        self.assertEqual(state["tasks"][tid]["diagnostics"], [errors[-1]])
+        self.assertEqual(state["tasks"][tid]["attempts"], 5)
+        with self.raises(ValueError, match="budget"):
+            tasks.claim(directory, "Bob", tid)
+
+    def test_disappeared_declaration_needs_positive_current_compiler_progress(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        later = {**diagnostic(line=3), "kind": "declaration"}
+        cases = {
+            "silent_unreached": [],
+            "different_file": [{**later, "path": "B.lean"}],
+            "warning_only": [{**later, "severity": "warning"}],
+            "boundary_error": [{**later, "line": 2}],
+            "remaining_error": [later, {**later, "line": 1}],
+            "import_failure": [later, {**diagnostic(), "kind": "import"}],
+            "unlocated_failure": [later, {"severity": "error", "path": None}],
+            "missing_line": [later, {"severity": "error", "path": "A.lean"}],
+        }
+        for label, errors in cases.items():
+            with self.subTest(label=label):
+                state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                                      declaration_build=declaration_build(inventory, errors))
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+                self.assertEqual(state["tasks"][tid]["attempts"], 0)
+                self.assertFalse(any(e["kind"] == "declaration_resolved" for e in state["events"]))
+
+    def test_earlier_failure_blocks_retirement_even_with_later_error(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path,
+            source="def earlier := 1\ndef wrapper := helper\ndef later := missing\n", error_lines=(2, 3))
+        errors = [{**diagnostic(line=n), "kind": "declaration"} for n in (1, 3)]
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, errors))
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+
+    def test_declaration_resolution_requires_matching_scanned_file_bytes(self):
+        root, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        errors = [{**diagnostic(line=3), "kind": "declaration"}]
+        build = declaration_build(inventory, errors)
+        write_source(root, "A.lean", "def wrapper := changed\n\ndef later := missing\n")
+        current = tasks.scan_sources(root, ["A.lean"])
+        state = tasks.refresh(directory, current, errors, main_sha="base", config_revision=0,
+                              declaration_build=build)
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        self.assertFalse(state["events"])
+
+    def test_declaration_resolution_uses_current_not_old_line_ranges(self):
+        root, directory, _, tid = prepare_declaration_refresh(self.tmp_path)
+        write_source(root, "A.lean", "\n\ndef wrapper := helper\n\ndef later := missing\n")
+        current = tasks.scan_sources(root, ["A.lean"])
+        errors = [{**diagnostic(line=5), "kind": "declaration"}]
+        state = tasks.refresh(directory, current, errors, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(current, errors))
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertEqual(state["events"][-1]["evidence"]["A.lean"]["end_line"], 4)
+
+    def test_missing_or_excluded_chunks_are_not_silently_completed(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        cid = tasks.load(directory)["tasks"][tid]["chunk_ids"][0]
+        for marker in ("missing", "after_exit", "scope_excluded", "scope_unclassified"):
+            with self.subTest(marker=marker):
+                current = json.loads(json.dumps(inventory))
+                if marker == "missing":
+                    del current["chunks"][cid]
+                else:
+                    current["chunks"][cid][marker] = True
+                build = declaration_build(current, [], checked=["A.lean"])
+                state = tasks.refresh(directory, current, [], main_sha="base", config_revision=0,
+                                      checked_files=["A.lean"], declaration_build=build)
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+
+    def test_entire_mutual_assignment_must_be_reached(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path,
+            source="mutual\ndef even := odd\ndef odd := missing\nend\ndef later := missing\n",
+            error_lines=(2, 5))
+        self.assertEqual(len(tasks.load(directory)["tasks"][tid]["chunk_ids"]), 2)
+        partial = [{**diagnostic(line=3), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, partial, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, partial))
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        later = [{**diagnostic(line=5), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, later, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, later))
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertTrue(all(state["chunks"][cid]["status"] == "clean"
+                            for cid in state["tasks"][tid]["chunk_ids"]))
+
+    def test_mutual_family_with_an_unassigned_member_cannot_be_retired(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path,
+            source="mutual\ndef even := odd\ndef odd := missing\nend\ndef later := missing\n",
+            error_lines=(2, 5))
+        with tasks.transaction(directory) as state:
+            state["tasks"][tid]["chunk_ids"].pop()
+        later = [{**diagnostic(line=5), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, later, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, later))
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        self.assertFalse(any(e["kind"] == "declaration_resolved" and e.get("task_id") == tid
+                             for e in state["events"]))
+
+    def test_rejected_declaration_build_cannot_fall_back_to_checked_files(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                              checked_files=["A.lean"], declaration_build={})
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        self.assertFalse(any(c["status"] == "clean" for c in state["chunks"].values()))
+        self.assertFalse(state["events"])
+
+    def test_grouped_assignment_cannot_finish_after_only_first_member(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path,
+            source="def first := 1\ndef middle := 2\ndef last := 3\ndef later := missing\n",
+            error_lines=(1, 4))
+        members = [cid for cid, c in inventory["chunks"].items() if c["name"] in {"first", "last"}]
+        with tasks.transaction(directory) as state:
+            state["tasks"][tid]["chunk_ids"] = members
+        partial = [{**diagnostic(line=2), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, partial, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, partial))
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        later = [{**diagnostic(line=4), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, later, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, later))
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+
+    def test_resolution_checks_every_file_in_multi_file_assignment(self):
+        root, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        write_source(root, "B.lean", "def other := 1\n")
+        inventory = tasks.scan_sources(root, ["A.lean", "B.lean"])
+        with tasks.transaction(directory) as state:
+            state["tasks"][tid]["files"].append("B.lean")
+            state["tasks"][tid]["chunk_ids"].extend(
+                cid for cid, chunk in inventory["chunks"].items() if chunk["path"] == "B.lean")
+        errors = [{**diagnostic(line=3), "kind": "declaration"}]
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              declaration_build=declaration_build(inventory, errors))
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0,
+                              checked_files=["B.lean"],
+                              declaration_build=declaration_build(inventory, errors, checked=["B.lean"]))
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+
+    def test_declaration_resolution_protects_active_work_and_review_requirements(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        original = tasks.load(directory)["tasks"][tid]
+        cases = [
+            ({"status": status}, {}, {}) for status in ("running", "submitted", "merging", "grouped")
+        ] + [
+            ({"owner": "Alice"}, {}, {}),
+            ({}, {"A.lean": {"task_id": "another"}}, {}),
+            ({}, {"B.lean": {"task_id": tid}}, {}),
+            ({}, {}, {"c": {"task_id": tid, "status": "submitted"}}),
+            ({}, {}, {"c": {"task_id": tid, "status": "merging"}}),
+        ] + [({marker: "requires repair"}, {}, {}) for marker in (
+            "audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback")]
+        for updates, leases, candidates in cases:
+            with self.subTest(updates=updates, leases=leases, candidates=candidates):
+                with tasks.transaction(directory) as state:
+                    state["tasks"][tid] = {**original, **updates}
+                    state.update(leases=leases, candidates=candidates)
+                build = declaration_build(inventory, [], checked=["A.lean"])
+                state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                                      checked_files=["A.lean"], declaration_build=build)
+                self.assertEqual(state["tasks"][tid]["status"], updates.get("status", "pending"))
+                self.assertFalse(any(e["kind"] == "declaration_resolved" and e.get("task_id") == tid
+                                     for e in state["events"]))
+
+    def test_fully_checked_declaration_records_resolution_without_an_extra_attempt(self):
+        _, directory, inventory, tid = prepare_declaration_refresh(self.tmp_path)
+        build = declaration_build(inventory, [], checked=["A.lean"])
+        state = tasks.refresh(directory, inventory, [], main_sha="base", config_revision=0,
+                              checked_files=["A.lean"], declaration_build=build)
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertEqual(state["tasks"][tid]["attempts"], 0)
+        event = next(e for e in state["events"] if e.get("task_id") == tid)
+        self.assertEqual(event["evidence"]["A.lean"], {"basis": "checked_file"})
 
     def test_authoritative_build_retires_exhausted_environment_task_without_resetting_history(self):
         directory, inventory, tid, environment = prepare_environment_task(self.tmp_path)

@@ -185,15 +185,15 @@ class Controller:
             project_scope=config.get("project_scope", "build"), lake_args=config.get("lake_args", ()))
 
     def refresh(self, result, *, authoritative_full_build=False):
-        from . import bump_tasks
+        from . import bump_tasks, bump_verification
         state = self.state()
         main_sha = git(self.paths.project_root, "rev-parse", "HEAD")
         identity = result.get("source_identity") or {}
         returncode = result.get("returncode")
-        # Only a finished full-project build can resolve pathless blockers.
+        # Only a finished full-project build can resolve obsolete task blockers.
         # `completed` means `passed` in build results: declaration failures must
-        # not prevent environment reconciliation. Streams/review aggregates opt out.
-        reconcile_environment = (
+        # not prevent reconciliation. Streams/review aggregates opt out.
+        authoritative_current_build = (
             authoritative_full_build
             and type(returncode) is int and returncode >= 0
             and result.get("source_stable") is True
@@ -203,11 +203,22 @@ class Controller:
             and identity.get("lake_args") == list(state["config"].get("lake_args", ()))
             and result.get("command") == ["lake", *state["config"].get("lake_args", ()), "--rehash", "build"]
         )
-        bump_tasks.refresh(self.paths.forum, self.inventory(state), result.get("diagnostics", []),
+        inventory = self.inventory(state)
+        # HEAD alone cannot detect an uncommitted import/configuration change
+        # since the build. This hashes files only; do not probe Lean/Lake here.
+        # An empty record opts into guarded declaration completion but supplies
+        # no evidence. Do not fall back to checked_files from a rejected build.
+        declaration_build = {}
+        if (authoritative_current_build and identity.get("files") is not None
+                and identity["files"] == bump_verification._files(
+                    self.paths.project_root, state["config"].get("scope", {}).get("build_dir", ".lake/build"))):
+            declaration_build = result
+        bump_tasks.refresh(self.paths.forum, inventory, result.get("diagnostics", []),
                            main_sha=main_sha,
                            config_revision=state["config"]["revision"],
                            checked_files=result.get("checked_files", ()), complete=False,
-                           reconcile_environment=reconcile_environment)
+                           reconcile_environment=authoritative_current_build,
+                           declaration_build=declaration_build)
         with bump_tasks.transaction(self.paths.forum) as state:
             # Large compiler output belongs in artifacts, not duplicated task state.
             state["last_build"] = {key: value for key, value in result.items()
