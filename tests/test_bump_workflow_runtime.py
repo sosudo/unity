@@ -195,13 +195,13 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         tid = self.exhausted_configuration_task()
         (self.paths.unity / "bump").mkdir(parents=True, exist_ok=True)
         changed_scope = {**self.scope, "default_modules": {"A": "A.lean"}}
-        result = self.authoritative_build_result()
-        result["config_revision"] += 1
-        result["source_identity"]["scope"] = changed_scope
+        calls = []
         with patch.object(self.controller, "discover_scope", return_value=changed_scope), \
-                patch.object(self.controller, "build", new=AsyncMock(return_value=result)):
+                patch.object(bump_workflow.bump_jobs, "run", side_effect=self.scope_compiler(calls)):
             self.assertFalse(await self.controller.review())
         self.assertEqual(self.controller.state()["tasks"][tid]["status"], "complete")
+        self.assertEqual([command for root, command in calls if root == self.root], [
+            ["lake", "--rehash", "build"], ["lake", "--rehash", "build", "+B"]])
 
     async def test_post_integration_full_build_reconciles_exhausted_configuration(self):
         tid, candidate, worker = self.submit()
@@ -258,6 +258,165 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tasks"][later]["attempts"], 1)
         self.assertFalse(any(event["kind"] == "claim" and event.get("task_id") == wrapper
                              for event in state["events"]))
+
+    def supplemental_tasks(self):
+        (self.root / "B.lean").write_text("import A\ndef b := a\n")
+        (self.root / "Tests.lean").write_text("import A\n#eval a\n")
+        (self.root / "Later.lean").write_text("import B\nimport Tests\ndef later := missingLater\n")
+        self.git(self.root, "add", ".")
+        self.git(self.root, "commit", "-qm", "supplemental declaration and command fixture")
+        self.base = self.git(self.root, "rev-parse", "HEAD")
+        self.scope.update(default_modules={"A": "A.lean"}, selected_modules={
+            "A": "A.lean", "B": "B.lean", "Tests": "Tests.lean", "Later": "Later.lean"})
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state.update(base_sha=self.base, main_sha=self.base)
+            state["config"].update(scope=deepcopy(self.scope), modules=["Tests", "B", "Later"])
+        diagnostics = [self.error("A.lean"), {**self.error("B.lean"), "line": 2},
+                       {**self.error("Tests.lean"), "line": 2, "kind": "command"},
+                       {**self.error("Later.lean"), "line": 3}]
+        self.controller.refresh(self.build_result(diagnostics))
+        tasks = {task["files"][0]: tid for tid, task in self.controller.state()["tasks"].items()}
+        with bump_tasks.transaction(self.paths.forum) as state:
+            for name in ("B.lean", "Tests.lean"):
+                task = state["tasks"][tasks[name]]
+                task["attempts"] = 5
+                for cid in task["chunk_ids"]:
+                    state["chunk_attempts"][cid] = 5
+        self.assertEqual(self.controller.state()["tasks"][tasks["Tests.lean"]]["kind"], "command")
+        self.assertEqual(self.controller.state()["tasks"][tasks["B.lean"]]["kind"], "repair")
+        return tasks
+
+    def scope_compiler(self, calls, *, remaining_error=False):
+        real_run = bump_workflow.bump_jobs.run
+        def execute(root, args, **kwargs):
+            if args[0] != "lake":
+                return real_run(root, args, **kwargs)
+            if args[-1] == "--version":
+                return subprocess.CompletedProcess(args, 0, "offline fixture version\n", "")
+            calls.append((Path(kwargs.get("cwd", root)).resolve(), list(args)))
+            modules = [arg[1:] for arg in args if arg.startswith("+")] or ["A"]
+            lines = ["✔ Built " + module for module in modules
+                     if module != "Later" or not remaining_error]
+            failed = remaining_error and "Later" in modules
+            if failed:
+                lines.append("Later.lean:3:1: error: unknown identifier 'missingLater'")
+            return subprocess.CompletedProcess(args, int(failed), "\n".join(lines) + "\n", "")
+        return execute
+
+    async def supplemental_merge_regression(self, *, remaining_error):
+        tasks = self.supplemental_tasks()
+        tid, candidate, worker = self.submit()
+        finished = self.active_worker(tid, worker)
+        calls = []
+        # Real integration, build aggregation and refresh; only compiler execution
+        # is replaced. Mocking Controller.build would hide the original bug.
+        with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+                patch.object(bump_workflow.bump_jobs, "run", side_effect=self.scope_compiler(
+                    calls, remaining_error=remaining_error)):
+            self.assertTrue(await self.controller.integrate_ready())
+        self.assertTrue(finished)
+        self.assertEqual([command for root, command in calls if root == self.root], [
+            ["lake", "--rehash", "build"],
+            ["lake", "--rehash", "build", "+B", "+Later", "+Tests"]])
+        state = self.controller.state()
+        self.assertEqual(state["candidates"][candidate["candidate_id"]]["status"], "merged")
+        for name in ("B.lean", "Tests.lean"):
+            task = state["tasks"][tasks[name]]
+            self.assertEqual(task["status"], "complete")
+            self.assertEqual(task["attempts"], 5)
+            self.assertTrue(all(state["chunk_attempts"][cid] == 5 for cid in task["chunk_ids"]))
+        self.assertEqual(state["tasks"][tasks["Later.lean"]]["dependencies"], [])
+        self.assertEqual(state["tasks"][tasks["Later.lean"]]["status"],
+                         "pending" if remaining_error else "complete")
+        self.assertEqual(state["last_build"]["returncode"], int(remaining_error))
+        self.assertEqual(len(state["last_build"]["builds"]), 2)
+        self.assertTrue(all("source_identity" not in item for item in state["last_build"]["builds"]))
+        self.assertNotEqual(state["phase"], "complete")
+        resolved = next(event for event in state["events"]
+                        if event["kind"] == "declaration_resolved" and event["task_id"] == tasks["B.lean"])
+        self.assertEqual(resolved["log_ref"], state["last_build"]["log_ref"])
+        with patch.object(self.controller, "worker", new=AsyncMock()) as launched:
+            self.controller.launch_ready()
+            records = list(self.controller.workers.values())
+            self.assertEqual([record["task_id"] for record in records],
+                             [tasks["Later.lean"]] if remaining_error else [])
+            await asyncio.gather(*(record["task"] for record in records))
+            self.assertEqual(launched.await_count, int(remaining_error))
+            await self.controller.reap_workers()
+        self.assertFalse(any(event["kind"] == "claim" and event.get("task_id") in
+                             {tasks["B.lean"], tasks["Tests.lean"]}
+                             for event in self.controller.state()["events"]))
+
+    async def test_postmerge_scope_build_retires_supplemental_declaration_and_command(self):
+        await self.supplemental_merge_regression(remaining_error=False)
+
+    async def test_postmerge_scope_build_preserves_unrelated_supplemental_error(self):
+        await self.supplemental_merge_regression(remaining_error=True)
+
+    async def test_scope_reconciliation_requires_every_current_component(self):
+        tasks = self.supplemental_tasks()
+        calls = []
+        with patch.object(bump_workflow.bump_jobs, "run", side_effect=self.scope_compiler(calls)):
+            good = await self.controller.build()
+        config_tid = self.exhausted_configuration_task()
+        cases = {}
+        for index in range(2):
+            for name, change in {
+                "missing_exit": lambda item: item.pop("returncode"),
+                "interrupted": lambda item: item.update(returncode=-15),
+                "boolean_exit": lambda item: item.update(returncode=True),
+                "unstable": lambda item: item.update(source_stable=False),
+                "old_head": lambda item: item["source_identity"].update(main_sha="old"),
+                "old_files": lambda item: item["source_identity"]["files"].update({"A.lean": "old"}),
+                "wrong_command": lambda item: item["command"].append("+NotSelected"),
+            }.items():
+                changed = deepcopy(good)
+                # Do not let mutation of one component also mutate the aggregate
+                # identity through the in-memory reference returned by build_scope.
+                changed["builds"][index] = deepcopy(changed["builds"][index])
+                change(changed["builds"][index])
+                cases[f"{index}_{name}"] = changed
+        for index in range(2):
+            changed = deepcopy(good)
+            changed["builds"].pop(index)
+            cases[f"missing_component_{index}"] = changed
+        bare = deepcopy(good["builds"][0])
+        bare["config_revision"] = good["config_revision"]
+        cases["default_only"] = bare
+        cases["no_components"] = {**good, "builds": None}
+        cases["wrong_plan"] = {**good, "commands": [good["commands"][0]]}
+        for label, result in cases.items():
+            with self.subTest(label=label):
+                self.controller.refresh(result, authoritative_full_build=True)
+                state = self.controller.state()
+                for name in ("B.lean", "Tests.lean"):
+                    self.assertEqual(state["tasks"][tasks[name]]["status"], "pending")
+                    self.assertEqual(state["tasks"][tasks[name]]["attempts"], 5)
+                self.assertEqual(state["tasks"][config_tid]["status"], "pending")
+        with patch.object(bump_verification, "source_identity", side_effect=AssertionError("no probes in refresh")):
+            self.controller.refresh(good, authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tasks["B.lean"]]["status"], "complete")
+        self.assertEqual(state["tasks"][tasks["Tests.lean"]]["status"], "complete")
+        self.assertEqual(state["tasks"][config_tid]["status"], "complete")
+
+    async def test_initial_scope_build_covers_supplemental_modules(self):
+        tasks = self.supplemental_tasks()
+        calls = []
+        async def review():
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][tasks["B.lean"]]["status"], "complete")
+            self.assertEqual(state["tasks"][tasks["Tests.lean"]]["status"], "complete")
+            return True
+        with patch.object(self.controller, "prepare", new=AsyncMock()), \
+                patch.object(self.controller, "review", side_effect=review), \
+                patch.object(bump_workflow.bump_jobs, "run", side_effect=self.scope_compiler(calls)), \
+                patch.object(self.controller, "worker", new=AsyncMock()) as worker:
+            self.assertTrue(await self.controller.run())
+        self.assertEqual([command for _, command in calls], [
+            ["lake", "--rehash", "build"],
+            ["lake", "--rehash", "build", "+B", "+Later", "+Tests"]])
+        worker.assert_not_awaited()
 
     async def test_declaration_reconciliation_requires_current_authoritative_build_and_file_bytes(self):
         tasks, later_error = self.same_file_declaration_tasks()

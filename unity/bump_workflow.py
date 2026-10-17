@@ -190,7 +190,21 @@ class Controller:
         main_sha = git(self.paths.project_root, "rev-parse", "HEAD")
         identity = result.get("source_identity") or {}
         returncode = result.get("returncode")
-        # Only a finished full-project build can resolve obsolete task blockers.
+        expected_commands = bump_verification.scope_build_commands(
+            state["config"].get("scope", {}), state["config"].get("lake_args", ()))
+        # A single default receipt remains sufficient when there are no extras.
+        # Candidate/module-only builds must never stand in for the whole scope.
+        builds = result.get("builds", [result])
+        full_scope = (
+            isinstance(builds, list) and len(builds) == len(expected_commands)
+            and ("builds" not in result or result.get("commands") == expected_commands)
+            and all(isinstance(item, dict)
+                    and item.get("command") == command
+                    and type(item.get("returncode")) is int and item["returncode"] >= 0
+                    and item.get("source_stable") is True
+                    and item.get("source_identity") == identity
+                    for item, command in zip(builds, expected_commands)))
+        # Only a finished full-scope build can resolve obsolete task blockers.
         # `completed` means `passed` in build results: declaration failures must
         # not prevent reconciliation. Streams/review aggregates opt out.
         authoritative_current_build = (
@@ -201,7 +215,7 @@ class Controller:
             and identity.get("main_sha") == main_sha == state["main_sha"]
             and identity.get("scope") == state["config"].get("scope", {})
             and identity.get("lake_args") == list(state["config"].get("lake_args", ()))
-            and result.get("command") == ["lake", *state["config"].get("lake_args", ()), "--rehash", "build"]
+            and full_scope
         )
         inventory = self.inventory(state)
         # HEAD alone cannot detect an uncommitted import/configuration change
@@ -223,6 +237,11 @@ class Controller:
             # Large compiler output belongs in artifacts, not duplicated task state.
             state["last_build"] = {key: value for key, value in result.items()
                                    if key not in {"output", "stdout", "stderr", "source_identity"}}
+            if isinstance(result.get("builds"), list):
+                state["last_build"]["builds"] = [
+                    {key: value for key, value in item.items()
+                     if key not in {"output", "stdout", "stderr", "source_identity"}}
+                    for item in result["builds"] if isinstance(item, dict)]
             for task in state["tasks"].values():
                 if task["kind"] == "configuration" and not task["files"]:
                     task["files"] = [name for name in CONFIG_FILES if (self.paths.project_root / name).exists()]
@@ -235,7 +254,8 @@ class Controller:
             loop.call_soon_threadsafe(self.diagnostics_queue.put_nowait, (channel, text))
         def execute():
             with bump_jobs.cancellation_scope(self.build_cancel):
-                return bump_verification.build(self.paths.project_root, modules=modules,
+                build = bump_verification.build if modules else bump_verification.build_scope
+                return build(self.paths.project_root, **({"modules": modules} if modules else {}),
                     lake_args=state["config"].get("lake_args", ()), scope=state["config"].get("scope"),
                     on_output=on_output if stream else None)
         result = await self.checked_job(execute)

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
@@ -195,6 +196,209 @@ class VerificationTests(unittest.TestCase):
             return self.run_tool(root, args, **kw)
         run.side_effect = execute
         self.assertFalse(v.build(self.root, scope=self.scope)["passed"])
+
+    def supplemental_scope(self):
+        self.write("Extra.lean", "def extra := 1\n")
+        return {**self.scope, "selected_modules": {**self.scope["selected_modules"], "Extra": "Extra.lean"}}
+
+    def test_scope_command_plan_preserves_default_targets_and_sorts_extras(self):
+        scope = {"default_modules": {"Library": "Library.lean"},
+                 "selected_modules": {"Tests": "Tests.lean", "Library": "Library.lean", "Example": "Example.lean"}}
+        original = deepcopy(scope)
+        with patch.object(v, "build") as build, patch.object(v.bump_jobs, "run") as run:
+            self.assertEqual(v.scope_build_commands(scope, ("-Ksetting=value",)), [
+                ["lake", "-Ksetting=value", "--rehash", "build"],
+                ["lake", "-Ksetting=value", "--rehash", "build", "+Example", "+Tests"]])
+            build.assert_not_called()
+            run.assert_not_called()
+        self.assertEqual(scope, original)
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_build_runs_default_and_extras_with_exact_artifact_refs(self, run):
+        scope = self.supplemental_scope()
+        run.side_effect = self.run_tool
+        output_callback = object()
+        result = v.build_scope(self.root, scope=scope, lake_args=("-Ksetting=value",), on_output=output_callback)
+        self.assertTrue(result["completed"])
+        self.assertTrue(result["passed"])
+        self.assertTrue(result["source_stable"])
+        self.assertEqual(result["checked_files"], ["Example.lean", "Extra.lean"])
+        self.assertEqual(result["covered_files"], result["checked_files"])
+        self.assertEqual(result["commands"], v.scope_build_commands(scope, ("-Ksetting=value",)))
+        builds = [call for call in run.call_args_list if "--rehash" in call.args[1]]
+        self.assertEqual([call.args[1] for call in builds], result["commands"])
+        self.assertTrue(all(call.kwargs["on_output"] is output_callback for call in builds))
+        self.assertTrue(all(item["source_identity"] == result["source_identity"] for item in result["builds"]))
+        artifacts_dir = self.root / ".unity/artifacts"
+        summary = json.loads(v.artifacts.artifact_bytes(artifacts_dir, result["log_ref"]["artifact_id"]))
+        self.assertEqual(summary["commands"], result["commands"])
+        self.assertEqual(len(summary["builds"]), 2)
+        for item, retained in zip(result["builds"], summary["builds"]):
+            self.assertEqual(retained["log_ref"], item["log_ref"])
+            self.assertEqual(retained["command"], item["command"])
+            self.assertEqual(retained["source_sha256"], item["source_sha256"])
+            self.assertEqual(v.artifacts.artifact_info(artifacts_dir, retained["log_ref"]["artifact_id"]), retained["log_ref"])
+            self.assertIn(b"Built Example", v.artifacts.artifact_bytes(artifacts_dir, retained["log_ref"]["artifact_id"]))
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_without_extras_runs_default_exactly_once(self, run):
+        run.side_effect = self.run_tool
+        result = v.build_scope(self.root, scope=self.scope)
+        self.assertEqual(result["commands"], [["lake", "--rehash", "build"]])
+        self.assertEqual(len(result["builds"]), 1)
+        self.assertEqual(sum("--rehash" in call.args[1] for call in run.call_args_list), 1)
+        self.assertEqual(result["checked_files"], ["Example.lean"])
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_default_nonlean_failure_not_hidden_by_successful_extras(self, run):
+        scope = self.supplemental_scope()
+        def execute(root, args, **kwargs):
+            if args[-1] == "--version":
+                return self.run_tool(root, args, **kwargs)
+            if "+Extra" in args:
+                return subprocess.CompletedProcess(args, 0, "✔ Built Extra\n", "")
+            return subprocess.CompletedProcess(args, 2, "✔ Built Example\nerror: native executable link failed\n", "")
+        run.side_effect = execute
+        result = v.build_scope(self.root, scope=scope)
+        self.assertEqual(len(result["builds"]), 2)
+        self.assertEqual(result["returncode"], 2)
+        self.assertFalse(result["passed"])
+        self.assertFalse(result["completed"])
+        self.assertTrue(result["source_stable"])
+        self.assertEqual(result["unmapped"][0]["message"], "error: native executable link failed")
+        self.assertEqual(result["checked_files"], ["Example.lean", "Extra.lean"])
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_regular_error_runs_extras_without_cleaning_error_or_blocked_files(self, run):
+        scope = self.supplemental_scope()
+        for message in ("tactic failed", "unknown module 'Missing'"):
+            def execute(root, args, **kwargs):
+                if args[-1] == "--version":
+                    return self.run_tool(root, args, **kwargs)
+                if "+Extra" in args:
+                    return subprocess.CompletedProcess(args, 0, "✔ Built Example\n✔ Built Extra\n", "")
+                return subprocess.CompletedProcess(args, 1, f"Example.lean:1:1: error: {message}\n", "")
+            with self.subTest(message=message):
+                run.side_effect = execute
+                result = v.build_scope(self.root, scope=scope)
+                self.assertEqual(len(result["builds"]), 2)
+                self.assertEqual(result["returncode"], 1)
+                self.assertFalse(result["completed"])
+                self.assertEqual(result["checked_files"], ["Extra.lean"])
+                self.assertEqual(result["attempted_files"], ["Example.lean", "Extra.lean"])
+                self.assertEqual(result["blocked_files"], ["Example.lean"] if "unknown module" in message else [])
+                self.assertEqual(result["errors"][0]["message"], message)
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_deduplicates_repeated_diagnostics_and_retains_supplemental_failure(self, run):
+        scope = self.supplemental_scope()
+        def execute(root, args, **kwargs):
+            if args[-1] == "--version":
+                return self.run_tool(root, args, **kwargs)
+            output = "Example.lean:1:1: warning: inherited warning\n"
+            if "+Extra" in args:
+                return subprocess.CompletedProcess(args, 3, output + "Extra.lean:1:1: error: tactic failed\n", "")
+            return subprocess.CompletedProcess(args, 0, output + "✔ Built Example\n", "")
+        run.side_effect = execute
+        result = v.build_scope(self.root, scope=scope)
+        self.assertEqual(len(result["diagnostics"]), 2)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["returncode"], 3)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["checked_files"], ["Example.lean"])
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_repeated_error_is_deduplicated(self, run):
+        scope = self.supplemental_scope()
+        def execute(root, args, **kwargs):
+            if args[-1] == "--version":
+                return self.run_tool(root, args, **kwargs)
+            return subprocess.CompletedProcess(args, 1, "Example.lean:1:1: error: tactic failed\n", "")
+        run.side_effect = execute
+        result = v.build_scope(self.root, scope=scope)
+        self.assertEqual(len(result["builds"]), 2)
+        self.assertEqual(len(result["diagnostics"]), 1)
+        self.assertEqual(len(result["errors"]), 1)
+        self.assertEqual(result["checked_files"], [])
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_source_changes_between_components_are_not_accepted(self, run):
+        scope = self.supplemental_scope()
+        run.side_effect = self.run_tool
+        original_build = v.build
+        def execute(root, **kwargs):
+            result = original_build(root, **kwargs)
+            if not kwargs.get("modules"):
+                self.write("Extra.lean", "def extra := 2\n")
+            return result
+        with patch.object(v, "build", side_effect=execute):
+            result = v.build_scope(self.root, scope=scope)
+        self.assertTrue(all(item["source_stable"] for item in result["builds"]))
+        self.assertFalse(result["source_stable"])
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["returncode"], 0)
+        self.assertTrue(any(row["id"] == "source-changed" for row in result["errors"]))
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_head_changes_during_last_component_are_not_accepted(self, run):
+        scope = self.supplemental_scope()
+        def execute(root, args, **kwargs):
+            if "+Extra" in args:
+                self.git("commit", "--quiet", "--allow-empty", "-m", "concurrent HEAD change")
+            return self.run_tool(root, args, **kwargs)
+        run.side_effect = execute
+        result = v.build_scope(self.root, scope=scope)
+        self.assertTrue(all(item["source_stable"] for item in result["builds"]))
+        self.assertEqual(result["builds"][0]["source_identity"], result["builds"][1]["source_identity"])
+        self.assertFalse(result["source_stable"])
+        self.assertFalse(result["completed"])
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_cancellation_propagates_without_running_next_component(self, run):
+        scope = self.supplemental_scope()
+        def execute(root, args, **kwargs):
+            if args[-1] == "--version":
+                return self.run_tool(root, args, **kwargs)
+            raise v.bump_jobs.JobCancelled("cancelled fixture")
+        run.side_effect = execute
+        with self.assertRaises(v.bump_jobs.JobCancelled):
+            v.build_scope(self.root, scope=scope)
+        self.assertEqual(sum("--rehash" in call.args[1] for call in run.call_args_list), 1)
+        self.assertEqual(list((self.root / ".unity/artifacts/records").glob("*.json")), [])
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_existing_cancellation_is_checked_before_any_command(self, run):
+        event = Event()
+        event.set()
+        with v.bump_jobs.cancellation_scope(event), self.assertRaises(v.bump_jobs.JobCancelled):
+            v.build_scope(self.root, scope=self.scope)
+        run.assert_not_called()
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_keeps_one_reentrant_build_lock_across_both_components(self, run):
+        scope = self.supplemental_scope()
+        locks = []
+        def execute(root, args, **kwargs):
+            locks.append(v.bump_jobs._held_build_locks.get())
+            return self.run_tool(root, args, **kwargs)
+        run.side_effect = execute
+        v.build_scope(self.root, scope=scope)
+        self.assertTrue(locks)
+        self.assertTrue(all(held == locks[0] and len(held) == 1 for held in locks))
+        self.assertEqual(v.bump_jobs._held_build_locks.get(), ())
+
+    @patch.object(v.bump_jobs, "run")
+    def test_scope_operational_exception_does_not_return_partial_aggregate(self, run):
+        scope = self.supplemental_scope()
+        def execute(root, args, **kwargs):
+            if "+Extra" in args:
+                raise OSError("offline fixture tool failure")
+            return self.run_tool(root, args, **kwargs)
+        run.side_effect = execute
+        with self.assertRaisesRegex(OSError, "fixture tool failure"):
+            v.build_scope(self.root, scope=scope)
+        records = [json.loads(path.read_text()) for path in (self.root / ".unity/artifacts/records").glob("*.json")]
+        self.assertEqual([row["kind"] for row in records], ["bump_workflow_build"])
 
     @patch.object(v.bump_jobs, "run")
     def test_fresh_build_retains_only_project_outputs_dependencies_untouched(self, run):

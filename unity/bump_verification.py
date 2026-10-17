@@ -340,6 +340,64 @@ def build(root: Path, *, modules=(), lake_args=(), fresh_project=False, on_outpu
             "fresh_project": fresh, "source_stable": stable}
 
 
+def scope_build_commands(scope: dict | None, lake_args=()) -> list[list[str]]:
+    """Plan the default targets plus selected modules outside that build."""
+    scope = scope or {}
+    default = ["lake", *lake_args, "--rehash", "build"]
+    supplemental = sorted(set(_module_paths(scope)) - set(_module_paths(scope, "default_modules")))
+    return [default, [*default, *["+" + name.removeprefix("+") for name in supplemental]]] if supplemental else [default]
+
+
+def build_scope(root: Path, *, lake_args=(), scope=None, on_output=None) -> dict:
+    """Refresh the configured scope without losing default-target failures.
+
+    Each command retains its own build evidence. Ordinary build failures still
+    permit the supplemental pass; cancellation and operational exceptions keep
+    the existing build behavior and do not produce a partial aggregate.
+    """
+    root, scope, lake_args = Path(root).resolve(), deepcopy(scope or {}), tuple(lake_args)
+    commands = scope_build_commands(scope, lake_args)
+    supplemental = sorted(set(_module_paths(scope)) - set(_module_paths(scope, "default_modules")))
+    with bump_jobs._build_lock(root):
+        builds = [build(root, lake_args=lake_args, scope=scope, on_output=on_output)]
+        if supplemental:
+            builds.append(build(root, modules=supplemental, lake_args=lake_args, scope=scope, on_output=on_output))
+        identity = builds[0]["source_identity"]
+        stable = (all(item["source_stable"] and item["source_identity"] == identity for item in builds)
+                  and identity["files"] == _files(root, scope.get("build_dir", ".lake/build"))
+                  and identity["main_sha"] == _git(root, "rev-parse", "HEAD"))
+        diagnostics, seen = [], set()
+        for item in builds:
+            for row in item["diagnostics"]:
+                key = digest(row)
+                if key not in seen:
+                    diagnostics.append(deepcopy(row))
+                    seen.add(key)
+        if not stable and not any(row.get("id") == "source-changed" for row in diagnostics):
+            diagnostics.append({"id": "source-changed", "path": None, "line": None, "column": None,
+                                "severity": "error", "kind": "environment",
+                                "message": "Source or configuration changed during full-scope build."})
+        errors = [row for row in diagnostics if row["severity"] == "error"]
+        blocked = set().union(*(set(item["blocked_files"]) for item in builds))
+        checked = set().union(*(set(item["checked_files"]) for item in builds))
+        checked.difference_update(blocked | {row["path"] for row in errors if row.get("path")})
+        attempted = set().union(*(set(item["attempted_files"]) for item in builds))
+        passed = stable and all(item["passed"] for item in builds) and not errors
+        returncode = next((item["returncode"] for item in builds if item["returncode"]), 0)
+        summary = {"commands": commands, "source_sha256": identity["sha256"], "source_stable": stable,
+                   "passed": passed, "returncode": returncode,
+                   "builds": [{key: item[key] for key in ("command", "source_sha256", "returncode", "log_ref")}
+                              for item in builds]}
+        log = artifacts.store_text(root / ".unity" / "artifacts", json.dumps(summary, indent=2, sort_keys=True),
+                                   kind="bump_workflow_scope_build", producer="Unity",
+                                   metadata={"commands": commands, "source_sha256": identity["sha256"], "returncode": returncode})
+    return {"passed": passed, "completed": passed, "returncode": returncode, "commands": commands, "builds": builds,
+            "diagnostics": diagnostics, "errors": errors, "unmapped": [row for row in errors if not row.get("path")],
+            "checked_files": sorted(checked), "covered_files": sorted(checked), "attempted_files": sorted(attempted),
+            "blocked_files": sorted(blocked), "source_identity": identity, "source_sha256": identity["sha256"],
+            "source_stable": stable, "log_ref": log}
+
+
 def _patch_replay(root: Path, base_sha: str, current_files: dict, artifacts_dir: Path) -> dict:
     """Create and replay a binary patch inside an independent temporary Git repo."""
     with tempfile.TemporaryDirectory(prefix="unity-bump-patch-") as directory:

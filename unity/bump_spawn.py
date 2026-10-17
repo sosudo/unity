@@ -656,6 +656,31 @@ def _log(name: str, msg, cwd=None) -> None:
 
 # ── backends ────────────────────────────────────────────────────────────────────
 
+def _claude_sandbox_tmpdir() -> Path:
+    """Keep Claude's HTTP/SOCKS bridge sockets below Unix path limits.
+
+    Worker cache paths can be much longer than sockaddr_un.sun_path. This is
+    private, invocation-local socket scratch, not a replacement for those
+    persistent caches or for the MCP servers' explicitly configured runtime.
+    """
+    import shutil
+
+    scratch = Path(tempfile.mkdtemp(prefix="ub-", dir="/tmp"))
+    try:
+        scratch.chmod(0o700)
+        # Claude 2.1.105 appends a 16-hex nonce. Use the smaller macOS bound
+        # (104 bytes, including NUL), which also fits Linux's 108-byte field.
+        for root in (scratch, scratch.resolve()):
+            for bridge in ("http", "socks"):
+                socket_path = root / f"claude-{bridge}-{'0' * 16}.sock"
+                if len(os.fsencode(socket_path)) >= 104:
+                    raise ValueError("Claude sandbox socket path exceeds Unix socket limit")
+        return scratch
+    except BaseException:
+        shutil.rmtree(scratch)
+        raise
+
+
 async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                          mcp_servers: dict, *, permission: str = "bypassPermissions",
                          idle_timeout: float = 600.0, subagents=(),
@@ -665,98 +690,132 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
     import shutil
 
-    isolation = {}
-    roots = _worktree_write_roots(cwd)
-    if roots:
-        from .bump_permissions import claude_worktree_options
-        isolation = claude_worktree_options(cwd, roots)
-        system_prompt += _worktree_prompt(cwd)
-
-    cli_path = None
+    scratch = None
+    sdk_closed = True
+    cleanup_failed = False
     pid_file = None
-    if own_process_group and os.name == "posix":
-        from claude_agent_sdk._internal.transport import subprocess_cli
-        bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
-        real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
-        if real_cli.is_file():
-            group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
-            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
 
-    agents_def = {
-        s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
-        for s in subagents
-    }
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        mcp_servers={name: ({"type": "http", **cfg} if cfg.get("url") else cfg)
-                     for name, cfg in mcp_servers.items()},
-        agents=agents_def,
-        cwd=str(cwd),
-        permission_mode=isolation.pop("permission_mode", permission),
-        model=agent.model,
-        max_budget_usd=agent.budget,
-        env=_agent_env(agent, env_overrides=env_overrides),
-        cli_path=cli_path,
-        **isolation,
-    )
-    attempt = 0
-    while True:
-        attempt += 1
+    def mark_sdk_closed() -> None:
+        nonlocal sdk_closed
+        sdk_closed = True
+
+    async def close_group() -> None:
+        nonlocal cleanup_failed
         try:
-            if on_normal_completion is not None:
-                return await _claude_continuation(
-                    agent, options, prompt, cwd,
-                    on_normal_completion, idle_timeout,
-                )
-            final = None
-            stream = query(prompt=prompt, options=options)
-            try:
-                async for msg in _idle_guard(stream, idle_timeout):
-                    _log(agent.name, msg, cwd)
-                    if type(msg).__name__ == "ResultMessage":
-                        final = getattr(msg, "result", None)
-                        _last_run_stats[agent.name] = {
-                            "cost_usd": getattr(msg, "total_cost_usd", None),
-                            "num_turns": getattr(msg, "num_turns", None),
-                        }
-                    if _stop_requested(cwd):
-                        # Safe stop: wind down at the next stream item instead of being killed
-                        # mid-write; abandoning the iterator disconnects the SDK client cleanly.
-                        _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                        return final
-            finally:
-                close = getattr(stream, "aclose", None)
-                if close is not None:
-                    await close()
-            return final
-        except _CompletionCallbackError as exc:
-            raise exc.error
-        except _UnsuccessfulTurnError:
+            await _terminate_process_group(pid_file)
+        except BaseException:
+            cleanup_failed = True
             raise
-        except Exception as e:
-            if _give_up(e, attempt):
+
+    try:
+        isolation = {}
+        roots = _worktree_write_roots(cwd)
+        if roots:
+            from .bump_permissions import claude_worktree_options
+            scratch = _claude_sandbox_tmpdir()
+            isolation = claude_worktree_options(cwd, (*roots, scratch))
+            system_prompt += _worktree_prompt(cwd)
+            env_overrides = {**(env_overrides or {}),
+                             **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(scratch))}
+
+        cli_path = None
+        if own_process_group and os.name == "posix":
+            from claude_agent_sdk._internal.transport import subprocess_cli
+            bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
+            real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
+            if real_cli.is_file():
+                group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
+                cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
+
+        agents_def = {
+            s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
+            for s in subagents
+        }
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            mcp_servers={name: ({"type": "http", **cfg} if cfg.get("url") else cfg)
+                         for name, cfg in mcp_servers.items()},
+            agents=agents_def,
+            cwd=str(cwd),
+            permission_mode=isolation.pop("permission_mode", permission),
+            model=agent.model,
+            max_budget_usd=agent.budget,
+            env=_agent_env(agent, env_overrides=env_overrides),
+            cli_path=cli_path,
+            **isolation,
+        )
+        attempt = 0
+        while True:
+            attempt += 1
+            sdk_closed = True
+            try:
+                if on_normal_completion is not None:
+                    sdk_closed = False
+                    return await _claude_continuation(
+                        agent, options, prompt, cwd,
+                        on_normal_completion, idle_timeout,
+                        on_sdk_closed=mark_sdk_closed,
+                    )
+                final = None
+                stream = query(prompt=prompt, options=options)
+                sdk_closed = False
+                try:
+                    async for msg in _idle_guard(stream, idle_timeout):
+                        _log(agent.name, msg, cwd)
+                        if type(msg).__name__ == "ResultMessage":
+                            final = getattr(msg, "result", None)
+                            _last_run_stats[agent.name] = {
+                                "cost_usd": getattr(msg, "total_cost_usd", None),
+                                "num_turns": getattr(msg, "num_turns", None),
+                            }
+                        if _stop_requested(cwd):
+                            # Safe stop: wind down at the next stream item instead of being killed
+                            # mid-write; abandoning the iterator disconnects the SDK client cleanly.
+                            _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                            return final
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if close is not None:
+                        await close()
+                        mark_sdk_closed()
+                return final
+            except _CompletionCallbackError as exc:
+                raise exc.error
+            except _UnsuccessfulTurnError:
                 raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await _terminate_process_group(pid_file)
-            await asyncio.sleep(wait)
-        finally:
-            await _terminate_process_group(pid_file)
+            except Exception as e:
+                if _give_up(e, attempt):
+                    raise
+                wait = _retry_sleep(e)
+                _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+                await close_group()
+                await asyncio.sleep(wait)
+            finally:
+                cleanup_failed |= not sdk_closed
+                await close_group()
+    finally:
+        # Never remove scratch while a failed/interrupted SDK or group cleanup
+        # could still leave an owned process using it. A retry uses the same
+        # private directory; closure failure remains sticky across attempts.
+        if scratch is not None and sdk_closed and not cleanup_failed:
+            shutil.rmtree(scratch)
 
 
 async def _claude_continuation(agent, options, prompt, cwd,
-                               callback, idle_timeout):
+                               callback, idle_timeout, *, on_sdk_closed=None):
     """One connected SDK session; validation corrections are ordinary user turns."""
     from claude_agent_sdk import ClaudeSDKClient
 
     client = ClaudeSDKClient(options=options)
     await client.connect()
     total_turns = 0
+    response_closed = True
     try:
         while not _stop_requested(cwd):
             await client.query(prompt)
             result = None
             stream = client.receive_response()
+            response_closed = False
             try:
                 async for msg in _idle_guard(stream, idle_timeout):
                     _log(agent.name, msg, cwd)
@@ -772,6 +831,7 @@ async def _claude_continuation(agent, options, prompt, cwd,
                         return getattr(result, "result", None)
             finally:
                 await stream.aclose()
+                response_closed = True
             if result is None or getattr(result, "is_error", True):
                 detail = getattr(result, "subtype", "missing successful result")
                 raise _UnsuccessfulTurnError(f"Claude turn did not complete successfully: {detail}")
@@ -781,6 +841,8 @@ async def _claude_continuation(agent, options, prompt, cwd,
                 return final
     finally:
         await client.disconnect()
+        if response_closed and on_sdk_closed is not None:
+            on_sdk_closed()
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
