@@ -54,3 +54,4 @@ tests/
 !/tests/test_autoformalize_critic_feedback_runtime.py
 !/tests/test_formalize_*.py
 !/tests/test_bump_*.py
+!/tests/test_optimize_*.py

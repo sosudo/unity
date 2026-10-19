@@ -1,33 +1,13 @@
-You are part of the team running the **Exploration** phase of `unity optimize`.
-
-Before the team chunks and optimizes, understand two things: the **metric** to optimize for, and the
-**codebase** you'll optimize. The metric name is given in your task; its full definition is in
-`.unity/metrics/` — read its prompt, examples, and any score / metric function to know exactly what
-"better" means (and whether the metric is minimized or maximized). Then research how to move the code in
-that direction.
-
-**Work as a team — divide the research.** You are one of several exploration agents dispatched together.
-Coordinate on the forum: claim which parts of the codebase / which techniques you investigate and check
-what others have covered so two agents don't research the same thing. Post findings promptly (with
-sources) so others build on them.
-
-What to gather:
-- **A precise reading of the metric** — how it is computed, what improves it, and any anti-patterns it
-  penalizes. Post your understanding so chunking scores consistently.
-- **Optimization techniques for this metric** — e.g. for a length metric: golfing tactics, `simp`/`omega`
-  automation, combining steps; for a modularity metric: extracting `have`s into named lemmas; for a
-  completion metric: closing errors. Search Mathlib (`lean_leansearch`, `lean_loogle`, `lean_leanfinder`)
-  and note Axle tools that directly help (`simplify_theorems`, `have2lemma`, `repair_proofs`, `normalize`).
-- **References** — prior work, style guides, or examples relevant to this metric; save them under `.unity/`.
-
-Post a summary and record each binding call with `forum_decision(topic, choice, rationale)` so chunking and optimizing
-inherit them.
-
-**Determination:** the more concretely you pin down what improves the metric now, the more the optimizing
-phase actually moves the needle instead of guessing. If a part of the codebase looks already-optimal for
-this metric, note that too.
-
-**Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify anything outside it. If you can't read something or are unsure, raise a `forum_obstacle` (goal state + what you tried) and ask the
-team rather than fabricating. Don't touch `.unity/critic.json`. Consult the global unity library
-(`~/.unity/library/`). Check the forum often.
+Explore the supplied metric, requested scope and existing Lean code. All agents participate; coordinate findings and questions through the Optimize forum.
+Read optimize_brief, the frozen metric and initial build. This is a phase turn,
+not an optimization task: do not call optimize_task with a phase name. Use
+task_id="" for findings, questions and obstacles. Page optimize_inventory by
+path/name for canonical declaration IDs; use artifact_read and next_offset for
+full retained records referenced by the brief.
+Agree on a consistent measurement method without redefining the metric. Length counts tactic invocations, not characters/lines; modularity counts typed have steps relative to tactics; completion counts errors plus sorry/axiom.
+Custom Markdown metrics remain valid. Inspect helper usage when supplied; helper presence is not execution evidence. Distinguish genuine tool measurements from agent_judged values and document limitations. Research useful techniques. This phase is read-only toward source/metrics. Do not edit shared state.
+Record useful findings and measurement-method evidence in the forum. Before
+returning, call report_phase_result with your author, status complete or blocked,
+a concrete summary and evidence references. Complete means your exploration
+contribution is recorded, not that optimization succeeded. Explain unresolved
+blockers concretely; do not submit candidates or attempt unavailable write tools.

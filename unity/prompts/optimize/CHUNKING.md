@@ -1,42 +1,27 @@
-You are part of the team running the **Chunking** phase of `unity optimize`.
+Collaboratively plan Optimize work through forum plan proposals. This is a phase
+turn, not a task: read optimize_brief, do not invent an optimize_task ID, and use
+task_id="" for findings/questions/obstacles. Read optimize_inventory with an exact
+project-relative path or declaration-name filter, paging with next_offset and
+retaining inventory_sha256. Use the returned canonical chunk IDs, not fabricated
+IDs derived from declaration names. Read full retained records through
+artifact_read when the brief supplies references.
+Enumerate every declaration in requested targets, including clean declarations. Default one declaration per chunk; document evidence for mutual/overlap/file-level or metric-specific grouping and retain covered declaration IDs. Record dependencies; group/report cycles rather than ignoring them. Inventory is a scheduling hint, not a semantic parser.
+Record original measurements with the agreed method and source identity using the forum measurement tools. Raw value and improvement differ. Baseline is immutable after planning; future scores are separate. Use measured only for actual retained tool evidence, otherwise agent_judged. No invented aggregate or LOC substitute. Submit proposals instead of editing dag.json. Do not edit Lean source. Omitted declarations need explicit out-of-scope reasons; Universe covers all eligible declarations.
 
-`unity optimize` improves the project's Lean code with respect to a metric (named in your task; defined in
-`.unity/metrics/`). Your job is to enumerate the code into a **dependency DAG of chunks — one chunk per
-Lean declaration** in scope, each declaring the chunk ids it depends on **and its current score on the
-metric**. You do not optimize anything in this phase.
+For a narrow file target, propose_chunk_plan may specify exclude_outside_paths
+as the list of exact known selected paths, together with exclusion_reason and
+the current inventory_sha256. The controller expands this selector to explicit
+per-declaration exclusions outside those paths before existing validation. For
+example, exclude_outside_paths=["Batteries/Data/List/Perm.lean"] keeps that file
+selected; it does not exclude that file. No natural-language scope is silently
+parsed, no omission implies exclusion, and every selected declaration must still
+be covered. Universe forbids this selector. Explicit declaration exclusions are
+still supported. The full configured build scope is unchanged. For large plan
+arguments, use the shell bridge's --args-file support if needed.
 
-- Walk the project and make each in-scope declaration its own chunk. Capture what it is in the chunk's
-  `summary`/`statement` and note its file + location. Axle's `extract_decls` and the lean-lsp tools can
-  help enumerate declarations.
-- `dependencies` = the other declarations this one uses (so optimizing respects order — optimizing a
-  declaration can affect its dependents).
-- **Score each chunk.** Compute the declaration's current value under the metric, using the metric's
-  score / metric function if one is provided (run it), or the metric's prompt otherwise, and store it in a
-  `score` field. Score consistently with the reading of the metric agreed on the forum during exploration.
-- **Record the metric name** at the top level of `.unity/dag.json` (a `"metric"` field) so the optimizing
-  and critic phases know which metric to use.
-
-Write to `.unity/dag.json`:
-{
-  "metric": "<metric name>",
-  "chunks": [
-    {"id": "chunk-1", "title": "Nat.foo", "summary": "...", "dependencies": [], "status": "pending",
-     "score": <current metric value>, "statement": "<declaration signature>", "type": "theorem"},
-    {"id": "chunk-2", "title": "...", "summary": "...", "dependencies": ["chunk-1"], "status": "pending",
-     "score": <current metric value>}
-  ]
-}
-Required per chunk: `id`, `title`, `summary`, `dependencies`, `status`, `score`. Optional: `statement`,
-`type`. Do not hand-write a topological ordering — the system toposorts the DAG (the top-level `metric`
-field is preserved).
-
-Work collaboratively via the forum: divide the files among you, agree on chunk ids and on how the score
-is computed so it's comparable across chunks, and converge before finalizing.
-
-**Determination:** capture every in-scope declaration with an accurate, consistent baseline score — the
-optimizing phase measures its improvement against these numbers, so a wrong baseline misjudges progress.
-
-**Norms:** operate only within the launch directory (the Lean project and `.unity/`); never scan or
-modify outside it. If a file won't parse, the metric is ambiguous, or you're unsure how to score
-something, raise it with `forum_obstacle`. Don't touch `.unity/critic.json`. Consult the global unity library
-(`~/.unity/library/`). Do not optimize or edit declarations in this phase.
+Collaborate and revise plans through the forum. Submit the complete converged plan last: the controller validates and installs that final proposal, retaining earlier drafts as discussion rather than requiring identical historical proposals or an extra primary planning approval.
+Before returning, call report_phase_result with your author, status complete or
+blocked, a concrete summary and retained plan/measurement evidence. Report
+validation failures concretely, using returned missing/unknown IDs and inventory
+pages to correct the proposal. A complete report does not substitute for an
+accepted plan and required original measurements. Do not submit candidates here.

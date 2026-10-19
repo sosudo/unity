@@ -317,6 +317,39 @@ def _workspace_unity() -> Path:
     return _bump_unity() if _bump_command() else ROOT_DIR
 
 
+def _optimize_command() -> bool:
+    try:
+        return json.loads((ROOT_DIR / "state.json").read_text()).get("command") == "optimize"
+    except (OSError, ValueError):
+        return False
+
+
+def _optimize_state() -> dict:
+    """Read Optimize only; the dashboard never initializes or advances a run."""
+    if not _optimize_command():
+        return {}
+    from ..optimize_tasks import STATE_FILE, load
+    directory = FORUM_DIR / "optimize"
+    return load(directory) if (directory / STATE_FILE).is_file() else {}
+
+
+def _optimize_dag(state: dict) -> dict:
+    colors = {"complete": "green", "running": "yellow", "pending": "grey",
+              "no_improvement": "blue", "grouped": "grey"}
+    nodes = [{"id": task["task_id"], "title": ", ".join(
+        state["chunks"][cid].get("name", cid) for cid in task["chunk_ids"]),
+        "type": "optimization", "summary": task.get("reason", ""),
+        "dependencies": task["dependencies"], "status": colors.get(task["status"], "red"),
+        "outcome": task["status"],
+        "acceptance": "recorded_complete" if state.get("phase") == "complete" else "provisional",
+        "baseline": {cid: state["baseline"].get("measurements", {}).get(cid) for cid in task["chunk_ids"]},
+        "current": {cid: state["measurements"].get(cid) for cid in task["chunk_ids"]}}
+        for task in state.get("tasks", {}).values()]
+    return {"graph_kind": "optimize", "schema": state.get("schema"), "chunks": nodes,
+            "phase": state.get("phase"), "metric": state.get("metric"),
+            "acceptance": "recorded_complete" if state.get("phase") == "complete" else "provisional"}
+
+
 def _dashboard_dag_path() -> Path:
     if _bump_command():
         return _bump_forum() / "dag.json"
@@ -328,6 +361,8 @@ def _autoformalize_forum() -> Path:
 
 
 def _discussion_forum() -> Path:
+    if _optimize_command() and _optimize_state():
+        return FORUM_DIR / "optimize"
     if _bump_command():
         return _bump_forum()
     if _formalize_command():
@@ -739,6 +774,8 @@ def get_tag(name: str):
 
 @app.get("/api/dag")
 def get_dag():
+    if _optimize_command() and (state := _optimize_state()):
+        return JSONResponse(_optimize_dag(state))
     if _bump_command():
         return JSONResponse(_bump_dag())
     if _formalize_command():
@@ -946,6 +983,24 @@ def get_bump_state():
         return current
     from ..bump_state import load_state
     return load_state(_bump_forum())
+
+
+@app.get("/api/optimize-state")
+def get_optimize_state():
+    return _optimize_state()
+
+
+@app.get("/api/optimize-metrics")
+def get_optimize_metrics():
+    state = _optimize_state()
+    if not state:
+        return {}
+    counts = {}
+    for task in state["tasks"].values():
+        counts[task["status"]] = counts.get(task["status"], 0) + 1
+    return {"phase": state["phase"], "tasks": counts, "rounds": state["rounds"],
+            "baseline": state["baseline"].get("measurements", {}), "current": state["measurements"],
+            "review": state["review"], "qualification": "Task counters are not verified optimization acceptance."}
 
 
 @app.get("/api/bump-metrics")
@@ -1688,6 +1743,14 @@ const STATUS_COLOR = {
 };
 const LEGEND = [['green','Merged','#2e7d32'], ['yellow','Active','#7c5cbf'], ['grey','Pending','#d97706'], ['red','Blocked','#c62828']];
 function updateHeaderLegend(data) {
+  if (data.graph_kind === 'optimize') {
+    const counts = {};
+    (data.chunks||[]).forEach(c => { counts[c.outcome] = (counts[c.outcome] || 0) + 1; });
+    const el = document.getElementById('hlegend');
+    if (el) el.textContent = Object.entries(counts).map(([outcome, count]) => outcome + ': ' + count).join(' · ')
+      + ' · ' + (data.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot' : 'Not accepted');
+    return;
+  }
   const counts = {green:0, yellow:0, grey:0, red:0};
   (data.chunks||[]).forEach(c => { const k = c.status === 'blue' ? 'yellow' : c.status; if (k in counts) counts[k]++; });
   const el = document.getElementById('hlegend');
@@ -1782,6 +1845,21 @@ function showPanel(id) {
   openId = id;
   const c = chunks[id]; if (!c) return;
   const col = STATUS_COLOR[c.status] || STATUS_COLOR.grey;
+  if (graphKind === 'optimize') {
+    const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value)+'</div></div>';
+    const measurements = rows => Object.entries(rows || {}).map(([subject, row]) => subject + ': '
+      + (row ? JSON.stringify(row.raw_value) + ' ' + (row.units || '') + ' [' + row.evidence_kind + ']' : 'not recorded')).join('\\n');
+    document.getElementById('info-content').innerHTML = field('declarations', c.title)
+      + field('task outcome', c.outcome)
+      + field('acceptance', c.acceptance === 'recorded_complete' ? 'Recorded accepted snapshot' : 'Provisional; task status is not acceptance')
+      + field('original measurements', measurements(c.baseline))
+      + field('current measurements', measurements(c.current))
+      + field('measurement qualification', 'Reported tool/agent evidence, not independent scorer execution')
+      + field('grouping / scope', c.summary || 'declaration-default')
+      + field('dependencies', (c.dependencies || []).join(', ') || 'none');
+    document.getElementById('info-panel').classList.add('visible');
+    return;
+  }
   if (graphKind === 'bump' && graphSchema === 'compiler-migration-v2') {
     const field = (label, value) => '<div class="info-field"><div class="info-label">'+esc(label)+'</div><div class="info-value">'+esc(value == null || value === '' ? '—' : value)+'</div></div>';
     const assignment = c.assignment || {};
@@ -1855,8 +1933,8 @@ async function loadDag(forceRebuild) {
   if (!res.ok) { waiting.style.display='block'; return; }
   waiting.style.display = 'none';
   const data = await res.json();
-  document.getElementById('dag-title').textContent = data.graph_kind === 'bump' ? 'Declaration repair DAG' : data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
-  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>(['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) || data.graph_kind === 'bump') ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
+  document.getElementById('dag-title').textContent = data.graph_kind === 'optimize' ? 'Optimization tasks' : data.graph_kind === 'bump' ? 'Declaration repair DAG' : data.graph_kind === 'informal_tasks' ? 'Informal proof tasks' : ['formalize', 'autoformalize', 'solve_formalization'].includes(data.graph_kind) ? 'Informal formalization DAG' : 'Formalization chunks';
+  const sig = (data.graph_kind || 'formalization') + ':' + (data.chunks||[]).map(c=>(['formalize', 'autoformalize', 'solve_formalization', 'optimize'].includes(data.graph_kind) || data.graph_kind === 'bump') ? JSON.stringify([c.id, c.title, c.dependencies]) : c.id).sort().join(',');
   if (forceRebuild || sig !== lastSig) { buildGraph(data); lastSig = sig; }
   else updateColors(data);
   updateHeaderLegend(data);

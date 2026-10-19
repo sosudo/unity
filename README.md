@@ -261,6 +261,12 @@ Finally, press the settings icon in the top right, and set your max attempts (ho
 
 When you're ready, hover over the `run` button, press `optimize`, set the metric you want to optimize for, and press the `start` button. In the `targets` box, you can put in any specific Lean declarations you want optimized (you can also leave it blank and the agents will treat all declarations as targets). If you want to edit the existing metrics or add new metrics, go to the metrics tab!
 
+Optimize records its original source/metric baseline separately from current measurements in `.unity/forum/optimize/optimize-workflow.json`. All agents may optimize, including the configured primary. Distinct approaches can compete in private worktrees; the team discusses candidates, the primary chooses winners, and the controller verifies and serializes publication. After changes, affected tasks and measurements are refreshed. Final review is read-only and belongs to that same configured primary, not a reserved reviewer.
+
+`MAX_ATTEMPTS` counts optimization/review rounds. `--continue` resumes the same project's saved round, candidates and budget without replacing its baseline. Old generic DAG/critic files cannot establish the new baseline and are not silently converted. Stop, exhaustion, blocked verification and no improvement found are distinct from accepted improvement. A finite search never proves global optimality. Set `RETROSPECTIVE=false` to skip optional lessons.
+
+Metric Markdown and custom helper files remain supported; they are not automatically executable scorers. Reports distinguish tool-measured values from agent judgments and do not substitute lines of code for tactic counts. Length/modularity retain statements and add no holes; completion may start with errors or holes but does not claim completion while they remain. Compilation/lexical checks are not a proof of semantic equivalence. Existing fresh-run, version-matched LeanArchitect setup remains separate from optimization improvement; Optimize does not inherit Bump's toolchain migration or dependency recursion.
+
 ## CLI Commands
 
 | Command | Flags | What it does |
