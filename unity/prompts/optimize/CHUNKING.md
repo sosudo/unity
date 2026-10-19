@@ -16,8 +16,12 @@ example, exclude_outside_paths=["Batteries/Data/List/Perm.lean"] keeps that file
 selected; it does not exclude that file. No natural-language scope is silently
 parsed, no omission implies exclusion, and every selected declaration must still
 be covered. Universe forbids this selector. Explicit declaration exclusions are
-still supported. The full configured build scope is unchanged. For large plan
-arguments, use the shell bridge's --args-file support if needed.
+still supported. The full configured build scope is unchanged. Store inventory
+exports, plan drafts, tool-argument JSON and temporary planning helpers only in
+the exact private directory supplied as UNITY_OPTIMIZE_SCRATCH, never the source
+root or an ad hoc .unity-tmp/ directory. For large plan arguments, use
+`unity mcp unity-forum propose_chunk_plan --args-file "$UNITY_OPTIMIZE_SCRATCH/plan.json"`
+if needed. This administrative scratch location does not authorize Lean source edits.
 
 Collaborate and revise plans through the forum. Submit the complete converged plan last: the controller validates and installs that final proposal, retaining earlier drafts as discussion rather than requiring identical historical proposals or an extra primary planning approval.
 Before returning, call report_phase_result with your author, status complete or

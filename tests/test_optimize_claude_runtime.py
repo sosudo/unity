@@ -74,12 +74,15 @@ class OptimizeClaudeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.shared.mkdir()
         self.persistent_tmp = self.shared / ("persistent-runtime-" * 6)
         self.persistent_tmp.mkdir()
+        self.planning_scratch = self.cwd / ".unity" / "scratch" / "optimize"
+        self.planning_scratch.mkdir(parents=True)
         self.runtime = {
             **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(self.persistent_tmp)),
             "UV_TOOL_DIR": str(self.shared / "uv-tools"),
             "UV_TOOL_BIN_DIR": str(self.shared / "uv-bin"),
             "LAKE_CACHE_DIR": str(self.shared / "lake-cache"),
             "UNITY_OPTIMIZE_PROFILE": "optimizing",
+            "UNITY_OPTIMIZE_SCRATCH": str(self.planning_scratch),
         }
         self.mcp = {"lean-lsp": {
             "command": "fixture-no-execute", "args": [],
@@ -190,7 +193,7 @@ class OptimizeClaudeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for key in ("TMPDIR", "TMP", "TEMP"):
             self.assertEqual(options.env[key], options.env["TMPDIR"])
             self.assertNotEqual(options.env[key], self.runtime[key])
-        for key in ("UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "LAKE_CACHE_DIR"):
+        for key in ("UV_TOOL_DIR", "UV_TOOL_BIN_DIR", "LAKE_CACHE_DIR", "UNITY_OPTIMIZE_SCRATCH"):
             self.assertEqual(options.env[key], self.runtime[key])
         self.assertEqual(options.mcp_servers, before_mcp)
         self.assertEqual(self.runtime, before_runtime)
@@ -312,6 +315,8 @@ class OptimizeClaudeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         for phase in ("optimizing", "critic"):
             with self.subTest(phase=phase):
                 runtime = {**self.runtime, "UNITY_OPTIMIZE_PROFILE": phase}
+                if phase == "critic":
+                    runtime["UNITY_OPTIMIZE_SCRATCH"] = ""
                 await optimize_spawn.spawn(self.agent, "system", "task", self.cwd,
                                        self.mcp, env_overrides=runtime)
                 options = self.options[-1]
@@ -320,6 +325,21 @@ class OptimizeClaudeRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(mcp_env["TMPDIR"], self.runtime["TMPDIR"])
                 self.assertEqual(mcp_env["UV_TOOL_DIR"], self.runtime["UV_TOOL_DIR"])
                 self.assertNotEqual(mcp_env["TMPDIR"], options.env["TMPDIR"])
+                for env in (options.env, mcp_env):
+                    self.assertEqual(env["UNITY_OPTIMIZE_SCRATCH"], runtime["UNITY_OPTIMIZE_SCRATCH"])
+                if phase == "critic":
+                    self.assertIn("Review is read-only", options.system_prompt)
+                    self.assertNotIn('--args-file "$UNITY_OPTIMIZE_SCRATCH', options.system_prompt)
+                    sandbox = json.loads(options.settings)["sandbox"]
+                    self.assertIn(str(self.cwd.resolve()), sandbox["filesystem"]["denyWrite"])
+                    hook = options.hooks["PreToolUse"][0].hooks[0]
+                    answer = await hook({"tool_name": "Write", "tool_input": {
+                        "file_path": str(self.planning_scratch / "plan.json"), "content": "{}"}}, None, None)
+                    self.assertEqual(answer["hookSpecificOutput"]["permissionDecision"], "deny")
+                else:
+                    self.assertNotEqual(options.env["TMPDIR"], str(self.planning_scratch))
+                    self.assertIn('--args-file "$UNITY_OPTIMIZE_SCRATCH', options.system_prompt)
+        self.assertTrue(self.planning_scratch.is_dir())
 
     async def test_non_sandboxed_claude_keeps_existing_environment(self):
         with patch.object(optimize_spawn, "_worktree_write_roots", return_value=()):

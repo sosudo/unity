@@ -17,8 +17,15 @@ edits. A missing phase-specific tool is not permission to bypass its restriction
 
 If native tools are unavailable for this backend, the shell bridge is
 `unity mcp unity-forum <tool> '<json-args>'` (server alias `forum`, not
-`unity_forum` or `optimize`). Large arguments can use
-`unity mcp unity-forum <tool> --args-file <json-file>` instead of positional JSON.
+`unity_forum` or `optimize`). For non-review turns, put inventory exports, plan
+drafts, tool-argument JSON and temporary planning helpers in the exact private
+directory supplied as `UNITY_OPTIMIZE_SCRATCH`. Large arguments can use
+`unity mcp unity-forum <tool> --args-file "$UNITY_OPTIMIZE_SCRATCH/plan.json"`
+instead of positional JSON. Do not create administrative files at the source
+root or in an ad hoc `.unity-tmp/` directory. Actual source/proof edits remain
+subject to the assigned phase's permissions; this scratch directory does not
+authorize source edits in read-only planning phases. Review remains read-only:
+use native tools or inline JSON arguments, without writing planning/scratch files.
 Large output includes an artifact reference; read every required page with
 artifact_read and next_offset rather than guessing omitted IDs or values.
 

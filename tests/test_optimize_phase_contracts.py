@@ -1,7 +1,9 @@
 """Real Optimize worker/prompt/forum contracts; only the model transport is fake."""
 import asyncio
 from copy import deepcopy
+import json
 import os
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -146,6 +148,177 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
                 await self.controller.prepare()
         self.assertFalse(self.controller.state()["baseline_sealed"])
         self.assertEqual(self.controller.state()["tasks"], {})
+
+    async def test_file_bridge_plan_keeps_source_snapshot_and_seals_baseline(self):
+        self.seed_baseline()
+        with tasks.transaction(self.paths.forum) as state:
+            state["exploration_done"] = True
+        scope = self.controller.state()["scope"]
+        original = workflow.verification.file_identity(self.root, scope=scope)
+        retained = []
+
+        async def respond(agent, system, instruction, tree, servers, **kwargs):
+            env = kwargs["env_overrides"]
+            scratch = Path(env["UNITY_OPTIMIZE_SCRATCH"])
+            self.assertEqual(scratch, tree / ".unity/scratch/optimize")
+            self.assertIn(str(scratch), system)
+            self.assertTrue(scratch.is_dir())
+            before = workflow.verification.file_identity(tree, scope=scope)
+            # Execute the installed private bridge wrapper, not an in-memory
+            # forum mock. Only provider transport and baseline build are fake.
+            child_env = {**os.environ, **env,
+                "PYTHONPATH": str(Path(workflow.__file__).resolve().parent.parent)}
+
+            async def bridge(tool, arguments):
+                process = await asyncio.create_subprocess_exec(
+                    "unity", "mcp", "unity-forum", tool, *arguments,
+                    cwd=tree, env=child_env,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                try:
+                    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30)
+                finally:
+                    if process.returncode is None:
+                        process.kill()
+                        await process.wait()
+                self.assertEqual(process.returncode, 0, stderr.decode())
+                return stdout.decode()
+
+            inventory = await bridge("optimize_inventory", ["{}"])
+            (scratch / "perm-inv.json").write_text(inventory)
+            chunks = json.loads(inventory)["chunks"]
+            plan = {"author": agent.name, "chunks": [{"chunk_ids": [row["chunk_id"]]} for row in chunks],
+                    "reason": "Offline file-based bridge regression"}
+            for name in ("plan.json", "plan2.json", "plan3.json", "plan4.json", "plan5.json", "plan6.json"):
+                (scratch / name).write_text(json.dumps(plan))
+            await bridge("propose_chunk_plan", ["--args-file", str(scratch / "plan6.json")])
+            for row in chunks:
+                await bridge("record_measurement", [json.dumps({"author": agent.name,
+                    "chunk_id": row["chunk_id"], "raw_value": 3, "method": self.method,
+                    "evidence": "Offline fixture: have; trivial; exact", "baseline": True})])
+            report = {"author": agent.name, "status": "complete", "summary": "Plan and measurements submitted",
+                      "evidence": {"chunks": len(chunks)}}
+            for name in ("report.json", "report2.json"):
+                (scratch / name).write_text(json.dumps(report))
+            await bridge("report_phase_result", ["--args-file", str(scratch / "report2.json")])
+            self.assertEqual(workflow.verification.file_identity(tree, scope=scope), before)
+            self.assertEqual(workflow.verification.file_identity(self.root, scope=scope), original)
+            retained.extend(scratch.iterdir())
+
+        with patch.object(workflow, "spawn", side_effect=respond):
+            self.assertTrue(await self.controller.prepare())
+        state = self.controller.state()
+        self.assertTrue(state["baseline_sealed"])
+        self.assertEqual(len(state["tasks"]), 1)
+        self.assertEqual(state["rounds"]["started"], 0)
+        self.assertEqual(len(retained), 9)
+        self.assertTrue(all(path.is_file() for path in retained))
+        dispatch = next(iter(state["phase_dispatches"].values()))
+        self.assertEqual(dispatch["status"], "complete")
+        self.assertEqual(dispatch["results"]["A"]["status"], "complete")
+        self.assertEqual(workflow.verification.file_identity(self.root, scope=scope), original)
+
+    async def test_readonly_phase_still_rejects_real_private_snapshot_changes(self):
+        cases = (("A.lean", "files modified"), ("New.lean", "files added"),
+                 (".unity-tmp/plan.json", "files added"),
+                 (".unity/agents.yaml", "configuration modified"),
+                 (".unity/metrics/length.md", "metric definition/helpers changed"))
+        for name, category in cases:
+            with self.subTest(path=name):
+                captured = []
+                def respond(agent, env, instruction, tree):
+                    target = tree / name
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text("private-fixture-content-not-for-diagnostics\n")
+                    captured.append(tree)
+                    forum.report_phase_result(agent.name, "complete", "Fixture result", "Fixture evidence")
+                with patch.object(workflow, "spawn", side_effect=self.transport(respond)):
+                    with self.assertRaisesRegex(ValueError, "read-only source snapshot") as raised:
+                        await self.controller.dispatch_phase("exploration")
+                message = str(raised.exception)
+                self.assertIn("worker A", message)
+                self.assertIn(str(captured[0]), message)
+                self.assertIn("dispatch ", message)
+                self.assertIn(category, message)
+                if "metric" not in name:
+                    self.assertIn(name, message)
+                self.assertNotIn("private-fixture-content", message)
+                dispatch = list(self.controller.state()["phase_dispatches"].values())[-1]
+                self.assertEqual(dispatch["status"], "blocked")
+                self.assertIn(message, dispatch["reason"])
+
+    async def test_readonly_phase_reports_deleted_files_and_head_changes(self):
+        def respond(agent, env, instruction, tree):
+            (tree / "A.lean").unlink()
+            workflow.git(tree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                         "commit", "--allow-empty", "-m", "Offline HEAD change")
+            forum.report_phase_result(agent.name, "complete", "Fixture result", "Fixture evidence")
+        with patch.object(workflow, "spawn", side_effect=self.transport(respond)):
+            with self.assertRaisesRegex(ValueError, "read-only source snapshot") as raised:
+                await self.controller.dispatch_phase("exploration")
+        self.assertIn('files removed: "A.lean"', str(raised.exception))
+        self.assertIn("Git HEAD changed", str(raised.exception))
+
+    async def test_canonical_snapshot_failure_is_distinct_from_worker_failure(self):
+        def respond(agent, env, instruction, tree):
+            (self.root / "A.lean").write_text("canonical fixture change\n")
+            forum.report_phase_result(agent.name, "complete", "Fixture result", "Fixture evidence")
+        with patch.object(workflow, "spawn", side_effect=self.transport(respond)):
+            with self.assertRaisesRegex(ValueError, "read-only project snapshot") as raised:
+                await self.controller.dispatch_phase("exploration")
+        message = str(raised.exception)
+        self.assertIn("canonical project", message)
+        self.assertIn('files modified: "A.lean"', message)
+        self.assertNotIn("worker A", message)
+
+    def test_snapshot_diagnostics_are_bounded_and_do_not_expose_values(self):
+        original = workflow.verification.file_identity(self.root)
+        changed = deepcopy(original)
+        changed["files"].update({f"file-{index:03}-\n" + "x" * 300: "hidden-content" for index in range(50)})
+        changed["config"][".unity/config.yaml"] = "hidden-config"
+        changed["scope"] = {"targets": "hidden-targets"}
+        changed["lake_args"] = ["hidden-option"]
+        summary = workflow._snapshot_changes((original, self.definition), (changed, {"definition": "hidden-metric"}))
+        self.assertIn("(+45 more)", summary)
+        self.assertIn("\\n", summary)
+        self.assertNotIn("\n", summary)
+        self.assertNotIn("hidden-", summary)
+        self.assertIn("scope changed", summary)
+        self.assertIn("Lake arguments changed", summary)
+        self.assertLess(len(summary), 2000)
+
+    async def test_planning_scratch_is_private_per_worktree_and_critic_gets_none(self):
+        directories = []
+        for name in ("A", "B"):
+            tree = workflow.task_worktree(self.paths, name, "chunking")
+            env = workflow.runtime_env(self.paths, name, None, "chunking", tree, self.controller.state())
+            scratch = Path(env["UNITY_OPTIMIZE_SCRATCH"])
+            self.assertEqual(scratch, tree / ".unity/scratch/optimize")
+            self.assertEqual(scratch.resolve(), scratch)
+            self.assertNotEqual(scratch, Path(env["TMPDIR"]))
+            directories.append(scratch)
+        self.assertNotEqual(*directories)
+
+        async def respond(agent, system, instruction, tree, servers, **kwargs):
+            self.assertEqual(kwargs["env_overrides"]["UNITY_OPTIMIZE_SCRATCH"], "")
+            self.assertFalse((tree / ".unity/scratch").exists())
+            self.assertIn("Final review remains read-only", system)
+            self.assertIn("do not create planning scratch files", system)
+        with patch.dict(os.environ, {"UNITY_OPTIMIZE_SCRATCH": "inherited-scratch"}), \
+                patch.object(workflow, "spawn", side_effect=respond):
+            await self.controller.dispatch_phase("critic", primary=True)
+
+    def test_planning_scratch_rejects_redirected_directories(self):
+        for index, relative in enumerate((".unity", ".unity/scratch", ".unity/scratch/optimize")):
+            with self.subTest(path=relative):
+                tree = self.root / f"redirect-fixture-{index}"
+                target = tree / relative
+                target.parent.mkdir(parents=True)
+                outside = self.root / f"outside-fixture-{index}"
+                outside.mkdir()
+                target.symlink_to(outside, target_is_directory=True)
+                with self.assertRaisesRegex(ValueError, "private|symlinks"):
+                    workflow._planning_scratch(tree)
+                self.assertEqual(list(outside.iterdir()), [])
 
     async def test_blocked_contributor_does_not_veto_collective_plan(self):
         self.seed_baseline()

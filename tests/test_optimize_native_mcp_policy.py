@@ -149,10 +149,30 @@ class OptimizeNativePolicyTests(unittest.TestCase):
                 self.assertIn("only for a real bound task", note)
                 self.assertIn("unity mcp unity-forum", note)
                 self.assertIn("alias forum", note)
-                self.assertIn("--args-file", note)
+                if phase == "critic":
+                    self.assertNotIn("--args-file", note)
+                    self.assertIn("inline JSON", note)
+                    self.assertIn("do not create or modify planning files", note)
+                else:
+                    self.assertIn('--args-file "$UNITY_OPTIMIZE_SCRATCH/plan.json"', note)
+                    self.assertIn("not the source root or an ad hoc .unity-tmp", note)
                 self.assertIn("artifact_read", note)
                 self.assertIn("next_offset", note)
                 self.assertIn("Use only tools advertised for your phase", note)
+
+    def test_worktree_guidance_distinguishes_planning_scratch_from_source_and_review(self):
+        for phase in optimize_server.PROFILES:
+            with self.subTest(phase=phase):
+                note = optimize_spawn._worktree_prompt(Path("/worker"), profile=phase)
+                self.assertIn("When your turn permits source changes", note)
+                self.assertIn("Administrative planning files are not source edits", note)
+                if phase == "critic":
+                    self.assertNotIn("UNITY_OPTIMIZE_SCRATCH", note)
+                    self.assertIn("Review is read-only", note)
+                    self.assertIn("inline JSON", note)
+                else:
+                    self.assertIn("UNITY_OPTIMIZE_SCRATCH", note)
+                    self.assertIn("source-read-only phase", note)
 
 
 class OptimizeShellEnvironmentTests(unittest.TestCase):
@@ -164,6 +184,7 @@ class OptimizeShellEnvironmentTests(unittest.TestCase):
                 "UNITY_OPTIMIZE_TASK_ID": "task-1" if phase == "optimizing" else "",
                 "UNITY_OPTIMIZE_PHASE_DISPATCH_ID": "" if phase == "optimizing" else "dispatch-1",
                 "UNITY_OPTIMIZE_PROFILE": phase, "UNITY_OPTIMIZE_DRAFT_PATH": "/worker/draft.json",
+                "UNITY_OPTIMIZE_SCRATCH": "" if phase == "critic" else "/worker/.unity/scratch/optimize",
                 "UNITY_AGENT_NAME": "Luna1"}
 
     def test_every_phase_pins_worker_runtime_without_secrets_or_lake_shim_requirement(self):
@@ -194,6 +215,17 @@ class OptimizeShellEnvironmentTests(unittest.TestCase):
         cleared = optimize_spawn.optimize_mcp_with_runtime_env(rebound, {})
         self.assertEqual(cleared["unity-forum"]["env"], {})
         self.assertEqual(cleared["lean-lsp"]["env"], {})
+
+    def test_critic_clears_stale_planning_scratch_in_both_transports(self):
+        runtime = self.runtime("critic")
+        servers = servers_for("critic")
+        for name in ("unity-forum", "lean-lsp"):
+            servers[name]["env"] = {"UNITY_OPTIMIZE_SCRATCH": "/old-worker/scratch"}
+        rebound = optimize_spawn.optimize_mcp_with_runtime_env(servers, runtime)
+        shell = tomllib.loads("\n".join(optimize_spawn._optimize_codex_shell_overrides(runtime)))
+        for env in (rebound["unity-forum"]["env"], rebound["lean-lsp"]["env"],
+                    shell["shell_environment_policy"]["set"]):
+            self.assertEqual(env["UNITY_OPTIMIZE_SCRATCH"], "")
 
     def test_phase_binding_explicitly_clears_a_stale_task_in_both_transports(self):
         runtime = self.runtime("chunking")

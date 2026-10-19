@@ -104,7 +104,22 @@ def mcp_servers(paths, profile):
     return servers
 
 
+def _planning_scratch(tree):
+    """Keep argument files private and outside the guarded source snapshot."""
+    runtime = Path(tree).resolve() / ".unity"
+    if runtime.is_symlink() or not runtime.is_dir():
+        raise ValueError("Optimize planning scratch requires private worktree configuration")
+    directory = runtime
+    for name in ("scratch", "optimize"):
+        directory = directory / name
+        if directory.is_symlink():
+            raise ValueError("Optimize planning scratch must not be redirected by symlinks")
+        directory.mkdir(mode=0o700, exist_ok=True)
+    return directory
+
+
 def runtime_env(paths, author, task_id, profile, tree, state, *, phase_dispatch_id=None):
+    planning = str(_planning_scratch(tree)) if profile != "critic" else ""
     scratch = paths.unity / "tmp" / "optimize" / re.sub(r"[^A-Za-z0-9_-]", "_", author)
     for name in ("uv-tools", "uv-bin", "lake-cache"):
         (scratch / name).mkdir(parents=True, exist_ok=True)
@@ -126,6 +141,7 @@ def runtime_env(paths, author, task_id, profile, tree, state, *, phase_dispatch_
         "UNITY_OPTIMIZE_TASK_ID": task_id or "", "UNITY_OPTIMIZE_PROJECT_ROOT": str(paths.project_root),
         "UNITY_OPTIMIZE_PHASE_DISPATCH_ID": phase_dispatch_id or "",
         "UNITY_OPTIMIZE_PROFILE": profile, "UNITY_OPTIMIZE_WORKFLOW": tasks.SCHEMA,
+        "UNITY_OPTIMIZE_SCRATCH": planning,
         "UNITY_OPTIMIZE_WORKTREE": str(tree), "UNITY_OPTIMIZE_BASE_SHA": git(tree, "rev-parse", "HEAD"),
         "UNITY_OPTIMIZE_PROCESS_RECEIPTS": str(paths.forum / "processes"),
         "UNITY_OPTIMIZE_LAKE_ARGS": json.dumps(state["config"].get("lake_args", [])),
@@ -135,6 +151,29 @@ def runtime_env(paths, author, task_id, profile, tree, state, *, phase_dispatch_
     if real_lake:
         env["UNITY_REAL_LAKE"] = str(Path(real_lake).absolute())
     return env
+
+
+def _snapshot_changes(before, after):
+    """Bounded path/category diagnostics only; never include source/config values."""
+    original, original_metric = before
+    current, current_metric = after
+    changes = []
+    for field, label in (("files", "files"), ("config", "configuration")):
+        old, new = original[field], current[field]
+        groups = (("added", new.keys() - old.keys()),
+                  ("removed", old.keys() - new.keys()),
+                  ("modified", {name for name in old.keys() & new.keys() if old[name] != new[name]}))
+        for kind, names in groups:
+            if names:
+                sample = [json.dumps(name[:200], ensure_ascii=True) for name in sorted(names)[:5]]
+                suffix = f" (+{len(names) - 5} more)" if len(names) > 5 else ""
+                changes.append(f"{label} {kind}: " + ", ".join(sample) + suffix)
+    for field, label in (("main_sha", "Git HEAD"), ("scope", "scope"), ("lake_args", "Lake arguments")):
+        if original[field] != current[field]:
+            changes.append(label + " changed")
+    if original_metric != current_metric:
+        changes.append("metric definition/helpers changed")
+    return "; ".join(changes) or "snapshot identity changed"
 
 
 async def stop_worker(task, interrupt, *, grace=5.0, hard=35.0):
@@ -190,6 +229,17 @@ class Controller:
             system += "\n\nProject instructions:\n" + self.paths.unity_md.read_text()
         system += f"\nYou are {agent.name}. Primary: {self.roster.primary.name}. Team: "
         system += ", ".join(a.name for a in self.roster.agents)
+        env = runtime_env(self.paths, agent.name, task_id, profile, tree, state,
+                          phase_dispatch_id=phase_dispatch_id)
+        if profile == "critic":
+            system += ("\nFinal review remains read-only: use native or inline tool arguments; "
+                       "do not create planning scratch files.")
+        else:
+            system += ("\nAdministrative scratch directory (UNITY_OPTIMIZE_SCRATCH): "
+                       + env["UNITY_OPTIMIZE_SCRATCH"]
+                       + ". Put inventory exports, plan drafts and tool-argument JSON there, "
+                       "not in .unity-tmp/ or source-root files. Source/proof edits still follow "
+                       "the assigned phase's permissions.")
         if not instruction:
             if task_id:
                 instruction = (f"Work on task {task_id}; read optimize_brief and optimize_task. "
@@ -204,8 +254,7 @@ class Controller:
         return await spawn(agent, system, instruction,
             tree, mcp_servers(self.paths, profile), own_process_group=True,
             interrupt_event=interrupt, mcp_profile="optimize",
-            env_overrides=runtime_env(self.paths, agent.name, task_id, profile, tree, state,
-                                      phase_dispatch_id=phase_dispatch_id),
+            env_overrides=env,
             log_context={"command": "optimize", "run_id": state["run_id"], "phase": profile,
                          "task_id": task_id or "", "phase_dispatch_id": phase_dispatch_id, "role": profile})
 
@@ -264,7 +313,7 @@ class Controller:
                         else task_worktree(self.paths, agent.name + "-" + profile, profile))
                 interrupt = asyncio.Event()
                 if readonly:
-                    views[str(tree)] = context(tree)
+                    views[str(tree)] = (agent.name, context(tree))
                 task = asyncio.create_task(self.worker(agent, None, tree, profile, interrupt, instruction,
                                                        phase_dispatch_id=dispatch_id))
                 records.append((task, interrupt, tree))
@@ -282,11 +331,17 @@ class Controller:
             if stopped(self.paths):
                 return False
             if readonly:
-                if context(self.paths.project_root) != original:
-                    raise ValueError(f"{profile} changed the read-only project snapshot")
+                current = context(self.paths.project_root)
+                if current != original:
+                    raise ValueError(f"{profile} changed the read-only project snapshot "
+                        f"(dispatch {dispatch_id}, canonical project): " + _snapshot_changes(original, current))
                 for _, _, tree in records:
-                    if context(tree) != views[str(tree)]:
-                        raise ValueError(f"{profile} changed its read-only source snapshot")
+                    author, before = views[str(tree)]
+                    current = context(tree)
+                    if current != before:
+                        raise ValueError(f"{profile} changed its read-only source snapshot "
+                            f"(dispatch {dispatch_id}, worker {author}, private worktree {tree}): "
+                            + _snapshot_changes(before, current))
             elif profile == "architect":
                 outcome = self.state()["phase_dispatches"][dispatch_id]["results"].get(self.roster.primary.name, {})
                 if outcome.get("status") == "skipped":

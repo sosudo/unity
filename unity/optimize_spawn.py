@@ -114,16 +114,34 @@ def _worktree_write_roots(cwd: Path, *, profile: str | None = None) -> tuple[Pat
     return tuple(dict.fromkeys(roots))
 
 
-def _worktree_prompt(cwd: Path) -> str:
+def _worktree_prompt(cwd: Path, *, profile: str | None = None) -> str:
     return (
         f"\n\nWORKTREE WRITE POLICY: Your source workspace is exactly {Path(cwd).resolve()}. "
         "Use this directory as workdir/cwd for every shell command and Lean tool. "
-        "Keep all source edits and scratch proofs here. Main and other agents' worktrees "
+        "When your turn permits source changes, keep source and proof edits here. "
+        "Administrative planning files are not source edits. Main and other agents' worktrees "
         "are read-only to you, including through absolute paths, ../ paths, and symlinks. "
         "Shared runtime/build directories exist for Unity tools, not as alternate source "
         "workspaces. Use the Forum tools for shared state, candidate submission, and sync; "
         "Unity alone integrates candidates into main. If a write is denied, correct its "
         "destination or report the blocker; do not disable or bypass the restriction."
+        + _planning_file_prompt(profile)
+    )
+
+
+def _planning_file_prompt(profile: str | None) -> str:
+    if profile == "critic":
+        return (
+            " Review is read-only: use native tools or inline JSON arguments to the "
+            "shell bridge; do not create or modify planning files or scratch files."
+        )
+    return (
+        " Put inventory exports, plan drafts, tool-argument JSON and temporary planning "
+        "helpers only in the supplied UNITY_OPTIMIZE_SCRATCH directory, not the source "
+        "root or an ad hoc .unity-tmp directory. For large arguments, use "
+        'unity mcp unity-forum <tool> --args-file "$UNITY_OPTIMIZE_SCRATCH/plan.json" '
+        "instead of positional JSON. This does not permit source changes in a "
+        "source-read-only phase."
     )
 
 
@@ -142,6 +160,7 @@ _OPTIMIZE_MCP_ENV_KEYS = (
     "UNITY_OPTIMIZE_BASE_SHA",
     "UNITY_OPTIMIZE_PROCESS_RECEIPTS",
     "UNITY_OPTIMIZE_PROFILE",
+    "UNITY_OPTIMIZE_SCRATCH",
     "UNITY_OPTIMIZE_WORKFLOW",
     "UNITY_OPTIMIZE_LAKE_ARGS",
     "UNITY_OPTIMIZE_DRAFT_PATH",
@@ -738,7 +757,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
             scratch = _claude_sandbox_tmpdir()
             isolation = claude_worktree_options(cwd, (*roots, scratch),
                 read_only=profile == "critic", retrospective=profile == "retrospective")
-            system_prompt += _worktree_prompt(cwd)
+            system_prompt += _worktree_prompt(cwd, profile=profile)
             env_overrides = {**(env_overrides or {}),
                              **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(scratch))}
 
@@ -957,8 +976,7 @@ _OPTIMIZE_CODEX_MCP_NOTE = (
     "If this backend does not expose native MCP, use the shell bridge:\n"
     "    unity mcp unity-forum <tool> '<json-args>'\n"
     "The Optimize forum server is unity-forum (alias forum), not unity_forum or optimize. "
-    "For large arguments, use unity mcp unity-forum <tool> --args-file <json-file> "
-    "instead of positional JSON. Large output may be retained as an artifact; read it "
+    "Large output may be retained as an artifact; read it "
     "with artifact_read and follow next_offset until complete. Read optimize_brief "
     "for your phase/task binding, then follow your turn's instructions. Preparation "
     "phase names are not task IDs; call optimize_task only for a real bound task. "
@@ -969,7 +987,7 @@ _OPTIMIZE_CODEX_MCP_NOTE = (
 
 
 def _codex_mcp_note(profile: str, phase: str | None = None) -> str:
-    return _OPTIMIZE_CODEX_MCP_NOTE
+    return _OPTIMIZE_CODEX_MCP_NOTE + _planning_file_prompt(phase)
 
 
 _CODEX_INTERRUPT_REQUEST_TIMEOUT = 10.0
@@ -1109,7 +1127,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
     roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
     if roots:
-        system_prompt += _worktree_prompt(cwd)
+        system_prompt += _worktree_prompt(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
     optimize_phase = None
     policy = {}
     if mcp_profile == "optimize":
@@ -1338,7 +1356,7 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                            "(https://antigravity.google)")
     roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
     if roots:
-        system_prompt += _worktree_prompt(cwd)
+        system_prompt += _worktree_prompt(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
     full = system_prompt + _codex_mcp_note(
         mcp_profile, (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"),
     ) + "\n\n---\n\nTASK:\n" + prompt
