@@ -1,9 +1,15 @@
 # Optimize tools and authority
 
 Read optimize_status and optimize_brief for the current phase, source, metric,
-baseline, round, dependencies, competing candidates and review. The brief is a
-summary; use its artifact references and artifact_read (following next_offset)
-for complete retained records. Use optimize_inventory to page canonical
+baseline, round, dependencies, competing candidates and review. Status, brief,
+task details and candidate acknowledgments are bounded summaries, not the full
+verification evidence. A candidate's records.candidate points to its complete
+record; records.tasks/candidates/rounds/review retain the full collections. If a
+response says summary_only, read records.response for the complete summary index
+and its evidence references. Use artifact_read and follow next_offset for all
+required pages, including during primary selection and final review. Artifact
+hashes identify the retained snapshot; summaries do not replace source/revision
+checks or establish acceptance. Use optimize_inventory to page canonical
 declaration IDs, filtering by exact project-relative path or declaration name as
 needed, and retain the returned inventory_sha256 for a plan submission.
 

@@ -105,6 +105,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(checked["status"], "checked", checked.get("verification"))
         forum.configure(self.paths.forum, self.root, "optimizing", "Primary")
         selected = forum.select_candidate("Primary", candidate["candidate_id"], "Best checked fixture improvement")
+        selected = tasks.load(self.paths.forum)["candidates"][selected["candidate_id"]]
         integrated = self.controller.integrate_selected(selected)
         row = tasks.load(self.paths.forum)["candidates"][candidate["candidate_id"]]
         self.assertTrue(integrated, {"status": row["status"], "feedback": row.get("feedback"),
@@ -167,6 +168,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.controller.check_submissions()
         forum.configure(self.paths.forum, self.root, "optimizing", "Primary")
         selected = forum.select_candidate("Primary", candidate["candidate_id"], "Choose checked improvement")
+        selected = tasks.load(self.paths.forum)["candidates"][selected["candidate_id"]]
         with patch.object(self.controller, "recover_integration", side_effect=OSError("offline interruption after fast-forward")):
             with self.assertRaises(OSError):
                 self.controller.integrate_selected(selected)
@@ -182,7 +184,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unassigned_file_patch_is_not_integrated(self):
         candidate = self.submit()
-        tree = Path(candidate["worktree"])
+        tree = Path(tasks.load(self.paths.forum)["candidates"][candidate["candidate_id"]]["worktree"])
         self.write("Other.lean", "def unrelated := 1\n", tree)
         self.git(tree, "add", "Other.lean")
         self.git(tree, "commit", "--quiet", "-m", "unassigned change")

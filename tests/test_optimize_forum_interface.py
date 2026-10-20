@@ -1,17 +1,23 @@
 """Offline model-visible Optimize contracts: actual FastMCP tools, no providers."""
 from contextlib import redirect_stdout
 from copy import deepcopy
+import hashlib
 import io
 import json
 import logging
 import os
 from pathlib import Path
+import subprocess
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
+from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk._errors import CLIJSONDecodeError
+from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
 from unity import artifacts, optimize_mcp_bridge as bridge, optimize_tasks as tasks
 from unity.forum import optimize_server as forum
@@ -59,6 +65,352 @@ class OptimizeForumInterfaceTests(unittest.IsolatedAsyncioTestCase):
         async with Client(forum.build_server(forum.PROFILE)) as client:
             result = await client.call_tool(tool, arguments)
         return result.structured_content
+
+    async def native_raw(self, tool, arguments):
+        """Retain actual FastMCP text AND structured output for wire-size tests."""
+        async with Client(forum.build_server(forum.PROFILE)) as client:
+            result = await client.call_tool_mcp(tool, arguments)
+        self.assertFalse(result.isError, result.content)
+        return result
+
+    def large_candidate_fixture(self):
+        tasks.close_phase_dispatch(self.directory, self.dispatch["dispatch_id"], "complete")
+        state = tasks.load(self.directory)
+        plan = tasks.propose_plan(self.directory, "Alice", [
+            {"chunk_ids": [cid]} for cid in state["chunks"]], "All declaration fixtures")
+        tasks.accept_plan(self.directory, plan["proposal_id"])
+        state = tasks.load(self.directory)
+        task_id = next(iter(state["tasks"]))
+        # A realistic repository-sized source map, not just a long display message.
+        files = {f"Batteries/Fixture/Module{index:05}.lean": hashlib.sha256(str(index).encode()).hexdigest()
+                 for index in range(12000)}
+        candidate = {"candidate_id": "candidate-1", "task_id": task_id, "author": "Alice",
+            "status": "checked", "base_main_sha": "base", "task_revision": 0, "config_revision": 0,
+            "assignment_id": "assignment-fixture", "strategy_id": "strategy-fixture",
+            "worktree": str(self.tree), "notes": "Shorter equivalent proof, Unicode evidence 雪 😀",
+            "measurements": {}, "endorsements": [], "objections": [],
+            "verification": {"passed": True, "source_identity": {"main_sha": "base", "files": files},
+                             "issues": [], "build": {"passed": True}}}
+        with tasks.transaction(self.directory) as current:
+            current["phase"] = "optimizing"
+            current["candidates"][candidate["candidate_id"]] = candidate
+        forum.configure(self.directory, self.root, "optimizing", author="Alice")
+        os.environ.update(UNITY_OPTIMIZE_PROFILE="optimizing", UNITY_OPTIMIZE_PHASE_DISPATCH_ID="",
+                          UNITY_OPTIMIZE_BASE_SHA="base")
+        return task_id, deepcopy(candidate)
+
+    @staticmethod
+    def claude_tool_message(raw):
+        result = raw.model_dump(mode="json", by_alias=True, exclude_none=True)
+        return {"type": "user", "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "offline-fixture", "content": result["content"],
+            "mcpMeta": {"serverName": "unity-forum", "toolName": "offline-fixture",
+                        "structuredContent": result.get("structuredContent")}}]}}
+
+    async def sdk_messages(self, messages):
+        """Use the installed SDK parser without connect(), CLI lookup or provider calls."""
+        payload = "\n".join(json.dumps(row, ensure_ascii=True, separators=(",", ":")) for row in messages) + "\n"
+        async def fragments():
+            offset = 0
+            while offset < len(payload):
+                end = min(offset + 4096, len(payload))
+                # The SDK strips chunk-edge whitespace; keep whitespace within a chunk.
+                while end < len(payload) and (payload[end - 1].isspace() or payload[end].isspace()):
+                    end += 1
+                yield payload[offset:end]
+                offset = end
+        transport = SubprocessCLITransport("offline fixture", ClaudeAgentOptions())
+        self.assertEqual(transport._max_buffer_size, 1024 * 1024)
+        transport._process = SimpleNamespace(wait=AsyncMock(return_value=0))
+        transport._stdout_stream = fragments()
+        return [message async for message in transport.read_messages()]
+
+    async def test_large_status_native_output_passes_actual_sdk_default_buffer(self):
+        self.large_candidate_fixture()
+        raw = await self.native_raw("optimize_status", {})
+        message = self.claude_tool_message(raw)
+        following = {"type": "result", "subtype": "success", "result": "next message retained"}
+        self.assertEqual(await self.sdk_messages([message, following]), [message, following])
+        encoded = raw.model_dump_json(by_alias=True, exclude_none=True).encode()
+        self.assertLess(len(encoded), 256 * 1024)
+
+    async def test_two_large_candidates_keep_comparison_provenance_and_review_bindings(self):
+        task_id, first = self.large_candidate_fixture()
+        comparison = {"subject": task_id, "before": 4, "after": 1, "improved": True,
+                      "regressed": False, "evidence_kind": "agent_judged"}
+        with tasks.transaction(self.directory) as state:
+            state["candidates"]["candidate-1"]["verification"]["comparisons"] = {task_id: comparison}
+            second = deepcopy(first)
+            second.update(candidate_id="candidate-2", author="Bob")
+            second["verification"]["comparisons"] = {task_id: {**comparison, "evidence_kind": "measured"}}
+            state["candidates"]["candidate-2"] = second
+            state["review"] = {"reviewer": "Alice", "snapshot": {
+                **deepcopy(first["verification"]), "snapshot_id": "current-snapshot", "sha256": "snapshot-hash",
+                "main_sha": "base", "config_revision": 0},
+                "repair_requests": [{"task_ids": [task_id], "reason": "Inspect exact patch"}]}
+        before = tasks.load(self.directory)
+        response = await self.assert_bounded_native(await self.native_raw("optimize_status", {}))
+        self.assertEqual(response["candidate_counts"], {"checked": 2})
+        for summary in response["candidates"]:
+            stored = before["candidates"][summary["candidate_id"]]
+            self.assertEqual(summary["comparisons"], stored["verification"]["comparisons"])
+            self.assertEqual(self.artifact_value(summary["records"]["candidate"]), stored)
+        self.assertEqual(response["review"]["reviewer"], "Alice")
+        for key in ("snapshot_id", "sha256", "main_sha", "config_revision", "passed"):
+            self.assertEqual(response["review"]["snapshot"][key], before["review"]["snapshot"][key])
+        self.assertEqual(response["review"]["repair_request_count"], 1)
+        self.assertEqual(self.artifact_value(response["records"]["review"]), before["review"])
+        self.assertEqual(tasks.load(self.directory), before)
+
+    def artifact_value(self, record):
+        payload = artifacts.artifact_bytes(self.root / ".unity/artifacts", record["artifact_id"])
+        self.assertEqual(len(payload), record["bytes"])
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), record["sha256"])
+        return json.loads(payload)
+
+    def response_index(self, response):
+        return self.artifact_value(response["records"]["response"]) if response.get("summary_only") else response
+
+    def semantic_response(self, value):
+        # Artifact IDs are intentionally fresh per call; compare exact referenced content instead.
+        if isinstance(value, dict):
+            if {"artifact_id", "sha256", "bytes"} <= value.keys():
+                return {"artifact_value": self.semantic_response(self.artifact_value(value))}
+            return {key: self.semantic_response(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self.semantic_response(item) for item in value]
+        return value
+
+    async def assert_bounded_native(self, raw):
+        self.assertEqual(forum.MAX_RESPONSE_BYTES, 65_536)
+        result = raw.structuredContent
+        self.assertLessEqual(len(json.dumps(result, ensure_ascii=True).encode()), forum.MAX_RESPONSE_BYTES)
+        self.assertLess(len(raw.model_dump_json(by_alias=True, exclude_none=True).encode()), 256 * 1024)
+        message = self.claude_tool_message(raw)
+        following = {"type": "result", "subtype": "success", "result": "subsequent message"}
+        self.assertEqual(await self.sdk_messages([message, following]), [message, following])
+        return result
+
+    async def test_actual_sdk_rejects_legacy_oversized_structured_content_even_with_short_text(self):
+        _, candidate = self.large_candidate_fixture()
+        # Text-only compaction is insufficient: Claude also emits the structured payload.
+        message = {"type": "user", "message": {"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "legacy-fixture", "content": "Short preview",
+            "mcpMeta": {"structuredContent": {"candidates": [candidate]}}}]}}
+        self.assertGreater(len(json.dumps(message)), 1024 * 1024)
+        with self.assertRaisesRegex(CLIJSONDecodeError, "1048576"):
+            await self.sdk_messages([message])
+
+    async def test_status_task_and_brief_preserve_exact_records_without_state_or_source_mutation(self):
+        task_id, candidate = self.large_candidate_fixture()
+        def git(*args):
+            return subprocess.run(["git", *args], cwd=self.root, text=True, capture_output=True,
+                                  check=True).stdout
+        (self.root / ".gitignore").write_text(".unity/\nprivate-worker/\n")
+        git("init", "-q")
+        git("add", "A.lean", "B.lean", ".gitignore")
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+            "commit", "-qm", "Read-only response source fixture")
+        git_before = (git("rev-parse", "HEAD", "HEAD^{tree}"), git("status", "--porcelain", "--untracked-files=all"))
+        state_path = self.directory / tasks.STATE_FILE
+        before_bytes = state_path.read_bytes()
+        before = tasks.load(self.directory)
+        source_before = {path.name: path.read_bytes() for path in self.root.glob("*.lean")}
+        for tool, args in (("optimize_status", {}), ("optimize_task", {"task_id": task_id}), ("optimize_brief", {})):
+            with self.subTest(tool=tool):
+                response = await self.assert_bounded_native(await self.native_raw(tool, args))
+                index = self.response_index(response)
+                records = index["records"]
+                expected_candidates = ([row for row in before["candidates"].values() if row["task_id"] == task_id]
+                                       if tool == "optimize_task" else before["candidates"])
+                self.assertEqual(self.artifact_value(records["candidates"]), expected_candidates)
+                if tool != "optimize_task":
+                    for key in ("tasks", "rounds", "review"):
+                        self.assertEqual(self.artifact_value(records[key]), before[key])
+                if tool != "optimize_brief":
+                    summary = next(row for row in index["candidates"] if row["candidate_id"] == candidate["candidate_id"])
+                    for field in ("candidate_id", "task_id", "author", "status", "base_main_sha", "task_revision", "config_revision"):
+                        self.assertEqual(summary[field], candidate[field])
+                    self.assertEqual(self.artifact_value(summary["records"]["candidate"]), candidate)
+                self.assertEqual(state_path.read_bytes(), before_bytes)
+                self.assertEqual({path.name: path.read_bytes() for path in self.root.glob("*.lean")}, source_before)
+                self.assertEqual((git("rev-parse", "HEAD", "HEAD^{tree}"),
+                                  git("status", "--porcelain", "--untracked-files=all")), git_before)
+
+    async def test_large_non_candidate_fields_fall_back_to_bounded_exact_index(self):
+        task_id, _ = self.large_candidate_fixture()
+        with tasks.transaction(self.directory) as state:
+            original = deepcopy(state["candidates"]["candidate-1"])
+            original["verification"] = {"passed": True}
+            state["candidates"] = {f"candidate-{index}": {**deepcopy(original), "candidate_id": f"candidate-{index}"}
+                                   for index in range(1, 241)}
+            state["tasks"][task_id]["reason"] = "long rationale\\\"\n" * 12000
+            state["rounds"]["history"] = [{"number": index, "feedback": "round detail" * 1000} for index in range(40)]
+            state["review"] = {"snapshot": {"notes": "review evidence" * 30000}}
+            state["metric"]["definition"] = "Unicode metric 雪\\\"\n" * 3000
+        before = tasks.load(self.directory)
+        for tool, args in (("optimize_status", {}), ("optimize_task", {"task_id": task_id})):
+            with self.subTest(tool=tool):
+                response = await self.assert_bounded_native(await self.native_raw(tool, args))
+                self.assertTrue(response["summary_only"])
+                index = self.response_index(response)
+                self.assertEqual(len(index["candidates"]), len(before["candidates"]))
+                expected_candidates = list(before["candidates"].values()) if tool == "optimize_task" else before["candidates"]
+                self.assertEqual(self.artifact_value(index["records"]["candidates"]), expected_candidates)
+        self.assertEqual(tasks.load(self.directory), before)
+
+    async def test_compact_views_keep_scope_chunk_locations_and_exact_long_ids_and_scores(self):
+        task_id, candidate = self.large_candidate_fixture()
+        long_id, long_score = "task-" + "x" * 700, "qualitative exact value " * 50
+        with tasks.transaction(self.directory) as state:
+            task = state["tasks"].pop(task_id)
+            task["task_id"] = long_id
+            state["tasks"][long_id] = task
+            state["candidates"][candidate["candidate_id"]]["task_id"] = long_id
+            state["candidates"][candidate["candidate_id"]]["measurements"] = {
+                task["chunk_ids"][0]: {"raw_value": long_score}}
+            state["config"].pop("targets")
+        before = tasks.load(self.directory)
+        status = await self.assert_bounded_native(await self.native_raw("optimize_status", {}))
+        self.assertEqual(status["scope"]["targets"], before["scope"]["targets"])
+        response = await self.assert_bounded_native(await self.native_raw("optimize_task", {"task_id": long_id}))
+        self.assertEqual(response["task"]["task_id"], long_id)
+        self.assertEqual(response["candidates"][0]["task_id"], long_id)
+        self.assertEqual(next(iter(response["candidates"][0]["measurements"].values()))["raw_value"], long_score)
+        for chunk in response["chunks"]:
+            original = before["chunks"][chunk["chunk_id"]]
+            for field in ("name", "path", "start_line", "end_line"):
+                self.assertEqual(chunk[field], original[field])
+        self.assertEqual(tasks.load(self.directory), before)
+
+    async def test_oversized_unicode_identifier_is_exact_in_fallback_index_not_clipped(self):
+        _, original = self.large_candidate_fixture()
+        candidate_id = "candidate-" + "雪" * 12000
+        with tasks.transaction(self.directory) as state:
+            candidate = state["candidates"].pop(original["candidate_id"])
+            candidate["candidate_id"] = candidate_id
+            state["candidates"][candidate_id] = candidate
+        response = await self.assert_bounded_native(await self.native_raw("select_candidate", {
+            "author": "Alice", "candidate_id": candidate_id, "reason": "Exact identifier fixture"}))
+        self.assertTrue(response["summary_only"])
+        self.assertNotIn("candidate_id", response)
+        index = self.response_index(response)
+        self.assertEqual(index["candidate_id"], candidate_id)
+        self.assertEqual(self.artifact_value(index["records"]["candidate"]),
+                         tasks.load(self.directory)["candidates"][candidate_id])
+
+    async def test_candidate_artifact_pages_are_exact_bounded_and_snapshot_stable(self):
+        _, candidate = self.large_candidate_fixture()
+        response = await self.native("optimize_status", {})
+        index = self.response_index(response)
+        record = index["candidates"][0]["records"]["candidate"]
+        parts, messages, offset = [], [], 0
+        async with Client(forum.build_server(forum.PROFILE)) as client:
+            while True:
+                raw = await client.call_tool_mcp("artifact_read", {"artifact_id": record["artifact_id"],
+                                                                   "offset": offset, "limit": 32000})
+                self.assertFalse(raw.isError)
+                page = raw.structuredContent
+                self.assertLessEqual(page["returned_bytes"], 32000)
+                self.assertLess(len(raw.model_dump_json(by_alias=True).encode()), 256 * 1024)
+                messages.append(self.claude_tool_message(raw))
+                parts.append(page["content"])
+                if page["next_offset"] is None:
+                    break
+                self.assertGreater(page["next_offset"], offset)
+                offset = page["next_offset"]
+        payload = "".join(parts).encode()
+        self.assertEqual(len(payload), record["bytes"])
+        self.assertEqual(hashlib.sha256(payload).hexdigest(), record["sha256"])
+        self.assertEqual(json.loads(payload), candidate)
+        self.assertGreater(len(messages), 1)
+        following = {"type": "result", "result": "all pages read"}
+        self.assertEqual(await self.sdk_messages([*messages, following]), [*messages, following])
+        with tasks.transaction(self.directory) as state:
+            state["candidates"][candidate["candidate_id"]]["notes"] = "Later live change"
+        self.assertEqual(self.artifact_value(record), candidate)
+
+    async def test_native_and_fi_bridge_have_same_compact_candidate_view(self):
+        task_id, _ = self.large_candidate_fixture()
+        for tool, args in (("optimize_status", {}), ("optimize_task", {"task_id": task_id})):
+            with self.subTest(tool=tool):
+                native = await self.native(tool, args)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    shell = await bridge.call_tool("forum", tool, args, cwd=self.tree)
+                self.assertEqual(self.semantic_response(native), self.semantic_response(shell.structured_content))
+                self.assertLess(len(output.getvalue().encode()), 65_536)
+                self.assertNotIn("Module11999.lean", output.getvalue())
+
+    async def test_select_returns_compact_receipt_after_exactly_one_unchanged_selection_mutation(self):
+        _, original = self.large_candidate_fixture()
+        before = tasks.load(self.directory)
+        response = await self.assert_bounded_native(await self.native_raw("select_candidate", {
+            "author": "Alice", "candidate_id": original["candidate_id"], "reason": "Best checked proof"}))
+        after = tasks.load(self.directory)
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        self.assertEqual(len(after["events"]), len(before["events"]) + 1)
+        self.assertEqual(after["events"][-1]["kind"], "candidate_selected")
+        candidate = after["candidates"][original["candidate_id"]]
+        self.assertEqual(candidate["status"], "selected")
+        self.assertEqual(candidate["selection"]["author"], "Alice")
+        self.assertEqual(candidate["verification"], original["verification"])
+        self.assertEqual(self.artifact_value(response["records"]["candidate"]), candidate)
+        self.assertEqual(response["candidate_id"], original["candidate_id"])
+        self.assertEqual(response["status"], "selected")
+        for key in ("tasks", "rounds", "review", "baseline", "measurements", "config", "main_sha"):
+            self.assertEqual(after[key], before[key])
+
+    async def test_submit_returns_compact_receipt_without_truncating_stored_measurements(self):
+        task_id, original = self.large_candidate_fixture()
+        with patch.dict(os.environ, {"UNITY_OPTIMIZE_TASK_ID": task_id}):
+            strategy = await self.native("register_strategy", {"author": "Alice", "task_id": task_id,
+                "title": "Offline shorter proof", "description": "Distinct shorter proof fixture"})
+            assignment = await self.native("claim_strategy", {"author": "Alice", "strategy_id": strategy["strategy_id"]})
+            chunk_id = tasks.load(self.directory)["tasks"][task_id]["chunk_ids"][0]
+            measurement = {"raw_value": 1, "evidence": original["verification"]["source_identity"]}
+            with tasks.transaction(self.directory) as state:
+                state["assignments"][assignment["assignment_id"]]["measurements"] = {chunk_id: measurement}
+            before = tasks.load(self.directory)
+            response = await self.assert_bounded_native(await self.native_raw("submit_candidate", {
+                "author": "Alice", "assignment_id": assignment["assignment_id"], "notes": "Shorter checked fixture"}))
+        after = tasks.load(self.directory)
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        self.assertEqual(len(after["events"]), len(before["events"]) + 1)
+        self.assertEqual(after["events"][-1]["kind"], "candidate_submitted")
+        self.assertEqual(len(after["candidates"]), len(before["candidates"]) + 1)
+        candidate = after["candidates"][response["candidate_id"]]
+        self.assertEqual(candidate["status"], "submitted")
+        self.assertEqual(candidate["measurements"], {chunk_id: measurement})
+        self.assertEqual(self.artifact_value(response["records"]["candidate"]), candidate)
+        for key in ("rounds", "review", "baseline", "measurements", "config", "main_sha"):
+            self.assertEqual(after[key], before[key])
+
+    async def test_compact_selection_does_not_relax_author_phase_or_stale_checks(self):
+        _, candidate = self.large_candidate_fixture()
+        args = {"author": "Alice", "candidate_id": candidate["candidate_id"], "reason": "Fixture reason"}
+        for field, invalid, expected in (("status", "submitted", "controller-checked"),
+                ("verification", {"passed": False}, "controller-checked"),
+                ("base_main_sha", "old", "stale"), ("config_revision", 3, "stale"),
+                ("task_revision", 3, "stale")):
+            with self.subTest(field=field):
+                with tasks.transaction(self.directory) as state:
+                    state["candidates"][candidate["candidate_id"]] = {**deepcopy(candidate), field: invalid}
+                before = (self.directory / tasks.STATE_FILE).read_bytes()
+                with self.assertRaisesRegex(ToolError, expected):
+                    await self.native("select_candidate", args)
+                self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
+        with tasks.transaction(self.directory) as state:
+            state["candidates"][candidate["candidate_id"]] = deepcopy(candidate)
+        forum.configure(self.directory, self.root, "optimizing", author="Bob")
+        with patch.dict(os.environ, {"UNITY_AGENT_NAME": "Bob", "UNITY_OPTIMIZE_AUTHOR": "Bob"}):
+            before = (self.directory / tasks.STATE_FILE).read_bytes()
+            with self.assertRaisesRegex(ToolError, "configured primary"):
+                await self.native("select_candidate", {**args, "author": "Bob"})
+            self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
+        forum.configure(self.directory, self.root, "critic", author="Alice")
+        async with Client(forum.build_server("critic")) as client:
+            self.assertNotIn("select_candidate", {tool.name for tool in await client.list_tools()})
 
     async def test_phase_brief_and_task_lookup_do_not_invent_a_task(self):
         brief = await self.native("optimize_brief", {})

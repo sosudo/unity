@@ -12,6 +12,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from fastmcp import Client
+
 from unity import optimize_tasks as tasks, optimize_workflow as workflow
 from unity.forum import optimize_server as forum
 from unity.optimize_spawn import SpawnCleanupError
@@ -466,6 +468,92 @@ class OptimizeSelectionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({row[1] for row in writers}, {"Primary", "Peer"})
         self.assertTrue(all(row[3] == candidate["integrated_sha"] for row in writers), writers)
         self.assertTrue(any(row[1] == "Primary" and row[2] != "task-a" for row in writers), writers)
+        self.assertGreaterEqual(len(self.compiler_calls), 4)
+
+    async def test_large_candidate_selection_uses_bounded_mcp_evidence_and_integrates(self):
+        candidate_id = await self.seed_checked()
+        verbose_evidence = "offline compiler verification detail\n" * 32000
+        self.assertGreater(len(verbose_evidence.encode()), 1024 * 1024)
+        with tasks.transaction(self.paths.forum) as state:
+            state["candidates"][candidate_id]["verification"]["offline_verbose_detail"] = verbose_evidence
+        original_candidate = deepcopy(self.controller.state()["candidates"][candidate_id])
+        original_baseline = deepcopy(self.controller.state()["baseline"])
+        original_rounds = deepcopy(self.controller.state()["rounds"])
+        selection_calls, page_counts, response_sizes = [], [], []
+
+        async def selection_transport(agent, system, instruction, tree, servers, **kwargs):
+            if not instruction.startswith("Selection-only"):
+                return await self.fake_transport(agent, system, instruction, tree, servers, **kwargs)
+            self.assertEqual(agent.name, "Primary")
+            env = kwargs["env_overrides"]
+            self.assertEqual(env["UNITY_OPTIMIZE_TASK_ID"], "")
+            self.assertTrue(env["UNITY_OPTIMIZE_PHASE_DISPATCH_ID"])
+            with patch.dict(os.environ, env):
+                forum.configure(self.paths.forum, self.root, "optimizing", author=agent.name)
+                async with Client(forum.build_server("optimizing")) as client:
+                    async def native(tool, arguments):
+                        response = await client.call_tool(tool, arguments)
+                        self.assertFalse(response.is_error)
+                        # Exercise actual FastMCP text plus structured serialization,
+                        # not just a direct Python function's abbreviated return.
+                        size = len(json.dumps({
+                            "content": [block.model_dump(mode="json") for block in response.content],
+                            "structuredContent": response.structured_content,
+                        }, ensure_ascii=False).encode())
+                        response_sizes.append(size)
+                        self.assertLessEqual(size, 65536, tool)
+                        return response.structured_content
+
+                    status = await native("optimize_status", {})
+                    self.assertTrue({"candidates", "tasks", "rounds", "review"} <= set(status["records"]))
+                    candidate = next(row for row in status["candidates"] if row["candidate_id"] == candidate_id)
+                    self.assertEqual(candidate["status"], "checked")
+                    reference = candidate["records"]["candidate"]
+                    parts, offset = [], 0
+                    while True:
+                        page = await native("artifact_read", {
+                            "artifact_id": reference["artifact_id"], "offset": offset, "limit": 16384})
+                        self.assertEqual(page["offset"], offset)
+                        parts.append(page["content"])
+                        next_offset = page["next_offset"]
+                        if next_offset is None:
+                            break
+                        self.assertGreater(next_offset, offset)
+                        offset = next_offset
+                    page_counts.append(len(parts))
+                    self.assertEqual(json.loads("".join(parts)), original_candidate)
+                    before = self.controller.state()
+                    acknowledgement = await native("select_candidate", {
+                        "author": agent.name, "candidate_id": candidate_id,
+                        "reason": "Read the complete checked evidence; shorter same-theorem proof"})
+                    self.assertEqual(acknowledgement["candidate_id"], candidate_id)
+                    self.assertEqual(acknowledgement["status"], "selected")
+                    self.assertIn("candidate", acknowledgement["records"])
+                    after = self.controller.state()
+                    selected_events = [row for row in after["events"][len(before["events"]):]
+                                       if row["kind"] == "candidate_selected"]
+                    self.assertEqual(len(selected_events), 1)
+                    self.assertEqual(selected_events[0]["candidate_id"], candidate_id)
+                    self.assertEqual(after["candidates"][candidate_id]["verification"],
+                                     original_candidate["verification"])
+                    self.assertEqual(after["baseline"], original_baseline)
+                    self.assertEqual(after["rounds"], original_rounds)
+                    selection_calls.append(candidate_id)
+
+        with patch.object(workflow, "spawn", side_effect=selection_transport):
+            state = await self.run_round()
+        self.assertEqual(selection_calls, [candidate_id])
+        self.assertGreater(page_counts[0], 1)
+        self.assertTrue(response_sizes)
+        self.assertEqual(state["candidates"][candidate_id]["status"], "merged")
+        self.assertTrue(state["candidates"][candidate_id]["integrated_verification"]["passed"])
+        self.assertEqual(state["tasks"]["task-a"]["status"], "complete")
+        self.assertEqual((self.root / "A.lean").read_text(), "theorem a : True := by trivial\n")
+        self.assertEqual(state["baseline"], original_baseline)
+        self.assertEqual(state["rounds"]["started"], original_rounds["started"])
+        self.assertEqual(state["rounds"]["completed"], original_rounds["completed"])
+        self.assertEqual(state["config"]["max_rounds"], 2)
+        self.assertEqual(len([row for row in state["events"] if row["kind"] == "candidate_selected"]), 1)
         self.assertGreaterEqual(len(self.compiler_calls), 4)
 
     async def test_busy_primary_finishes_without_interrupt_before_selection_and_reassignment(self):

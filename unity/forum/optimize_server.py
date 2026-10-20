@@ -18,6 +18,9 @@ PROJECT_ROOT: Path | None = None
 PROFILE = "optimizing"
 BOUND_AUTHOR = ""
 PROFILES = {"preparation", "architect", "exploration", "chunking", "optimizing", "critic", "retrospective"}
+# Bound the actual JSON data before FastMCP copies it into text and structured
+# content. Full evidence stays in immutable artifacts and in workflow state.
+MAX_RESPONSE_BYTES = 64 * 1024
 
 
 def configure(forum_dir: Path, project_root: Path, profile: str = "optimizing", author: str = "") -> None:
@@ -80,20 +83,98 @@ def _mirror(author: str, title: str, body: str, task_id: str = "global") -> None
 
 
 def optimize_status() -> dict:
-    """Current task/strategy/candidate state, with no claim of optimization success."""
+    """Bounded current summaries; artifact references retain complete evidence."""
     state = tasks.load(FORUM_DIR)
     counts = {}
     for task in state["tasks"].values(): counts[task["status"]] = counts.get(task["status"], 0) + 1
-    return {key: deepcopy(state[key]) for key in ("run_id", "revision", "phase", "main_sha", "metric",
-                                                 "scope", "config", "rounds", "review")} | {
-        "task_counts": counts, "tasks": list(state["tasks"].values()),
-        "candidates": list(state["candidates"].values()), "baseline_sealed": state["baseline_sealed"],
-        "phase_dispatches": _phase_summaries(state)}
+    candidate_counts = {}
+    for row in state["candidates"].values():
+        candidate_counts[row["status"]] = candidate_counts.get(row["status"], 0) + 1
+    rounds, review = state["rounds"], state["review"]
+    scope = state["scope"] if isinstance(state["scope"], dict) else {"targets": state["scope"] or "Universe"}
+    response = {key: deepcopy(state[key]) for key in ("run_id", "revision", "phase", "main_sha")} | {
+        "metric": _summary_fields(state["metric"], ("name", "builtin", "direction", "units", "sha256", "qualification"))
+                  if isinstance(state["metric"], dict) else _summary_text(state["metric"]),
+        "scope": {"targets": _summary_text(state["config"].get("targets", scope.get("targets", "Universe"))),
+                  "file_count": len(scope.get("files", []))},
+        "config": _summary_fields(state["config"], ("revision", "primary", "max_rounds")),
+        "rounds": {"started": rounds["started"], "completed": rounds["completed"],
+                   "active": _summary_fields(rounds.get("active") or {}, ("number", "started_at")),
+                   "history_count": len(rounds.get("history", []))},
+        "review": {**_summary_fields(review, ("reviewer", "status")),
+                   "snapshot": _verification_summary(review.get("snapshot") or {}),
+                   "verdict": _summary_fields(review.get("verdict") or {},
+                       ("author", "approved", "verdict", "snapshot_id", "snapshot_sha256", "reasoning")),
+                   "repair_request_count": len(review.get("repair_requests", []))},
+        "task_counts": counts, "candidate_counts": candidate_counts,
+        "tasks": [_task_summary(row) for row in state["tasks"].values()],
+        "candidates": [_candidate_summary(state, row) for row in state["candidates"].values()],
+        "baseline_sealed": state["baseline_sealed"], "phase_dispatches": _phase_summaries(state),
+        "records": {key: _brief_artifact(state, key, state[key]) for key in
+                    ("tasks", "candidates", "rounds", "review", "metric", "scope", "config")}}
+    return _bounded_response(state, "status", response)
 
 
 def _summary_text(value, limit: int = 512) -> str:
     text = str(value)
     return text if len(text) <= limit else text[:limit] + "… [see full artifact]"
+
+
+def _summary_fields(row: dict, keys) -> dict:
+    prose = {"notes", "feedback", "reason", "reasoning", "qualification", "definition", "description", "title"}
+    return {key: (_summary_text(row[key]) if key in prose and isinstance(row[key], str) else deepcopy(row[key]))
+            for key in keys if key in row and not isinstance(row[key], (dict, list))}
+
+
+def _task_summary(row: dict) -> dict:
+    return _summary_fields(row, ("task_id", "status", "revision", "title", "reason")) | {
+        "chunk_ids": deepcopy(row.get("chunk_ids", [])),
+        "dependencies": deepcopy(row.get("dependencies", []))}
+
+
+def _verification_summary(row: dict) -> dict:
+    build, audit = row.get("build") or {}, row.get("hole_audit") or {}
+    return _summary_fields(row, ("passed", "snapshot_id", "sha256", "main_sha", "metric_sha256", "baseline_sha256",
+                                "config_revision", "reason", "stale", "qualification")) | {
+        "issue_count": len(row.get("issues", [])),
+        "build": _summary_fields(build, ("passed", "source_stable")) | {
+            "unchecked_file_count": len(build.get("unchecked_files", []))},
+        "hole_audit": _summary_fields(audit, ("passed", "holes_remaining", "qualification")) | {
+            "issue_count": len(audit.get("issues", [])), "inherited_count": len(audit.get("inherited", [])),
+            "introduced_count": len(audit.get("introduced", []))}}
+
+
+def _candidate_summary(state: dict, row: dict) -> dict:
+    verification = row.get("verification") or {}
+    return _summary_fields(row, ("candidate_id", "task_id", "author", "status", "assignment_id", "strategy_id",
+        "base_main_sha", "task_revision", "config_revision", "commit_sha", "diff_sha256", "notes", "feedback")) | {
+        "verification": _verification_summary(verification),
+        "comparisons": {cid: _summary_fields(value, ("subject", "before", "after", "improved", "regressed",
+            "delta", "improvement_percent", "improvement_score", "evidence_kind", "qualification"))
+            for cid, value in verification.get("comparisons", {}).items()},
+        "measurements": {cid: _summary_fields(value, ("subject", "raw_value", "units", "direction", "evidence_kind",
+            "metric_sha256", "source_sha256", "method_sha256", "sha256"))
+            for cid, value in row.get("measurements", {}).items()},
+        "selection": _summary_fields(row.get("selection") or {}, ("author", "reason", "at")),
+        "endorsement_count": len(row.get("endorsements", [])), "objection_count": len(row.get("objections", [])),
+        "records": {"candidate": _brief_artifact(state, "candidate", row)}}
+
+
+def _bounded_response(state: dict, key: str, response: dict) -> dict:
+    # Count escaped JSON, not a row count or the CLI's visible text preview.
+    if len(json.dumps(response, ensure_ascii=True).encode("utf-8")) <= MAX_RESPONSE_BYTES:
+        return response
+    # The index retains every summary and its full-evidence references. No rows
+    # are silently dropped and neither workflow state nor evidence is trimmed.
+    header = _summary_fields(response, ("run_id", "revision", "phase", "main_sha", "candidate_id", "task_id", "status"))
+    # Never turn a long identifier or qualitative score into a different value.
+    # Oversized identifiers remain exact in the referenced index, not clipped.
+    result = {key: value for key, value in header.items() if len(json.dumps(value).encode("utf-8")) <= 1024}
+    result.update(summary_only=True, counts={key: len(value) for key, value in response.items()
+                                            if isinstance(value, (dict, list))},
+                  records={"response": _brief_artifact(state, key + "_response", response)},
+                  next_action="Read records.response with artifact_read; follow next_offset for the full index and evidence references.")
+    return result
 
 
 def _phase_summaries(state: dict, limit: int = 5) -> dict:
@@ -110,7 +191,9 @@ def _phase_summaries(state: dict, limit: int = 5) -> dict:
 def _brief_artifact(state: dict, key: str, value) -> dict:
     """Retain complete data without duplicating it in every model-facing brief."""
     record = artifacts.store_text(_root() / ".unity" / "artifacts",
-        json.dumps(value, sort_keys=True, ensure_ascii=False), kind="optimize_brief",
+        # ASCII escapes preserve exact Unicode data across the existing
+        # byte-paged artifact reader, including pages split inside an escape.
+        json.dumps(value, sort_keys=True, ensure_ascii=True), kind="optimize_brief",
         source=key, metadata={"run_id": state["run_id"], "revision": state["revision"]})
     return {field: record[field] for field in ("artifact_id", "sha256", "bytes")}
 
@@ -128,7 +211,9 @@ def optimize_brief() -> dict:
             "chunks": state["chunks"], "plan_proposals": state["plan_proposals"],
             "baseline_measurements": state["baseline_measurements"],
             "current_measurements": state["measurements"],
-            "phase_dispatches": state.get("phase_dispatches", {})}
+            "phase_dispatches": state.get("phase_dispatches", {}),
+            "tasks": state["tasks"], "candidates": state["candidates"],
+            "rounds": state["rounds"], "review": state["review"]}
     metric = state["metric"] if isinstance(state["metric"], dict) else {"name": state["metric"]}
     next_actions = [
         "Read optimize_task only for a nonempty bound_task; phase names are not task IDs.",
@@ -138,7 +223,7 @@ def optimize_brief() -> dict:
     ]
     if PROFILE in {"architect", "exploration", "chunking"}:
         next_actions.append("Use report_phase_result to record your completed, blocked or eligible skipped preparation contribution.")
-    return {"root": state["root"], "run_id": state["run_id"], "revision": state["revision"],
+    response = {"root": state["root"], "run_id": state["run_id"], "revision": state["revision"],
             "phase": state["phase"], "profile": PROFILE,
             "metric": {key: _summary_text(metric[key]) for key in
                        ("name", "builtin", "direction", "units", "definition", "sha256") if key in metric},
@@ -166,6 +251,7 @@ def optimize_brief() -> dict:
                 "The primary selects among checked candidates; only the controller integrates them.",
                 "Only the configured primary reviews the exact final snapshot, read-only.",
                 "Distinguish measured scores from agent judgments; no improvement found is not global optimality."]}
+    return _bounded_response(state, "brief", response)
 
 
 def optimize_task(task_id: str) -> dict:
@@ -174,10 +260,20 @@ def optimize_task(task_id: str) -> dict:
         raise ValueError("unknown Optimize task ID; phase names are not tasks. "
                          "Use optimize_brief for phase work and optimize_status for existing tasks")
     task = state["tasks"][task_id]
-    return {"task": task, "chunks": [state["chunks"][cid] for cid in task["chunk_ids"]],
+    full = {"task": task, "chunks": [state["chunks"][cid] for cid in task["chunk_ids"]],
             "strategies": [row for row in state["strategies"].values() if row["task_id"] == task_id],
             "assignments": [row for row in state["assignments"].values() if row["task_id"] == task_id],
             "candidates": [row for row in state["candidates"].values() if row["task_id"] == task_id]}
+    response = {"task": _task_summary(task),
+                "chunks": [_summary_fields(row, ("chunk_id", "name", "path", "kind", "start_line", "end_line", "source_sha256"))
+                           for row in full["chunks"]],
+                "strategies": [_summary_fields(row, ("strategy_id", "author", "status", "title", "description"))
+                               for row in full["strategies"]],
+                "assignments": [_summary_fields(row, ("assignment_id", "author", "status", "base_main_sha", "task_revision", "config_revision"))
+                                for row in full["assignments"]],
+                "candidates": [_candidate_summary(state, row) for row in full["candidates"]],
+                "records": {key: _brief_artifact(state, key, value) for key, value in full.items()}}
+    return _bounded_response(state, "task", response)
 
 
 def optimize_inventory(path: str = "", name: str = "", offset: int = 0, limit: int = 50,
@@ -416,8 +512,10 @@ def submit_candidate(author: str, assignment_id: str, notes: str, measurements: 
     author = _author(author)
     assignment = _assignment(author, assignment_id)
     selected = measurements if measurements is not None else assignment.get("measurements", {})
-    return tasks.submit_candidate(FORUM_DIR, author, assignment_id, notes, selected,
-                                  judgments=assignment.get("judgments", {}))
+    candidate = tasks.submit_candidate(FORUM_DIR, author, assignment_id, notes, selected,
+                                      judgments=assignment.get("judgments", {}))
+    state = tasks.load(FORUM_DIR)
+    return _bounded_response(state, "submitted_candidate", _candidate_summary(state, candidate))
 
 
 def endorse_candidate(author: str, candidate_id: str, reason: str, evidence: str = "") -> dict:
@@ -432,7 +530,9 @@ def object_candidate(author: str, candidate_id: str, reason: str, evidence: str 
 
 def select_candidate(author: str, candidate_id: str, reason: str) -> dict:
     _profile("optimizing")
-    return tasks.select_candidate(FORUM_DIR, _author(author), candidate_id, reason)
+    candidate = tasks.select_candidate(FORUM_DIR, _author(author), candidate_id, reason)
+    state = tasks.load(FORUM_DIR)
+    return _bounded_response(state, "selected_candidate", _candidate_summary(state, candidate))
 
 
 def request_scope_group(author: str, task_id: str, chunk_ids: list[str], files: list[str],
