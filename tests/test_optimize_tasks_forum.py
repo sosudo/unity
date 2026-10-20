@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from unity import optimize_metrics as metrics, optimize_tasks as tasks
+from unity import optimize_verification as verification
 from unity.forum import optimize_server as forum
 
 
@@ -41,7 +42,16 @@ class OptimizeStateForumTests(unittest.TestCase):
         environment = patch.dict(os.environ, {}, clear=True)
         environment.start()
         self.addCleanup(environment.stop)
+        identities = patch.object(verification, "file_identity", side_effect=self.source_identity)
+        identities.start()
+        self.addCleanup(identities.stop)
+        git = patch.object(verification, "_git", return_value="")
+        git.start()
+        self.addCleanup(git.stop)
         forum.configure(self.directory, self.root, "chunking")
+
+    def source_identity(self, root, **kwargs):
+        return deepcopy(self.identity)
 
     def plan(self, dependencies=False):
         rows = [{"chunk_ids": [cid]} for cid in self.chunks]
@@ -50,27 +60,35 @@ class OptimizeStateForumTests(unittest.TestCase):
         tasks.accept_plan(self.directory, proposal["proposal_id"])
         return tasks.load(self.directory)
 
-    def baseline_and_round(self):
-        self.plan()
+    def baseline_and_round(self, dependencies=False):
+        self.plan(dependencies=dependencies)
         for cid in self.chunks:
             measurement = metrics.record_measurement(self.metric, subject=cid, raw_value=5,
                 source_identity=self.identity, method=self.method, evidence={"tactics": 5})
             tasks.record_baseline_measurement(self.directory, "Bob", cid, measurement)
         tasks.seal_baseline(self.directory)
+        with tasks.transaction(self.directory) as state:
+            state["measurements"] = deepcopy(state["baseline"]["measurements"])
         tasks.begin_round(self.directory, max_rounds=2)
         forum.configure(self.directory, self.root, "optimizing")
 
-    def assignment(self, author="Alice", chunk=None, strategy="replace long tactic chain"):
+    def assignment(self, author="Alice", chunk=None, strategy="replace long tactic chain", measured=True):
         chunk = chunk or self.chunks[0]
         row = tasks.register_strategy(self.directory, author, chunk, strategy, strategy)
         tasks.claim_strategy(self.directory, author, row["strategy_id"])
         tree = self.temp / (author + "-" + row["strategy_id"])
         tree.mkdir()
-        return tasks.configure_assignment(self.directory, author, row["strategy_id"], tree, "base")
+        assignment = tasks.configure_assignment(self.directory, author, row["strategy_id"], tree, "base")
+        if measured:
+            state = tasks.load(self.directory)
+            for cid in state["tasks"][chunk]["chunk_ids"]:
+                tasks.record_candidate_measurement(self.directory, author, assignment["assignment_id"], cid,
+                    3, self.method, {"tactics": 3})
+        return assignment
 
     def candidate(self, author="Alice", strategy="simplify"):
         assignment = self.assignment(author, strategy=strategy)
-        return tasks.submit_candidate(self.directory, author, assignment["assignment_id"], "Retained statement; improved tactics", {})
+        return tasks.submit_candidate(self.directory, author, assignment["assignment_id"], "Retained statement; improved tactics")
 
     def test_initialization_rejects_old_or_duplicate_state(self):
         with self.assertRaisesRegex(ValueError, "already initialized"):
@@ -101,6 +119,196 @@ class OptimizeStateForumTests(unittest.TestCase):
         state = tasks.load(self.directory)
         self.assertEqual(len(state["events"]), 16)
         self.assertEqual(len({row["event_id"] for row in state["events"]}), 16)
+
+    def grouped_assignment(self):
+        (self.root / "A.lean").write_text("".join(
+            f"theorem item{i} : True := by trivial\n" for i in range(23)))
+        tasks.install_inventory(self.directory, tasks.scan_sources(self.root, ["A.lean"]))
+        self.chunks = list(tasks.load(self.directory)["chunks"])
+        proposal = tasks.propose_plan(self.directory, "Alice", [{"chunk_ids": self.chunks,
+            "reason": "Shared proof helpers require one declaration group"}], "Grouped fixture")
+        tasks.accept_plan(self.directory, proposal["proposal_id"])
+        for cid in self.chunks:
+            measurement = metrics.record_measurement(self.metric, subject=cid, raw_value=5,
+                source_identity=self.identity, method=self.method, evidence={"tactics": 5})
+            tasks.record_baseline_measurement(self.directory, "Bob", cid, measurement)
+        tasks.seal_baseline(self.directory)
+        with tasks.transaction(self.directory) as state:
+            state["measurements"] = deepcopy(state["baseline"]["measurements"])
+        tasks.begin_round(self.directory, max_rounds=5)
+        task_id = next(iter(tasks.load(self.directory)["tasks"]))
+        return self.assignment(chunk=task_id, measured=False)
+
+    def assert_report_rejected_without_change(self, assignment, measurements=None, expected=None, **kwargs):
+        path = self.directory / tasks.STATE_FILE
+        before = path.read_bytes()
+        with self.assertRaises(tasks.MeasurementValidationError) as caught:
+            tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"],
+                "Same statements with a shorter proof", measurements, **kwargs)
+        self.assertEqual(path.read_bytes(), before)
+        current = tasks.load(self.directory)["assignments"][assignment["assignment_id"]]
+        self.assertEqual(current["status"], "running")
+        if expected:
+            self.assertIn(expected, {issue["code"] for issue in caught.exception.details["issues"]})
+        return caught.exception.details
+
+    def test_grouped_reports_require_all_records_and_allow_same_assignment_correction(self):
+        assignment = self.grouped_assignment()
+        details = self.assert_report_rejected_without_change(assignment, expected="missing_measurement")
+        self.assertEqual(details["issue_count"], 23)
+        for cid in self.chunks[:10]:
+            tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+                cid, 3, self.method, {"tactics": 3})
+        details = self.assert_report_rejected_without_change(assignment, expected="missing_measurement")
+        self.assertEqual(details["issue_count"], 13)
+        for cid in self.chunks[10:]:
+            tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+                cid, 5, self.method, {"tactics": 5, "note": "Unchanged declaration, counted again"})
+        before = tasks.load(self.directory)
+        self.assert_report_rejected_without_change(assignment, {}, expected="missing_measurement")
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Complete report")
+        after = tasks.load(self.directory)
+        self.assertEqual(len(candidate["measurements"]), 23)
+        self.assertEqual(after["rounds"], before["rounds"])
+        self.assertEqual(after["baseline"], before["baseline"])
+        self.assertEqual(after["assignments"][assignment["assignment_id"]]["status"], "submitted")
+
+    def test_submission_rejects_raw_bad_digest_method_subject_source_and_extra_records(self):
+        assignment = self.grouped_assignment()
+        good = {cid: metrics.record_measurement(self.metric, subject=cid, raw_value=3,
+            source_identity=self.identity, method=self.method, evidence={"tactics": 3}) for cid in self.chunks}
+        cid = self.chunks[0]
+        wrong_method = metrics.record_measurement(self.metric, subject=cid, raw_value=3,
+            source_identity=self.identity, method={"description": "Paraphrased counting method"}, evidence={"tactics": 3})
+        wrong_source = metrics.record_measurement(self.metric, subject=cid, raw_value=3,
+            source_identity=seal({"main_sha": "old", "files": {}, "config": {}}),
+            method=self.method, evidence={"tactics": 3})
+        cases = [({key: 3 for key in self.chunks}, "invalid_measurement_type"),
+                 ({**good, cid: {**good[cid], "raw_value": 2}}, "invalid_measurement_digest"),
+                 ({**good, cid: wrong_method}, "measurement_comparison_mismatch"),
+                 ({**good, cid: good[self.chunks[1]]}, "measurement_subject_mismatch"),
+                 ({**good, cid: wrong_source}, "measurement_source_mismatch"),
+                 ({**good, "unassigned": good[cid]}, "unassigned_measurement")]
+        for records, expected in cases:
+            with self.subTest(expected=expected):
+                self.assert_report_rejected_without_change(assignment, records, expected=expected)
+        self.assert_report_rejected_without_change(assignment, 3, expected="invalid_measurement_map")
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Valid explicit report", good)
+        self.assertEqual(candidate["measurements"], good)
+
+    def test_record_rejects_changed_method_without_replacing_prior_measurement(self):
+        self.baseline_and_round()
+        assignment = self.assignment()
+        before = (self.directory / tasks.STATE_FILE).read_bytes()
+        with self.assertRaises(tasks.MeasurementValidationError) as caught:
+            tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+                self.chunks[0], 2, {**self.method, "commit": "candidate-specific"}, {"tactics": 2})
+        self.assertIn("measurement_comparison_mismatch", {row["code"] for row in caught.exception.details["issues"]})
+        self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
+        result = tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+            self.chunks[0], 2, self.method, {"tactics": 2, "commit": "candidate-specific"})
+        self.assertEqual(result["method"], self.method)
+        self.assertEqual(result["evidence"]["commit"], "candidate-specific")
+
+    def test_submission_rechecks_clean_source_and_current_assignment(self):
+        self.baseline_and_round()
+        assignment = self.assignment()
+        with patch.object(verification, "_git", return_value=" M A.lean"):
+            self.assert_report_rejected_without_change(assignment, expected="candidate_not_committed")
+        with tasks.transaction(self.directory) as state:
+            state["assignments"][assignment["assignment_id"]]["base_main_sha"] = "old"
+        self.assert_report_rejected_without_change(assignment, expected="assignment_base_changed")
+
+    def test_record_and_submission_detect_source_change_during_check(self):
+        self.baseline_and_round()
+        assignment = self.assignment()
+        changed = seal({"main_sha": "base", "files": {"A.lean": "changed"}, "config": {}})
+        identities = [self.identity, self.identity, self.identity, changed]
+        before = (self.directory / tasks.STATE_FILE).read_bytes()
+        with patch.object(verification, "file_identity", side_effect=deepcopy(identities)):
+            self.assert_report_rejected_without_change(assignment, expected="source_changed_during_submission")
+        with patch.object(verification, "file_identity", side_effect=deepcopy(identities)):
+            with self.assertRaises(tasks.MeasurementValidationError) as caught:
+                tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+                    self.chunks[0], 2, self.method, {"tactics": 2})
+        self.assertEqual(caught.exception.details["issues"], [{"code": "source_changed_during_measurement"}])
+        self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
+
+    def test_missing_current_measurements_are_not_automatically_copied_from_baseline(self):
+        self.baseline_and_round()
+        assignment = self.assignment()
+        with tasks.transaction(self.directory) as state:
+            state["measurements"].pop(self.chunks[0])
+        details = self.assert_report_rejected_without_change(assignment)
+        self.assertTrue(any(issue.get("record") == "current" for issue in details["issues"]))
+
+    def test_valid_equal_or_worse_scores_are_not_new_submission_gates(self):
+        for raw_value in (5, 6):
+            with self.subTest(raw_value=raw_value):
+                if not tasks.load(self.directory)["baseline_sealed"]:
+                    self.baseline_and_round()
+                assignment = self.assignment(strategy=f"Valid count {raw_value}")
+                tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+                    self.chunks[0], raw_value, self.method, {"tactics": raw_value})
+                candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Honest score report")
+                self.assertEqual(candidate["measurements"][self.chunks[0]]["raw_value"], raw_value)
+                self.assertEqual(candidate["status"], "submitted")
+
+    def test_numeric_report_keeps_judgment_ignored_by_existing_comparator(self):
+        self.baseline_and_round()
+        assignment = self.assignment()
+        ignored = {"improved": "not used for numeric comparison", "reason": 0, "regressed": "not used"}
+        tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+            self.chunks[0], 3, self.method, {"tactics": 3}, comparison_judgment=ignored)
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Numeric report")
+        self.assertEqual(candidate["judgments"], {self.chunks[0]: ignored})
+        comparison = metrics.compare_measurements(tasks.load(self.directory)["measurements"][self.chunks[0]],
+            candidate["measurements"][self.chunks[0]], judgment=ignored)
+        self.assertTrue(comparison["improved"])
+        self.assertFalse(comparison["regressed"])
+
+    def test_concurrent_recording_keeps_all_scores_without_global_revision_guard(self):
+        assignment = self.grouped_assignment()
+        def record(cid):
+            return tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+                cid, 3, self.method, {"tactics": 3})
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(record, self.chunks))
+        with tasks.transaction(self.directory) as state:
+            tasks._event(state, "finding", "Bob", content="Unrelated forum event")
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Complete concurrent report")
+        self.assertEqual(set(candidate["measurements"]), set(self.chunks))
+
+    def test_qualitative_report_needs_existing_comparison_judgment_and_keeps_it(self):
+        self.directory = self.root / ".unity" / "forum" / "qualitative-fixture"
+        self.metric = seal({"name": "clarity", "builtin": None, "definition": "Explain the clarity judgment"})
+        self.method = {"description": "Fixture clarity review", "direction": "lower"}
+        self.baseline = seal({"source_identity": self.identity, "metric": self.metric,
+                              "measurements": {}, "build": {"passed": True}})
+        tasks.initialize(self.directory, self.root, run_id="qualitative-fixture", base_sha="base",
+            metric=self.metric, scope={"targets": "Universe"},
+            config={"primary": "Alice", "agents": ["Alice", "Bob"]})
+        tasks.install_inventory(self.directory, tasks.scan_sources(self.root, ["A.lean"]))
+        tasks.set_baseline(self.directory, self.baseline)
+        with tasks.transaction(self.directory) as state:
+            state["phase"] = "chunking"
+        self.baseline_and_round()
+        assignment = self.assignment(measured=False)
+        tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+            self.chunks[0], "clearer", self.method, {"reason": "The repeated steps are removed"})
+        self.assert_report_rejected_without_change(assignment, expected="invalid_comparison_judgment")
+        judgment = {"improved": False, "reason": {"evidence": "Equivalent clarity; no improvement is claimed"},
+                    "regressed": "reported regression"}
+        tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
+            self.chunks[0], "clearer", self.method, {"reason": "The repeated steps are removed"},
+            comparison_judgment=judgment)
+        self.assert_report_rejected_without_change(assignment, judgments={}, expected="invalid_comparison_judgment")
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Complete qualitative report")
+        self.assertEqual(candidate["judgments"], {self.chunks[0]: judgment})
+        comparison = metrics.compare_measurements(tasks.load(self.directory)["measurements"][self.chunks[0]],
+            candidate["measurements"][self.chunks[0]], judgment=judgment)
+        self.assertFalse(comparison["improved"])
+        self.assertTrue(comparison["regressed"])
 
     def test_baseline_immutable_and_current_measurements_separate(self):
         self.baseline_and_round()
@@ -305,9 +513,7 @@ def draft := sorry
         self.assertNotEqual(state["phase"], "complete")
 
     def test_refresh_invalidates_dependent_revisions_scores_and_verdict(self):
-        self.plan(dependencies=True)
-        tasks.seal_baseline(self.directory)
-        tasks.begin_round(self.directory, max_rounds=1)
+        self.baseline_and_round(dependencies=True)
         candidate = self.candidate()
         with tasks.transaction(self.directory) as state:
             state["review"] = {"verdict": {"approved": True}}

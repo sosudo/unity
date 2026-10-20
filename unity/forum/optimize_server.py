@@ -144,6 +144,30 @@ def _verification_summary(row: dict) -> dict:
             "introduced_count": len(audit.get("introduced", []))}}
 
 
+def _measurement_summary(row, *, include_method: bool = False) -> dict:
+    # Older rejected candidates can contain raw integers. Keep those exact bytes
+    # in their artifact, without letting a display-only summary hide every task.
+    if not isinstance(row, dict):
+        return {"malformed": True, "value_type": type(row).__name__}
+    summary = _summary_fields(row, ("subject", "raw_value", "units", "direction", "evidence_kind",
+        "metric_sha256", "source_sha256", "method_sha256", "sha256"))
+    if include_method and "method" in row:
+        # This is an exact comparison contract, not prose to shorten. Large
+        # methods use the existing response/artifact paging boundary instead.
+        summary["method"] = deepcopy(row["method"])
+    return summary
+
+
+def _assignment_summary(row: dict, required_chunk_ids: list[str]) -> dict:
+    required = set(required_chunk_ids)
+    measurements = row.get("measurements", {})
+    recorded = set(measurements) if isinstance(measurements, dict) else set()
+    return _summary_fields(row, ("assignment_id", "author", "status", "base_main_sha", "task_revision", "config_revision")) | {
+        "required_count": len(required), "recorded_count": len(required & recorded),
+        "missing_count": len(required - recorded), "measurement_map_malformed": not isinstance(measurements, dict),
+        "coverage_qualification": "Counts reflect assigned-key coverage only, not measurement validity or acceptance."}
+
+
 def _candidate_summary(state: dict, row: dict) -> dict:
     verification = row.get("verification") or {}
     return _summary_fields(row, ("candidate_id", "task_id", "author", "status", "assignment_id", "strategy_id",
@@ -152,9 +176,8 @@ def _candidate_summary(state: dict, row: dict) -> dict:
         "comparisons": {cid: _summary_fields(value, ("subject", "before", "after", "improved", "regressed",
             "delta", "improvement_percent", "improvement_score", "evidence_kind", "qualification"))
             for cid, value in verification.get("comparisons", {}).items()},
-        "measurements": {cid: _summary_fields(value, ("subject", "raw_value", "units", "direction", "evidence_kind",
-            "metric_sha256", "source_sha256", "method_sha256", "sha256"))
-            for cid, value in row.get("measurements", {}).items()},
+        "measurements": {cid: _measurement_summary(value)
+                         for cid, value in row.get("measurements", {}).items()},
         "selection": _summary_fields(row.get("selection") or {}, ("author", "reason", "at")),
         "endorsement_count": len(row.get("endorsements", [])), "objection_count": len(row.get("objections", [])),
         "records": {"candidate": _brief_artifact(state, "candidate", row)}}
@@ -260,16 +283,30 @@ def optimize_task(task_id: str) -> dict:
         raise ValueError("unknown Optimize task ID; phase names are not tasks. "
                          "Use optimize_brief for phase work and optimize_status for existing tasks")
     task = state["tasks"][task_id]
+    contract = {"required_chunk_ids": deepcopy(task["chunk_ids"]),
+                "original": {cid: deepcopy(state["baseline"].get("measurements", {}).get(cid))
+                             for cid in task["chunk_ids"]},
+                "current": {cid: deepcopy(state["measurements"].get(cid)) for cid in task["chunk_ids"]}}
     full = {"task": task, "chunks": [state["chunks"][cid] for cid in task["chunk_ids"]],
+            "measurement_contract": contract,
             "strategies": [row for row in state["strategies"].values() if row["task_id"] == task_id],
             "assignments": [row for row in state["assignments"].values() if row["task_id"] == task_id],
             "candidates": [row for row in state["candidates"].values() if row["task_id"] == task_id]}
     response = {"task": _task_summary(task),
+                "measurement_contract": {"required_chunk_ids": contract["required_chunk_ids"],
+                    **{key: {cid: _measurement_summary(row, include_method=True) for cid, row in contract[key].items()}
+                       for key in ("original", "current")},
+                    "instructions": "Finish source edits, commit, then measure every required chunk including unchanged declarations. "
+                        "Use each original record's exact method; put source-specific counting details in evidence. "
+                        "Submit sealed records, never raw numbers. Follow error-specific guidance: correct fixable reports "
+                        "in the same assignment; after private-tree changes, remeasure all chunks once bytes are stable. "
+                        "If the assignment base or integrated source changed, preserve private work, report the obstacle "
+                        "and end the turn for normal controller handling; do not reset, rebind, update source or claim no_improvement."},
                 "chunks": [_summary_fields(row, ("chunk_id", "name", "path", "kind", "start_line", "end_line", "source_sha256"))
                            for row in full["chunks"]],
                 "strategies": [_summary_fields(row, ("strategy_id", "author", "status", "title", "description"))
                                for row in full["strategies"]],
-                "assignments": [_summary_fields(row, ("assignment_id", "author", "status", "base_main_sha", "task_revision", "config_revision"))
+                "assignments": [_assignment_summary(row, task["chunk_ids"])
                                 for row in full["assignments"]],
                 "candidates": [_candidate_summary(state, row) for row in full["candidates"]],
                 "records": {key: _brief_artifact(state, key, value) for key, value in full.items()}}
@@ -391,9 +428,10 @@ def record_measurement(author: str, chunk_id: str, raw_value: int | float | str,
     """Bind evidenced measured/judged values to baseline or actual worker bytes.
 
     This records supplied evidence; it does not invent or execute a scorer.
-    Commit a candidate before measuring if its method includes the Git commit.
+    Finish source edits and commit before candidate measurement: source identity
+    always includes HEAD. Reuse the exact original method for each subject.
     """
-    from .. import optimize_metrics, optimize_verification
+    from .. import optimize_metrics
     author = _author(author)
     _judgment(comparison_judgment)
     state = tasks.load(FORUM_DIR)
@@ -403,22 +441,17 @@ def record_measurement(author: str, chunk_id: str, raw_value: int | float | str,
         identity = state["baseline"].get("source_identity", state["baseline"].get("identity"))
     else:
         _profile("optimizing")
-        assignment = _assignment(author, assignment_id)
-        if chunk_id not in state["tasks"][assignment["task_id"]]["chunk_ids"]:
-            raise ValueError("measurement chunk not assigned")
-        identity = optimize_verification.file_identity(Path(assignment["worktree"]), scope=state["scope"],
-                                                       lake_args=state["config"].get("lake_args", []))
+        _assignment(author, assignment_id)
+        try:
+            return tasks.record_candidate_measurement(FORUM_DIR, author, assignment_id, chunk_id,
+                raw_value, method, evidence, evidence_kind=evidence_kind, units=units,
+                comparison_judgment=comparison_judgment)
+        except tasks.MeasurementValidationError as exc:
+            raise _candidate_validation_error(exc, author, assignment_id, "record_measurement") from exc
     measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
         raw_value=raw_value, source_identity=identity, method=method, evidence=evidence,
         evidence_kind=evidence_kind, units=units)
-    if baseline:
-        return tasks.record_baseline_measurement(FORUM_DIR, author, chunk_id, measurement)
-    with tasks.transaction(FORUM_DIR) as current:
-        row = tasks._owned(current, author, assignment_id)
-        row.setdefault("measurements", {})[chunk_id] = deepcopy(measurement)
-        if comparison_judgment is not None:
-            row.setdefault("judgments", {})[chunk_id] = deepcopy(comparison_judgment)
-    return measurement
+    return tasks.record_baseline_measurement(FORUM_DIR, author, chunk_id, measurement)
 
 
 def measure_candidate(author: str, assignment_id: str, chunk_id: str, raw_value: int | float | str,
@@ -506,14 +539,47 @@ def assist_strategy(author: str, strategy_id: str, contribution: str) -> dict:
     return result
 
 
+def _candidate_validation_error(error, author: str, assignment_id: str, operation: str) -> ValueError:
+    state = tasks.load(FORUM_DIR)
+    report = {"schema": "optimize-measurement-validation-v1", "run_id": state["run_id"],
+              "revision": state["revision"], "author": author, "assignment_id": assignment_id,
+              "operation": operation, "code": error.code, "details": error.details}
+    record = artifacts.store_text(_root() / ".unity" / "artifacts", json.dumps(report, sort_keys=True),
+                                  kind="optimize_measurement_validation", producer=author)
+    # Only normalized validator facts are recorded, never supplied evidence,
+    # method prose, notes or provider diagnostics. Full facts remain paged.
+    codes = {issue.get("code") for issue in error.details.get("issues", [])}
+    message = _summary_text(str(error), 1000)
+    action = "Correct the records and retry in the same assignment; no candidate was submitted."
+    if codes & {"assignment_base_changed", "current_source_changed"}:
+        message = "The assignment base or integrated source changed; editing reports cannot repair that binding."
+        action = ("Preserve private work, report the obstacle, and end this turn for normal controller handling. "
+                  "Do not reset, rebind or update source, and do not claim no_improvement. No candidate was submitted.")
+    elif codes & {"source_changed_during_measurement", "source_changed_during_submission"}:
+        action = ("After the assigned tree is stable, measure every required chunk again and retry in the same assignment. "
+                  "No candidate was submitted.")
+    response = {"code": error.code, "message": message,
+                "issue_count": error.details.get("issue_count", 0),
+                "issues": error.details.get("issues", [])[:8],
+                "artifact": {key: record[key] for key in ("artifact_id", "sha256", "bytes")},
+                "next_action": "Read optimize_task measurement_contract and this artifact with artifact_read. "
+                    + action}
+    if len(json.dumps(response, ensure_ascii=True).encode()) > 8192:
+        response["issues"] = []
+    return ValueError(json.dumps(response, sort_keys=True, ensure_ascii=True))
+
+
 def submit_candidate(author: str, assignment_id: str, notes: str, measurements: dict | None = None) -> dict:
     """Submit a private-tree proposal; controller collects and checks actual Git evidence."""
     _profile("optimizing")
     author = _author(author)
-    assignment = _assignment(author, assignment_id)
-    selected = measurements if measurements is not None else assignment.get("measurements", {})
-    candidate = tasks.submit_candidate(FORUM_DIR, author, assignment_id, notes, selected,
-                                      judgments=assignment.get("judgments", {}))
+    _assignment(author, assignment_id)
+    try:
+        # Resolve omitted measurements and judgments under the task transaction,
+        # not from a separately loaded assignment snapshot.
+        candidate = tasks.submit_candidate(FORUM_DIR, author, assignment_id, notes, measurements)
+    except tasks.MeasurementValidationError as exc:
+        raise _candidate_validation_error(exc, author, assignment_id, "submit_candidate") from exc
     state = tasks.load(FORUM_DIR)
     return _bounded_response(state, "submitted_candidate", _candidate_summary(state, candidate))
 

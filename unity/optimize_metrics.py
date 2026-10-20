@@ -136,6 +136,72 @@ def validate_measurement_binding(measurement: dict, metric: dict, source_identit
         return False
 
 
+def _intact(value) -> bool:
+    try:
+        return _valid(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def measurement_errors(measurement, metric: dict, source_identity: dict, *, subject=None) -> list[dict]:
+    """Explain the existing sealed-record contract without changing evidence.
+
+    These checks are pure and do not infer a score, provenance or improvement.
+    Malformed payloads are distinct from records bound to different source bytes
+    or Git identity. Callers supply the actual identity they intend to validate.
+    """
+    context = {"subject": subject} if subject is not None else {}
+    if not isinstance(measurement, dict):
+        return [{"code": "invalid_measurement_type", **context}]
+    if not _intact(measurement):
+        return [{"code": "invalid_measurement_digest", **context}]
+    if not _intact(metric):
+        return [{"code": "invalid_metric_digest", **context}]
+    if not _intact(source_identity):
+        return [{"code": "invalid_source_identity_digest", **context}]
+    errors = []
+    for code, field, expected in (
+        ("measurement_subject_mismatch", "subject", subject),
+        ("measurement_metric_mismatch", "metric_sha256", metric["sha256"]),
+        ("measurement_source_mismatch", "source_sha256", source_identity["sha256"]),
+    ):
+        if (field != "subject" or subject is not None) and measurement.get(field) != expected:
+            errors.append({"code": code, "fields": [field], **context})
+    method = measurement.get("method")
+    if not isinstance(method, dict) or not method.get("description"):
+        errors.append({"code": "invalid_measurement_method", "fields": ["method"], **context})
+    elif measurement.get("method_sha256") != digest(method):
+        errors.append({"code": "invalid_measurement_method_digest", "fields": ["method_sha256"], **context})
+    if errors:
+        return errors
+    try:
+        expected = record_measurement(metric, subject=measurement["subject"], raw_value=measurement["raw_value"],
+            source_identity=source_identity, method=method, evidence=measurement["evidence"],
+            evidence_kind=measurement["evidence_kind"], units=measurement.get("units"))
+    except (TypeError, ValueError, KeyError) as exc:
+        return [{"code": "invalid_measurement_record", "reason": str(exc), **context}]
+    fields = [key for key, value in expected.items() if key != "sha256" and measurement.get(key) != value]
+    return [{"code": "invalid_measurement_record", "fields": fields, **context}] if fields else []
+
+
+def comparison_errors(before, after, *, subject=None) -> list[dict]:
+    """Check existing comparison metadata, not values or qualitative judgments."""
+    context = {"subject": subject} if subject is not None else {}
+    errors = []
+    for side, measurement in (("before", before), ("after", after)):
+        if not isinstance(measurement, dict):
+            errors.append({"code": "invalid_measurement_type", "side": side, **context})
+        elif not _intact(measurement):
+            errors.append({"code": "invalid_measurement_digest", "side": side, **context})
+    if errors:
+        return errors
+    fields = [key for key in ("subject", "metric_sha256", "method_sha256", "units", "direction", "metric_kind")
+              if before.get(key) != after.get(key)]
+    if subject is not None and (before.get("subject") != subject or after.get("subject") != subject) and "subject" not in fields:
+        fields.insert(0, "subject")
+    return [{"code": "measurement_comparison_mismatch", "fields": fields, **context}] if fields else []
+
+
 def rebind_measurement(measurement: dict, metric: dict, old_identity: dict, new_identity: dict) -> dict:
     """Carry evidence across a commit-only change, never across changed bytes."""
     if not validate_measurement_binding(measurement, metric, old_identity) or not _valid(new_identity):

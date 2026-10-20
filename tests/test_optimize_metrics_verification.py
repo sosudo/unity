@@ -148,6 +148,116 @@ class MetricsAndVerificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "not comparable"):
             m.compare_measurements(self.measurement(3), self.measurement(1, method={"description": "Different counting convention", "direction": "lower"}))
 
+    def test_measurement_errors_distinguish_raw_values_and_bad_seals_from_source_changes(self):
+        identity = v.file_identity(self.root, self.scope)
+        for payload in (0, 3, None, "3", [], [3]):
+            with self.subTest(payload=payload):
+                self.assertEqual(m.measurement_errors(payload, self.metric, identity, subject="first"),
+                    [{"code": "invalid_measurement_type", "subject": "first"}])
+        row = self.measurement(3, identity=identity)
+        row["raw_value"] = 1
+        self.assertEqual(m.measurement_errors(row, self.metric, identity),
+                         [{"code": "invalid_measurement_digest"}])
+        row = self.measurement(3, identity=identity)
+        changed = deepcopy(identity)
+        changed["main_sha"] = "different-commit-same-source-bytes"
+        changed["sha256"] = m.digest({key: value for key, value in changed.items() if key != "sha256"})
+        self.assertEqual(m.measurement_errors(row, self.metric, changed),
+                         [{"code": "measurement_source_mismatch", "fields": ["source_sha256"]}])
+
+    def test_measurement_errors_report_subject_metric_and_method_fields(self):
+        identity = v.file_identity(self.root, self.scope)
+        row = self.measurement(3, identity=identity, subject="other")
+        self.assertEqual(m.measurement_errors(row, self.metric, identity, subject="first"),
+            [{"code": "measurement_subject_mismatch", "fields": ["subject"], "subject": "first"}])
+        mutations = (
+            ({"metric_sha256": "different"}, "measurement_metric_mismatch", "metric_sha256"),
+            ({"method": "count tactics"}, "invalid_measurement_method", "method"),
+            ({"method_sha256": "different"}, "invalid_measurement_method_digest", "method_sha256"),
+        )
+        for changes, code, field in mutations:
+            with self.subTest(code=code):
+                row = self.measurement(3, identity=identity)
+                row.update(changes)
+                row["sha256"] = m.digest({key: value for key, value in row.items() if key != "sha256"})
+                self.assertEqual(m.measurement_errors(row, self.metric, identity),
+                                 [{"code": code, "fields": [field]}])
+
+    def test_measurement_errors_preserve_existing_record_rules(self):
+        identity = v.file_identity(self.root, self.scope)
+        for changes in ({"raw_value": -1}, {"raw_value": True}, {"evidence": ""},
+                        {"units": "lines"}, {"evidence_kind": "assumed"}, {"schema_version": 2}):
+            with self.subTest(changes=changes):
+                row = self.measurement(3, identity=identity)
+                row.update(changes)
+                row["sha256"] = m.digest({key: value for key, value in row.items() if key != "sha256"})
+                self.assertFalse(m.validate_measurement_binding(row, self.metric, identity))
+                self.assertEqual(m.measurement_errors(row, self.metric, identity)[0]["code"],
+                                 "invalid_measurement_record")
+        self.assertEqual(m.measurement_errors(self.measurement(3, identity=identity), {}, identity),
+                         [{"code": "invalid_metric_digest"}])
+        self.assertEqual(m.measurement_errors(self.measurement(3, identity=identity), self.metric, {}),
+                         [{"code": "invalid_source_identity_digest"}])
+
+    def test_measurement_helpers_are_pure_and_preserve_provenance(self):
+        identity = v.file_identity(self.root, self.scope)
+        before = self.measurement(3, identity=identity, kind="measured")
+        after = self.measurement(1, identity=identity)
+        saved = deepcopy((before, after, self.metric, identity))
+        with patch.object(v, "_git", side_effect=AssertionError("no Git")), patch("unity.optimize_jobs.run", side_effect=AssertionError("no tools")):
+            self.assertEqual(m.measurement_errors(before, self.metric, identity, subject="first"), [])
+            self.assertEqual(m.measurement_errors(after, self.metric, identity, subject="first"), [])
+            self.assertEqual(m.comparison_errors(before, after, subject="first"), [])
+        self.assertEqual((before, after, self.metric, identity), saved)
+        self.assertEqual((before["evidence_kind"], after["evidence_kind"]), ("measured", "agent_judged"))
+
+    def test_comparison_errors_require_exact_method_without_rewriting_it(self):
+        before = self.measurement(3)
+        for method in ({"description": "Counted tactic calls", "direction": "lower"},
+                       {**self.method, "commit": "candidate-commit"},
+                       {**self.method, "baseline_count": 3}):
+            with self.subTest(method=method):
+                after = self.measurement(1, method=method)
+                saved = deepcopy(after)
+                self.assertEqual(m.comparison_errors(before, after, subject="first"),
+                    [{"code": "measurement_comparison_mismatch", "fields": ["method_sha256"], "subject": "first"}])
+                self.assertEqual(after, saved)
+                with self.assertRaisesRegex(ValueError, "not comparable"):
+                    m.compare_measurements(before, after)
+
+    def test_comparison_errors_cover_existing_metadata_fields(self):
+        before = self.measurement(3)
+        for field in ("subject", "metric_sha256", "units", "direction", "metric_kind"):
+            with self.subTest(field=field):
+                after = deepcopy(before)
+                after[field] = "different"
+                after["sha256"] = m.digest({key: value for key, value in after.items() if key != "sha256"})
+                self.assertEqual(m.comparison_errors(before, after),
+                    [{"code": "measurement_comparison_mismatch", "fields": [field]}])
+        self.assertEqual(m.comparison_errors(before, before, subject="other"),
+            [{"code": "measurement_comparison_mismatch", "fields": ["subject"], "subject": "other"}])
+        self.assertEqual(m.comparison_errors(before, 1),
+                         [{"code": "invalid_measurement_type", "side": "after"}])
+        self.assertEqual(m.comparison_errors({}, before),
+                         [{"code": "invalid_measurement_digest", "side": "before"}])
+
+    def test_comparison_errors_do_not_add_improvement_or_qualitative_judgment_gates(self):
+        before = self.measurement(3)
+        for value in (0, 1, 3, 4):
+            with self.subTest(value=value):
+                self.assertEqual(m.comparison_errors(before, self.measurement(value)), [])
+        self.write(".unity/metrics/style.md", "# style\n## Prompt\nPrefer clearer proof explanations.\n")
+        metric = m.load_metric(self.root, "style")
+        identity = v.file_identity(self.root, self.scope)
+        before = self.measurement("unclear", metric=metric, identity=identity)
+        after = self.measurement("clearer", metric=metric, identity=identity)
+        self.assertEqual(m.measurement_errors(after, metric, identity), [])
+        self.assertEqual(m.comparison_errors(before, after), [])
+        with self.assertRaisesRegex(ValueError, "judgment"):
+            m.compare_measurements(before, after)
+        result = m.compare_measurements(before, after, judgment={"improved": False, "reason": "No better under the rubric"})
+        self.assertFalse(result["improved"])
+
     def test_changed_source_invalidates_measurement(self):
         row = self.measurement(3)
         self.write("Example.lean", "theorem first : True := by trivial\n")

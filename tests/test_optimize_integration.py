@@ -226,6 +226,126 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await self.controller.review()
         self.assertNotEqual(tasks.load(self.paths.forum)["phase"], "complete")
 
+    async def test_grouped_candidate_corrects_measurements_in_same_assignment_then_merges(self):
+        # A separate real repository keeps the existing single-chunk fixtures
+        # unchanged while exercising a group the size of the observed failure.
+        real_job = self.real_job
+        def git_only(root, command, **kwargs):
+            self.assertEqual(command[0], "git", "no model or native probes in the offline grouped regression")
+            return real_job(root, command, **kwargs)
+        self.real_job = git_only
+        self.root = self.root / "grouped-project"
+        self.root.mkdir()
+        self.git(self.root, "init", "--quiet")
+        self.git(self.root, "config", "user.name", "Fixture")
+        self.git(self.root, "config", "user.email", "fixture@localhost")
+        self.write(".gitignore", ".unity/\n.worktrees/\n.lake/\n.env\n")
+        source = "".join(f"theorem grouped_{index:02d} : True := by\n  have h : True := by trivial\n  exact h\n"
+                         for index in range(23))
+        self.write("Example.lean", source)
+        self.write("lean-toolchain", "leanprover/lean4:v4.34.1\n")
+        self.write("lakefile.toml", 'name = "Example"\n')
+        self.git(self.root, "add", ".")
+        self.git(self.root, "commit", "--quiet", "-m", "grouped fixture baseline")
+        self.write(".unity/metrics/length.md", self.metric["definition"])
+        self.head = self.git(self.root, "rev-parse", "HEAD")
+        self.paths = workflow.paths_for(self.root)
+        tasks.initialize(self.paths.forum, self.root, run_id="optimize-grouped-offline-fixture", base_sha=self.head,
+                         metric=self.metric, scope=self.scope,
+                         config={"primary": "Primary", "agents": ["Primary", "Peer"], "targets": "Universe", "lake_args": []})
+        tasks.set_baseline(self.paths.forum, verification.capture_baseline(self.root, metric=self.metric, scope=self.scope))
+        inventory = tasks.scan_sources(self.root, self.scope["files"])
+        tasks.install_inventory(self.paths.forum, inventory)
+        chunk_ids = sorted(inventory["chunks"])
+        self.assertEqual(len(chunk_ids), 23)
+        changed_chunk = next(cid for cid, row in inventory["chunks"].items() if row["name"] == "grouped_00")
+        workflow.phase(self.paths, "chunking")
+        forum.configure(self.paths.forum, self.root, "chunking", "Primary")
+        plan = forum.propose_chunk_plan("Primary", [{"chunk_ids": chunk_ids,
+            "reason": "These 23 declarations share Example.lean; group their overlapping file edit scope"}],
+            "Same-file grouped declaration fixture")
+        tasks.accept_plan(self.paths.forum, plan["proposal_id"])
+        for chunk_id in chunk_ids:
+            forum.record_measurement("Primary", chunk_id, 3, self.method,
+                                     {"reason": "Counted original fixture invocations"}, baseline=True)
+        tasks.seal_baseline(self.paths.forum)
+        with tasks.transaction(self.paths.forum) as state:
+            state["measurements"] = deepcopy(state["baseline"]["measurements"])
+        self.baseline = deepcopy(tasks.load(self.paths.forum)["baseline"])
+        tasks.begin_round(self.paths.forum, max_rounds=5)
+        self.controller = workflow.Controller(self.paths, self.roster, max_attempts=5)
+        task_id = next(iter(tasks.load(self.paths.forum)["tasks"]))
+        tree = workflow.task_worktree(self.paths, "Primary-grouped", task_id)
+        forum.configure(self.paths.forum, self.root, "optimizing", "Primary")
+        env = {"UNITY_OPTIMIZE_TASK_ID": task_id, "UNITY_OPTIMIZE_WORKTREE": str(tree),
+               "UNITY_OPTIMIZE_BASE_SHA": self.head, "UNITY_AGENT_NAME": "Primary"}
+        with patch.dict(os.environ, env):
+            strategy = forum.register_strategy("Primary", task_id, "Shorten one grouped proof",
+                                               "Optimize one declaration and retain the other 22")
+            assignment = forum.claim_strategy("Primary", strategy["strategy_id"])
+            self.write("Example.lean", source.replace("by\n  have h : True := by trivial\n  exact h", "by trivial", 1), tree)
+            self.git(tree, "add", "Example.lean")
+            self.git(tree, "commit", "--quiet", "-m", "shorter grouped fixture proof")
+            identity = verification.file_identity(tree, self.scope)
+            records = {cid: metrics.record_measurement(self.metric, subject=cid,
+                raw_value=1 if cid == changed_chunk else 3, source_identity=identity,
+                method=self.baseline["measurements"][cid]["method"],
+                evidence={"reason": "Counted final committed fixture proof", "changed": cid == changed_chunk})
+                for cid in chunk_ids}
+            wrong_method = {**self.method, "description": "Paraphrased candidate counting method"}
+            wrong_records = {cid: metrics.record_measurement(self.metric, subject=cid,
+                raw_value=1 if cid == changed_chunk else 3, source_identity=identity,
+                method=wrong_method, evidence={"reason": "Same raw count, wrong recorded method"})
+                for cid in chunk_ids}
+            invalid_reports = (
+                ({}, "missing_measurement"),
+                ({cid: 3 for cid in chunk_ids[:10]}, "invalid_measurement_type"),
+                ({cid: records[cid] for cid in chunk_ids[:6]}, "missing_measurement"),
+                (wrong_records, "measurement_comparison_mismatch"),
+            )
+            checkpoint = self.paths.forum / tasks.STATE_FILE
+            unchanged = checkpoint.read_bytes()
+            before = tasks.load(self.paths.forum)
+            build_count = len(self.build_calls)
+            for measurements, expected_code in invalid_reports:
+                with self.subTest(expected_code=expected_code, count=len(measurements)):
+                    with self.assertRaises(ValueError) as caught:
+                        forum.submit_candidate("Primary", assignment["assignment_id"], "Grouped candidate proposal", measurements)
+                    cause = caught.exception.__cause__
+                    self.assertIsInstance(cause, tasks.MeasurementValidationError)
+                    self.assertIn(expected_code, {issue["code"] for issue in cause.details["issues"]})
+                    self.assertEqual(checkpoint.read_bytes(), unchanged)
+                    self.assertEqual(tasks.load(self.paths.forum), before)
+                    self.assertEqual(before["assignments"][assignment["assignment_id"]]["status"], "running")
+                    self.assertEqual(len(self.build_calls), build_count)
+            for chunk_id in chunk_ids:
+                forum.measure_candidate("Primary", assignment["assignment_id"], chunk_id,
+                    1 if chunk_id == changed_chunk else 3, self.baseline["measurements"][chunk_id]["method"],
+                    {"reason": "Remeasured final committed fixture", "changed": chunk_id == changed_chunk})
+            corrected = tasks.load(self.paths.forum)
+            self.assertEqual(len(corrected["assignments"][assignment["assignment_id"]]["measurements"]), 23)
+            self.assertEqual(corrected["rounds"], before["rounds"])
+            self.assertEqual(corrected["baseline"], self.baseline)
+            candidate = forum.submit_candidate("Primary", assignment["assignment_id"],
+                                               "One shorter proof; other 22 measured unchanged")
+        await self.controller.check_submissions()
+        checked = tasks.load(self.paths.forum)["candidates"][candidate["candidate_id"]]
+        self.assertEqual(checked["status"], "checked", checked.get("verification"))
+        self.assertEqual(len(checked["verification"]["comparisons"]), 23)
+        self.assertEqual(sum(row["improved"] for row in checked["verification"]["comparisons"].values()), 1)
+        self.assertTrue(all(row["passed"] for row in checked["verification"]["builds"]))
+        selected = forum.select_candidate("Primary", candidate["candidate_id"], "All grouped measurements checked; one proof shorter")
+        selected = tasks.load(self.paths.forum)["candidates"][selected["candidate_id"]]
+        self.assertTrue(self.controller.integrate_selected(selected))
+        final = tasks.load(self.paths.forum)
+        self.assertEqual(final["candidates"][candidate["candidate_id"]]["status"], "merged")
+        self.assertEqual(final["tasks"][task_id]["status"], "complete")
+        self.assertNotEqual(final["main_sha"], self.head)
+        self.assertEqual(final["baseline"], self.baseline)
+        integrated = verification.file_identity(self.root, self.scope)
+        self.assertTrue(all(metrics.validate_measurement_binding(final["measurements"][cid], self.metric, integrated)
+                            for cid in chunk_ids))
+
 
 if __name__ == "__main__":
     unittest.main()

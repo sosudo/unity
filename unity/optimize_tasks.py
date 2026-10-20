@@ -30,6 +30,15 @@ class PlanValidationError(ValueError):
         self.details = details
 
 
+class MeasurementValidationError(ValueError):
+    """Correctable Optimize report errors; no workflow change was published."""
+
+    def __init__(self, issues: list[dict]):
+        super().__init__("Candidate report is not ready. Read the issue details before retrying.")
+        self.code = "candidate_measurement_validation"
+        self.details = {"issues": deepcopy(issues), "issue_count": len(issues)}
+
+
 def _plan_error(code: str, message: str, **collections):
     details = {"inventory_tool": "optimize_inventory", "sample_limit": 10}
     for key, values in collections.items():
@@ -702,26 +711,114 @@ def _owned(state: dict, author: str, assignment_id: str) -> dict:
     return row
 
 
+def _candidate_identities(state: dict, row: dict) -> tuple[dict, dict]:
+    from . import optimize_verification
+    if row["base_main_sha"] != state["main_sha"]:
+        raise MeasurementValidationError([{"code": "assignment_base_changed"}])
+    options = {"scope": state["scope"], "lake_args": state["config"].get("lake_args", [])}
+    current = optimize_verification.file_identity(Path(state["root"]), **options)
+    if current.get("main_sha") != state["main_sha"]:
+        raise MeasurementValidationError([{"code": "current_source_changed"}])
+    private = optimize_verification.file_identity(Path(row["worktree"]), **options)
+    return current, private
+
+
+def _candidate_measurement_issues(state: dict, chunk_id: str, measurement,
+                                  current_identity: dict, private_identity: dict) -> list[dict]:
+    from . import optimize_metrics
+    issues = optimize_metrics.measurement_errors(measurement, state["metric"], private_identity,
+                                                 subject=chunk_id)
+    baseline = state["baseline"]
+    original = baseline.get("measurements", {}).get(chunk_id)
+    original_identity = baseline.get("source_identity", baseline.get("identity"))
+    current = state["measurements"].get(chunk_id)
+    for label, previous, identity in (("baseline", original, original_identity),
+                                      ("current", current, current_identity)):
+        errors = optimize_metrics.measurement_errors(previous, state["metric"], identity, subject=chunk_id)
+        issues.extend({**error, "record": label} for error in errors)
+        if not errors:
+            issues.extend({**error, "compared_to": label} for error in
+                          optimize_metrics.comparison_errors(previous, measurement, subject=chunk_id))
+    return issues
+
+
+def _measurement_judgment_issues(chunk_id: str, before, after, judgment, *, required: bool) -> list[dict]:
+    qualitative = (isinstance(before, dict) and isinstance(after, dict)
+                   and (isinstance(before.get("raw_value"), str) or isinstance(after.get("raw_value"), str)))
+    if not qualitative or (judgment is None and not required):
+        return []
+    if (not isinstance(judgment, dict) or not isinstance(judgment.get("improved"), bool)
+            or not judgment.get("reason")):
+        return [{"code": "invalid_comparison_judgment", "subject": chunk_id}]
+    return []
+
+
+def record_candidate_measurement(forum_dir: Path, author: str, assignment_id: str, chunk_id: str,
+                                 raw_value, method: dict, evidence, *, evidence_kind="agent_judged",
+                                 units=None, comparison_judgment=None) -> dict:
+    """Check and store one report against current assignment and actual bytes."""
+    from . import optimize_metrics
+    with transaction(forum_dir) as state:
+        row = _owned(state, author, assignment_id)
+        if chunk_id not in state["tasks"][row["task_id"]]["chunk_ids"]:
+            raise MeasurementValidationError([{"code": "unassigned_measurement", "subject": chunk_id}])
+        current, private = _candidate_identities(state, row)
+        measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
+            raw_value=raw_value, source_identity=private, method=method, evidence=evidence,
+            evidence_kind=evidence_kind, units=units)
+        issues = _candidate_measurement_issues(state, chunk_id, measurement, current, private)
+        issues.extend(_measurement_judgment_issues(chunk_id, state["measurements"].get(chunk_id),
+            measurement, comparison_judgment, required=False))
+        if issues:
+            raise MeasurementValidationError(issues)
+        if _candidate_identities(state, row) != (current, private):
+            raise MeasurementValidationError([{"code": "source_changed_during_measurement"}])
+        row.setdefault("measurements", {})[chunk_id] = deepcopy(measurement)
+        if comparison_judgment is not None:
+            row.setdefault("judgments", {})[chunk_id] = deepcopy(comparison_judgment)
+    return measurement
+
+
 def submit_candidate(forum_dir: Path, author: str, assignment_id: str, notes: str,
                      measurements: dict | None = None, **git_evidence) -> dict:
+    from . import optimize_verification
     with transaction(forum_dir) as state:
         row = _owned(state, author, assignment_id)
         if not notes.strip(): raise ValueError("candidate needs explanation and correctness evidence")
         task = state["tasks"][row["task_id"]]
-        if not set(measurements or {}) <= set(task["chunk_ids"]):
-            raise ValueError("candidate measurements name unassigned chunks")
+        selected = row.get("measurements", {}) if measurements is None else measurements
+        judgments = git_evidence.get("judgments", row.get("judgments", {}))
+        allowed_evidence = {"commit_sha", "files", "diff_sha256", "artifact", "judgments"}
+        if not set(git_evidence) <= allowed_evidence: raise ValueError("unexpected Git evidence fields")
+        if not isinstance(selected, dict) or any(not isinstance(key, str) for key in selected):
+            raise MeasurementValidationError([{"code": "invalid_measurement_map"}])
+        if not isinstance(judgments, dict) or not set(judgments) <= set(task["chunk_ids"]):
+            raise MeasurementValidationError([{"code": "invalid_judgment_map"}])
+        issues = [{"code": "missing_measurement", "subject": cid}
+                  for cid in sorted(set(task["chunk_ids"]) - set(selected))]
+        issues.extend({"code": "unassigned_measurement", "subject": cid}
+                      for cid in sorted(set(selected) - set(task["chunk_ids"])))
+        current, private = _candidate_identities(state, row)
+        if optimize_verification._git(Path(row["worktree"]), "status", "--porcelain", "--untracked-files=all"):
+            issues.append({"code": "candidate_not_committed"})
+        for cid in sorted(set(selected) & set(task["chunk_ids"])):
+            issues.extend(_candidate_measurement_issues(state, cid, selected[cid], current, private))
+            issues.extend(_measurement_judgment_issues(cid, state["measurements"].get(cid), selected[cid],
+                judgments.get(cid), required=True))
+        if issues:
+            raise MeasurementValidationError(issues)
+        if (_candidate_identities(state, row) != (current, private)
+                or optimize_verification._git(Path(row["worktree"]), "status", "--porcelain", "--untracked-files=all")):
+            raise MeasurementValidationError([{"code": "source_changed_during_submission"}])
         cid = "candidate-" + str(len(state["candidates"]) + 1)
         candidate = {"candidate_id": cid, "author": author, "assignment_id": assignment_id,
                      "strategy_id": row["strategy_id"], "task_id": row["task_id"], "status": "submitted",
                      "base_main_sha": row["base_main_sha"], "task_revision": row["task_revision"],
                      "config_revision": row["config_revision"], "worktree": row["worktree"],
-                     "notes": notes, "measurements": deepcopy(measurements or {}), "at": now(),
+                     "notes": notes, "measurements": deepcopy(selected), "at": now(),
                      "endorsements": [], "objections": []}
-        allowed_evidence = {"commit_sha", "files", "diff_sha256", "artifact", "judgments"}
-        if not set(git_evidence) <= allowed_evidence: raise ValueError("unexpected Git evidence fields")
-        if not set(git_evidence.get("judgments", {})) <= set(task["chunk_ids"]):
-            raise ValueError("candidate judgments name unassigned chunks")
         candidate.update(deepcopy(git_evidence))
+        candidate["judgments"] = deepcopy(judgments)
         state["candidates"][cid] = candidate
         row.update(status="submitted", candidate_id=cid)
         state["strategies"][row["strategy_id"]]["status"] = "submitted"
