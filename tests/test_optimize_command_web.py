@@ -142,13 +142,15 @@ class PromptContracts(unittest.TestCase):
             with self.subTest(term=term):
                 self.assertIn(term, prompt)
 
-    def test_optimizing_prompt_keeps_primary_selection_and_measurement_refresh_phase_scoped(self):
+    def test_optimizing_prompt_keeps_primary_selection_and_verifier_scoring_read_only(self):
         prompt = (Path(workflow.__file__).parent / "prompts/optimize/OPTIMIZING.md").read_text()
         self.assertIn("For a real bound optimization task", prompt)
-        self.assertIn("primary candidate selection and measurement-refresh turns", prompt)
-        self.assertIn("phase turns without a bound task", prompt)
+        self.assertIn("primary candidate selection and verifier scoring turns", prompt)
+        self.assertIn("read-only turns without a bound task", prompt)
         self.assertIn("Neither turn registers a strategy or submits a candidate", prompt)
         self.assertIn("without replacing the original baseline", prompt)
+        self.assertIn("submit_score_report", prompt)
+        self.assertIn("workers do not need to create measurement records before submission", prompt)
 
     def test_owned_runtime_does_not_import_bump_workflow_or_prove(self):
         import ast

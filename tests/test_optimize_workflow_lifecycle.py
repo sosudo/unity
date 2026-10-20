@@ -64,6 +64,15 @@ class OptimizeWorkflowLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.phases.append((profile, task_id))
         forum.configure(self.paths.forum, self.root, profile, author=agent.name)
         state = tasks.load(self.paths.forum)
+        request_id = os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID")
+        if request_id:
+            request = state["scoring_requests"][request_id]
+            for cid in request["subjects"]:
+                text = (tree / state["chunks"][cid]["path"]).read_text()
+                value = 3 if "have h : True := by trivial" in text else 1
+                forum.submit_score_report(agent.name, request_id, cid, value,
+                    request["original_methods"].get(cid) or self.method, {"fixture": "known proof value"})
+            return
         if profile in {"architect", "exploration"}:
             forum.publish_finding(agent.name, "", "Offline setup/measurement-method finding", self.method["description"])
             forum.report_phase_result(agent.name, "skipped" if profile == "architect" else "complete",
@@ -74,10 +83,7 @@ class OptimizeWorkflowLifecycleTests(unittest.IsolatedAsyncioTestCase):
             chunks = [row["chunk_id"] for row in forum.optimize_inventory()["chunks"]]
             forum.propose_chunk_plan(agent.name, [{"chunk_ids": [cid]} for cid in chunks],
                                      "Each declaration gets a task, including compiling declarations")
-            for cid in chunks:
-                forum.record_measurement(agent.name, cid, 3, self.method,
-                                         {"count": "have; trivial; exact"}, baseline=True)
-            forum.report_phase_result(agent.name, "complete", "Plan and original measurements submitted",
+            forum.report_phase_result(agent.name, "complete", "Declaration plan submitted",
                                       {"chunk_ids": chunks})
         elif profile == "critic":
             snapshot = state["review"]["snapshot"]
@@ -88,10 +94,6 @@ class OptimizeWorkflowLifecycleTests(unittest.IsolatedAsyncioTestCase):
             for candidate in state["candidates"].values():
                 if candidate["status"] == "checked":
                     forum.select_candidate(agent.name, candidate["candidate_id"], "Strictly shorter checked proof")
-        elif instruction.startswith("Measurement refresh"):
-            for cid in state["baseline"]["measurements"]:
-                forum.record_current_measurement(agent.name, cid, 1, self.method,
-                                                 {"count": "trivial"})
         elif profile == "optimizing":
             strategy = tasks.register_strategy(self.paths.forum, agent.name, task_id, "Shorten proof",
                 "Use trivial directly; fixture attempt " + str(len(state["assignments"])))
@@ -107,12 +109,8 @@ class OptimizeWorkflowLifecycleTests(unittest.IsolatedAsyncioTestCase):
             workflow.git(tree, "add", "A.lean")
             workflow.git(tree, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                          "commit", "-m", "Fixture shorter proof")
-            identity = workflow.verification.file_identity(tree, scope=state["scope"], lake_args=[])
-            measured = {cid: workflow.metrics.record_measurement(self.definition, subject=cid, raw_value=1,
-                source_identity=identity, method=self.method, evidence={"count": "trivial"})
-                for cid in state["tasks"][task_id]["chunk_ids"]}
             tasks.submit_candidate(self.paths.forum, agent.name, assignment["assignment_id"],
-                                   "Same theorem; remove intermediate have/exact", measured)
+                                   "Same theorem; remove intermediate have/exact")
         else:
             self.fail("Unexpected fake provider profile " + profile)
 
@@ -125,7 +123,7 @@ class OptimizeWorkflowLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(task_id, self.controller.state()["tasks"])
             self.assertIn("Work on task " + task_id, instruction)
         else:
-            self.assertTrue(env["UNITY_OPTIMIZE_PHASE_DISPATCH_ID"])
+            self.assertTrue(env["UNITY_OPTIMIZE_PHASE_DISPATCH_ID"] or env["UNITY_OPTIMIZE_SCORE_REQUEST_ID"])
             self.assertNotIn("Work on task " + profile, instruction)
         self.assertIsNone(kwargs.get("on_normal_completion"), "no unbounded corrective turn loop")
         with patch.dict(os.environ, env):
@@ -165,6 +163,55 @@ class OptimizeWorkflowLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await workflow.stop_worker(task, interrupt, grace=0.1, hard=0.1)
         self.assertTrue(closed.is_set())
         self.assertTrue(task.done())
+
+    def scoring_request(self):
+        state = self.controller.state()
+        return {"source_identity": state["baseline"]["identity"],
+            "subjects": list(state["baseline"]["measurements"]),
+            "original_methods": {cid: row["method"] for cid, row in state["baseline"]["measurements"].items()},
+            "metric": state["metric"], "build_result": state["baseline"]["build"]}
+
+    async def test_stop_during_verifier_scoring_closes_turn_without_using_round(self):
+        with self.fake_runtime():
+            await self.controller.prepare()
+        baseline = deepcopy(self.controller.state()["baseline"])
+        entered, closed = asyncio.Event(), asyncio.Event()
+        async def scoring_turn(*args, **kwargs):
+            self.assertTrue(kwargs["env_overrides"]["UNITY_OPTIMIZE_SCORE_REQUEST_ID"])
+            entered.set()
+            await kwargs["interrupt_event"].wait()
+            closed.set()
+        with patch.object(workflow, "spawn", side_effect=scoring_turn):
+            pending = self.start(self.controller.judge_snapshot(self.scoring_request()))
+            await entered.wait()
+            (self.paths.unity / "stop-requested").write_text("offline scoring cancellation\n")
+            with self.assertRaises(workflow.jobs.JobCancelled):
+                await asyncio.wait_for(pending, 5)
+        state = self.controller.state()
+        self.assertTrue(closed.is_set())
+        self.assertEqual(list(state["scoring_requests"].values())[-1]["status"], "interrupted")
+        self.assertEqual(state["rounds"]["started"], 0)
+        self.assertEqual(state["baseline"], baseline)
+        self.assertEqual(state["candidates"], {})
+
+    async def test_verifier_scoring_requires_reports_and_preserves_source(self):
+        with self.fake_runtime():
+            await self.controller.prepare()
+        baseline = deepcopy(self.controller.state()["baseline"])
+        async def missing(*args, **kwargs):
+            return "All scores are good"
+        with patch.object(workflow, "spawn", side_effect=missing):
+            with self.assertRaisesRegex(ValueError, "without all requested"):
+                await self.controller.judge_snapshot(self.scoring_request())
+        async def edits_source(agent, system, instruction, tree, servers, **kwargs):
+            (tree / "A.lean").write_text("theorem a : True := by trivial\n")
+        with patch.object(workflow, "spawn", side_effect=edits_source):
+            with self.assertRaisesRegex(ValueError, "read-only source"):
+                await self.controller.judge_snapshot(self.scoring_request())
+        state = self.controller.state()
+        self.assertEqual([row["status"] for row in state["scoring_requests"].values()][-2:], ["blocked", "blocked"])
+        self.assertEqual(state["baseline"], baseline)
+        self.assertEqual(state["rounds"]["started"], 0)
 
     async def test_cancel_cleanup_failure_keeps_exact_exception(self):
         fatal = SpawnCleanupError("fixture cleanup failure")
@@ -359,7 +406,10 @@ class OptimizeSelectionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         ], "Independent declaration fixtures")
         tasks.accept_plan(self.paths.forum, plan["proposal_id"])
         for cid in self.chunks.values():
-            forum.record_measurement("Primary", cid, 3, self.method, {"count": "have; trivial; exact"}, baseline=True)
+            tasks.record_baseline_measurement(self.paths.forum, "Primary", cid,
+                workflow.metrics.record_measurement(self.metric, subject=cid, raw_value=3,
+                    source_identity=tasks.load(self.paths.forum)["baseline"]["identity"],
+                    method=self.method, evidence={"fixture": "known original proof"}))
         tasks.seal_baseline(self.paths.forum)
         with tasks.transaction(self.paths.forum) as state:
             state["measurements"] = deepcopy(state["baseline"]["measurements"])
@@ -403,8 +453,6 @@ class OptimizeSelectionSchedulingTests(unittest.IsolatedAsyncioTestCase):
             (tree / name).write_text(f"theorem {Path(name).stem.lower()} : True := by trivial\n")
             self.git(tree, "add", name)
             self.git(tree, "commit", "-qm", "shorter offline fixture proof")
-            forum.measure_candidate(author, assignment["assignment_id"], self.chunks[task_id], 1,
-                                    self.method, {"count": "trivial"})
             return forum.submit_candidate(author, assignment["assignment_id"],
                                           "Same theorem, direct proof with fewer tactics")
 
@@ -422,6 +470,17 @@ class OptimizeSelectionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         env = kwargs["env_overrides"]
         self.assertEqual(env["UNITY_OPTIMIZE_PROFILE"], "optimizing")
         task_id = env["UNITY_OPTIMIZE_TASK_ID"]
+        if env["UNITY_OPTIMIZE_SCORE_REQUEST_ID"]:
+            with patch.dict(os.environ, env):
+                forum.configure(self.paths.forum, self.root, "optimizing", agent.name)
+                request = self.controller.state()["scoring_requests"][env["UNITY_OPTIMIZE_SCORE_REQUEST_ID"]]
+                state = self.controller.state()
+                for cid in request["subjects"]:
+                    text = (tree / state["chunks"][cid]["path"]).read_text()
+                    value = 3 if "have h : True := by trivial" in text else 1
+                    forum.submit_score_report(agent.name, request["request_id"], cid, value,
+                        request["original_methods"].get(cid) or self.method, {"fixture": "known proof value"})
+            return
         if not task_id:
             self.assertEqual(agent.name, "Primary")
             self.assertTrue(env["UNITY_OPTIMIZE_PHASE_DISPATCH_ID"])
@@ -453,6 +512,35 @@ class OptimizeSelectionSchedulingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["config"]["max_rounds"], 2)
         self.assertFalse(self.controller.workers)
         return state
+
+    async def test_second_task_after_merge_scores_current_source_without_refresh(self):
+        async def select_and_merge(cid):
+            forum.configure(self.paths.forum, self.root, "optimizing", "Primary")
+            forum.select_candidate("Primary", cid, "Checked fixture improvement")
+            self.assertTrue(await self.controller.integrate_selected(self.controller.state()["candidates"][cid]))
+
+        first = await self.seed_checked("task-a")
+        await select_and_merge(first)
+        first_main = self.controller.state()["main_sha"]
+        old_b = self.controller.state()["measurements"][self.chunks["task-b"]]
+        self.assertNotEqual(old_b["source_sha256"],
+            workflow.verification.file_identity(self.root, scope=self.scope)["sha256"])
+
+        # No worker measurement or global refresh is required before B submits.
+        second = await self.seed_checked("task-b", "Peer")
+        checked = self.controller.state()["candidates"][second]
+        self.assertEqual(checked["verification"]["comparison"]["identity"]["main_sha"], first_main)
+        comparison = checked["verification"]["comparisons"][self.chunks["task-b"]]
+        self.assertTrue(comparison["improved"])
+        await select_and_merge(second)
+        state = self.controller.state()
+        self.assertEqual(state["candidates"][first]["status"], "merged")
+        self.assertEqual(state["candidates"][second]["status"], "merged")
+        self.assertEqual(state["baseline"], self.baseline)
+        self.assertEqual(state["rounds"]["started"], 1)
+        self.assertEqual(state["rounds"]["completed"], 0)
+        self.assertEqual(state.get("phase_dispatches", {}), {})
+        self.assertFalse(self.controller.workers)
 
     async def test_idle_primary_selects_and_integrates_before_next_writer(self):
         candidate_id = await self.seed_checked()

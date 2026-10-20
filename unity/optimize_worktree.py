@@ -64,17 +64,8 @@ def agent_worktree(project_path: Path, name: str) -> Path:
 
 
 def create_worktree(name: str, project_path: Path) -> Path:
-    path = agent_worktree(project_path, name)
-    branch = agent_branch(name)
-    if path.exists() or path.is_symlink() or _shared._git(
-        project_path, "show-ref", "--verify", "--quiet", "refs/heads/" + branch,
-    ).returncode == 0:
-        raise ValueError("existing Optimize work must be recovered, not overwritten")
-    _shared.ensure_git_excludes(project_path, (".worktrees", ".unity/"))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    _shared._git(project_path, "worktree", "add", "-b", branch, str(path), check=True)
-    link_runtime_state(path, project_path)
-    return path
+    return _shared.create_worktree(_name(name), project_path, preserve_existing=True,
+                                  runtime_linker=link_runtime_state)
 
 
 def verify_candidate_commit(project_path, name, commit_sha, *, allow_unchanged=False):

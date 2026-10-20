@@ -280,6 +280,128 @@ def seal_baseline(forum_dir: Path) -> dict:
     return baseline
 
 
+def install_verified_baseline_measurements(forum_dir: Path, records: dict) -> dict:
+    """Controller publication after snapshot scoring; never rewrite a sealed baseline."""
+    from . import optimize_metrics
+    with transaction(forum_dir) as state:
+        if state["baseline_sealed"] or not state["baseline"]:
+            raise ValueError("verified baseline records require an unsealed captured baseline")
+        selected = {cid for task in state["tasks"].values() for cid in task["chunk_ids"]}
+        if not isinstance(records, dict) or set(records) != selected or not selected:
+            raise ValueError("verified baseline records must cover every selected subject")
+        identity = state["baseline"].get("source_identity", state["baseline"].get("identity"))
+        for cid, record in records.items():
+            if (not isinstance(record, dict) or record.get("subject") != cid
+                    or not optimize_metrics.validate_measurement_binding(record, state["metric"], identity)):
+                raise ValueError("verified baseline record has an invalid source/metric binding")
+            previous = state["baseline_measurements"].get(cid)
+            if previous and previous.get("method_sha256") != record.get("method_sha256"):
+                raise ValueError("verified baseline cannot silently change the original measurement method")
+        for cid, record in records.items():
+            previous = state["baseline_measurements"].get(cid)
+            if previous and previous != record:
+                state.setdefault("baseline_measurement_history", {}).setdefault(cid, []).append(
+                    {"author": "retained", "at": now(), "measurement": deepcopy(previous)})
+            state["baseline_measurements"][cid] = deepcopy(record)
+        _event(state, "verified_baseline_measurements", "controller", subjects=sorted(selected))
+    return deepcopy(records)
+
+
+def begin_scoring_request(forum_dir: Path, *, author: str, worktree: Path,
+                          source_identity: dict, subjects: list[str], original_methods: dict,
+                          metric_sha256: str | None = None, build_ref=None,
+                          comparison_records: dict | None = None) -> dict:
+    """Bind a read-only assessment inside verification, not a new workflow phase."""
+    from . import optimize_metrics, optimize_verification
+    root = Path(worktree).resolve()
+    with transaction(forum_dir) as state:
+        _agent(state, author)
+        if root == Path(state["root"]).resolve() or not root.is_dir():
+            raise ValueError("snapshot scoring requires an existing private source view")
+        if (not subjects or len(subjects) != len(set(subjects))
+                or any(subject not in state["chunks"] for subject in subjects)):
+            raise ValueError("snapshot scoring needs distinct known subjects")
+        if not isinstance(original_methods, dict) or not set(original_methods) <= set(subjects):
+            raise ValueError("snapshot scoring methods must name requested subjects")
+        if metric_sha256 is not None and metric_sha256 != state["metric"]["sha256"]:
+            raise ValueError("snapshot scoring metric differs from the frozen metric")
+        if (not optimize_metrics._valid(source_identity)
+                or optimize_verification.file_identity(root, scope=state["scope"],
+                    lake_args=state["config"].get("lake_args", [])) != source_identity):
+            raise ValueError("snapshot scoring source identity changed")
+        requests = state.setdefault("scoring_requests", {})
+        if any(row["status"] == "running" and row["author"] == author for row in requests.values()):
+            raise ValueError("agent already has a running scoring request")
+        request_id = "score-request-" + str(len(requests) + 1)
+        row = {"request_id": request_id, "author": author, "root": str(root),
+               "source_identity": deepcopy(source_identity), "subjects": list(subjects),
+               "original_methods": deepcopy(original_methods), "metric_sha256": state["metric"]["sha256"],
+               "config_revision": state["config"]["revision"], "build_ref": deepcopy(build_ref),
+               "comparison_records": deepcopy(comparison_records or {}),
+               "reports": {}, "status": "running", "started_at": now()}
+        requests[request_id] = row
+        _event(state, "scoring_requested", "controller", request_id=request_id, author_requested=author)
+    return deepcopy(row)
+
+
+def record_score_report(forum_dir: Path, author: str, request_id: str, subject: str,
+                        raw_value, method: dict, evidence, *, units=None,
+                        comparison_judgment=None) -> dict:
+    """Retain raw assessment only; the verifier owns sealing and publication."""
+    from . import optimize_metrics, optimize_verification
+    with transaction(forum_dir) as state:
+        _agent(state, author)
+        request = state.get("scoring_requests", {}).get(request_id)
+        if not request or request["status"] != "running" or request["author"] != author:
+            raise ValueError("no live scoring request owned by this worker")
+        if (request["metric_sha256"] != state["metric"]["sha256"]
+                or request["config_revision"] != state["config"]["revision"]):
+            raise ValueError("scoring request configuration changed")
+        if subject not in request["subjects"]:
+            raise ValueError("subject is outside this scoring request")
+        root = Path(request["root"])
+        options = {"scope": state["scope"], "lake_args": state["config"].get("lake_args", [])}
+        if optimize_verification.file_identity(root, **options) != request["source_identity"]:
+            raise ValueError("scoring request source changed")
+        expected = request["original_methods"].get(subject)
+        if expected is not None and method != expected:
+            raise ValueError("score report differs from the original measurement method")
+        # Validate shape and units without treating a numeric report as a tool measurement.
+        optimize_metrics.record_measurement(state["metric"], subject=subject, raw_value=raw_value,
+            source_identity=request["source_identity"], method=method, evidence=evidence,
+            evidence_kind="agent_judged", units=units)
+        if comparison_judgment is not None and (
+                not isinstance(comparison_judgment, dict)
+                or not isinstance(comparison_judgment.get("improved"), bool)
+                or not comparison_judgment.get("reason")
+                or ("regressed" in comparison_judgment and not isinstance(comparison_judgment["regressed"], bool))):
+            raise ValueError("score comparison needs explicit judgment and evidence")
+        if optimize_verification.file_identity(root, **options) != request["source_identity"]:
+            raise ValueError("scoring request source changed during reporting")
+        report = {"subject": subject, "raw_value": raw_value, "method": deepcopy(method),
+                  "evidence": deepcopy(evidence), "evidence_kind": "agent_judged", "units": units}
+        if comparison_judgment is not None:
+            report["comparison_judgment"] = deepcopy(comparison_judgment)
+        request["reports"][subject] = report
+        _event(state, "score_reported", author, request_id=request_id, subject=subject)
+    return deepcopy(report)
+
+
+def close_scoring_request(forum_dir: Path, request_id: str, status: str, reason: str = "") -> dict:
+    if status not in {"complete", "blocked", "interrupted"}:
+        raise ValueError("unknown scoring request outcome")
+    with transaction(forum_dir) as state:
+        row = state["scoring_requests"][request_id]
+        if row["status"] != "running":
+            raise ValueError("scoring request is already closed")
+        if status == "complete" and set(row["reports"]) != set(row["subjects"]):
+            raise ValueError("scoring request is missing subject reports")
+        row.update(status=status, reason=reason, finished_at=now())
+        _event(state, "scoring_closed", "controller", request_id=request_id, status=status)
+        result = deepcopy(row)
+    return result
+
+
 def mask_source(source: str) -> str:
     """Blank nested comments and strings without moving declaration offsets."""
     chars = list(source)
@@ -756,7 +878,7 @@ def _measurement_judgment_issues(chunk_id: str, before, after, judgment, *, requ
 def record_candidate_measurement(forum_dir: Path, author: str, assignment_id: str, chunk_id: str,
                                  raw_value, method: dict, evidence, *, evidence_kind="agent_judged",
                                  units=None, comparison_judgment=None) -> dict:
-    """Check and store one report against current assignment and actual bytes."""
+    """Retain an optional worker claim; only verification establishes a score."""
     from . import optimize_metrics
     with transaction(forum_dir) as state:
         row = _owned(state, author, assignment_id)
@@ -766,16 +888,11 @@ def record_candidate_measurement(forum_dir: Path, author: str, assignment_id: st
         measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
             raw_value=raw_value, source_identity=private, method=method, evidence=evidence,
             evidence_kind=evidence_kind, units=units)
-        issues = _candidate_measurement_issues(state, chunk_id, measurement, current, private)
-        issues.extend(_measurement_judgment_issues(chunk_id, state["measurements"].get(chunk_id),
-            measurement, comparison_judgment, required=False))
-        if issues:
-            raise MeasurementValidationError(issues)
         if _candidate_identities(state, row) != (current, private):
             raise MeasurementValidationError([{"code": "source_changed_during_measurement"}])
-        row.setdefault("measurements", {})[chunk_id] = deepcopy(measurement)
+        row.setdefault("advisory_measurements", {})[chunk_id] = deepcopy(measurement)
         if comparison_judgment is not None:
-            row.setdefault("judgments", {})[chunk_id] = deepcopy(comparison_judgment)
+            row.setdefault("advisory_judgments", {})[chunk_id] = deepcopy(comparison_judgment)
     return measurement
 
 
@@ -786,25 +903,18 @@ def submit_candidate(forum_dir: Path, author: str, assignment_id: str, notes: st
         row = _owned(state, author, assignment_id)
         if not notes.strip(): raise ValueError("candidate needs explanation and correctness evidence")
         task = state["tasks"][row["task_id"]]
-        selected = row.get("measurements", {}) if measurements is None else measurements
-        judgments = git_evidence.get("judgments", row.get("judgments", {}))
+        selected = row.get("advisory_measurements", row.get("measurements", {})) if measurements is None else measurements
+        judgments = git_evidence.get("judgments", row.get("advisory_judgments", row.get("judgments", {})))
         allowed_evidence = {"commit_sha", "files", "diff_sha256", "artifact", "judgments"}
         if not set(git_evidence) <= allowed_evidence: raise ValueError("unexpected Git evidence fields")
         if not isinstance(selected, dict) or any(not isinstance(key, str) for key in selected):
             raise MeasurementValidationError([{"code": "invalid_measurement_map"}])
         if not isinstance(judgments, dict) or not set(judgments) <= set(task["chunk_ids"]):
             raise MeasurementValidationError([{"code": "invalid_judgment_map"}])
-        issues = [{"code": "missing_measurement", "subject": cid}
-                  for cid in sorted(set(task["chunk_ids"]) - set(selected))]
-        issues.extend({"code": "unassigned_measurement", "subject": cid}
-                      for cid in sorted(set(selected) - set(task["chunk_ids"])))
+        issues = []
         current, private = _candidate_identities(state, row)
         if optimize_verification._git(Path(row["worktree"]), "status", "--porcelain", "--untracked-files=all"):
             issues.append({"code": "candidate_not_committed"})
-        for cid in sorted(set(selected) & set(task["chunk_ids"])):
-            issues.extend(_candidate_measurement_issues(state, cid, selected[cid], current, private))
-            issues.extend(_measurement_judgment_issues(cid, state["measurements"].get(cid), selected[cid],
-                judgments.get(cid), required=True))
         if issues:
             raise MeasurementValidationError(issues)
         if (_candidate_identities(state, row) != (current, private)
@@ -815,10 +925,11 @@ def submit_candidate(forum_dir: Path, author: str, assignment_id: str, notes: st
                      "strategy_id": row["strategy_id"], "task_id": row["task_id"], "status": "submitted",
                      "base_main_sha": row["base_main_sha"], "task_revision": row["task_revision"],
                      "config_revision": row["config_revision"], "worktree": row["worktree"],
-                     "notes": notes, "measurements": deepcopy(selected), "at": now(),
+                     "notes": notes, "measurements": {}, "advisory_measurements": deepcopy(selected), "at": now(),
                      "endorsements": [], "objections": []}
         candidate.update(deepcopy(git_evidence))
-        candidate["judgments"] = deepcopy(judgments)
+        candidate.pop("judgments", None)
+        candidate["advisory_judgments"] = deepcopy(judgments)
         state["candidates"][cid] = candidate
         row.update(status="submitted", candidate_id=cid)
         state["strategies"][row["strategy_id"]]["status"] = "submitted"

@@ -143,8 +143,10 @@ class OptimizeForumInterfaceTests(unittest.IsolatedAsyncioTestCase):
                 for cid, row in state["chunks"].items() if row["path"] != "A.lean"})
         tasks.accept_plan(self.directory, proposal["proposal_id"])
         self.method = {"description": "Explicit tactic invocation count", "direction": "lower"}
-        for chunk_id in self.required:
-            forum.record_measurement("Alice", chunk_id, 1, self.method, {"count": "trivial"}, baseline=True)
+        records = {chunk_id: metrics.record_measurement(self.metric, subject=chunk_id, raw_value=1,
+            source_identity=identity, method=self.method, evidence={"count": "trivial"})
+            for chunk_id in self.required}
+        tasks.install_verified_baseline_measurements(self.directory, records)
         tasks.close_phase_dispatch(self.directory, self.dispatch["dispatch_id"], "complete")
         tasks.seal_baseline(self.directory)
         with tasks.transaction(self.directory) as current:
@@ -450,50 +452,68 @@ class OptimizeForumInterfaceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(after["candidates"]), len(before["candidates"]) + 1)
         candidate = after["candidates"][response["candidate_id"]]
         self.assertEqual(candidate["status"], "submitted")
-        self.assertEqual(candidate["measurements"], measurements)
+        self.assertEqual(candidate["advisory_measurements"], measurements)
+        self.assertEqual(candidate["measurements"], {})
         self.assertEqual(self.artifact_value(response["records"]["candidate"]), candidate)
         for key in ("rounds", "review", "baseline", "measurements", "config", "main_sha"):
             self.assertEqual(after[key], before[key])
 
-    async def test_grouped_task_measurement_errors_are_bounded_actionable_and_recoverable(self):
+    async def test_scoring_tools_keep_exact_evidence_paged_and_cannot_publish_scores(self):
+        self.measurement_fixture()
+        before = tasks.load(self.directory)
+        identity = verification.file_identity(self.tree, scope=before["scope"])
+        request = tasks.begin_scoring_request(self.directory, author="Alice", worktree=self.tree,
+            source_identity=identity, subjects=self.required,
+            original_methods={cid: self.method for cid in self.required})
+        evidence = {"exact_details": "Raw score evidence 雪 😀\n" * 10000}
+        with patch.dict(os.environ, {"UNITY_OPTIMIZE_SCORE_REQUEST_ID": request["request_id"],
+                                    "UNITY_OPTIMIZE_TASK_ID": ""}):
+            brief = await self.assert_bounded_native(await self.native_raw("scoring_request", {}))
+            self.assertEqual(self.artifact_value(brief["records"]["request"]), request)
+            raw = await self.native_raw("submit_score_report", {"author": "Alice",
+                "request_id": request["request_id"], "subject": self.required[0], "raw_value": 0,
+                "method": self.method, "evidence": evidence})
+            response = await self.assert_bounded_native(raw)
+            self.assertEqual(response["evidence_kind"], "agent_judged")
+            self.assertTrue(response["verification_required"])
+            stored = self.artifact_value(response["records"]["request"])
+            self.assertEqual(stored["reports"][self.required[0]]["evidence"], evidence)
+            self.assertNotIn("sha256", stored["reports"][self.required[0]])
+            async with Client(forum.build_server("optimizing")) as client:
+                names = {tool.name for tool in await client.list_tools()}
+            self.assertNotIn("submit_candidate", names)
+            self.assertNotIn("record_current_measurement", names)
+        after = tasks.load(self.directory)
+        for key in ("baseline", "baseline_measurements", "measurements", "candidates", "rounds", "review"):
+            self.assertEqual(after[key], before[key])
+
+    async def test_malformed_submission_errors_are_bounded_without_score_prerequisites(self):
         assignment = self.measurement_fixture()
         arguments = {"author": "Alice", "assignment_id": assignment["assignment_id"],
                      "notes": "PRIVATE-RAW-DIAGNOSTIC-MUST-NOT-BE-COPIED"}
-        for measurements in ({}, {cid: 0 for cid in self.required}):
+        for measurements in ([], 3):
             before = (self.directory / tasks.STATE_FILE).read_bytes()
             async with Client(forum.build_server("optimizing")) as client:
                 raw = await client.call_tool_mcp("submit_candidate", {**arguments, "measurements": measurements})
             self.assertTrue(raw.isError)
             text = "\n".join(block.text for block in raw.content)
-            self.assertIn("candidate_measurement_validation", text)
-            self.assertIn("same assignment", text)
-            self.assertIn("artifact-", text)
+            self.assertIn("valid dictionary", text)
             self.assertNotIn("PRIVATE-RAW-DIAGNOSTIC", text)
             self.assertLess(len(text.encode()), 12000)
             message = self.claude_tool_message(raw)
             following = {"type": "result", "result": "Author can correct the evidence"}
             self.assertEqual(await self.sdk_messages([message, following]), [message, following])
             self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
-            with self.assertRaisesRegex(ToolError, "same assignment"):
+            with self.assertRaisesRegex(ToolError, "valid dictionary"):
                 with redirect_stdout(io.StringIO()):
                     await bridge.call_tool("forum", "submit_candidate", {**arguments, "measurements": measurements}, cwd=self.tree)
             self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
-        before = (self.directory / tasks.STATE_FILE).read_bytes()
-        with self.assertRaisesRegex(ToolError, "candidate_measurement_validation"):
-            await self.native("measure_candidate", self.measurement_args(self.required[0],
-                method={"description": "PRIVATE-RAW-DIAGNOSTIC new wording", "direction": "lower"}))
-        self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
-        await self.native("measure_candidate", self.measurement_args(self.required[0]))
-        before = (self.directory / tasks.STATE_FILE).read_bytes()
-        with self.assertRaisesRegex(ToolError, "same assignment"):
-            await self.native("submit_candidate", arguments)
-        self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
-        await self.native("measure_candidate", self.measurement_args(self.required[1]))
         result = await self.native("submit_candidate", arguments)
         state = tasks.load(self.directory)
         self.assertEqual(result["status"], "submitted")
         self.assertEqual(len(state["candidates"]), 1)
-        self.assertEqual(set(state["candidates"][result["candidate_id"]]["measurements"]), set(self.required))
+        self.assertEqual(state["candidates"][result["candidate_id"]]["measurements"], {})
+        self.assertEqual(state["candidates"][result["candidate_id"]]["advisory_measurements"], {})
         for record in artifacts.list_artifacts(self.root / ".unity/artifacts"):
             if record["kind"] == "optimize_measurement_validation":
                 text = artifacts.artifact_bytes(self.root / ".unity/artifacts", record["artifact_id"]).decode()
@@ -506,7 +526,7 @@ class OptimizeForumInterfaceTests(unittest.IsolatedAsyncioTestCase):
         native = await self.assert_bounded_native(await self.native_raw("optimize_task", {"task_id": self.task_id}))
         contract = self.response_index(native)["measurement_contract"]
         self.assertEqual(contract["required_chunk_ids"], self.required)
-        self.assertIn("Follow error-specific guidance", contract["instructions"])
+        self.assertIn("not submission prerequisites", contract["instructions"])
         self.assertIn("preserve private work", contract["instructions"])
         self.assertIn("end the turn for normal controller handling", contract["instructions"])
         self.assertIn("do not reset, rebind, update source or claim no_improvement", contract["instructions"])
@@ -569,7 +589,7 @@ class OptimizeForumInterfaceTests(unittest.IsolatedAsyncioTestCase):
                     self.assertNotIn("same assignment", text)
                 else:
                     self.assertIn("tree is stable", payload["next_action"])
-                    self.assertIn("measure every required chunk again", payload["next_action"])
+                    self.assertIn("retry submission", payload["next_action"])
                     self.assertIn("same assignment", payload["next_action"])
                 self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
                 self.assertEqual((self.tree / "A.lean").read_bytes(), source_before)

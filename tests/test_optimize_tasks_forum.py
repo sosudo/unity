@@ -152,63 +152,38 @@ class OptimizeStateForumTests(unittest.TestCase):
             self.assertIn(expected, {issue["code"] for issue in caught.exception.details["issues"]})
         return caught.exception.details
 
-    def test_grouped_reports_require_all_records_and_allow_same_assignment_correction(self):
+    def test_grouped_candidate_submission_needs_no_worker_scores(self):
         assignment = self.grouped_assignment()
-        details = self.assert_report_rejected_without_change(assignment, expected="missing_measurement")
-        self.assertEqual(details["issue_count"], 23)
-        for cid in self.chunks[:10]:
-            tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
-                cid, 3, self.method, {"tactics": 3})
-        details = self.assert_report_rejected_without_change(assignment, expected="missing_measurement")
-        self.assertEqual(details["issue_count"], 13)
-        for cid in self.chunks[10:]:
-            tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
-                cid, 5, self.method, {"tactics": 5, "note": "Unchanged declaration, counted again"})
         before = tasks.load(self.directory)
-        self.assert_report_rejected_without_change(assignment, {}, expected="missing_measurement")
-        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Complete report")
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Committed source")
         after = tasks.load(self.directory)
-        self.assertEqual(len(candidate["measurements"]), 23)
+        self.assertEqual(candidate["measurements"], {})
+        self.assertEqual(candidate["advisory_measurements"], {})
         self.assertEqual(after["rounds"], before["rounds"])
         self.assertEqual(after["baseline"], before["baseline"])
         self.assertEqual(after["assignments"][assignment["assignment_id"]]["status"], "submitted")
 
-    def test_submission_rejects_raw_bad_digest_method_subject_source_and_extra_records(self):
+    def test_worker_claims_cannot_become_authoritative_candidate_scores(self):
         assignment = self.grouped_assignment()
-        good = {cid: metrics.record_measurement(self.metric, subject=cid, raw_value=3,
-            source_identity=self.identity, method=self.method, evidence={"tactics": 3}) for cid in self.chunks}
-        cid = self.chunks[0]
-        wrong_method = metrics.record_measurement(self.metric, subject=cid, raw_value=3,
-            source_identity=self.identity, method={"description": "Paraphrased counting method"}, evidence={"tactics": 3})
-        wrong_source = metrics.record_measurement(self.metric, subject=cid, raw_value=3,
-            source_identity=seal({"main_sha": "old", "files": {}, "config": {}}),
-            method=self.method, evidence={"tactics": 3})
-        cases = [({key: 3 for key in self.chunks}, "invalid_measurement_type"),
-                 ({**good, cid: {**good[cid], "raw_value": 2}}, "invalid_measurement_digest"),
-                 ({**good, cid: wrong_method}, "measurement_comparison_mismatch"),
-                 ({**good, cid: good[self.chunks[1]]}, "measurement_subject_mismatch"),
-                 ({**good, cid: wrong_source}, "measurement_source_mismatch"),
-                 ({**good, "unassigned": good[cid]}, "unassigned_measurement")]
-        for records, expected in cases:
-            with self.subTest(expected=expected):
-                self.assert_report_rejected_without_change(assignment, records, expected=expected)
         self.assert_report_rejected_without_change(assignment, 3, expected="invalid_measurement_map")
-        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Valid explicit report", good)
-        self.assertEqual(candidate["measurements"], good)
+        claims = {self.chunks[0]: {"raw_value": 1, "source_sha256": "stale", "sha256": "untrusted"}}
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Optional claims", claims)
+        self.assertEqual(candidate["advisory_measurements"], claims)
+        self.assertEqual(candidate["measurements"], {})
+        self.assertEqual(candidate["status"], "submitted")
+        with self.assertRaises(ValueError):
+            tasks.select_candidate(self.directory, "Alice", candidate["candidate_id"], "Not verified")
 
-    def test_record_rejects_changed_method_without_replacing_prior_measurement(self):
+    def test_optional_advice_does_not_change_authoritative_method_or_scores(self):
         self.baseline_and_round()
         assignment = self.assignment()
-        before = (self.directory / tasks.STATE_FILE).read_bytes()
-        with self.assertRaises(tasks.MeasurementValidationError) as caught:
-            tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
-                self.chunks[0], 2, {**self.method, "commit": "candidate-specific"}, {"tactics": 2})
-        self.assertIn("measurement_comparison_mismatch", {row["code"] for row in caught.exception.details["issues"]})
-        self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
+        before = tasks.load(self.directory)
         result = tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
-            self.chunks[0], 2, self.method, {"tactics": 2, "commit": "candidate-specific"})
-        self.assertEqual(result["method"], self.method)
-        self.assertEqual(result["evidence"]["commit"], "candidate-specific")
+            self.chunks[0], 2, {**self.method, "commit": "candidate-specific"}, {"tactics": 2})
+        self.assertEqual(result["method"]["commit"], "candidate-specific")
+        after = tasks.load(self.directory)
+        self.assertEqual(after["baseline"], before["baseline"])
+        self.assertEqual(after["measurements"], before["measurements"])
 
     def test_submission_rechecks_clean_source_and_current_assignment(self):
         self.baseline_and_round()
@@ -234,13 +209,17 @@ class OptimizeStateForumTests(unittest.TestCase):
         self.assertEqual(caught.exception.details["issues"], [{"code": "source_changed_during_measurement"}])
         self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
 
-    def test_missing_current_measurements_are_not_automatically_copied_from_baseline(self):
+    def test_missing_current_measurements_do_not_block_source_submission(self):
         self.baseline_and_round()
         assignment = self.assignment()
         with tasks.transaction(self.directory) as state:
             state["measurements"].pop(self.chunks[0])
-        details = self.assert_report_rejected_without_change(assignment)
-        self.assertTrue(any(issue.get("record") == "current" for issue in details["issues"]))
+        baseline = tasks.load(self.directory)["baseline"]
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Committed source")
+        after = tasks.load(self.directory)
+        self.assertEqual(candidate["status"], "submitted")
+        self.assertNotIn(self.chunks[0], after["measurements"])
+        self.assertEqual(after["baseline"], baseline)
 
     def test_valid_equal_or_worse_scores_are_not_new_submission_gates(self):
         for raw_value in (5, 6):
@@ -251,7 +230,8 @@ class OptimizeStateForumTests(unittest.TestCase):
                 tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
                     self.chunks[0], raw_value, self.method, {"tactics": raw_value})
                 candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Honest score report")
-                self.assertEqual(candidate["measurements"][self.chunks[0]]["raw_value"], raw_value)
+                self.assertEqual(candidate["advisory_measurements"][self.chunks[0]]["raw_value"], raw_value)
+                self.assertEqual(candidate["measurements"], {})
                 self.assertEqual(candidate["status"], "submitted")
 
     def test_numeric_report_keeps_judgment_ignored_by_existing_comparator(self):
@@ -261,9 +241,9 @@ class OptimizeStateForumTests(unittest.TestCase):
         tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
             self.chunks[0], 3, self.method, {"tactics": 3}, comparison_judgment=ignored)
         candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Numeric report")
-        self.assertEqual(candidate["judgments"], {self.chunks[0]: ignored})
+        self.assertEqual(candidate["advisory_judgments"], {self.chunks[0]: ignored})
         comparison = metrics.compare_measurements(tasks.load(self.directory)["measurements"][self.chunks[0]],
-            candidate["measurements"][self.chunks[0]], judgment=ignored)
+            candidate["advisory_measurements"][self.chunks[0]], judgment=ignored)
         self.assertTrue(comparison["improved"])
         self.assertFalse(comparison["regressed"])
 
@@ -277,9 +257,10 @@ class OptimizeStateForumTests(unittest.TestCase):
         with tasks.transaction(self.directory) as state:
             tasks._event(state, "finding", "Bob", content="Unrelated forum event")
         candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Complete concurrent report")
-        self.assertEqual(set(candidate["measurements"]), set(self.chunks))
+        self.assertEqual(set(candidate["advisory_measurements"]), set(self.chunks))
+        self.assertEqual(candidate["measurements"], {})
 
-    def test_qualitative_report_needs_existing_comparison_judgment_and_keeps_it(self):
+    def test_qualitative_advice_does_not_require_worker_comparison_judgment(self):
         self.directory = self.root / ".unity" / "forum" / "qualitative-fixture"
         self.metric = seal({"name": "clarity", "builtin": None, "definition": "Explain the clarity judgment"})
         self.method = {"description": "Fixture clarity review", "direction": "lower"}
@@ -296,19 +277,10 @@ class OptimizeStateForumTests(unittest.TestCase):
         assignment = self.assignment(measured=False)
         tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
             self.chunks[0], "clearer", self.method, {"reason": "The repeated steps are removed"})
-        self.assert_report_rejected_without_change(assignment, expected="invalid_comparison_judgment")
-        judgment = {"improved": False, "reason": {"evidence": "Equivalent clarity; no improvement is claimed"},
-                    "regressed": "reported regression"}
-        tasks.record_candidate_measurement(self.directory, "Alice", assignment["assignment_id"],
-            self.chunks[0], "clearer", self.method, {"reason": "The repeated steps are removed"},
-            comparison_judgment=judgment)
-        self.assert_report_rejected_without_change(assignment, judgments={}, expected="invalid_comparison_judgment")
-        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Complete qualitative report")
-        self.assertEqual(candidate["judgments"], {self.chunks[0]: judgment})
-        comparison = metrics.compare_measurements(tasks.load(self.directory)["measurements"][self.chunks[0]],
-            candidate["measurements"][self.chunks[0]], judgment=judgment)
-        self.assertFalse(comparison["improved"])
-        self.assertTrue(comparison["regressed"])
+        candidate = tasks.submit_candidate(self.directory, "Alice", assignment["assignment_id"], "Committed qualitative candidate")
+        self.assertEqual(candidate["advisory_judgments"], {})
+        self.assertEqual(candidate["advisory_measurements"][self.chunks[0]]["raw_value"], "clearer")
+        self.assertEqual(candidate["measurements"], {})
 
     def test_baseline_immutable_and_current_measurements_separate(self):
         self.baseline_and_round()
@@ -341,8 +313,8 @@ class OptimizeStateForumTests(unittest.TestCase):
         corrected = metrics.record_measurement(self.metric, subject=cid, raw_value=5,
             source_identity=self.identity, method=self.method,
             evidence="Recount: two earlier entries were term syntax rather than tactic invocations")
-        forum.submit_baseline_measurement("Alice", cid, first)
-        forum.submit_baseline_measurement("Bob", cid, corrected)
+        tasks.record_baseline_measurement(self.directory, "Alice", cid, first)
+        tasks.record_baseline_measurement(self.directory, "Bob", cid, corrected)
         state = tasks.load(self.directory)
         self.assertEqual(state["baseline_measurements"][cid], corrected)
         history = state["baseline_measurement_history"][cid]
@@ -350,7 +322,7 @@ class OptimizeStateForumTests(unittest.TestCase):
         self.assertEqual([row["measurement"]["raw_value"] for row in history], [7, 5])
         tasks.seal_baseline(self.directory)
         with self.assertRaisesRegex(ValueError, "only collected"):
-            forum.submit_baseline_measurement("Alice", cid, first)
+            tasks.record_baseline_measurement(self.directory, "Alice", cid, first)
         self.assertEqual(tasks.load(self.directory)["baseline"]["measurements"][cid], corrected)
 
     def test_clean_declarations_are_tasks_and_unknown_omissions_rejected(self):
@@ -649,7 +621,96 @@ def draft := sorry
             with self.assertRaisesRegex(ValueError, "comparison judgment"):
                 forum.record_current_measurement("Bob", self.chunks[0], 3, self.method, "evidence",
                                                    comparison_judgment={"improved": True})
-        self.assertEqual(tasks.load(self.directory)["judgments"][self.chunks[0]], judgment)
+        state = tasks.load(self.directory)
+        self.assertEqual(state["advisory_current_measurements"][self.chunks[0]][-1]["comparison_judgment"], judgment)
+        self.assertNotIn(self.chunks[0], state.get("judgments", {}))
+
+    def scoring_request(self, methods=None):
+        tree = self.temp / "score-view"
+        tree.mkdir(exist_ok=True)
+        return tasks.begin_scoring_request(self.directory, author="Bob", worktree=tree,
+            source_identity=self.identity, subjects=self.chunks, original_methods=methods or {},
+            metric_sha256=self.metric["sha256"], build_ref={"passed": True})
+
+    def test_scoring_reports_are_bound_raw_judgments_not_authoritative_maps(self):
+        self.baseline_and_round()
+        before = tasks.load(self.directory)
+        request = self.scoring_request({cid: self.method for cid in self.chunks})
+        for cid in self.chunks:
+            row = tasks.record_score_report(self.directory, "Bob", request["request_id"], cid,
+                3, self.method, "Counted the exact source")
+            self.assertEqual(row["evidence_kind"], "agent_judged")
+            self.assertNotIn("sha256", row)
+        closed = tasks.close_scoring_request(self.directory, request["request_id"], "complete")
+        self.assertEqual(closed["status"], "complete")
+        after = tasks.load(self.directory)
+        for key in ("baseline", "baseline_measurements", "measurements", "phase", "rounds", "tasks"):
+            self.assertEqual(after[key], before[key])
+
+    def test_scoring_reports_reject_wrong_author_subject_method_and_source(self):
+        request = self.scoring_request({cid: self.method for cid in self.chunks})
+        args = (self.directory, "Bob", request["request_id"], self.chunks[0], 3, self.method, "Exact count")
+        before = (self.directory / tasks.STATE_FILE).read_bytes()
+        for replacement, message in (({1: "Alice"}, "owned"), ({3: "unknown"}, "outside"),
+                                     ({5: {"description": "Different method"}}, "original measurement method")):
+            changed = list(args)
+            for index, value in replacement.items(): changed[index] = value
+            with self.assertRaisesRegex(ValueError, message):
+                tasks.record_score_report(*changed)
+        changed_identity = seal({"main_sha": "base", "files": {"A.lean": "changed"}, "config": {}})
+        for identities in ([changed_identity], [self.identity, changed_identity]):
+            with patch.object(verification, "file_identity", side_effect=identities):
+                with self.assertRaisesRegex(ValueError, "source changed"):
+                    tasks.record_score_report(*args)
+        self.assertEqual((self.directory / tasks.STATE_FILE).read_bytes(), before)
+        with self.assertRaisesRegex(ValueError, "missing subject reports"):
+            tasks.close_scoring_request(self.directory, request["request_id"], "complete")
+        tasks.close_scoring_request(self.directory, request["request_id"], "blocked", "No complete report")
+        with self.assertRaisesRegex(ValueError, "live scoring request"):
+            tasks.record_score_report(*args)
+
+    def test_scoring_request_requires_private_bound_snapshot(self):
+        with self.assertRaisesRegex(ValueError, "private source view"):
+            tasks.begin_scoring_request(self.directory, author="Bob", worktree=self.root,
+                source_identity=self.identity, subjects=self.chunks, original_methods={})
+        request = self.scoring_request()
+        with self.assertRaisesRegex(ValueError, "already has a running"):
+            self.scoring_request()
+        forum.configure(self.directory, self.root, "optimizing", author="Bob")
+        with self.assertRaisesRegex(ValueError, "running bound request"):
+            forum.scoring_request()
+        with patch.dict(os.environ, {"UNITY_OPTIMIZE_SCORE_REQUEST_ID": request["request_id"],
+                                    "UNITY_OPTIMIZE_WORKTREE": request["root"]}):
+            self.assertEqual(forum.scoring_request()["request_id"], request["request_id"])
+            for mutation in (lambda: forum.record_current_measurement("Bob", self.chunks[0], 3,
+                                self.method, "Unauthorized publication"),
+                             lambda: forum.register_strategy("Bob", self.chunks[0], "edit", "edit")):
+                with self.assertRaisesRegex(ValueError, "read-only"):
+                    mutation()
+            names = {tool.__name__ for tool in forum.SCORE_TOOLS}
+            self.assertTrue({"scoring_request", "submit_score_report", "report_obstacle"} <= names)
+            self.assertFalse({"record_current_measurement", "submit_candidate", "measure_candidate",
+                              "submit_baseline_measurement", "register_strategy"} & names)
+
+    def test_worker_baseline_advice_cannot_publish_verified_baseline(self):
+        self.plan()
+        before = tasks.load(self.directory)
+        forum.record_measurement("Bob", self.chunks[0], 3, self.method, "Optional count", baseline=True)
+        after = tasks.load(self.directory)
+        self.assertEqual(after["baseline_measurements"], before["baseline_measurements"])
+        self.assertEqual(after["baseline"], before["baseline"])
+        self.assertEqual(after["advisory_baseline_measurements"][self.chunks[0]][0]["author"], "Bob")
+        records = {cid: metrics.record_measurement(self.metric, subject=cid, raw_value=3,
+            source_identity=self.identity, method=self.method, evidence="Verified snapshot assessment")
+            for cid in self.chunks}
+        with self.assertRaisesRegex(ValueError, "every selected subject"):
+            tasks.install_verified_baseline_measurements(self.directory, {})
+        tasks.install_verified_baseline_measurements(self.directory, records)
+        tasks.seal_baseline(self.directory)
+        sealed_before = tasks.load(self.directory)["baseline"]
+        with self.assertRaisesRegex(ValueError, "unsealed"):
+            tasks.install_verified_baseline_measurements(self.directory, records)
+        self.assertEqual(tasks.load(self.directory)["baseline"], sealed_before)
 
 
 if __name__ == "__main__":

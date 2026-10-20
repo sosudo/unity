@@ -18,6 +18,11 @@ from pathlib import Path
 from rich.console import Console
 
 from .roster import Agent
+from .execution_policy import ExecutionPolicy
+
+
+class _PolicyCallbackError(Exception):
+    """Unreachable sentinel for callers without an execution policy."""
 
 _console = Console()
 
@@ -284,69 +289,167 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                          mcp_servers: dict, *, permission: str = "bypassPermissions",
                          idle_timeout: float = 600.0, subagents=(),
                          env_overrides: dict[str, str] | None = None,
-                         own_process_group: bool = False) -> str | None:
+                         own_process_group: bool = False,
+                         execution_policy: ExecutionPolicy | None = None) -> str | None:
     from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
     import shutil
 
-    cli_path = None
+    runtime = execution_policy.hooks if execution_policy else sys.modules[__name__]
+    on_normal_completion = execution_policy.on_normal_completion if execution_policy else None
+    CallbackError = execution_policy.callback_error if execution_policy else _PolicyCallbackError
+    UnsuccessfulTurnError = execution_policy.unsuccessful_error if execution_policy else _PolicyCallbackError
+    scratch = None
+    sdk_closed = True
+    cleanup_failed = False
     pid_file = None
-    if own_process_group and os.name == "posix":
-        from claude_agent_sdk._internal.transport import subprocess_cli
-        bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
-        real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
-        if real_cli.is_file():
-            group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
-            cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
 
-    agents_def = {
-        s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
-        for s in subagents
-    }
-    options = ClaudeAgentOptions(
-        system_prompt=system_prompt,
-        mcp_servers=mcp_servers,
-        agents=agents_def,
-        cwd=str(cwd),
-        permission_mode=permission,
-        model=agent.model,
-        max_budget_usd=agent.budget,
-        env=_agent_env(agent, env_overrides=env_overrides),
-        cli_path=cli_path,
-    )
-    attempt = 0
-    while True:
-        attempt += 1
+    def mark_sdk_closed() -> None:
+        nonlocal sdk_closed
+        sdk_closed = True
+
+    async def close_group() -> None:
+        nonlocal cleanup_failed
         try:
-            final = None
-            stream = query(prompt=prompt, options=options)
+            await runtime._terminate_process_group(pid_file)
+        except BaseException:
+            cleanup_failed = True
+            raise
+
+    try:
+        isolation = {}
+        if execution_policy is not None:
+            prepared = execution_policy.claude_options(cwd, system_prompt, mcp_servers, permission, env_overrides)
+            system_prompt = prepared["system_prompt"]
+            mcp_servers = prepared["mcp_servers"]
+            env_overrides = prepared["env_overrides"]
+            isolation = prepared["options"]
+            scratch = prepared["scratch"]
+
+        cli_path = None
+        if own_process_group and os.name == "posix":
+            from claude_agent_sdk._internal.transport import subprocess_cli
+            bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
+            real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
+            if real_cli.is_file():
+                group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
+                cli_path, pid_file = runtime._process_group_wrapper(real_cli, group_dir, "claude")
+
+        agents_def = {
+            s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
+            for s in subagents
+        }
+        options = ClaudeAgentOptions(
+            system_prompt=system_prompt,
+            mcp_servers=mcp_servers,
+            agents=agents_def,
+            cwd=str(cwd),
+            permission_mode=isolation.pop("permission_mode", permission),
+            model=agent.model,
+            max_budget_usd=agent.budget,
+            env=runtime._agent_env(agent, env_overrides=env_overrides),
+            cli_path=cli_path,
+            **isolation,
+        )
+        attempt = 0
+        while True:
+            attempt += 1
+            sdk_closed = True
             try:
-                async for msg in _idle_guard(stream, idle_timeout):
-                    _log(agent.name, msg, cwd)
-                    if type(msg).__name__ == "ResultMessage":
-                        final = getattr(msg, "result", None)
-                        _last_run_stats[agent.name] = {
-                            "cost_usd": getattr(msg, "total_cost_usd", None),
-                            "num_turns": getattr(msg, "num_turns", None),
-                        }
-                    if _stop_requested(cwd):
-                        # Safe stop: wind down at the next stream item instead of being killed
-                        # mid-write; abandoning the iterator disconnects the SDK client cleanly.
-                        _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                        return final
-            finally:
-                close = getattr(stream, "aclose", None)
-                if close is not None:
-                    await close()
-            return final
-        except Exception as e:
-            if _give_up(e, attempt):
+                if on_normal_completion is not None:
+                    sdk_closed = False
+                    return await _claude_continuation(
+                        agent, options, prompt, cwd,
+                        on_normal_completion, idle_timeout,
+                        on_sdk_closed=mark_sdk_closed, execution_policy=execution_policy,
+                    )
+                final = None
+                stream = query(prompt=prompt, options=options)
+                sdk_closed = False
+                try:
+                    async for msg in runtime._idle_guard(stream, idle_timeout):
+                        runtime._log(agent.name, msg, cwd)
+                        if type(msg).__name__ == "ResultMessage":
+                            final = getattr(msg, "result", None)
+                            runtime._last_run_stats[agent.name] = {
+                                "cost_usd": getattr(msg, "total_cost_usd", None),
+                                "num_turns": getattr(msg, "num_turns", None),
+                            }
+                        if runtime._stop_requested(cwd):
+                            # Safe stop: wind down at the next stream item instead of being killed
+                            # mid-write; abandoning the iterator disconnects the SDK client cleanly.
+                            _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                            return final
+                finally:
+                    close = getattr(stream, "aclose", None)
+                    if close is not None:
+                        await close()
+                        mark_sdk_closed()
+                return final
+            except CallbackError as exc:
+                raise exc.error
+            except UnsuccessfulTurnError:
                 raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await _terminate_process_group(pid_file)
-            await asyncio.sleep(wait)
-        finally:
-            await _terminate_process_group(pid_file)
+            except Exception as e:
+                if runtime._give_up(e, attempt):
+                    raise
+                wait = runtime._retry_sleep(e)
+                runtime._log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+                await close_group()
+                await asyncio.sleep(wait)
+            finally:
+                cleanup_failed |= not sdk_closed
+                await close_group()
+    finally:
+        # Never remove scratch while a failed/interrupted SDK or group cleanup
+        # could still leave an owned process using it. A retry uses the same
+        # private directory; closure failure remains sticky across attempts.
+        if execution_policy is not None:
+            execution_policy.finish_claude(scratch, sdk_closed, cleanup_failed)
+
+
+async def _claude_continuation(agent, options, prompt, cwd,
+                               callback, idle_timeout, *, on_sdk_closed=None, execution_policy):
+    """One connected SDK session; validation corrections are ordinary user turns."""
+    from claude_agent_sdk import ClaudeSDKClient
+
+    runtime = execution_policy.hooks
+    client = ClaudeSDKClient(options=options)
+    await client.connect()
+    total_turns = 0
+    response_closed = True
+    try:
+        while not runtime._stop_requested(cwd):
+            await client.query(prompt)
+            result = None
+            stream = client.receive_response()
+            response_closed = False
+            try:
+                async for msg in runtime._idle_guard(stream, idle_timeout):
+                    runtime._log(agent.name, msg, cwd)
+                    if type(msg).__name__ == "ResultMessage":
+                        result = msg
+                        total_turns += getattr(msg, "num_turns", 0) or 0
+                        # The SDK reports cumulative session cost, not a per-turn delta.
+                        runtime._last_run_stats[agent.name] = {
+                            "cost_usd": getattr(msg, "total_cost_usd", None),
+                            "num_turns": total_turns,
+                        }
+                    if runtime._stop_requested(cwd):
+                        return getattr(result, "result", None)
+            finally:
+                await stream.aclose()
+                response_closed = True
+            if result is None or getattr(result, "is_error", True):
+                detail = getattr(result, "subtype", "missing successful result")
+                raise execution_policy.unsuccessful_error(f"Claude turn did not complete successfully: {detail}")
+            final = getattr(result, "result", None)
+            prompt = await runtime._completion_feedback(callback, final, cwd)
+            if not prompt:
+                return final
+    finally:
+        await client.disconnect()
+        if response_closed and on_sdk_closed is not None:
+            on_sdk_closed()
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
@@ -507,20 +610,32 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         interrupt_event: asyncio.Event | None = None,
                         env_overrides: dict[str, str] | None = None,
                         own_process_group: bool = False,
-                        mcp_profile: str = "prove") -> str | None:
+                        mcp_profile: str = "prove",
+                        execution_policy: ExecutionPolicy | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
-    system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
-
+    runtime = execution_policy.hooks if execution_policy else sys.modules[__name__]
+    on_normal_completion = execution_policy.on_normal_completion if execution_policy else None
+    CallbackError = execution_policy.callback_error if execution_policy else _PolicyCallbackError
+    CleanupError = execution_policy.cleanup_error if execution_policy else _PolicyCallbackError
+    UnsuccessfulTurnError = execution_policy.unsuccessful_error if execution_policy else _PolicyCallbackError
     home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    # from a worktree cwd, the agent still needs write access to the main project (.unity/)
-    from .config import find_unity_dir
-    unity_dir = find_unity_dir(Path(cwd))
-    provider = _write_codex_config(home, agent, mcp_servers,
-                                   writable_root=unity_dir.parent if unity_dir else None)
-    _write_codex_agents(home, subagents)
-    # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
-    sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
+    if execution_policy is None:
+        system_prompt = system_prompt + _codex_mcp_note(mcp_profile)
+
+        # from a worktree cwd, the agent still needs write access to the main project (.unity/)
+        from .config import find_unity_dir
+        unity_dir = find_unity_dir(Path(cwd))
+        provider = _write_codex_config(home, agent, mcp_servers,
+                                       writable_root=unity_dir.parent if unity_dir else None)
+        _write_codex_agents(home, subagents)
+        # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
+        sandbox = Sandbox.full_access if permission == "bypassPermissions" else Sandbox.workspace_write
+    else:
+        prepared = execution_policy.codex_options(agent, cwd, system_prompt, mcp_servers, home,
+                                                    permission, env_overrides, mcp_profile)
+        system_prompt, provider, sandbox = (prepared[name] for name in ("system_prompt", "provider", "sandbox"))
+        runtime._write_codex_agents(home, subagents)
 
     # Prefer the user's installed codex CLI (kept current by its own updater) over the
     # SDK's pinned bundled binary — newest models often require a newer runtime.
@@ -535,21 +650,24 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             except ImportError:
                 pass
         if codex_bin:
-            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), home, "codex")
+            wrapped, pid_file = runtime._process_group_wrapper(Path(codex_bin), home, "codex")
             codex_bin = str(wrapped)
     attempt = 0
     while True:
         attempt += 1
-        agent_env = _agent_env(agent, home, env_overrides)
-        config_kwargs = {}
-        if mcp_profile == "solve" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
-            # Login startup and cached shell state can move elan ahead of solve's
-            # Lake shim even when the app-server process receives the right PATH.
-            config_kwargs["config_overrides"] = (
-                "allow_login_shell=false",
-                "features.shell_snapshot=false",
-                "shell_environment_policy.set.PATH=" + json.dumps(agent_env["PATH"]),
-            )
+        agent_env = runtime._agent_env(agent, home, env_overrides)
+        if execution_policy is None:
+            config_kwargs = {}
+            if mcp_profile == "solve" and (env_overrides or {}).get("UNITY_REAL_LAKE"):
+                # Login startup and cached shell state can move elan ahead of solve's
+                # Lake shim even when the app-server process receives the right PATH.
+                config_kwargs["config_overrides"] = (
+                    "allow_login_shell=false",
+                    "features.shell_snapshot=false",
+                    "shell_environment_policy.set.PATH=" + json.dumps(agent_env["PATH"]),
+                )
+        else:
+            config_kwargs = prepared["config_options"](agent_env)
         cfg = CodexConfig(
             cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,
         )
@@ -560,102 +678,154 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
         stream_started = asyncio.Event()
         try:
             # login_api_key is OpenAI-official auth only; custom providers (base_url set)
-            # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
+            # authenticate via the provider's env_key (CODEX_API_KEY in runtime._agent_env).
             if agent.api_key and not agent.base_url:
                 await codex.login_api_key(agent.api_key)
+            thread_options = prepared["thread_options"] if execution_policy else {}
             thread = await codex.thread_start(
                 model=agent.model,
                 model_provider=provider,
                 sandbox=sandbox,
                 base_instructions=system_prompt,
                 cwd=str(cwd),
+                **thread_options,
             )
-            handle = await thread.turn(prompt)
+            next_prompt = prompt
+            thread_usage = None
+            while True:
+                if execution_policy is not None and (runtime._stop_requested(cwd)
+                        or (interrupt_event is not None and interrupt_event.is_set())):
+                    return final
+                turn_finished = asyncio.Event()
+                stream_started = asyncio.Event()
+                final = None
+                handle = await thread.turn(next_prompt)
 
-            async def interrupt_turn() -> None:
-                """Stop a Codex turn without cancelling its thread-backed queue wait.
+                async def interrupt_turn() -> None:
+                    """Stop a Codex turn without cancelling its thread-backed queue wait.
 
-                openai-codex implements next_turn_notification with asyncio.to_thread
-                around a blocking Queue.get(). Cancelling that await abandons the worker
-                thread. Ask the app server to interrupt instead, then leave the stream
-                registered until it completes or transport shutdown wakes the waiter.
-                """
-                assert interrupt_event is not None
-                await interrupt_event.wait()
-                await stream_started.wait()
-                try:
-                    await asyncio.wait_for(
-                        handle.interrupt(), timeout=_CODEX_INTERRUPT_REQUEST_TIMEOUT
+                    openai-codex implements next_turn_notification with asyncio.to_thread
+                    around a blocking Queue.get(). Cancelling that await abandons the worker
+                    thread. Ask the app server to interrupt instead, then leave the stream
+                    registered until it completes or transport shutdown wakes the waiter.
+                    """
+                    assert interrupt_event is not None
+                    await interrupt_event.wait()
+                    await stream_started.wait()
+                    try:
+                        await asyncio.wait_for(
+                            handle.interrupt(), timeout=runtime._CODEX_INTERRUPT_REQUEST_TIMEOUT
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        await asyncio.wait_for(codex.close(), timeout=runtime._CODEX_CLOSE_TIMEOUT)
+                        return
+
+                    try:
+                        await asyncio.wait_for(
+                            turn_finished.wait(), timeout=runtime._CODEX_INTERRUPT_DRAIN_TIMEOUT
+                        )
+                    except asyncio.TimeoutError:
+                        # Interrupt was acknowledged but no terminal event arrived. Close
+                        # while the stream queue is still registered so fail_all() wakes its
+                        # blocking notification waiter before the generator unregisters it.
+                        await asyncio.wait_for(codex.close(), timeout=runtime._CODEX_CLOSE_TIMEOUT)
+
+                if interrupt_event is not None:
+                    interrupt_task = asyncio.create_task(
+                        interrupt_turn(), name=f"codex-interrupt:{agent.name}"
                     )
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-                    return
 
-                try:
-                    await asyncio.wait_for(
-                        turn_finished.wait(), timeout=_CODEX_INTERRUPT_DRAIN_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    # Interrupt was acknowledged but no terminal event arrived. Close
-                    # while the stream queue is still registered so fail_all() wakes its
-                    # blocking notification waiter before the generator unregisters it.
-                    await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-
-            if interrupt_event is not None:
-                interrupt_task = asyncio.create_task(
-                    interrupt_turn(), name=f"codex-interrupt:{agent.name}"
-                )
-
-            # handle.run() and handle.stream() are competing consumers of one notification
-            # queue — using both (in any order) starves one and hangs. Consume ONLY the
-            # stream and assemble the final response from agentMessage items ourselves.
-            usage = None
-            async for note in _codex_notifications(
-                handle, codex, idle_timeout, stream_started
-            ):
-                _log(agent.name, note, cwd)
-                if _stop_requested(cwd):
-                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                    break
-                method = getattr(note, "method", "") or ""
-                payload = getattr(note, "payload", None)
-                if method == "turn/completed":
-                    turn_finished.set()
-                if method == "item/completed":
-                    root = getattr(getattr(payload, "item", None), "root", None)
-                    if getattr(root, "type", "") == "agentMessage":
-                        final = getattr(root, "text", None) or final
-                elif method == "thread/tokenUsage/updated":
-                    total = getattr(getattr(payload, "token_usage", None), "total", None)
-                    if total is not None:
-                        usage = {k: getattr(total, k) for k in
-                                 ("input_tokens", "cached_input_tokens", "output_tokens",
-                                  "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
-            _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
-            return final
+                # handle.run() and handle.stream() are competing consumers of one notification
+                # queue — using both (in any order) starves one and hangs. Consume ONLY the
+                # stream and assemble the final response from agentMessage items ourselves.
+                usage = None
+                successful = False
+                failure_detail = ""
+                notifications = (runtime._codex_notifications(handle, codex, idle_timeout, stream_started, pid_file)
+                                 if execution_policy else _codex_notifications(handle, codex, idle_timeout, stream_started))
+                async for note in notifications:
+                    runtime._log(agent.name, note, cwd)
+                    if runtime._stop_requested(cwd):
+                        _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
+                        break
+                    method = getattr(note, "method", "") or ""
+                    payload = getattr(note, "payload", None)
+                    if execution_policy is not None and method in {"error", "turn/failed"}:
+                        error = getattr(payload, "error", None)
+                        failure_detail = str(getattr(error, "message", None)
+                                             or getattr(payload, "message", None) or failure_detail)[:1000]
+                    if method == "turn/completed":
+                        turn_finished.set()
+                        if execution_policy is not None:
+                            turn = getattr(payload, "turn", None)
+                            status = getattr(turn, "status", None)
+                            successful = getattr(status, "value", status) == "completed"
+                            error = getattr(turn, "error", None)
+                            failure_detail = str(getattr(error, "message", None) or failure_detail)[:1000]
+                    if method == "item/completed":
+                        root = getattr(getattr(payload, "item", None), "root", None)
+                        if getattr(root, "type", "") == "agentMessage":
+                            final = getattr(root, "text", None) or final
+                    elif method == "thread/tokenUsage/updated":
+                        total = getattr(getattr(payload, "token_usage", None), "total", None)
+                        if total is not None:
+                            usage = {k: getattr(total, k) for k in
+                                     ("input_tokens", "cached_input_tokens", "output_tokens",
+                                      "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
+                thread_usage = usage if usage is not None else thread_usage
+                runtime._last_run_stats[agent.name] = {"cost_usd": None, "usage": thread_usage}
+                if execution_policy is None:
+                    return final
+                if interrupt_task is not None:
+                    interrupt_task.cancel()
+                    await asyncio.gather(interrupt_task, return_exceptions=True)
+                    interrupt_task = None
+                if (runtime._stop_requested(cwd)
+                        or (interrupt_event is not None and interrupt_event.is_set())):
+                    return final
+                if not successful:
+                    # Codex can report provider errors as a terminal notification
+                    # rather than raising from the stream. Route those through
+                    # the same inherited transport retry cap and backoff.
+                    raise RuntimeError("Codex turn did not complete successfully"
+                                       + (": " + failure_detail if failure_detail else ""))
+                if on_normal_completion is None:
+                    return final
+                next_prompt = await runtime._completion_feedback(on_normal_completion, final, cwd)
+                if not next_prompt:
+                    return final
         except asyncio.CancelledError:
+            raise
+        except CallbackError as exc:
+            raise exc.error
+        except CleanupError:
+            raise
+        except UnsuccessfulTurnError:
             raise
         except Exception as e:
             if interrupt_event is not None and interrupt_event.is_set():
                 return final
-            if _give_up(e, attempt):
+            if runtime._give_up(e, attempt):
                 raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            wait = runtime._retry_sleep(e)
+            runtime._log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
             await asyncio.sleep(wait)
         finally:
             turn_finished.set()
-            if interrupt_task is not None:
-                interrupt_task.cancel()
-                await asyncio.gather(interrupt_task, return_exceptions=True)
-            # close() can hang after an aborted turn; don't let cleanup wedge the agent.
-            try:
-                await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-            except (asyncio.TimeoutError, Exception):
-                pass
-            await _terminate_process_group(pid_file)
+            if execution_policy is not None:
+                await runtime._cleanup_codex_attempt(codex, interrupt_task, pid_file)
+            else:
+                if interrupt_task is not None:
+                    interrupt_task.cancel()
+                    await asyncio.gather(interrupt_task, return_exceptions=True)
+                # close() can hang after an aborted turn; don't let cleanup wedge the agent.
+                try:
+                    await asyncio.wait_for(codex.close(), timeout=runtime._CODEX_CLOSE_TIMEOUT)
+                except (asyncio.TimeoutError, Exception):
+                    pass
+                await runtime._terminate_process_group(pid_file)
 
 
 async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
@@ -663,7 +833,8 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                               idle_timeout: float = 600.0, subagents=(),
                               env_overrides: dict[str, str] | None = None,
                               own_process_group: bool = False,
-                              mcp_profile: str = "prove") -> str | None:
+                              mcp_profile: str = "prove",
+                              execution_policy: ExecutionPolicy | None = None) -> str | None:
     """Google Antigravity backend: drives the user's installed `agy` CLI in print mode
     (subscription auth; serves both the Gemini pool and the Claude/GPT pool). MCP tools
     reach the model through the `unity mcp` shell bridge, like codex."""
@@ -673,22 +844,36 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
     if agy is None:
         raise RuntimeError("antigravity backend needs the `agy` CLI installed and logged in "
                            "(https://antigravity.google)")
-    from .config import find_unity_dir
-    unity_dir = find_unity_dir(Path(cwd))
-    full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
-    cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
-           "--dangerously-skip-permissions", "--print-timeout", "72h"]
-    if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
-        cmd += ["--add-dir", str(unity_dir.parent)]
+    runtime = execution_policy.hooks if execution_policy else sys.modules[__name__]
+    on_normal_completion = execution_policy.on_normal_completion if execution_policy else None
+    CallbackError = execution_policy.callback_error if execution_policy else _PolicyCallbackError
+    UnsuccessfulTurnError = execution_policy.unsuccessful_error if execution_policy else _PolicyCallbackError
+    pid_file = None
+    if execution_policy is None:
+        from .config import find_unity_dir
+        unity_dir = find_unity_dir(Path(cwd))
+        full = system_prompt + _codex_mcp_note(mcp_profile) + "\n\n---\n\nTASK:\n" + prompt
+        cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
+               "--dangerously-skip-permissions", "--print-timeout", "72h"]
+        if unity_dir is not None:  # worktree cwd still needs to write the main project's .unity/
+            cmd += ["--add-dir", str(unity_dir.parent)]
+    else:
+        prepared = execution_policy.antigravity_options(agent, agy, cwd, system_prompt, prompt,
+                                                          env_overrides, own_process_group, mcp_profile)
+        full, cmd, pid_file = (prepared[name] for name in ("full", "cmd", "pid_file"))
 
     attempt = 0
+    total_usage = None
+    continuation_warned = False
     while True:
+        if execution_policy is not None and runtime._stop_requested(cwd):
+            return None
         attempt += 1
         proc = await asyncio.create_subprocess_exec(
             *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
-            env=_agent_env(agent, env_overrides=env_overrides),
-            start_new_session=own_process_group and os.name == "posix")
+            env=runtime._agent_env(agent, env_overrides=env_overrides),
+            start_new_session=execution_policy is None and own_process_group and os.name == "posix")
 
         async def _lines():
             while True:
@@ -701,7 +886,8 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
             final = None
             usage = None
             failed = None
-            async for raw in _idle_guard(_lines(), idle_timeout):
+            successful = False
+            async for raw in runtime._idle_guard(_lines(), idle_timeout):
                 try:
                     e = _json.loads(raw)
                 except _json.JSONDecodeError:
@@ -711,52 +897,85 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                     su = e.get("step_update", {})
                     st = su.get("step_type", "")
                     if st == "agent_response" and su.get("text_delta"):
-                        _emit_delta(agent.name, su["text_delta"])
+                        runtime._emit_delta(agent.name, su["text_delta"])
                     elif (su.get("state") == "DONE"
                           and st not in ("agent_response", "checkpoint", "user_input", "unknown", "")):
                         _console.print(f"[dim]{_ts()} \\[{agent.name}][/dim] [cyan]⚙ {st[:80]}[/cyan]")
-                        _tool_log(cwd, agent.name, st)
+                        runtime._tool_log(cwd, agent.name, st)
                 elif ev == "result":
                     r = e.get("result", {})
+                    successful = r.get("status") == "SUCCESS"
                     final = r.get("response") or final
                     usage = r.get("usage")
                     if r.get("status") not in (None, "SUCCESS"):
                         failed = r.get("status")
                         _console.print(f"[red]{_ts()} \\[{agent.name}] ✗ agy result: {failed}[/red]")
-                if _stop_requested(cwd):
+                if runtime._stop_requested(cwd):
                     _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                    if own_process_group and os.name == "posix":
+                    if execution_policy is not None and pid_file is not None:
+                        # Keep safe stop on the policy's existing receipt-based
+                        # cleanup path instead of signalling a raw wrapper PID.
+                        await runtime._drain_spawn_cleanup(runtime._terminate_process_group(pid_file))
+                    elif own_process_group and os.name == "posix":
                         os.killpg(proc.pid, signal.SIGTERM)
                     else:
                         proc.terminate()
                     break
             rc = await proc.wait()
             if failed:
-                raise RuntimeError(f"agy turn failed: {failed}")
+                failure_type = UnsuccessfulTurnError if on_normal_completion is not None else RuntimeError
+                raise failure_type(f"agy turn failed: {failed}")
             if final is None and rc not in (0, -15):
-                raise RuntimeError(f"agy exited with code {rc} and no response")
-            _flush_delta(agent.name)
+                failure_type = UnsuccessfulTurnError if on_normal_completion is not None else RuntimeError
+                raise failure_type(f"agy exited with code {rc} and no response")
+            runtime._flush_delta(agent.name)
             _console.print(f"[green]{_ts()} \\[{agent.name}] ✓ turn complete[/green]")
-            _last_run_stats[agent.name] = {"cost_usd": None, "usage": usage}
+            total_usage = runtime._sum_usage(total_usage, usage) if execution_policy else usage
+            runtime._last_run_stats[agent.name] = {"cost_usd": None, "usage": total_usage}
+            if on_normal_completion is not None and not runtime._stop_requested(cwd):
+                if not successful or rc != 0:
+                    raise UnsuccessfulTurnError("Antigravity turn did not complete successfully")
+                feedback = await runtime._completion_feedback(on_normal_completion, final, cwd)
+                if feedback:
+                    if not continuation_warned:
+                        runtime._log(agent.name, "Antigravity continuation: retaining this logical attempt and draft; "
+                             "conversation resume is unavailable, so feedback starts a new CLI session.")
+                        continuation_warned = True
+                    cmd[2] = full + "\n\nCONTROLLER VALIDATION FEEDBACK:\n" + feedback
+                    attempt -= 1  # A draft correction is not a backend failure.
+                    continue
             return final
+        except CallbackError as exc:
+            raise exc.error
+        except UnsuccessfulTurnError:
+            raise
         except Exception as e:
             if proc.returncode is None:
                 proc.kill()
-            if _give_up(e, attempt):
+            if runtime._give_up(e, attempt):
                 raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
+            wait = runtime._retry_sleep(e)
+            runtime._log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
             await asyncio.sleep(wait)
         finally:
-            if proc.returncode is None:
-                if own_process_group and os.name == "posix":
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                else:
-                    proc.kill()
-                await proc.wait()
+            if execution_policy is not None:
+                try:
+                    if pid_file is not None:
+                        await runtime._drain_spawn_cleanup(runtime._terminate_process_group(pid_file))
+                    elif proc.returncode is None:
+                        proc.kill()
+                finally:
+                    await proc.wait()
+            else:
+                if proc.returncode is None:
+                    if own_process_group and os.name == "posix":
+                        try:
+                            os.killpg(proc.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    else:
+                        proc.kill()
+                    await proc.wait()
 
 
 # ── dispatch ──────────────────────────────────────────────────────────────────
@@ -820,11 +1039,15 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 log_context: dict | None = None,
                 env_overrides: dict[str, str] | None = None,
                 own_process_group: bool = False,
-                mcp_profile: str = "prove") -> str | None:
+                mcp_profile: str = "prove",
+                execution_policy: ExecutionPolicy | None = None) -> str | None:
     backend = {"claude_code": claude_spawner, "codex": codex_spawner,
                "antigravity": antigravity_spawner}[agent.backend]
     import time
-    t0 = time.monotonic()
+    t0 = (execution_policy.started_at
+          if execution_policy is not None and execution_policy.started_at is not None
+          else time.monotonic())
+    cleanup_failed = False
     try:
         # Other solve phases keep their own prompts, without proof-development catalogs.
         if mcp_profile == "solve" and (log_context or {}).get("phase") == "formalizing":
@@ -840,11 +1063,19 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             "env_overrides": env_overrides,
             "own_process_group": own_process_group,
         }
+        if execution_policy is not None:
+            kwargs["execution_policy"] = execution_policy
         if agent.backend == "codex":
             kwargs["interrupt_event"] = interrupt_event
             kwargs["mcp_profile"] = mcp_profile
         elif agent.backend == "antigravity":
             kwargs["mcp_profile"] = mcp_profile
         return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
+    except BaseException as exc:
+        cleanup_failed = bool(execution_policy is not None and
+                              isinstance(exc, execution_policy.cleanup_error))
+        raise
     finally:
-        _write_run_log(agent, cwd, time.monotonic() - t0, log_context)
+        if not cleanup_failed:
+            logger = execution_policy.hooks._write_run_log if execution_policy else _write_run_log
+            logger(agent, cwd, time.monotonic() - t0, log_context)

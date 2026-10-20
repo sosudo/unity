@@ -40,10 +40,12 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
         async def respond(agent, system, instruction, tree, servers, **kwargs):
             env = kwargs["env_overrides"]
             self.assertEqual(env["UNITY_OPTIMIZE_TASK_ID"], "")
-            self.assertTrue(env["UNITY_OPTIMIZE_PHASE_DISPATCH_ID"])
+            self.assertTrue(env["UNITY_OPTIMIZE_PHASE_DISPATCH_ID"] or env["UNITY_OPTIMIZE_SCORE_REQUEST_ID"])
             self.assertNotIn("on_normal_completion", kwargs)
             with patch.dict(os.environ, env):
                 forum.configure(self.paths.forum, self.root, env["UNITY_OPTIMIZE_PROFILE"], author=agent.name)
+                if env["UNITY_OPTIMIZE_SCORE_REQUEST_ID"]:
+                    return await self.fake_worker(agent, None, tree, "optimizing", kwargs["interrupt_event"], instruction)
                 return action(agent, env, instruction, tree)
         return respond
 
@@ -135,7 +137,7 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tasks"], {})
         self.assertEqual(state["rounds"]["started"], 0)
 
-    async def test_chunking_missing_measurements_does_not_install_partial_plan(self):
+    async def test_chunking_plan_without_worker_scores_uses_verifier_scoring(self):
         self.seed_baseline()
         with tasks.transaction(self.paths.forum) as state:
             state["exploration_done"] = True
@@ -143,11 +145,14 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
             rows = forum.optimize_inventory()["chunks"]
             forum.propose_chunk_plan(agent.name, [{"chunk_ids": [row["chunk_id"]]} for row in rows], "Fixture plan")
             forum.report_phase_result(agent.name, "complete", "Plan only", "No measurements supplied")
-        with patch.object(workflow, "spawn", side_effect=self.transport(respond)):
-            with self.assertRaisesRegex(ValueError, "missing original metric measurements"):
-                await self.controller.prepare()
-        self.assertFalse(self.controller.state()["baseline_sealed"])
-        self.assertEqual(self.controller.state()["tasks"], {})
+        with self.fake_runtime(), patch.object(workflow, "spawn", side_effect=self.transport(respond)):
+            self.assertTrue(await self.controller.prepare())
+        state = self.controller.state()
+        self.assertTrue(state["baseline_sealed"])
+        self.assertTrue(state["tasks"])
+        self.assertEqual(len(state["scoring_requests"]), 1)
+        self.assertEqual(next(iter(state["scoring_requests"].values()))["status"], "complete")
+        self.assertNotIn("advisory_baseline_measurements", state)
 
     async def test_file_bridge_plan_keeps_source_snapshot_and_seals_baseline(self):
         self.seed_baseline()
@@ -159,6 +164,10 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
 
         async def respond(agent, system, instruction, tree, servers, **kwargs):
             env = kwargs["env_overrides"]
+            if env["UNITY_OPTIMIZE_SCORE_REQUEST_ID"]:
+                self.assertEqual(env["UNITY_OPTIMIZE_SCRATCH"], "")
+                with patch.dict(os.environ, env):
+                    return await self.fake_worker(agent, None, tree, "optimizing", kwargs["interrupt_event"], instruction)
             scratch = Path(env["UNITY_OPTIMIZE_SCRATCH"])
             self.assertEqual(scratch, tree / ".unity/scratch/optimize")
             self.assertIn(str(scratch), system)
@@ -191,11 +200,7 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
             for name in ("plan.json", "plan2.json", "plan3.json", "plan4.json", "plan5.json", "plan6.json"):
                 (scratch / name).write_text(json.dumps(plan))
             await bridge("propose_chunk_plan", ["--args-file", str(scratch / "plan6.json")])
-            for row in chunks:
-                await bridge("record_measurement", [json.dumps({"author": agent.name,
-                    "chunk_id": row["chunk_id"], "raw_value": 3, "method": self.method,
-                    "evidence": "Offline fixture: have; trivial; exact", "baseline": True})])
-            report = {"author": agent.name, "status": "complete", "summary": "Plan and measurements submitted",
+            report = {"author": agent.name, "status": "complete", "summary": "Plan submitted",
                       "evidence": {"chunks": len(chunks)}}
             for name in ("report.json", "report2.json"):
                 (scratch / name).write_text(json.dumps(report))
@@ -204,7 +209,7 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(workflow.verification.file_identity(self.root, scope=scope), original)
             retained.extend(scratch.iterdir())
 
-        with patch.object(workflow, "spawn", side_effect=respond):
+        with self.fake_runtime(), patch.object(workflow, "spawn", side_effect=respond):
             self.assertTrue(await self.controller.prepare())
         state = self.controller.state()
         self.assertTrue(state["baseline_sealed"])
@@ -301,7 +306,7 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
         async def respond(agent, system, instruction, tree, servers, **kwargs):
             self.assertEqual(kwargs["env_overrides"]["UNITY_OPTIMIZE_SCRATCH"], "")
             self.assertFalse((tree / ".unity/scratch").exists())
-            self.assertIn("Final review remains read-only", system)
+            self.assertIn("Review and verifier scoring remain read-only", system)
             self.assertIn("do not create planning scratch files", system)
         with patch.dict(os.environ, {"UNITY_OPTIMIZE_SCRATCH": "inherited-scratch"}), \
                 patch.object(workflow, "spawn", side_effect=respond):
@@ -333,10 +338,8 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
                 return
             rows = forum.optimize_inventory()["chunks"]
             forum.propose_chunk_plan("B", [{"chunk_ids": [row["chunk_id"]]} for row in rows], "Collaborative plan")
-            for row in rows:
-                forum.record_measurement("B", row["chunk_id"], 3, self.method, "have; trivial; exact", baseline=True)
-            forum.report_phase_result("B", "complete", "Plan and original measurements", {"chunks": len(rows)})
-        with patch.object(workflow, "spawn", side_effect=self.transport(respond)):
+            forum.report_phase_result("B", "complete", "Complete plan", {"chunks": len(rows)})
+        with self.fake_runtime(), patch.object(workflow, "spawn", side_effect=self.transport(respond)):
             self.assertTrue(await self.controller.prepare())
         state = self.controller.state()
         self.assertTrue(state["baseline_sealed"])
@@ -364,7 +367,8 @@ class OptimizePhaseContractTests(unittest.IsolatedAsyncioTestCase):
         with self.fake_runtime():
             self.assertTrue(await self.controller.prepare())
         after = self.controller.state()
-        self.assertEqual([phase for phase, _ in self.phases], ["chunking"])
+        self.assertEqual([phase for phase, _ in self.phases], ["chunking", "optimizing"])
+        self.assertEqual(len(self.controller.state()["scoring_requests"]), 1)
         self.assertEqual(after["base_sha"], before["base_sha"])
         self.assertEqual(after["scope"], before["scope"])
         self.assertEqual(after["rounds"], before["rounds"])

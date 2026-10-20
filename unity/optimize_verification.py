@@ -387,7 +387,7 @@ def _patch(root, baseline, files, owner):
 
 
 def _verify(root, *, baseline, metric, scope, measurements, task=None, lake_args=(), project_root=None, judgments=None,
-            comparison=None, config_revision=0, selected_files=None, final=False):
+            comparison=None, config_revision=0, selected_files=None, final=False, build_result=None):
     root, owner = Path(root).resolve(), Path(project_root or root).resolve()
     if not _valid(baseline) or not _valid(metric) or baseline.get("metric") != metric:
         raise ValueError("Optimize baseline/metric is missing or has changed")
@@ -398,7 +398,10 @@ def _verify(root, *, baseline, metric, scope, measurements, task=None, lake_args
     if selected_files is None:
         selected_files = (task or {}).get("files", scope.get("files", []))
     selected_files = sorted({name for name in selected_files if name.endswith(".lean") and name != "lakefile.lean"})
-    build = build_scope(root, scope=scope, lake_args=lake_args, project_root=owner, selected_files=selected_files)
+    build = (deepcopy(build_result) if build_result is not None else
+             build_scope(root, scope=scope, lake_args=lake_args, project_root=owner, selected_files=selected_files))
+    if build_result is not None and set(build.get("selected_files", [])) != set(selected_files):
+        raise ValueError("verification build does not cover the selected files")
     identity = file_identity(root, scope=scope, lake_args=lake_args)
     audit = audit_sources(root, baseline)
     if final and comparison is not None:
@@ -445,6 +448,161 @@ def verify_candidate(root, **kwargs):
 
 def verify_final(root, **kwargs):
     return _verify(root, **kwargs, final=True)
+
+
+async def score_source(root, *, metric, scope, subjects, original_methods, evaluator,
+                       run_checked, project_root=None, selected_files=None, lake_args=(),
+                       cache=None, comparison_records=None):
+    """Build and score one source; no build lock spans the evaluator await.
+
+    Cache reuse requires an exact source, metric, method and build binding.
+    Stale current records are ignored, never relabeled or made into a task gate.
+    """
+    from .optimize_scoring import score_snapshot
+    root = Path(root).resolve()
+    owner = Path(project_root or root).resolve()
+    subjects = sorted(set(subjects))
+    selected = sorted(set(selected_files if selected_files is not None else scope.get("files", [])))
+    selected = [name for name in selected if name.endswith(".lean") and name != "lakefile.lean"]
+    identity = file_identity(root, scope=scope, lake_args=lake_args)
+    if load_metric(root, metric["name"]) != metric:
+        raise ValueError("metric definition or helper bytes changed")
+    cached = cache if isinstance(cache, dict) else {}
+    records = cached.get("measurements", {})
+    build = cached.get("build", {})
+    records = records if isinstance(records, dict) else {}
+    build = build if isinstance(build, dict) else {}
+    comparable_cache = (not comparison_records or all(
+        isinstance(records.get(subject), dict) and
+        isinstance(comparison_records.get(subject), dict) and
+        isinstance(records[subject].get("raw_value"), (int, float)) and
+        isinstance(comparison_records[subject].get("raw_value"), (int, float))
+        for subject in subjects) or cached.get("comparison_measurements") == comparison_records)
+    cache_valid = (cached.get("identity", cached.get("source_identity")) == identity
+        and cached.get("metric", metric) == metric and build.get("source_stable")
+        and build.get("source_identity") == identity
+        and set(build.get("selected_files", [])) == set(selected)
+        and (build.get("passed") or metric.get("builtin") == "completion")
+        and comparable_cache and all(validate_measurement_binding(records.get(subject), metric, identity,
+            (original_methods or {}).get(subject)) for subject in subjects))
+    if cache_valid:
+        return {"identity": identity, "metric": deepcopy(metric),
+            "measurements": {subject: deepcopy(records[subject]) for subject in subjects},
+            "judgments": {subject: deepcopy(cached["judgments"][subject]) for subject in subjects
+                          if subject in cached.get("judgments", {})},
+            "build": deepcopy(build), "scoring": deepcopy(cached.get("scoring")),
+            "reused_exact_snapshot": True}
+    build = await run_checked(build_scope, root, scope=scope, lake_args=lake_args,
+                              project_root=owner, selected_files=selected)
+    after_build = file_identity(root, scope=scope, lake_args=lake_args)
+    if not build.get("source_stable") or build.get("source_identity") != identity or after_build != identity:
+        raise ValueError("source changed during verification build")
+    scoring = await score_snapshot(root, metric=metric, subjects=subjects,
+        source_identity=identity, build_result=build, original_methods=original_methods,
+        evaluator=evaluator, comparison_records=comparison_records, project_root=owner)
+    return {"identity": identity, "metric": deepcopy(metric), "measurements": scoring["measurements"],
+        "judgments": scoring["judgments"], "build": build, "scoring": scoring,
+        "reused_exact_snapshot": False}
+
+
+async def complete_baseline_scored(baseline, root, *, subjects, evaluator, run_checked,
+                                    project_root=None, original_methods=None):
+    """Complete an unsealed original baseline without replacing its source.
+
+    The caller owns the initial baseline seal. This function returns a new value
+    and never changes the saved baseline or resets any existing workflow state.
+    """
+    from .optimize_scoring import score_snapshot
+    if not _valid(baseline):
+        raise ValueError("baseline scoring requires an intact original snapshot")
+    root = Path(root).resolve()
+    metric, identity = baseline["metric"], baseline["identity"]
+    if file_identity(root, scope=baseline["scope"], lake_args=identity.get("lake_args", ())) != identity:
+        raise ValueError("original source changed before baseline scoring")
+    if baseline.get("measurements"):
+        # Preserving an already populated original method is mandatory, even if
+        # the caller passes a conflicting replacement method mapping.
+        recorded = {subject: row["method"] for subject, row in baseline["measurements"].items()}
+        if original_methods is not None and original_methods != recorded:
+            raise ValueError("cannot replace original baseline measurement methods")
+        if (set(baseline["measurements"]) != set(subjects)
+                or any(not validate_measurement_binding(row, metric, identity)
+                       for row in baseline["measurements"].values())):
+            raise ValueError("existing baseline measurements are incomplete or invalid; retained unchanged")
+        # No implicit method/evidence migration of a retained baseline. This
+        # also makes an interrupted baseline-completion call idempotent.
+        return deepcopy(baseline)
+    scoring = await score_snapshot(root, metric=metric, subjects=subjects,
+        source_identity=identity, build_result=baseline["build"], original_methods=original_methods or {},
+        evaluator=evaluator, project_root=project_root)
+    result = deepcopy(baseline)
+    result.update(measurements=scoring["measurements"], scoring=scoring)
+    return _seal({key: value for key, value in result.items() if key != "sha256"})
+
+
+async def _verify_scored(root, *, baseline, metric, scope, evaluator, run_checked,
+                         before_root=None, task=None, lake_args=(), project_root=None,
+                         config_revision=0, selected_files=None, subjects=None,
+                         before_cache=None, after_cache=None, current_measurements=None, final=False):
+    if not _valid(baseline) or baseline.get("metric") != metric or baseline.get("scope") != scope:
+        raise ValueError("Optimize baseline/metric/scope is missing or has changed")
+    subjects = sorted(set(subjects if subjects is not None else
+        (task or {}).get("chunk_ids", baseline.get("measurements", {}))))
+    original = baseline.get("measurements", {})
+    if not subjects or any(subject not in original for subject in subjects):
+        raise ValueError("verification requires original measurements for every subject")
+    methods = {subject: deepcopy(original[subject]["method"]) for subject in subjects}
+    selected = selected_files if selected_files is not None else (task or {}).get("files", scope.get("files", []))
+    owner = Path(project_root or before_root or root).resolve()
+    if final:
+        if set(subjects) != set(original) or before_root is not None:
+            raise ValueError("final scoring compares every subject against the original baseline")
+        comparison = baseline
+    else:
+        if before_root is None:
+            raise ValueError("candidate scoring needs the exact accepted before-source")
+        comparison = await score_source(before_root, metric=metric, scope=scope, subjects=subjects,
+            original_methods=methods, evaluator=evaluator, run_checked=run_checked,
+            project_root=owner, selected_files=selected, lake_args=lake_args,
+            cache=before_cache if before_cache is not None else current_measurements)
+    # Old candidate snapshots contain worker-supplied measurement records, not
+    # verifier-owned scoring. Retain them as history but score their source anew.
+    # This restriction does not replace or invalidate the original baseline.
+    cached_score = after_cache.get("scoring") if isinstance(after_cache, dict) else None
+    if not (isinstance(cached_score, dict) and _valid(cached_score)
+            and cached_score.get("metric_sha256") == metric["sha256"]
+            and cached_score.get("source_identity") == after_cache.get("identity", after_cache.get("source_identity"))
+            and cached_score.get("measurements") == after_cache.get("measurements")
+            and cached_score.get("judgments") == after_cache.get("judgments")):
+        after_cache = None
+    after = await score_source(root, metric=metric, scope=scope, subjects=subjects,
+        original_methods=methods, evaluator=evaluator, run_checked=run_checked,
+        project_root=owner, selected_files=selected, lake_args=lake_args,
+        comparison_records=comparison["measurements"], cache=after_cache)
+    if not final and file_identity(before_root, scope=scope, lake_args=lake_args) != comparison["identity"]:
+        raise ValueError("accepted source changed during candidate scoring")
+    snapshot = await run_checked(_verify, root, baseline=baseline, metric=metric, scope=scope,
+        measurements=after["measurements"], task=task, lake_args=lake_args, project_root=owner,
+        judgments=after["judgments"], comparison=None if final else comparison,
+        config_revision=config_revision, selected_files=selected, final=final, build_result=after["build"])
+    if not final and file_identity(before_root, scope=scope, lake_args=lake_args) != comparison["identity"]:
+        raise ValueError("accepted source changed during candidate verification")
+    # Include the actual before-scores in the same sealed verification result.
+    # The controller can retain this cache without promoting any worker claims.
+    snapshot.update(scoring=after["scoring"], judgments=after["judgments"],
+        comparison=deepcopy(comparison), comparison_measurements=deepcopy(comparison["measurements"]))
+    snapshot["qualification"] = ("Build and score evidence refer to exact source snapshots. "
+        "Executable scorer output is measured; existing-roster assessments remain agent_judged. "
+        "Semantic preservation and metric validity remain primary review judgments.")
+    return _seal({key: value for key, value in snapshot.items() if key != "sha256"})
+
+
+async def verify_candidate_scored(root, **kwargs):
+    return await _verify_scored(root, **kwargs, final=False)
+
+
+async def verify_final_scored(root, **kwargs):
+    return await _verify_scored(root, **kwargs, final=True)
 
 
 def completion_report(state, snapshot=None, verdict=None):

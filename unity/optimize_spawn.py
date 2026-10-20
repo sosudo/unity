@@ -1,9 +1,7 @@
-"""Optimize-owned agent launcher, ported from current Bump operational helpers.
+"""Optimize permissions, tool catalogs and ownership adapters for shared spawn.
 
-Each agent's credentials are turned into a per-process env here and handed only
-to that agent's child — os.environ is never mutated, so a mixed roster can run
-concurrently under asyncio.gather. Callers use this module's spawn(); its backend
-helpers are independent copies, not the solve/prove launch implementation.
+All backend execution loops live in unity.spawn. This module supplies explicit
+Optimize policy without changing the default behavior of other pipelines.
 """
 
 import asyncio
@@ -20,6 +18,8 @@ from pathlib import Path
 from rich.console import Console
 
 from .roster import Agent
+from . import spawn as _shared_spawn
+from .execution_policy import ExecutionPolicy
 
 _console = Console()
 
@@ -153,6 +153,7 @@ _OPTIMIZE_MCP_ENV_KEYS = (
     "UNITY_REAL_LEAN",
     "UNITY_OPTIMIZE_PROJECT_ROOT",
     "UNITY_OPTIMIZE_TASK_ID",
+    "UNITY_OPTIMIZE_SCORE_REQUEST_ID",
     "UNITY_OPTIMIZE_PHASE_DISPATCH_ID",
     "UNITY_OPTIMIZE_STRATEGY_ID",
     "UNITY_OPTIMIZE_AUTHOR",
@@ -232,26 +233,28 @@ _OPTIMIZE_ARISTOTLE_INSPECTION_TOOLS = (
 )
 
 
-def _optimize_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[str, ...]]:
+def _optimize_codex_tool_policy(mcp_servers: dict, phase: str, *,
+                                score_only: bool = False) -> dict[str, tuple[str, ...]]:
     """Authorize only this phase's existing public tools on known transports.
 
     Codex MCP approval is independent of shell approval_policy. Preapproval here
     is scoped to the pipeline API already delegated to this worker, not to an
     arbitrary server or any tools it might advertise in a future release.
     """
-    from .forum.optimize_server import PROFILE_TOOLS
+    from .forum.optimize_server import PROFILE_TOOLS, SCORE_TOOLS
 
     if phase not in PROFILE_TOOLS:
         raise ValueError(f"unknown optimize MCP phase {phase!r}")
     catalogs = {
-        "unity-forum": tuple(tool.__name__ for tool in PROFILE_TOOLS[phase]),
+        "unity-forum": tuple(tool.__name__ for tool in
+                             (SCORE_TOOLS if score_only else PROFILE_TOOLS[phase])),
         "lean-lsp": _OPTIMIZE_LEAN_INSPECTION_TOOLS
-            + (("lean_multi_attempt",) if phase == "optimizing" else ()),
+            + (("lean_multi_attempt",) if phase == "optimizing" and not score_only else ()),
         "axle": _OPTIMIZE_AXLE_INSPECTION_TOOLS
-            + (_OPTIMIZE_AXLE_PROOF_TOOLS if phase == "optimizing" else ()),
+            + (_OPTIMIZE_AXLE_PROOF_TOOLS if phase == "optimizing" and not score_only else ()),
         "aristotle": _OPTIMIZE_ARISTOTLE_INSPECTION_TOOLS
             + (("aristotle_submit", "aristotle_result", "aristotle_cancel")
-               if phase == "optimizing" else ()),
+               if phase == "optimizing" and not score_only else ()),
     }
     # lean_build is intentionally not authorized: workers must not initiate the
     # controller's project-wide build through either native MCP or the bridge.
@@ -728,173 +731,21 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
                          env_overrides: dict[str, str] | None = None,
                          own_process_group: bool = False,
                          on_normal_completion: CompletionCallback | None = None) -> str | None:
-    from claude_agent_sdk import query, ClaudeAgentOptions, AgentDefinition
-    import shutil
-
-    scratch = None
-    sdk_closed = True
-    cleanup_failed = False
-    pid_file = None
-
-    def mark_sdk_closed() -> None:
-        nonlocal sdk_closed
-        sdk_closed = True
-
-    async def close_group() -> None:
-        nonlocal cleanup_failed
-        try:
-            await _terminate_process_group(pid_file)
-        except BaseException:
-            cleanup_failed = True
-            raise
-
-    try:
-        isolation = {}
-        profile = (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE")
-        roots = _worktree_write_roots(cwd, profile=profile)
-        if roots:
-            from .optimize_permissions import claude_worktree_options
-            scratch = _claude_sandbox_tmpdir()
-            isolation = claude_worktree_options(cwd, (*roots, scratch),
-                read_only=profile == "critic", retrospective=profile == "retrospective")
-            system_prompt += _worktree_prompt(cwd, profile=profile)
-            env_overrides = {**(env_overrides or {}),
-                             **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(scratch))}
-
-        cli_path = None
-        if own_process_group and os.name == "posix":
-            from claude_agent_sdk._internal.transport import subprocess_cli
-            bundled = Path(subprocess_cli.__file__).parent.parent.parent / "_bundled" / "claude"
-            real_cli = bundled if bundled.is_file() else Path(shutil.which("claude") or "")
-            if real_cli.is_file():
-                group_dir = Path(tempfile.mkdtemp(prefix="unity-claude-group-"))
-                cli_path, pid_file = _process_group_wrapper(real_cli, group_dir, "claude")
-
-        agents_def = {
-            s["name"]: AgentDefinition(description=s["description"], prompt=s["prompt"], tools=s["tools"])
-            for s in subagents
-        }
-        options = ClaudeAgentOptions(
-            system_prompt=system_prompt,
-            mcp_servers={name: ({"type": "http", **cfg} if cfg.get("url") else cfg)
-                         for name, cfg in mcp_servers.items()},
-            agents=agents_def,
-            cwd=str(cwd),
-            permission_mode=isolation.pop("permission_mode", permission),
-            model=agent.model,
-            max_budget_usd=agent.budget,
-            env=_agent_env(agent, env_overrides=env_overrides),
-            cli_path=cli_path,
-            **isolation,
-        )
-        attempt = 0
-        while True:
-            attempt += 1
-            sdk_closed = True
-            try:
-                if on_normal_completion is not None:
-                    sdk_closed = False
-                    return await _claude_continuation(
-                        agent, options, prompt, cwd,
-                        on_normal_completion, idle_timeout,
-                        on_sdk_closed=mark_sdk_closed,
-                    )
-                final = None
-                stream = query(prompt=prompt, options=options)
-                sdk_closed = False
-                try:
-                    async for msg in _idle_guard(stream, idle_timeout):
-                        _log(agent.name, msg, cwd)
-                        if type(msg).__name__ == "ResultMessage":
-                            final = getattr(msg, "result", None)
-                            _last_run_stats[agent.name] = {
-                                "cost_usd": getattr(msg, "total_cost_usd", None),
-                                "num_turns": getattr(msg, "num_turns", None),
-                            }
-                        if _stop_requested(cwd):
-                            # Safe stop: wind down at the next stream item instead of being killed
-                            # mid-write; abandoning the iterator disconnects the SDK client cleanly.
-                            _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                            return final
-                finally:
-                    close = getattr(stream, "aclose", None)
-                    if close is not None:
-                        await close()
-                        mark_sdk_closed()
-                return final
-            except _CompletionCallbackError as exc:
-                raise exc.error
-            except _UnsuccessfulTurnError:
-                raise
-            except Exception as e:
-                if _give_up(e, attempt):
-                    raise
-                wait = _retry_sleep(e)
-                _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-                await close_group()
-                await asyncio.sleep(wait)
-            finally:
-                cleanup_failed |= not sdk_closed
-                await close_group()
-    finally:
-        # Never remove scratch while a failed/interrupted SDK or group cleanup
-        # could still leave an owned process using it. A retry uses the same
-        # private directory; closure failure remains sticky across attempts.
-        if scratch is not None and sdk_closed and not cleanup_failed:
-            shutil.rmtree(scratch)
-
-
-async def _claude_continuation(agent, options, prompt, cwd,
-                               callback, idle_timeout, *, on_sdk_closed=None):
-    """One connected SDK session; validation corrections are ordinary user turns."""
-    from claude_agent_sdk import ClaudeSDKClient
-
-    client = ClaudeSDKClient(options=options)
-    await client.connect()
-    total_turns = 0
-    response_closed = True
-    try:
-        while not _stop_requested(cwd):
-            await client.query(prompt)
-            result = None
-            stream = client.receive_response()
-            response_closed = False
-            try:
-                async for msg in _idle_guard(stream, idle_timeout):
-                    _log(agent.name, msg, cwd)
-                    if type(msg).__name__ == "ResultMessage":
-                        result = msg
-                        total_turns += getattr(msg, "num_turns", 0) or 0
-                        # The SDK reports cumulative session cost, not a per-turn delta.
-                        _last_run_stats[agent.name] = {
-                            "cost_usd": getattr(msg, "total_cost_usd", None),
-                            "num_turns": total_turns,
-                        }
-                    if _stop_requested(cwd):
-                        return getattr(result, "result", None)
-            finally:
-                await stream.aclose()
-                response_closed = True
-            if result is None or getattr(result, "is_error", True):
-                detail = getattr(result, "subtype", "missing successful result")
-                raise _UnsuccessfulTurnError(f"Claude turn did not complete successfully: {detail}")
-            final = getattr(result, "result", None)
-            prompt = await _completion_feedback(callback, final, cwd)
-            if not prompt:
-                return final
-    finally:
-        await client.disconnect()
-        if response_closed and on_sdk_closed is not None:
-            on_sdk_closed()
+    """Compatibility entry point; execution uses the shared backend loop."""
+    return await _shared_spawn.claude_spawner(agent, system_prompt, prompt, cwd, mcp_servers,
+        permission=permission, idle_timeout=idle_timeout, subagents=subagents,
+        env_overrides=env_overrides, own_process_group=own_process_group,
+        execution_policy=_execution_policy(on_normal_completion))
 
 
 def _write_codex_config(home: Path, agent: Agent, mcp_servers: dict,
                         writable_roots: tuple[Path, ...] = (), *,
-                        optimize_phase: str | None = None) -> str | None:
+                        optimize_phase: str | None = None,
+                        score_only: bool = False) -> str | None:
     """Seed CODEX_HOME/config.toml with a custom provider (if base_url), MCP servers,
     and workspace-write sandbox tuning. Returns the provider id to pass as
     model_provider, or None for the default openai provider."""
-    policy = (_optimize_codex_tool_policy(mcp_servers, optimize_phase)
+    policy = (_optimize_codex_tool_policy(mcp_servers, optimize_phase, score_only=score_only)
               if optimize_phase is not None else {})
     home.mkdir(parents=True, exist_ok=True)
     # No api_key -> ride the user's Codex subscription: copy their login into this
@@ -1118,224 +969,12 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         own_process_group: bool = False,
                         mcp_profile: str = "optimize",
                         on_normal_completion: CompletionCallback | None = None) -> str | None:
-    from openai_codex import AsyncCodex, CodexConfig, Sandbox
-
-    system_prompt = system_prompt + _codex_mcp_note(
-        mcp_profile, (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"),
-    )
-
-    home = Path(tempfile.mkdtemp(prefix="unity-codex-"))
-    roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
-    if roots:
-        system_prompt += _worktree_prompt(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
-    optimize_phase = None
-    policy = {}
-    if mcp_profile == "optimize":
-        optimize_phase = (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE")
-        if optimize_phase is None:
-            forum_args = mcp_servers.get("unity-forum", {}).get("args", [])
-            if len(forum_args) in {8, 10} and forum_args[6] == "--profile":
-                optimize_phase = forum_args[7]
-        if optimize_phase is None:
-            raise ValueError("optimize Codex worker requires an explicit phase")
-        policy = _optimize_codex_tool_policy(mcp_servers, optimize_phase)
-    provider = _write_codex_config(home, agent, mcp_servers,
-                                   writable_roots=roots, optimize_phase=optimize_phase)
-    _write_codex_agents(home, subagents)
-    # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
-    sandbox = (Sandbox.workspace_write if roots or permission != "bypassPermissions"
-               else Sandbox.full_access)
-    # The critic must use shell-MCP for providers without native MCP. A
-    # filesystem-wide read-only sandbox would also forbid its Forum verdict.
-    # Preserve worktree sandboxing; phase tools and the controller's exact
-    # before/after source/config check enforce the read-only review contract.
-
-    # Prefer the user's installed codex CLI (kept current by its own updater) over the
-    # SDK's pinned bundled binary — newest models often require a newer runtime.
-    import shutil as _sh
-    codex_bin = _sh.which("codex")
-    pid_file = None
-    if own_process_group and os.name == "posix":
-        if codex_bin is None:
-            try:
-                from codex_cli_bin import bundled_codex_path
-                codex_bin = str(bundled_codex_path())
-            except ImportError:
-                pass
-        if codex_bin:
-            wrapped, pid_file = _process_group_wrapper(Path(codex_bin), home, "codex")
-            codex_bin = str(wrapped)
-    attempt = 0
-    while True:
-        attempt += 1
-        agent_env = _agent_env(agent, home, env_overrides)
-        config_kwargs = {}
-        if roots:
-            # CLI overrides outrank project configuration; workers cannot inherit
-            # an extra writable checkout or a full-access project profile.
-            config_kwargs["config_overrides"] = (
-                'sandbox_mode="workspace-write"',
-                'approval_policy="never"',
-                "sandbox_workspace_write.writable_roots=" + json.dumps([str(path) for path in roots]),
-                "sandbox_workspace_write.network_access=true",
-                "sandbox_workspace_write.exclude_slash_tmp=true",
-                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
-            )
-        if mcp_profile == "optimize":
-            # Login startup and cached shell state can move elan ahead of optimize's
-            # Lake shim even when the app-server process receives the right PATH.
-            config_kwargs["config_overrides"] = (
-                config_kwargs.get("config_overrides", ())
-                + _optimize_codex_shell_overrides(agent_env)
-                + _optimize_codex_policy_overrides(policy, mcp_servers)
-            )
-        cfg = CodexConfig(
-            cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,
-        )
-        codex = AsyncCodex(config=cfg)
-        final = None
-        interrupt_task = None
-        turn_finished = asyncio.Event()
-        stream_started = asyncio.Event()
-        try:
-            # login_api_key is OpenAI-official auth only; custom providers (base_url set)
-            # authenticate via the provider's env_key (CODEX_API_KEY in _agent_env).
-            if agent.api_key and not agent.base_url:
-                await codex.login_api_key(agent.api_key)
-            thread_options = {}
-            if roots:
-                from openai_codex import ApprovalMode
-                thread_options["approval_mode"] = ApprovalMode.deny_all
-            thread = await codex.thread_start(
-                model=agent.model,
-                model_provider=provider,
-                sandbox=sandbox,
-                base_instructions=system_prompt,
-                cwd=str(cwd),
-                **thread_options,
-            )
-            next_prompt = prompt
-            thread_usage = None
-            while True:
-                if (_stop_requested(cwd)
-                        or (interrupt_event is not None and interrupt_event.is_set())):
-                    return final
-                turn_finished = asyncio.Event()
-                stream_started = asyncio.Event()
-                final = None
-                handle = await thread.turn(next_prompt)
-
-                async def interrupt_turn() -> None:
-                    """Stop a Codex turn without cancelling its thread-backed queue wait.
-
-                    openai-codex implements next_turn_notification with asyncio.to_thread
-                    around a blocking Queue.get(). Cancelling that await abandons the worker
-                    thread. Ask the app server to interrupt instead, then leave the stream
-                    registered until it completes or transport shutdown wakes the waiter.
-                    """
-                    assert interrupt_event is not None
-                    await interrupt_event.wait()
-                    await stream_started.wait()
-                    try:
-                        await asyncio.wait_for(
-                            handle.interrupt(), timeout=_CODEX_INTERRUPT_REQUEST_TIMEOUT
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception:
-                        await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-                        return
-
-                    try:
-                        await asyncio.wait_for(
-                            turn_finished.wait(), timeout=_CODEX_INTERRUPT_DRAIN_TIMEOUT
-                        )
-                    except asyncio.TimeoutError:
-                        # Interrupt was acknowledged but no terminal event arrived. Close
-                        # while the stream queue is still registered so fail_all() wakes its
-                        # blocking notification waiter before the generator unregisters it.
-                        await asyncio.wait_for(codex.close(), timeout=_CODEX_CLOSE_TIMEOUT)
-
-                if interrupt_event is not None:
-                    interrupt_task = asyncio.create_task(
-                        interrupt_turn(), name=f"codex-interrupt:{agent.name}"
-                    )
-
-                # handle.run() and handle.stream() are competing consumers of one notification
-                # queue — using both (in any order) starves one and hangs. Consume ONLY the
-                # stream and assemble the final response from agentMessage items ourselves.
-                usage = None
-                successful = False
-                failure_detail = ""
-                async for note in _codex_notifications(
-                    handle, codex, idle_timeout, stream_started, pid_file
-                ):
-                    _log(agent.name, note, cwd)
-                    if _stop_requested(cwd):
-                        _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                        break
-                    method = getattr(note, "method", "") or ""
-                    payload = getattr(note, "payload", None)
-                    if method in {"error", "turn/failed"}:
-                        error = getattr(payload, "error", None)
-                        failure_detail = str(getattr(error, "message", None)
-                                             or getattr(payload, "message", None) or failure_detail)[:1000]
-                    if method == "turn/completed":
-                        turn_finished.set()
-                        turn = getattr(payload, "turn", None)
-                        status = getattr(turn, "status", None)
-                        successful = getattr(status, "value", status) == "completed"
-                        error = getattr(turn, "error", None)
-                        failure_detail = str(getattr(error, "message", None) or failure_detail)[:1000]
-                    if method == "item/completed":
-                        root = getattr(getattr(payload, "item", None), "root", None)
-                        if getattr(root, "type", "") == "agentMessage":
-                            final = getattr(root, "text", None) or final
-                    elif method == "thread/tokenUsage/updated":
-                        total = getattr(getattr(payload, "token_usage", None), "total", None)
-                        if total is not None:
-                            usage = {k: getattr(total, k) for k in
-                                     ("input_tokens", "cached_input_tokens", "output_tokens",
-                                      "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
-                thread_usage = usage if usage is not None else thread_usage
-                _last_run_stats[agent.name] = {"cost_usd": None, "usage": thread_usage}
-                if interrupt_task is not None:
-                    interrupt_task.cancel()
-                    await asyncio.gather(interrupt_task, return_exceptions=True)
-                    interrupt_task = None
-                if (_stop_requested(cwd)
-                        or (interrupt_event is not None and interrupt_event.is_set())):
-                    return final
-                if not successful:
-                    # Codex can report provider errors as a terminal notification
-                    # rather than raising from the stream. Route those through
-                    # the same inherited transport retry cap and backoff.
-                    raise RuntimeError("Codex turn did not complete successfully"
-                                       + (": " + failure_detail if failure_detail else ""))
-                if on_normal_completion is None:
-                    return final
-                next_prompt = await _completion_feedback(on_normal_completion, final, cwd)
-                if not next_prompt:
-                    return final
-        except asyncio.CancelledError:
-            raise
-        except _CompletionCallbackError as exc:
-            raise exc.error
-        except SpawnCleanupError:
-            raise
-        except _UnsuccessfulTurnError:
-            raise
-        except Exception as e:
-            if interrupt_event is not None and interrupt_event.is_set():
-                return final
-            if _give_up(e, attempt):
-                raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await asyncio.sleep(wait)
-        finally:
-            turn_finished.set()
-            await _cleanup_codex_attempt(codex, interrupt_task, pid_file)
+    """Compatibility entry point; execution uses the shared backend loop."""
+    return await _shared_spawn.codex_spawner(agent, system_prompt, prompt, cwd, mcp_servers,
+        permission=permission, idle_timeout=idle_timeout, subagents=subagents,
+        env_overrides=env_overrides, own_process_group=own_process_group,
+        execution_policy=_execution_policy(on_normal_completion),
+        interrupt_event=interrupt_event, mcp_profile=mcp_profile)
 
 
 async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
@@ -1345,140 +984,11 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                               own_process_group: bool = False,
                               mcp_profile: str = "optimize",
                               on_normal_completion: CompletionCallback | None = None) -> str | None:
-    """Google Antigravity backend: drives the user's installed `agy` CLI in print mode
-    (subscription auth; serves both the Gemini pool and the Claude/GPT pool). MCP tools
-    reach the model through the `unity mcp` shell bridge, like codex."""
-    import json as _json
-    import shutil as _sh
-    agy = _sh.which("agy")
-    if agy is None:
-        raise RuntimeError("antigravity backend needs the `agy` CLI installed and logged in "
-                           "(https://antigravity.google)")
-    roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
-    if roots:
-        system_prompt += _worktree_prompt(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
-    full = system_prompt + _codex_mcp_note(
-        mcp_profile, (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"),
-    ) + "\n\n---\n\nTASK:\n" + prompt
-    cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
-           "--dangerously-skip-permissions", "--print-timeout", "72h"]
-    pid_file = None
-    if own_process_group and os.name == "posix":
-        group_dir = Path(tempfile.mkdtemp(prefix="unity-antigravity-group-"))
-        wrapped, pid_file = _process_group_wrapper(Path(agy), group_dir, "antigravity")
-        cmd[0] = str(wrapped)
-    if roots:
-        # AG has no per-session editor/path hook. Its native terminal sandbox is
-        # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
-        cmd += ["--sandbox"]
-        for root in roots:
-            if root == Path(cwd).resolve():
-                continue
-            cmd += ["--add-dir", str(root)]
-        _console.print(
-            f"[yellow]{agent.name}: Antigravity worktree isolation is best effort; "
-            "terminal sandbox enabled, editor writes rely on the worktree policy.[/yellow]"
-        )
-
-    attempt = 0
-    total_usage = None
-    continuation_warned = False
-    while True:
-        if _stop_requested(cwd):
-            return None
-        attempt += 1
-        proc = await asyncio.create_subprocess_exec(
-            *cmd, cwd=str(cwd), stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL, stdin=asyncio.subprocess.DEVNULL,
-            env=_agent_env(agent, env_overrides=env_overrides),
-            start_new_session=False)  # The wrapper records birth immediately after setsid.
-
-        async def _lines():
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    return
-                yield line
-
-        try:
-            final = None
-            usage = None
-            failed = None
-            successful = False
-            async for raw in _idle_guard(_lines(), idle_timeout):
-                try:
-                    e = _json.loads(raw)
-                except _json.JSONDecodeError:
-                    continue
-                ev = e.get("event")
-                if ev == "step_update":
-                    su = e.get("step_update", {})
-                    st = su.get("step_type", "")
-                    if st == "agent_response" and su.get("text_delta"):
-                        _emit_delta(agent.name, su["text_delta"])
-                    elif (su.get("state") == "DONE"
-                          and st not in ("agent_response", "checkpoint", "user_input", "unknown", "")):
-                        _console.print(f"[dim]{_ts()} \\[{agent.name}][/dim] [cyan]⚙ {st[:80]}[/cyan]")
-                        _tool_log(cwd, agent.name, st)
-                elif ev == "result":
-                    r = e.get("result", {})
-                    successful = r.get("status") == "SUCCESS"
-                    final = r.get("response") or final
-                    usage = r.get("usage")
-                    if r.get("status") not in (None, "SUCCESS"):
-                        failed = r.get("status")
-                        _console.print(f"[red]{_ts()} \\[{agent.name}] ✗ agy result: {failed}[/red]")
-                if _stop_requested(cwd):
-                    _console.print(f"[yellow]{_ts()} \\[{agent.name}] safe stop — ending turn[/yellow]")
-                    if own_process_group and os.name == "posix":
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    else:
-                        proc.terminate()
-                    break
-            rc = await proc.wait()
-            if failed:
-                failure_type = _UnsuccessfulTurnError if on_normal_completion is not None else RuntimeError
-                raise failure_type(f"agy turn failed: {failed}")
-            if final is None and rc not in (0, -15):
-                failure_type = _UnsuccessfulTurnError if on_normal_completion is not None else RuntimeError
-                raise failure_type(f"agy exited with code {rc} and no response")
-            _flush_delta(agent.name)
-            _console.print(f"[green]{_ts()} \\[{agent.name}] ✓ turn complete[/green]")
-            total_usage = _sum_usage(total_usage, usage)
-            _last_run_stats[agent.name] = {"cost_usd": None, "usage": total_usage}
-            if on_normal_completion is not None and not _stop_requested(cwd):
-                if not successful or rc != 0:
-                    raise _UnsuccessfulTurnError("Antigravity turn did not complete successfully")
-                feedback = await _completion_feedback(on_normal_completion, final, cwd)
-                if feedback:
-                    if not continuation_warned:
-                        _log(agent.name, "Antigravity continuation: retaining this logical attempt and draft; "
-                             "conversation resume is unavailable, so feedback starts a new CLI session.")
-                        continuation_warned = True
-                    cmd[2] = full + "\n\nCONTROLLER VALIDATION FEEDBACK:\n" + feedback
-                    attempt -= 1  # A draft correction is not a backend failure.
-                    continue
-            return final
-        except _CompletionCallbackError as exc:
-            raise exc.error
-        except _UnsuccessfulTurnError:
-            raise
-        except Exception as e:
-            if proc.returncode is None:
-                proc.kill()
-            if _give_up(e, attempt):
-                raise
-            wait = _retry_sleep(e)
-            _log(agent.name, f"API Error ({e}), retrying in {int(wait)}s...")
-            await asyncio.sleep(wait)
-        finally:
-            try:
-                if pid_file is not None:
-                    await _drain_spawn_cleanup(_terminate_process_group(pid_file))
-                elif proc.returncode is None:
-                    proc.kill()
-            finally:
-                await proc.wait()
+    """Compatibility entry point; execution uses the shared backend loop."""
+    return await _shared_spawn.antigravity_spawner(agent, system_prompt, prompt, cwd, mcp_servers,
+        permission=permission, idle_timeout=idle_timeout, subagents=subagents,
+        env_overrides=env_overrides, own_process_group=own_process_group,
+        execution_policy=_execution_policy(on_normal_completion), mcp_profile=mcp_profile)
 
 
 def _sum_usage(previous, current):
@@ -1548,6 +1058,143 @@ def _optimize_external_tools_prompt(mcp_servers: dict) -> str:
     return "\n\n".join(sections)
 
 
+def _claude_options(cwd, system_prompt, mcp_servers, permission, env_overrides):
+    scratch = None
+    isolation = {}
+    profile = (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE")
+    read_only = profile == "critic" or bool((env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID"))
+    roots = _worktree_write_roots(cwd, profile=profile)
+    if roots:
+        from .optimize_permissions import claude_worktree_options
+        scratch = _claude_sandbox_tmpdir()
+        try:
+            isolation = claude_worktree_options(cwd, (*roots, scratch),
+                read_only=read_only, retrospective=profile == "retrospective")
+            system_prompt += _worktree_prompt(cwd, profile="critic" if read_only else profile)
+            env_overrides = {**(env_overrides or {}),
+                             **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(scratch))}
+        except BaseException:
+            _finish_claude(scratch, True, False)
+            raise
+
+    return {"system_prompt": system_prompt, "env_overrides": env_overrides,
+            "mcp_servers": {name: ({"type": "http", **cfg} if cfg.get("url") else cfg)
+                            for name, cfg in mcp_servers.items()},
+            "options": isolation, "scratch": scratch}
+
+
+def _finish_claude(scratch, sdk_closed, cleanup_failed):
+    if scratch is not None and sdk_closed and not cleanup_failed:
+        import shutil
+        shutil.rmtree(scratch)
+
+
+def _codex_options(agent, cwd, system_prompt, mcp_servers, home, permission, env_overrides, mcp_profile):
+    from openai_codex import Sandbox
+    score_only = bool((env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID"))
+    system_prompt = system_prompt + _codex_mcp_note(
+        mcp_profile, "critic" if score_only else (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"),
+    )
+
+    roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
+    if roots:
+        system_prompt += _worktree_prompt(cwd, profile="critic" if score_only else (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
+    optimize_phase = None
+    policy = {}
+    if mcp_profile == "optimize":
+        optimize_phase = (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE")
+        if optimize_phase is None:
+            forum_args = mcp_servers.get("unity-forum", {}).get("args", [])
+            if len(forum_args) in {8, 10} and forum_args[6] == "--profile":
+                optimize_phase = forum_args[7]
+        if optimize_phase is None:
+            raise ValueError("optimize Codex worker requires an explicit phase")
+        policy = _optimize_codex_tool_policy(mcp_servers, optimize_phase, score_only=score_only)
+    provider = _write_codex_config(home, agent, mcp_servers,
+                                   writable_roots=roots, optimize_phase=optimize_phase,
+                                   score_only=score_only)
+    # bypassPermissions ~ full_access; anything more restrictive still needs to edit files.
+    sandbox = (Sandbox.workspace_write if roots or permission != "bypassPermissions"
+               else Sandbox.full_access)
+    # The critic must use shell-MCP for providers without native MCP. A
+    # filesystem-wide read-only sandbox would also forbid its Forum verdict.
+    # Preserve worktree sandboxing; phase tools and the controller's exact
+    # before/after source/config check enforce the read-only review contract.
+
+
+    def config_options(agent_env):
+        config_kwargs = {}
+        if roots:
+            # CLI overrides outrank project configuration; workers cannot inherit
+            # an extra writable checkout or a full-access project profile.
+            config_kwargs["config_overrides"] = (
+                'sandbox_mode="workspace-write"',
+                'approval_policy="never"',
+                "sandbox_workspace_write.writable_roots=" + json.dumps([str(path) for path in roots]),
+                "sandbox_workspace_write.network_access=true",
+                "sandbox_workspace_write.exclude_slash_tmp=true",
+                "sandbox_workspace_write.exclude_tmpdir_env_var=true",
+            )
+        if mcp_profile == "optimize":
+            # Login startup and cached shell state can move elan ahead of optimize's
+            # Lake shim even when the app-server process receives the right PATH.
+            config_kwargs["config_overrides"] = (
+                config_kwargs.get("config_overrides", ())
+                + _optimize_codex_shell_overrides(agent_env)
+                + _optimize_codex_policy_overrides(policy, mcp_servers)
+            )
+        return config_kwargs
+
+    thread_options = {}
+    if roots:
+        from openai_codex import ApprovalMode
+        thread_options["approval_mode"] = ApprovalMode.deny_all
+    return {"system_prompt": system_prompt, "provider": provider, "sandbox": sandbox,
+            "config_options": config_options, "thread_options": thread_options}
+
+
+def _antigravity_options(agent, agy, cwd, system_prompt, prompt, env_overrides, own_process_group, mcp_profile):
+    score_only = bool((env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID"))
+    roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
+    if roots:
+        system_prompt += _worktree_prompt(cwd, profile="critic" if score_only else (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
+    full = system_prompt + _codex_mcp_note(
+        mcp_profile, "critic" if score_only else (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"),
+    ) + "\n\n---\n\nTASK:\n" + prompt
+    cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
+           "--dangerously-skip-permissions", "--print-timeout", "72h"]
+    pid_file = None
+    if own_process_group and os.name == "posix":
+        group_dir = Path(tempfile.mkdtemp(prefix="unity-antigravity-group-"))
+        wrapped, pid_file = _process_group_wrapper(Path(agy), group_dir, "antigravity")
+        cmd[0] = str(wrapped)
+    if roots:
+        # AG has no per-session editor/path hook. Its native terminal sandbox is
+        # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
+        cmd += ["--sandbox"]
+        for root in roots:
+            if root == Path(cwd).resolve():
+                continue
+            cmd += ["--add-dir", str(root)]
+        _console.print(
+            f"[yellow]{agent.name}: Antigravity worktree isolation is best effort; "
+            "terminal sandbox enabled, editor writes rely on the worktree policy.[/yellow]"
+        )
+
+    return {"full": full, "cmd": cmd, "pid_file": pid_file}
+
+
+def _execution_policy(on_normal_completion=None, *, started_at=None):
+    return ExecutionPolicy(
+        hooks=sys.modules[__name__], claude_options=_claude_options, finish_claude=_finish_claude,
+        codex_options=_codex_options, antigravity_options=_antigravity_options,
+        callback_error=_CompletionCallbackError,
+        unsuccessful_error=_UnsuccessfulTurnError, cleanup_error=SpawnCleanupError,
+        on_normal_completion=on_normal_completion,
+        started_at=started_at,
+    )
+
+
 async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 mcp_servers: dict, *, permission: str = "bypassPermissions",
                 idle_timeout: float = 600.0, subagents=(),
@@ -1557,42 +1204,34 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 own_process_group: bool = False,
                 mcp_profile: str = "optimize",
                 on_normal_completion: CompletionCallback | None = None) -> str | None:
-    backend = {"claude_code": claude_spawner, "codex": codex_spawner,
-               "antigravity": antigravity_spawner}[agent.backend]
-    import time
-    t0 = time.monotonic()
-    cleanup_failed = False
+    started_at = time.monotonic()
+    delegated = False
     try:
         if _stop_requested(cwd):
             return None
         phase = (log_context or {}).get("phase")
         if phase and "UNITY_OPTIMIZE_PROFILE" not in (env_overrides or {}):
             env_overrides = {**(env_overrides or {}), "UNITY_OPTIMIZE_PROFILE": phase}
+        if (env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID"):
+            # Scoring has no planning-write grant, even if the caller supplied a
+            # previous writer's scratch path. Keep the existing optimizing profile.
+            env_overrides = {**env_overrides, "UNITY_OPTIMIZE_SCRATCH": ""}
         # Other optimize phases keep their own prompts, without proof-development catalogs.
         if (mcp_profile == "optimize"
+                and not (env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID")
                 and (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE", phase) == "optimizing"):
             system_prompt += "\n\n" + _optimize_external_tools_prompt(mcp_servers)
         if mcp_profile == "optimize":
             worker_env = dict(os.environ)
             worker_env.update(_agent_env(agent, env_overrides=env_overrides))
             mcp_servers = optimize_mcp_with_runtime_env(mcp_servers, worker_env)
-        kwargs = {
-            "permission": permission,
-            "idle_timeout": idle_timeout,
-            "subagents": subagents,
-            "env_overrides": env_overrides,
-            "own_process_group": own_process_group,
-            "on_normal_completion": on_normal_completion,
-        }
-        if agent.backend == "codex":
-            kwargs["interrupt_event"] = interrupt_event
-            kwargs["mcp_profile"] = mcp_profile
-        elif agent.backend == "antigravity":
-            kwargs["mcp_profile"] = mcp_profile
-        return await backend(agent, system_prompt, prompt, cwd, mcp_servers, **kwargs)
-    except SpawnCleanupError:
-        cleanup_failed = True
-        raise
+        policy = _execution_policy(on_normal_completion, started_at=started_at)
+        delegated = True
+        return await _shared_spawn.spawn(agent, system_prompt, prompt, cwd, mcp_servers,
+            permission=permission, idle_timeout=idle_timeout, subagents=subagents,
+            interrupt_event=interrupt_event, log_context=log_context, env_overrides=env_overrides,
+            own_process_group=own_process_group, mcp_profile=mcp_profile, execution_policy=policy)
     finally:
-        if not cleanup_failed:
-            _write_run_log(agent, cwd, time.monotonic() - t0, log_context)
+        # Once delegated, shared dispatch accounts only after owned cleanup.
+        if not delegated:
+            _write_run_log(agent, cwd, time.monotonic() - started_at, log_context)

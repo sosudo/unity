@@ -58,8 +58,10 @@ def _task_id(task_id: str) -> str:
     return task_id
 
 
-def _profile(*allowed: str) -> None:
+def _profile(*allowed: str, scoring: bool = False) -> None:
     if PROFILE not in allowed: raise ValueError("tool not available in this Optimize phase")
+    if os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip() and not scoring:
+        raise ValueError("verification scoring is read-only; use submit_score_report for the bound request")
 
 
 def _assignment(author: str, assignment_id: str) -> dict:
@@ -160,12 +162,12 @@ def _measurement_summary(row, *, include_method: bool = False) -> dict:
 
 def _assignment_summary(row: dict, required_chunk_ids: list[str]) -> dict:
     required = set(required_chunk_ids)
-    measurements = row.get("measurements", {})
+    measurements = row.get("advisory_measurements", row.get("measurements", {}))
     recorded = set(measurements) if isinstance(measurements, dict) else set()
     return _summary_fields(row, ("assignment_id", "author", "status", "base_main_sha", "task_revision", "config_revision")) | {
         "required_count": len(required), "recorded_count": len(required & recorded),
         "missing_count": len(required - recorded), "measurement_map_malformed": not isinstance(measurements, dict),
-        "coverage_qualification": "Counts reflect assigned-key coverage only, not measurement validity or acceptance."}
+        "coverage_qualification": "Optional advisory-key coverage only, not measurement validity or acceptance; submission does not require scores."}
 
 
 def _candidate_summary(state: dict, row: dict) -> dict:
@@ -178,6 +180,8 @@ def _candidate_summary(state: dict, row: dict) -> dict:
             for cid, value in verification.get("comparisons", {}).items()},
         "measurements": {cid: _measurement_summary(value)
                          for cid, value in row.get("measurements", {}).items()},
+        "advisory_measurements": {cid: _measurement_summary(value)
+                         for cid, value in row.get("advisory_measurements", {}).items()},
         "selection": _summary_fields(row.get("selection") or {}, ("author", "reason", "at")),
         "endorsement_count": len(row.get("endorsements", [])), "objection_count": len(row.get("objections", [])),
         "records": {"candidate": _brief_artifact(state, "candidate", row)}}
@@ -237,6 +241,9 @@ def optimize_brief() -> dict:
             "phase_dispatches": state.get("phase_dispatches", {}),
             "tasks": state["tasks"], "candidates": state["candidates"],
             "rounds": state["rounds"], "review": state["review"]}
+    request_id = os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip()
+    if request_id:
+        full["scoring_request"] = _bound_scoring_request(state, request_id)
     metric = state["metric"] if isinstance(state["metric"], dict) else {"name": state["metric"]}
     next_actions = [
         "Read optimize_task only for a nonempty bound_task; phase names are not task IDs.",
@@ -246,6 +253,10 @@ def optimize_brief() -> dict:
     ]
     if PROFILE in {"architect", "exploration", "chunking"}:
         next_actions.append("Use report_phase_result to record your completed, blocked or eligible skipped preparation contribution.")
+    if request_id:
+        next_actions = ["Read records.scoring_request with artifact_read; inspect only this request's exact source view.",
+                        "Use submit_score_report for every requested subject and the exact original method when supplied.",
+                        "Do not edit source, claim strategies, submit candidates or change current/baseline records."]
     response = {"root": state["root"], "run_id": state["run_id"], "revision": state["revision"],
             "phase": state["phase"], "profile": PROFILE,
             "metric": {key: _summary_text(metric[key]) for key in
@@ -263,13 +274,14 @@ def optimize_brief() -> dict:
                  "task_count": len(row.get("tasks", {})), "exclusion_count": len(row.get("exclusions", {})),
                  "reason": _summary_text(row.get("reason", ""), 240)} for row in proposals[-5:]]},
             "records": {key: _brief_artifact(state, key, value) for key, value in full.items()},
-            "turn_kind": "task" if bound_task else "phase", "bound_task": bound_task,
+            "turn_kind": "scoring" if request_id else "task" if bound_task else "phase", "bound_task": bound_task,
+            "scoring_request_id": request_id,
             "phase_dispatch_id": os.getenv("UNITY_OPTIMIZE_PHASE_DISPATCH_ID", "").strip(),
             "phase_dispatches": _phase_summaries(state, limit=1),
             "next_actions": next_actions, "rules": [
                 "Every roster member, including the primary, may optimize.",
                 "Use distinct competing strategies in separate assigned private worktrees.",
-                "Preserve the original baseline; report current measurements separately.",
+                "Preserve the original baseline; verification owns current scores.",
                 "Do not weaken statements or add holes/axioms to improve a score.",
                 "The primary selects among checked candidates; only the controller integrates them.",
                 "Only the configured primary reviews the exact final snapshot, read-only.",
@@ -296,10 +308,10 @@ def optimize_task(task_id: str) -> dict:
                 "measurement_contract": {"required_chunk_ids": contract["required_chunk_ids"],
                     **{key: {cid: _measurement_summary(row, include_method=True) for cid, row in contract[key].items()}
                        for key in ("original", "current")},
-                    "instructions": "Finish source edits, commit, then measure every required chunk including unchanged declarations. "
-                        "Use each original record's exact method; put source-specific counting details in evidence. "
-                        "Submit sealed records, never raw numbers. Follow error-specific guidance: correct fixable reports "
-                        "in the same assignment; after private-tree changes, remeasure all chunks once bytes are stable. "
+                    "instructions": "Finish source edits, commit, then submit the candidate with its explanation and evidence. "
+                        "Verification builds and scores every required subject. Worker score claims are optional advisory evidence, "
+                        "not submission prerequisites or checked scores. Missing or stale current scores do not block submission. "
+                        "Follow error-specific guidance for source or assignment errors. "
                         "If the assignment base or integrated source changed, preserve private work, report the obstacle "
                         "and end the turn for normal controller handling; do not reset, rebind, update source or claim no_improvement."},
                 "chunks": [_summary_fields(row, ("chunk_id", "name", "path", "kind", "start_line", "end_line", "source_sha256"))
@@ -354,6 +366,9 @@ def _communication(kind: str, author: str, task_id: str, content: str, **details
         if not task_id:
             details.update(phase=PROFILE,
                 phase_dispatch_id=os.getenv("UNITY_OPTIMIZE_PHASE_DISPATCH_ID", "").strip())
+            if request_id := os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip():
+                _bound_scoring_request(state, request_id)
+                details["scoring_request_id"] = request_id
         row = tasks._event(state, kind, author, task_id=task_id, content=content, **details)
     _mirror(author, kind.replace("_", " "), content, task_id or "global")
     return row
@@ -418,19 +433,21 @@ def propose_chunk_plan(author: str, chunks: list[dict], reason: str, exclusions:
 
 def submit_baseline_measurement(author: str, chunk_id: str, measurement: dict) -> dict:
     _profile("chunking")
-    return tasks.record_baseline_measurement(FORUM_DIR, _author(author), chunk_id, measurement)
+    author = _author(author)
+    with tasks.transaction(FORUM_DIR) as state:
+        if state["baseline_sealed"] or chunk_id not in state["chunks"]:
+            raise ValueError("baseline advice requires an unsealed baseline and known subject")
+        state.setdefault("advisory_baseline_measurements", {}).setdefault(chunk_id, []).append(
+            {"author": author, "measurement": deepcopy(measurement)})
+        tasks._event(state, "baseline_measurement_advice", author, chunk_id=chunk_id)
+    return {"advisory": True, "subject": chunk_id, "verification_required": True}
 
 
 def record_measurement(author: str, chunk_id: str, raw_value: int | float | str,
                        method: dict, evidence: dict | list | str, evidence_kind: str = "agent_judged",
                        baseline: bool = False, assignment_id: str = "", units: str | None = None,
                        comparison_judgment: dict | None = None) -> dict:
-    """Bind evidenced measured/judged values to baseline or actual worker bytes.
-
-    This records supplied evidence; it does not invent or execute a scorer.
-    Finish source edits and commit before candidate measurement: source identity
-    always includes HEAD. Reuse the exact original method for each subject.
-    """
+    """Retain optional worker advice. Verification owns authoritative scoring."""
     from .. import optimize_metrics
     author = _author(author)
     _judgment(comparison_judgment)
@@ -451,13 +468,13 @@ def record_measurement(author: str, chunk_id: str, raw_value: int | float | str,
     measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
         raw_value=raw_value, source_identity=identity, method=method, evidence=evidence,
         evidence_kind=evidence_kind, units=units)
-    return tasks.record_baseline_measurement(FORUM_DIR, author, chunk_id, measurement)
+    return submit_baseline_measurement(author, chunk_id, measurement)
 
 
 def measure_candidate(author: str, assignment_id: str, chunk_id: str, raw_value: int | float | str,
                       method: dict, evidence: dict | list | str, evidence_kind: str = "agent_judged",
                       units: str | None = None, comparison_judgment: dict | None = None) -> dict:
-    """Record a candidate score against this assigned private tree's actual bytes."""
+    """Record optional candidate advice; this never establishes a checked score."""
     return record_measurement(author, chunk_id, raw_value, method, evidence, evidence_kind,
                               assignment_id=assignment_id, units=units, comparison_judgment=comparison_judgment)
 
@@ -473,7 +490,7 @@ def record_current_measurement(author: str, chunk_id: str, raw_value: int | floa
                                method: dict, evidence: dict | list | str,
                                evidence_kind: str = "agent_judged", units: str | None = None,
                                comparison_judgment: dict | None = None) -> dict:
-    """Score current integrated source without changing the immutable baseline."""
+    """Retain current-source advice without publishing an authoritative score."""
     from .. import optimize_metrics, optimize_verification
     _profile("optimizing")
     author = _author(author)
@@ -497,11 +514,54 @@ def record_current_measurement(author: str, chunk_id: str, raw_value: int | floa
         if optimize_verification.file_identity(_root(), scope=state["scope"],
                                                lake_args=state["config"].get("lake_args", [])) != identity:
             raise ValueError("integrated source changed while recording the measurement")
-        state["measurements"][chunk_id] = deepcopy(measurement)
-        if comparison_judgment is not None:
-            state.setdefault("judgments", {})[chunk_id] = deepcopy(comparison_judgment)
-        tasks._event(state, "current_measurement", author, chunk_id=chunk_id)
+        state.setdefault("advisory_current_measurements", {}).setdefault(chunk_id, []).append(
+            {"author": author, "measurement": deepcopy(measurement),
+             "comparison_judgment": deepcopy(comparison_judgment)})
+        tasks._event(state, "current_measurement_advice", author, chunk_id=chunk_id)
     return measurement
+
+
+def _bound_scoring_request(state: dict, request_id: str) -> dict:
+    bound = os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip()
+    request = state.get("scoring_requests", {}).get(request_id)
+    if not bound or request_id != bound or not request or request["status"] != "running":
+        raise ValueError("scoring report requires this worker's running bound request")
+    _author(request["author"])
+    tree = os.getenv("UNITY_OPTIMIZE_WORKTREE", "").strip()
+    if not tree or Path(tree).resolve() != Path(request["root"]).resolve():
+        raise ValueError("scoring request does not match the bound source view")
+    return request
+
+
+def scoring_request() -> dict:
+    """Read a bounded verification request; full methods/evidence are paged."""
+    _profile("optimizing", scoring=True)
+    state = tasks.load(FORUM_DIR)
+    request = _bound_scoring_request(state, os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip())
+    return _bounded_response(state, "scoring_request", {
+        "request_id": request["request_id"], "author": request["author"], "root": request["root"],
+        "source_sha256": request["source_identity"]["sha256"], "subjects": request["subjects"],
+        "reported_subjects": sorted(request["reports"]),
+        "records": {"request": _brief_artifact(state, "scoring_request", request)}})
+
+
+def submit_score_report(author: str, request_id: str, subject: str, raw_value: int | float | str,
+                        method: dict, evidence: dict | list | str, units: str | None = None,
+                        comparison_judgment: dict | None = None) -> dict:
+    """Report a read-only assessment; the verifier validates and seals the score."""
+    _profile("optimizing", scoring=True)
+    author = _author(author)
+    state = tasks.load(FORUM_DIR)
+    _bound_scoring_request(state, request_id)
+    tasks.record_score_report(FORUM_DIR, author, request_id, subject, raw_value, method, evidence,
+                              units=units, comparison_judgment=comparison_judgment)
+    state = tasks.load(FORUM_DIR)
+    request = state["scoring_requests"][request_id]
+    return _bounded_response(state, "score_report", {
+        "request_id": request_id, "subject": subject, "reported": True,
+        "verification_required": True, "evidence_kind": "agent_judged",
+        "reported_subjects": sorted(request["reports"]),
+        "records": {"request": _brief_artifact(state, "scoring_request", request)}})
 
 
 def register_strategy(author: str, task_id: str, title: str, description: str) -> dict:
@@ -550,19 +610,19 @@ def _candidate_validation_error(error, author: str, assignment_id: str, operatio
     # method prose, notes or provider diagnostics. Full facts remain paged.
     codes = {issue.get("code") for issue in error.details.get("issues", [])}
     message = _summary_text(str(error), 1000)
-    action = "Correct the records and retry in the same assignment; no candidate was submitted."
+    action = "Correct the reported argument or source error and retry in the same assignment; no candidate was submitted."
     if codes & {"assignment_base_changed", "current_source_changed"}:
         message = "The assignment base or integrated source changed; editing reports cannot repair that binding."
         action = ("Preserve private work, report the obstacle, and end this turn for normal controller handling. "
                   "Do not reset, rebind or update source, and do not claim no_improvement. No candidate was submitted.")
     elif codes & {"source_changed_during_measurement", "source_changed_during_submission"}:
-        action = ("After the assigned tree is stable, measure every required chunk again and retry in the same assignment. "
+        action = ("After the assigned tree is stable and committed, retry submission in the same assignment. "
                   "No candidate was submitted.")
     response = {"code": error.code, "message": message,
                 "issue_count": error.details.get("issue_count", 0),
                 "issues": error.details.get("issues", [])[:8],
                 "artifact": {key: record[key] for key in ("artifact_id", "sha256", "bytes")},
-                "next_action": "Read optimize_task measurement_contract and this artifact with artifact_read. "
+                "next_action": "Read optimize_task and this artifact with artifact_read. "
                     + action}
     if len(json.dumps(response, ensure_ascii=True).encode()) > 8192:
         response["issues"] = []
@@ -687,9 +747,11 @@ def submit_optimization_verdict(author: str, snapshot_id: str, approved: bool, r
 
 COMMON = (optimize_status, optimize_brief, optimize_task, optimize_inventory, forum_post, forum_read, artifact_info, artifact_read, publish_finding,
           report_obstacle, ask_question, answer_question, record_workflow_change)
+SCORE_TOOLS = COMMON + (scoring_request, submit_score_report)
 WORK = (register_strategy, claim_strategy, assist_strategy, record_measurement, measure_candidate,
         record_current_measurement, submit_candidate,
-        endorse_candidate, object_candidate, select_candidate, request_scope_group, record_no_improvement)
+        endorse_candidate, object_candidate, select_candidate, request_scope_group, record_no_improvement,
+        scoring_request, submit_score_report)
 PROFILE_TOOLS = {
     "preparation": COMMON,
     "architect": COMMON + (report_phase_result,), "exploration": COMMON + (report_phase_result,),
@@ -703,7 +765,8 @@ PROFILE_TOOLS = {
 def build_server(profile: str) -> FastMCP:
     if profile not in PROFILES: raise ValueError("unknown Optimize forum profile")
     server = FastMCP("unity-optimize-forum-" + profile)
-    for function in PROFILE_TOOLS[profile]: server.tool(function)
+    tools = SCORE_TOOLS if profile == "optimizing" and os.getenv("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip() else PROFILE_TOOLS[profile]
+    for function in tools: server.tool(function)
     return server
 
 

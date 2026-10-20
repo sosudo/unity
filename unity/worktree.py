@@ -47,27 +47,35 @@ def ensure_git_excludes(repo_path: Path, patterns: tuple[str, ...]) -> None:
         handle.write("".join(pattern + "\n" for pattern in missing))
 
 
-def create_worktree(name: str, project_path: Path) -> Path:
+def create_worktree(name: str, project_path: Path, *, preserve_existing: bool = False,
+                    runtime_linker=None) -> Path:
     """Create a git worktree for `name` under <project>/.worktrees/; return its path.
-    Tolerates leftovers from a crashed run: stale worktrees/branches are pruned first."""
+    By default stale worktrees/branches are pruned first. ``preserve_existing``
+    rejects collisions without cleanup. ``runtime_linker`` opts into a caller's
+    runtime layout; the default shares normal runtime state.
+    """
     safe = _safe(name)
     worktree_path = agent_worktree(project_path, name)
+    branch = agent_branch(name)
+    if preserve_existing and (worktree_path.exists() or worktree_path.is_symlink() or
+            _git(project_path, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}").returncode == 0):
+        raise ValueError("existing work must be recovered, not overwritten")
     ensure_git_excludes(project_path, (".worktrees", ".unity/"))
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     # Clear stale state from a previous crashed run before re-adding.
-    if worktree_path.exists():
+    if not preserve_existing and worktree_path.exists():
         subprocess.run(["git", "worktree", "remove", "--force", str(worktree_path)],
                        cwd=project_path, capture_output=True)
-    subprocess.run(["git", "worktree", "prune"], cwd=project_path, capture_output=True)
-    branch = agent_branch(name)
-    if subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
+    if not preserve_existing:
+        subprocess.run(["git", "worktree", "prune"], cwd=project_path, capture_output=True)
+    if not preserve_existing and subprocess.run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"],
                       cwd=project_path).returncode == 0:
         subprocess.run(["git", "branch", "-D", branch],
                        cwd=project_path, capture_output=True)
 
     lake.run(["git", "worktree", "add", "-b", f"worktree/{safe}", str(worktree_path)], cwd=project_path)
-    link_runtime_state(worktree_path, project_path)
+    (runtime_linker or link_runtime_state)(worktree_path, project_path)
     return worktree_path
 
 

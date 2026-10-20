@@ -23,6 +23,7 @@ import uuid
 
 from . import artifacts, optimize_jobs as jobs, optimize_tasks as tasks
 from . import optimize_metrics as metrics, optimize_verification as verification
+from . import optimize_scoring as scoring
 from . import optimize_worktree as worktree
 from . import optimize_workspace as workspace
 from .config import Paths
@@ -118,8 +119,9 @@ def _planning_scratch(tree):
     return directory
 
 
-def runtime_env(paths, author, task_id, profile, tree, state, *, phase_dispatch_id=None):
-    planning = str(_planning_scratch(tree)) if profile != "critic" else ""
+def runtime_env(paths, author, task_id, profile, tree, state, *, phase_dispatch_id=None,
+                score_request_id=None):
+    planning = str(_planning_scratch(tree)) if profile != "critic" and not score_request_id else ""
     scratch = paths.unity / "tmp" / "optimize" / re.sub(r"[^A-Za-z0-9_-]", "_", author)
     for name in ("uv-tools", "uv-bin", "lake-cache"):
         (scratch / name).mkdir(parents=True, exist_ok=True)
@@ -140,6 +142,7 @@ def runtime_env(paths, author, task_id, profile, tree, state, *, phase_dispatch_
         "LAKE_CACHE_DIR": str(scratch / "lake-cache"), "UNITY_AGENT_NAME": author,
         "UNITY_OPTIMIZE_TASK_ID": task_id or "", "UNITY_OPTIMIZE_PROJECT_ROOT": str(paths.project_root),
         "UNITY_OPTIMIZE_PHASE_DISPATCH_ID": phase_dispatch_id or "",
+        "UNITY_OPTIMIZE_SCORE_REQUEST_ID": score_request_id or "",
         "UNITY_OPTIMIZE_PROFILE": profile, "UNITY_OPTIMIZE_WORKFLOW": tasks.SCHEMA,
         "UNITY_OPTIMIZE_SCRATCH": planning,
         "UNITY_OPTIMIZE_WORKTREE": str(tree), "UNITY_OPTIMIZE_BASE_SHA": git(tree, "rev-parse", "HEAD"),
@@ -195,6 +198,7 @@ class Controller:
         self.writers = roster.agents
         self.workers = {}
         self.build_cancel = Event()
+        self.measurement_cache = None
 
     def state(self):
         return tasks.load(self.paths.forum)
@@ -216,7 +220,7 @@ class Controller:
             raise
 
     async def worker(self, agent, task_id: str | None, tree, profile, interrupt, instruction="",
-                     *, phase_dispatch_id: str | None = None):
+                     *, phase_dispatch_id: str | None = None, score_request_id: str | None = None):
         state = self.state()
         if task_id and task_id not in state["tasks"]:
             raise ValueError("Cannot dispatch an unknown Optimize task: " + task_id)
@@ -230,9 +234,9 @@ class Controller:
         system += f"\nYou are {agent.name}. Primary: {self.roster.primary.name}. Team: "
         system += ", ".join(a.name for a in self.roster.agents)
         env = runtime_env(self.paths, agent.name, task_id, profile, tree, state,
-                          phase_dispatch_id=phase_dispatch_id)
-        if profile == "critic":
-            system += ("\nFinal review remains read-only: use native or inline tool arguments; "
+                          phase_dispatch_id=phase_dispatch_id, score_request_id=score_request_id)
+        if profile == "critic" or score_request_id:
+            system += ("\nThis source assessment is read-only: use native or inline tool arguments; "
                        "do not create planning scratch files.")
         else:
             system += ("\nAdministrative scratch directory (UNITY_OPTIMIZE_SCRATCH): "
@@ -256,7 +260,85 @@ class Controller:
             interrupt_event=interrupt, mcp_profile="optimize",
             env_overrides=env,
             log_context={"command": "optimize", "run_id": state["run_id"], "phase": profile,
-                         "task_id": task_id or "", "phase_dispatch_id": phase_dispatch_id, "role": profile})
+                         "task_id": task_id or "", "phase_dispatch_id": phase_dispatch_id,
+                         "score_request_id": score_request_id, "role": profile})
+
+    def evaluator(self):
+        """Use only the metric's explicit helper, otherwise the existing roster."""
+        return (scoring.executable_evaluator(self.state()["metric"], run_checked=self.checked_job,
+                                            project_root=self.paths.project_root)
+                or self.judge_snapshot)
+
+    async def judge_snapshot(self, request):
+        """A verifier-owned read-only turn, not another role or search round."""
+        while True:
+            await self.reap_workers()
+            if stopped(self.paths):
+                raise jobs.JobCancelled("Optimize stopped before scoring")
+            agent = next((agent for agent in self.writers if agent.name not in self.workers), None)
+            if agent is not None:
+                break
+            await asyncio.sleep(0.1)
+        state = self.state()
+        options = {"scope": state["scope"], "lake_args": state["config"].get("lake_args", [])}
+        canonical = verification.file_identity(self.paths.project_root, **options)
+        tree = task_worktree(self.paths, agent.name + "-score", "verification")
+        # This is a new clean view, never a reset of a worker's retained attempt.
+        git(tree, "checkout", "--detach", request["source_identity"]["main_sha"])
+        identity = verification.file_identity(tree, **options)
+        if identity != request["source_identity"]:
+            raise ValueError("Scoring view does not match the requested source snapshot")
+        evidence = artifacts.store_text(self.paths.artifacts, json.dumps(request, sort_keys=True),
+                                        kind="optimize_score_request", producer="Unity")
+        row = tasks.begin_scoring_request(self.paths.forum, author=agent.name, worktree=tree,
+            source_identity=identity, subjects=request["subjects"],
+            original_methods=request["original_methods"], metric_sha256=state["metric"]["sha256"],
+            build_ref=evidence, comparison_records=request.get("comparison_records"))
+        request_id = row["request_id"]
+        interrupt = asyncio.Event()
+        instruction = (
+            "Verification scoring only. Read optimize_brief and its bound scoring request. "
+            "Inspect the exact source in this read-only view. Report every requested subject with "
+            "submit_score_report using the original method exactly when supplied. For the initial baseline, "
+            "describe a reproducible method that follows the metric. Retain actual evidence and explain "
+            "qualitative comparisons where requested. Do not edit source, claim strategies, submit candidates, "
+            "select winners, or update baseline/current measurements. This assessment is agent_judged, "
+            "not an independently executed metric. Request: " + request_id)
+        worker = asyncio.create_task(self.worker(agent, None, tree, "optimizing", interrupt,
+            instruction, score_request_id=request_id))
+        status, reason = "interrupted", "Scoring turn did not finish"
+        try:
+            while not worker.done():
+                if stopped(self.paths):
+                    raise jobs.JobCancelled("Optimize stopped during scoring")
+                await asyncio.wait({worker}, timeout=0.1)
+            await worker
+            if stopped(self.paths):
+                raise jobs.JobCancelled("Optimize stopped during scoring")
+            if (verification.file_identity(tree, **options) != identity
+                    or verification.file_identity(self.paths.project_root, **options) != canonical
+                    or metrics.load_metric(tree, state["metric"]["name"]) != state["metric"]):
+                raise ValueError("Scoring turn changed its read-only source or metric")
+            reports = self.state()["scoring_requests"][request_id]["reports"]
+            if set(reports) != set(request["subjects"]):
+                raise ValueError("Scoring turn ended without all requested subject reports")
+            status, reason = "complete", "Requested source-bound reports collected"
+            return {"measurements": reports,
+                    "judgments": {subject: report["comparison_judgment"]
+                                  for subject, report in reports.items() if report.get("comparison_judgment")}}
+        except BaseException as exc:
+            status = "interrupted" if isinstance(exc, asyncio.CancelledError) or stopped(self.paths) else "blocked"
+            reason = type(exc).__name__ + ": " + str(exc)
+            raise
+        finally:
+            await stop_worker(worker, interrupt)
+            active_error = sys.exception()
+            try:
+                tasks.close_scoring_request(self.paths.forum, request_id, status, reason)
+            except Exception as receipt_error:
+                if active_error is None:
+                    raise
+                active_error.add_note("Optimize scoring receipt could not be closed: " + type(receipt_error).__name__)
 
     @staticmethod
     def latest_plan(state):
@@ -285,12 +367,7 @@ class Controller:
                              f"missing results: {missing}; blockers: {blockers}")
         if profile == "chunking":
             proposal = self.latest_plan(state)
-            planned = tasks._validated_plan(state, list(proposal["tasks"].values()), proposal.get("exclusions"))
-            required = {cid for task in planned.values() for cid in task["chunk_ids"]}
-            missing = required - state["baseline_measurements"].keys()
-            if missing:
-                raise ValueError(f"Selected declarations are missing original metric measurements "
-                                 f"({len(missing)}; sample: {sorted(missing)[:5]})")
+            tasks._validated_plan(state, list(proposal["tasks"].values()), proposal.get("exclusions"))
 
     async def dispatch_phase(self, profile, *, primary=False, instruction=""):
         phase(self.paths, profile)
@@ -433,9 +510,14 @@ class Controller:
             # retained as discussion, not a permanent unanimity gate.
             final_plan = self.latest_plan(state)
             required = {cid for task in final_plan["tasks"].values() for cid in task["chunk_ids"]}
-            if required - state["baseline_measurements"].keys():
-                raise ValueError("Selected declarations are missing original metric measurements")
             tasks.accept_plan(self.paths.forum, final_plan["proposal_id"])
+            baseline = await verification.complete_baseline_scored(state["baseline"], self.paths.project_root,
+                subjects=sorted(required),
+                original_methods={subject: row["method"] for subject, row in state.get("baseline_measurements", {}).items()
+                                  if subject in required},
+                evaluator=self.evaluator(), run_checked=self.checked_job,
+                project_root=self.paths.project_root)
+            tasks.install_verified_baseline_measurements(self.paths.forum, baseline["measurements"])
             tasks.seal_baseline(self.paths.forum)
             with tasks.transaction(self.paths.forum) as current:
                 current["measurements"] = deepcopy(current["baseline"]["measurements"])
@@ -519,7 +601,7 @@ class Controller:
                 raise result
         await self.reap_workers()
 
-    def check_candidate(self, candidate):
+    async def check_candidate(self, candidate):
         state = self.state()
         tree, root = Path(candidate["worktree"]), self.paths.project_root
         task = state["tasks"][candidate["task_id"]]
@@ -528,21 +610,21 @@ class Controller:
         if git(tree, "status", "--porcelain", "--untracked-files=all"):
             return {"passed": False, "reason": "Commit the exact candidate before submission"}
         head = git(tree, "rev-parse", "HEAD")
+        if candidate.get("commit_sha") and candidate["commit_sha"] != head:
+            return {"passed": False, "reason": "Submitted candidate commit changed"}
         if git(tree, "merge-base", head, state["main_sha"]) != state["main_sha"]:
             return {"passed": False, "reason": "Candidate does not descend from its bound integration base"}
         diff = git(tree, "diff", "--binary", "--full-index", "--no-ext-diff", state["main_sha"], head, raw=True)
         changed = git(tree, "diff", "--name-only", "--no-renames", state["main_sha"], head).splitlines()
         if not changed or set(changed) - set(task["files"]):
             return {"passed": False, "reason": "Candidate is empty or changes unassigned files"}
-        identity = verification.file_identity(root, scope=state["scope"], lake_args=state["config"].get("lake_args", []))
-        before = {cid: state["measurements"].get(cid) for cid in task["chunk_ids"]}
-        if any(not row or not metrics.validate_measurement_binding(row, state["metric"], identity) for row in before.values()):
-            return {"passed": False, "reason": "Record current before measurements before editing; old source scores cannot be reused"}
-        result = verification.verify_candidate(tree, baseline=state["baseline"], metric=state["metric"],
-            scope=state["scope"], measurements=candidate["measurements"], task=task,
-            comparison={"identity": identity, "measurements": before, "metric": state["metric"]},
+        result = await verification.verify_candidate_scored(tree, before_root=root,
+            baseline=state["baseline"], metric=state["metric"],
+            scope=state["scope"], task=task, evaluator=self.evaluator(), run_checked=self.checked_job,
+            before_cache=self.measurement_cache or state["baseline"],
+            after_cache=candidate.get("verification"),
             project_root=root, lake_args=state["config"].get("lake_args", []),
-            judgments=candidate.get("judgments"), config_revision=state["config"]["revision"])
+            config_revision=state["config"]["revision"])
         return {**result, "commit_sha": head, "files": changed,
                 "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()}
 
@@ -554,15 +636,24 @@ class Controller:
             if owner and str(owner["tree"]) == candidate["worktree"]:
                 # A worker may submit before finishing; never check mutable source.
                 continue
-            result = await self.checked_job(self.check_candidate, candidate)
+            result = await self.check_candidate(candidate)
+            if result.get("comparison"):
+                self.measurement_cache = result["comparison"]
             with tasks.transaction(self.paths.forum) as state:
                 row = state["candidates"][candidate["candidate_id"]]
                 row.update(status="checked" if result["passed"] else "stale" if result.get("stale") else "rejected",
                            verification=result)
+                if "measurements" in result:
+                    row["measurements"] = deepcopy(result["measurements"])
+                    row["judgments"] = deepcopy(result.get("judgments", {}))
+                # Current-source scores are a cache of verifier evidence, never a
+                # prerequisite that writers must repair before submission.
+                if result.get("comparison", {}).get("identity", {}).get("main_sha") == state["main_sha"]:
+                    state["measurements"].update(deepcopy(result.get("comparison_measurements", {})))
                 for field in ("commit_sha", "files", "diff_sha256"):
                     if field in result: row[field] = result[field]
 
-    def integrate_selected(self, candidate):
+    async def integrate_selected(self, candidate):
         with merge_lock(self.paths):
             state = self.state()
             root = self.paths.project_root
@@ -572,7 +663,7 @@ class Controller:
             if (candidate["status"] != "selected" or candidate["selection"]["author"] != self.roster.primary.name
                     or candidate["base_main_sha"] != before):
                 return False
-            result = self.check_candidate(candidate)
+            result = await self.check_candidate(candidate)
             if not result["passed"] or result.get("diff_sha256") != candidate.get("diff_sha256"):
                 with tasks.transaction(self.paths.forum) as current:
                     current["candidates"][candidate["candidate_id"]].update(status="rejected", verification=result)
@@ -586,22 +677,19 @@ class Controller:
                 return False
             git(tree, "-c", "user.name=Unity", "-c", "user.email=unity@localhost", "commit", "-m",
                 "UNITY: merge chunk " + candidate["task_id"])
-            after_identity = verification.file_identity(tree, scope=state["scope"], lake_args=state["config"].get("lake_args", []))
-            measured = {cid: metrics.rebind_measurement(row, state["metric"], result["source_identity"], after_identity)
-                        for cid, row in candidate["measurements"].items()}
-            before_measures = {cid: state["measurements"][cid] for cid in state["tasks"][candidate["task_id"]]["chunk_ids"]}
-            checked = verification.verify_candidate(tree, baseline=state["baseline"], metric=state["metric"], scope=state["scope"],
-                measurements=measured, task=state["tasks"][candidate["task_id"]], project_root=root,
-                comparison={"identity": verification.file_identity(root, scope=state["scope"], lake_args=state["config"].get("lake_args", [])),
-                            "measurements": before_measures, "metric": state["metric"]},
-                lake_args=state["config"].get("lake_args", []), judgments=candidate.get("judgments"))
+            checked = await verification.verify_candidate_scored(tree, before_root=root,
+                baseline=state["baseline"], metric=state["metric"], scope=state["scope"],
+                task=state["tasks"][candidate["task_id"]], project_root=root,
+                evaluator=self.evaluator(), run_checked=self.checked_job,
+                before_cache=result.get("comparison"),
+                lake_args=state["config"].get("lake_args", []), config_revision=state["config"]["revision"])
             if not checked["passed"]:
                 with tasks.transaction(self.paths.forum) as current:
                     current["candidates"][candidate["candidate_id"]].update(status="rejected", verification=checked)
                 return False
             after = git(tree, "rev-parse", "HEAD")
             journal = {"before": before, "after": after, "candidate_id": candidate["candidate_id"],
-                "task_id": candidate["task_id"], "files": candidate["files"], "measurements": measured,
+                "task_id": candidate["task_id"], "files": candidate["files"], "measurements": checked["measurements"],
                 "verification": checked}
             write_json(self.paths.forum / "integration.json", journal)
             if git(root, "rev-parse", "HEAD") != before:
@@ -662,7 +750,7 @@ class Controller:
             await self.check_submissions()
             for candidate in self.state()["candidates"].values():
                 if candidate["status"] == "selected":
-                    await self.checked_job(self.integrate_selected, candidate)
+                    await self.integrate_selected(candidate)
             self.close_unsuccessful_tasks()
             state = self.state()
             checked = [c for c in state["candidates"].values() if c["status"] == "checked"]
@@ -691,24 +779,14 @@ class Controller:
             with tasks.transaction(self.paths.forum) as current:
                 current["round_feedback"] = "Tasks remain unresolved; retained candidates and compiler feedback are available"
             return False
-        original_identity = verification.file_identity(self.paths.project_root, scope=state["scope"],
-                                                       lake_args=state["config"].get("lake_args", []))
-        records = await self.dispatch_phase("optimizing", instruction=(
-            "Measurement refresh only, no source edits, strategy claims or new candidates. Collaboratively record current "
-            "measurements for every selected baseline subject using record_current_measurement, the original method and "
-            "actual current source evidence. Include unchanged declarations. Retain numeric or qualitative comparison reasons."))
-        if not records: return False
-        for _, _, tree in records:
-            identity = verification.file_identity(tree, scope=state["scope"], lake_args=state["config"].get("lake_args", []))
-            if identity != original_identity:
-                raise ValueError("Measurement-only turn changed its source snapshot")
-        state = self.state()
-        snapshot = await self.checked_job(verification.verify_final, self.paths.project_root,
-            baseline=state["baseline"], metric=state["metric"], scope=state["scope"], measurements=state["measurements"],
+        snapshot = await verification.verify_final_scored(self.paths.project_root,
+            baseline=state["baseline"], metric=state["metric"], scope=state["scope"],
+            evaluator=self.evaluator(), run_checked=self.checked_job,
             selected_files=sorted({path for task in state["tasks"].values() if task["status"] != "grouped" for path in task["files"]}),
-            lake_args=state["config"].get("lake_args", []), judgments=state.get("judgments"),
+            project_root=self.paths.project_root, lake_args=state["config"].get("lake_args", []),
             config_revision=state["config"]["revision"])
         with tasks.transaction(self.paths.forum) as current:
+            current["measurements"] = deepcopy(snapshot["measurements"])
             current["review"] = {"reviewer": self.roster.primary.name, "snapshot": snapshot, "verdicts": []}
         if not await self.dispatch_phase("critic", primary=True):
             return False
@@ -824,6 +902,10 @@ async def run(paths, roster, *, metric, targets="Universe", continue_=False,
                     if dispatch["status"] == "running":
                         dispatch.update(status="interrupted", finished_at=tasks.now(),
                                         reason="Prior invocation closed before phase completion")
+                for request in current.get("scoring_requests", {}).values():
+                    if request["status"] == "running":
+                        request.update(status="interrupted", finished_at=tasks.now(),
+                                       reason="Prior invocation closed before scoring completion")
                 for assignment in current["assignments"].values():
                     if assignment["status"] == "running":
                         assignment.update(status="interrupted", closed=True)

@@ -1,7 +1,8 @@
 """Frozen Optimize metric definitions and source-bound measurements.
 
-Metric Markdown is a specification, not an executable scorer. In particular we
-do not substitute line counts or a lexical tactic counter for proof length.
+Metric Markdown is a specification. Only an explicit Evaluator section opts
+into helper execution; we never substitute line counts or a lexical tactic
+counter for proof length.
 """
 from __future__ import annotations
 
@@ -69,13 +70,34 @@ def load_metric(root: Path, metric_name: str) -> dict:
         helpers[filename] = {"sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload), "section": section}
     default = Path(__file__).parent / "defaults" / "metrics" / (name + ".md")
     builtin = name if default.is_file() and default.read_text() == definition else None
-    return _sealed({"schema_version": 1, "name": name, "definition": definition,
+    result = {"schema_version": 1, "name": name, "definition": definition,
                     "definition_sha256": hashlib.sha256(definition.encode()).hexdigest(),
                     "helpers": helpers, "builtin": builtin,
                     "direction": {"length": "lower", "modularity": "higher", "completion": "lower"}.get(builtin),
                     "units": {"length": "tactic invocations", "modularity": "typed-have / tactics ratio",
                               "completion": "compiler errors + sorry/axiom"}.get(builtin),
-                    "qualification": "Markdown specification; helper presence alone is not execution evidence."})
+                    "qualification": "Markdown specification; helper presence alone is not execution evidence."}
+    # Opt-in only. In particular, retain the exact old metric hash when this
+    # section is absent; stopped runs must not acquire a new scoring method.
+    if "evaluator" in sections:
+        try:
+            evaluator = json.loads(sections["evaluator"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("metric Evaluator must be a JSON object") from exc
+        if (not isinstance(evaluator, dict)
+                or set(evaluator) - {"protocol", "helper", "interpreter", "timeout_seconds"}
+                or evaluator.get("protocol") != "unity-optimize-score-v1"
+                or not isinstance(evaluator.get("helper"), str)
+                or evaluator.get("helper") not in helpers
+                or not isinstance(evaluator.get("interpreter", "executable"), str)
+                or evaluator.get("interpreter", "executable") not in {"python", "executable"}):
+            raise ValueError("unsupported metric evaluator or unfrozen helper")
+        timeout = evaluator.get("timeout_seconds")
+        if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
+                                    or not math.isfinite(timeout) or timeout <= 0):
+            raise ValueError("metric evaluator timeout_seconds must be positive and finite")
+        result["evaluator"] = evaluator
+    return _sealed(result)
 
 
 def record_measurement(metric: dict, *, subject: str, raw_value, source_identity: dict,
@@ -237,10 +259,15 @@ def compare_measurements(before: dict, after: dict, *, judgment=None) -> dict:
             raise ValueError("qualitative comparison requires an explicit evidenced judgment")
         improved, delta, percent = judgment["improved"], None, None
     score = percent if before.get("metric_kind") == "length" else delta if before.get("metric_kind") in {"modularity", "completion"} else None
+    qualification = "Comparison uses the recorded method and reported tool/agent evidence, not an independently executed metric scorer; no aggregate score is invented."
+    if all(row.get("evidence_kind") == "measured" and isinstance(row.get("evidence"), dict)
+           and row["evidence"].get("verifier_owned_execution") is True for row in (before, after)):
+        qualification = ("Comparison uses controller-executed scorer output for the frozen method and exact sources; "
+                         "this is not independent proof of metric validity or semantic equivalence. No aggregate score is invented.")
     return {"subject": before["subject"], "before": old, "after": new, "improved": improved,
             "delta": delta, "improvement_percent": percent, "zero_baseline": old == 0,
             "improvement_score": score,
             "regressed": delta < 0 if numeric else bool((judgment or {}).get("regressed", False)),
             "before_sha256": before["sha256"], "after_sha256": after["sha256"],
             "evidence_kind": "measured" if numeric and before["evidence_kind"] == after["evidence_kind"] == "measured" else "agent_judged",
-            "judgment": deepcopy(judgment), "qualification": "Comparison uses the recorded method and reported tool/agent evidence, not an independently executed metric scorer; no aggregate score is invented."}
+            "judgment": deepcopy(judgment), "qualification": qualification}

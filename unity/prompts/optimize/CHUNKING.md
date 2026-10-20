@@ -6,7 +6,7 @@ retaining inventory_sha256. Use the returned canonical chunk IDs, not fabricated
 IDs derived from declaration names. Read full retained records through
 artifact_read when the brief supplies references.
 Enumerate every declaration in requested targets, including clean declarations. Default one declaration per chunk; document evidence for mutual/overlap/file-level or metric-specific grouping and retain covered declaration IDs. Record dependencies; group/report cycles rather than ignoring them. Inventory is a scheduling hint, not a semantic parser.
-Record original measurements with the agreed method and source identity using the forum measurement tools. Raw value and improvement differ. Baseline is immutable after planning; future scores are separate. Use measured only for actual retained tool evidence, otherwise agent_judged. No invented aggregate or LOC substitute. Submit proposals instead of editing dag.json. Do not edit Lean source. Omitted declarations need explicit out-of-scope reasons; Universe covers all eligible declarations.
+Explain the metric and useful measurement evidence in the plan. The controller scores the selected original subjects during verification before sealing the baseline. Baseline is immutable after sealing. Chunking does not require workers to create measurement records. Raw value and improvement differ. No invented aggregate or LOC substitute. Submit proposals instead of editing dag.json. Do not edit Lean source. Omitted declarations need explicit out-of-scope reasons; Universe covers all eligible declarations.
 
 For a narrow file target, propose_chunk_plan may specify exclude_outside_paths
 as the list of exact known selected paths, together with exclusion_reason and
@@ -25,7 +25,7 @@ if needed. This administrative scratch location does not authorize Lean source e
 
 Collaborate and revise plans through the forum. Submit the complete converged plan last: the controller validates and installs that final proposal, retaining earlier drafts as discussion rather than requiring identical historical proposals or an extra primary planning approval.
 Before returning, call report_phase_result with your author, status complete or
-blocked, a concrete summary and retained plan/measurement evidence. Report
+blocked, a concrete summary and retained plan evidence. Report
 validation failures concretely, using returned missing/unknown IDs and inventory
 pages to correct the proposal. A complete report does not substitute for an
-accepted plan and required original measurements. Do not submit candidates here.
+accepted plan or controller verification. Do not submit candidates here.

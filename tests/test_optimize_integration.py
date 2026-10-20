@@ -57,13 +57,35 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         forum.configure(self.paths.forum, self.root, "chunking", "Primary")
         plan = forum.propose_chunk_plan("Primary", [{"chunk_ids": [self.cid]}], "Single declaration fixture")
         tasks.accept_plan(self.paths.forum, plan["proposal_id"])
-        forum.record_measurement("Primary", self.cid, 3, self.method, {"reason": "Counted fixture invocations"}, baseline=True)
+        self.seed_measurement(self.cid)
         tasks.seal_baseline(self.paths.forum)
         with tasks.transaction(self.paths.forum) as state:
             state["measurements"] = deepcopy(state["baseline"]["measurements"])
         self.baseline = deepcopy(tasks.load(self.paths.forum)["baseline"])
         tasks.begin_round(self.paths.forum, max_rounds=5)
         self.controller = workflow.Controller(self.paths, self.roster, max_attempts=5)
+        self.controller.evaluator = lambda: self.fake_evaluator
+
+    def seed_measurement(self, cid):
+        baseline = tasks.load(self.paths.forum)["baseline"]
+        tasks.record_baseline_measurement(self.paths.forum, "Primary", cid,
+            metrics.record_measurement(self.metric, subject=cid, raw_value=3,
+                source_identity=baseline["identity"], method=self.method,
+                evidence={"fixture": "known original proof"}))
+
+    async def fake_evaluator(self, request):
+        # Fixture answers only. This is not a production tactic counter.
+        root = Path(request["root"])
+        inventory = tasks.scan_sources(root, self.scope["files"])["chunks"]
+        rows = {}
+        for cid in request["subjects"]:
+            chunk = inventory[cid]
+            lines = (root / chunk["path"]).read_text().splitlines()
+            body = "\n".join(lines[chunk["start_line"] - 1:chunk["end_line"]])
+            value = 3 if "have h : True := by trivial" in body else 2 if "have h := True.intro" in body else 1
+            rows[cid] = {"raw_value": value, "method": request["original_methods"].get(cid) or self.method,
+                         "evidence": {"fixture": "known proof value"}}
+        return {"measurements": rows}
 
     def write(self, name, text, root=None):
         path = (root or self.root) / name
@@ -93,8 +115,6 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.write("Example.lean", text, tree)
             self.git(tree, "add", "Example.lean")
             self.git(tree, "commit", "--quiet", "-m", "fixture candidate")
-            forum.measure_candidate(author, assignment["assignment_id"], self.cid, value, self.method,
-                                    {"reason": "Counted candidate fixture invocations"})
             candidate = forum.submit_candidate(author, assignment["assignment_id"], "Same statement; direct proof, fewer tactics")
         return candidate
 
@@ -106,7 +126,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         forum.configure(self.paths.forum, self.root, "optimizing", "Primary")
         selected = forum.select_candidate("Primary", candidate["candidate_id"], "Best checked fixture improvement")
         selected = tasks.load(self.paths.forum)["candidates"][selected["candidate_id"]]
-        integrated = self.controller.integrate_selected(selected)
+        integrated = await self.controller.integrate_selected(selected)
         row = tasks.load(self.paths.forum)["candidates"][candidate["candidate_id"]]
         self.assertTrue(integrated, {"status": row["status"], "feedback": row.get("feedback"),
                                      "issues": row.get("verification", {}).get("issues")})
@@ -116,10 +136,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             workflow.phase(self.paths, profile)
             tree = workflow.task_worktree(self.paths, "offline-" + profile, profile)
             forum.configure(self.paths.forum, self.root, profile, "Primary")
-            if profile == "optimizing":
-                forum.record_current_measurement("Primary", self.cid, value, self.method,
-                                                 {"reason": "Remeasured integrated fixture"})
-            elif profile == "critic":
+            if profile == "critic":
                 snapshot = tasks.load(self.paths.forum)["review"]["snapshot"]
                 if change_during_review:
                     self.write("Example.lean", "theorem first : True := by trivial\n-- changed after snapshot\n")
@@ -161,7 +178,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.select_and_merge(first)
         state = tasks.load(self.paths.forum)
         self.assertEqual(state["candidates"][second["candidate_id"]]["status"], "stale")
-        self.assertFalse(self.controller.check_candidate(state["candidates"][second["candidate_id"]])["passed"])
+        self.assertFalse((await self.controller.check_candidate(state["candidates"][second["candidate_id"]]))["passed"])
 
     async def test_publication_crash_recovers_once_without_second_merge(self):
         candidate = self.submit()
@@ -171,7 +188,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         selected = tasks.load(self.paths.forum)["candidates"][selected["candidate_id"]]
         with patch.object(self.controller, "recover_integration", side_effect=OSError("offline interruption after fast-forward")):
             with self.assertRaises(OSError):
-                self.controller.integrate_selected(selected)
+                await self.controller.integrate_selected(selected)
         published = self.git(self.root, "rev-parse", "HEAD")
         self.assertNotEqual(published, self.head)
         self.controller.recover_integration()
@@ -226,7 +243,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 await self.controller.review()
         self.assertNotEqual(tasks.load(self.paths.forum)["phase"], "complete")
 
-    async def test_grouped_candidate_corrects_measurements_in_same_assignment_then_merges(self):
+    async def test_grouped_candidate_submits_without_measurements_then_verification_scores_all(self):
         # A separate real repository keeps the existing single-chunk fixtures
         # unchanged while exercising a group the size of the observed failure.
         real_job = self.real_job
@@ -266,14 +283,14 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "Same-file grouped declaration fixture")
         tasks.accept_plan(self.paths.forum, plan["proposal_id"])
         for chunk_id in chunk_ids:
-            forum.record_measurement("Primary", chunk_id, 3, self.method,
-                                     {"reason": "Counted original fixture invocations"}, baseline=True)
+            self.seed_measurement(chunk_id)
         tasks.seal_baseline(self.paths.forum)
         with tasks.transaction(self.paths.forum) as state:
             state["measurements"] = deepcopy(state["baseline"]["measurements"])
         self.baseline = deepcopy(tasks.load(self.paths.forum)["baseline"])
         tasks.begin_round(self.paths.forum, max_rounds=5)
         self.controller = workflow.Controller(self.paths, self.roster, max_attempts=5)
+        self.controller.evaluator = lambda: self.fake_evaluator
         task_id = next(iter(tasks.load(self.paths.forum)["tasks"]))
         tree = workflow.task_worktree(self.paths, "Primary-grouped", task_id)
         forum.configure(self.paths.forum, self.root, "optimizing", "Primary")
@@ -286,48 +303,14 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.write("Example.lean", source.replace("by\n  have h : True := by trivial\n  exact h", "by trivial", 1), tree)
             self.git(tree, "add", "Example.lean")
             self.git(tree, "commit", "--quiet", "-m", "shorter grouped fixture proof")
-            identity = verification.file_identity(tree, self.scope)
-            records = {cid: metrics.record_measurement(self.metric, subject=cid,
-                raw_value=1 if cid == changed_chunk else 3, source_identity=identity,
-                method=self.baseline["measurements"][cid]["method"],
-                evidence={"reason": "Counted final committed fixture proof", "changed": cid == changed_chunk})
-                for cid in chunk_ids}
-            wrong_method = {**self.method, "description": "Paraphrased candidate counting method"}
-            wrong_records = {cid: metrics.record_measurement(self.metric, subject=cid,
-                raw_value=1 if cid == changed_chunk else 3, source_identity=identity,
-                method=wrong_method, evidence={"reason": "Same raw count, wrong recorded method"})
-                for cid in chunk_ids}
-            invalid_reports = (
-                ({}, "missing_measurement"),
-                ({cid: 3 for cid in chunk_ids[:10]}, "invalid_measurement_type"),
-                ({cid: records[cid] for cid in chunk_ids[:6]}, "missing_measurement"),
-                (wrong_records, "measurement_comparison_mismatch"),
-            )
-            checkpoint = self.paths.forum / tasks.STATE_FILE
-            unchanged = checkpoint.read_bytes()
             before = tasks.load(self.paths.forum)
             build_count = len(self.build_calls)
-            for measurements, expected_code in invalid_reports:
-                with self.subTest(expected_code=expected_code, count=len(measurements)):
-                    with self.assertRaises(ValueError) as caught:
-                        forum.submit_candidate("Primary", assignment["assignment_id"], "Grouped candidate proposal", measurements)
-                    cause = caught.exception.__cause__
-                    self.assertIsInstance(cause, tasks.MeasurementValidationError)
-                    self.assertIn(expected_code, {issue["code"] for issue in cause.details["issues"]})
-                    self.assertEqual(checkpoint.read_bytes(), unchanged)
-                    self.assertEqual(tasks.load(self.paths.forum), before)
-                    self.assertEqual(before["assignments"][assignment["assignment_id"]]["status"], "running")
-                    self.assertEqual(len(self.build_calls), build_count)
-            for chunk_id in chunk_ids:
-                forum.measure_candidate("Primary", assignment["assignment_id"], chunk_id,
-                    1 if chunk_id == changed_chunk else 3, self.baseline["measurements"][chunk_id]["method"],
-                    {"reason": "Remeasured final committed fixture", "changed": chunk_id == changed_chunk})
-            corrected = tasks.load(self.paths.forum)
-            self.assertEqual(len(corrected["assignments"][assignment["assignment_id"]]["measurements"]), 23)
-            self.assertEqual(corrected["rounds"], before["rounds"])
-            self.assertEqual(corrected["baseline"], self.baseline)
             candidate = forum.submit_candidate("Primary", assignment["assignment_id"],
-                                               "One shorter proof; other 22 measured unchanged")
+                                               "One shorter proof; other 22 unchanged")
+            submitted = tasks.load(self.paths.forum)
+            self.assertEqual(submitted["rounds"], before["rounds"])
+            self.assertEqual(submitted["baseline"], self.baseline)
+            self.assertEqual(len(self.build_calls), build_count)
         await self.controller.check_submissions()
         checked = tasks.load(self.paths.forum)["candidates"][candidate["candidate_id"]]
         self.assertEqual(checked["status"], "checked", checked.get("verification"))
@@ -336,7 +319,7 @@ class OptimizeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(all(row["passed"] for row in checked["verification"]["builds"]))
         selected = forum.select_candidate("Primary", candidate["candidate_id"], "All grouped measurements checked; one proof shorter")
         selected = tasks.load(self.paths.forum)["candidates"][selected["candidate_id"]]
-        self.assertTrue(self.controller.integrate_selected(selected))
+        self.assertTrue(await self.controller.integrate_selected(selected))
         final = tasks.load(self.paths.forum)
         self.assertEqual(final["candidates"][candidate["candidate_id"]]["status"], "merged")
         self.assertEqual(final["tasks"][task_id]["status"], "complete")
