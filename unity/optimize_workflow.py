@@ -664,7 +664,6 @@ class Controller:
                 if candidate["status"] == "selected":
                     await self.checked_job(self.integrate_selected, candidate)
             self.close_unsuccessful_tasks()
-            self.launch_ready()
             state = self.state()
             checked = [c for c in state["candidates"].values() if c["status"] == "checked"]
             signature = (state["main_sha"], tuple(sorted(c["candidate_id"] for c in checked)))
@@ -679,6 +678,8 @@ class Controller:
                     if git(tree, "status", "--porcelain", "--untracked-files=no") or git(tree, "rev-parse", "HEAD") != state["main_sha"]:
                         raise ValueError("Selection-only turn changed its source view")
                 continue
+            # Give an idle primary pending selection before another writer task.
+            self.launch_ready()
             if not self.workers:
                 break
             await asyncio.sleep(0.1)
