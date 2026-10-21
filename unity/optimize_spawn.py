@@ -349,12 +349,12 @@ def _agent_env(
     return env
 
 
-def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tuple[Path, Path]:
+def _process_group_wrapper(executable: Path, directory: Path, label: str, *, isolated=False) -> tuple[Path, Path]:
     """Wrap a CLI so its entire process tree has an optimize-owned process group."""
     wrapper = directory / f"{label}-group-wrapper"
     pid_file = directory / f"{label}-group.pid"
     wrapper.write_text(
-        f"#!{sys.executable}\n"
+        f"#!{sys.executable}{' -I' if isolated else ''}\n"
         "import os, sys, json, pathlib, subprocess, time, uuid\n"
         "os.setsid()\n"
         f"breadcrumb = pathlib.Path({str(pid_file.with_suffix('.receipt'))!r})\n"
@@ -985,10 +985,19 @@ async def antigravity_spawner(agent: Agent, system_prompt: str, prompt: str, cwd
                               mcp_profile: str = "optimize",
                               on_normal_completion: CompletionCallback | None = None) -> str | None:
     """Compatibility entry point; execution uses the shared backend loop."""
-    return await _shared_spawn.antigravity_spawner(agent, system_prompt, prompt, cwd, mcp_servers,
-        permission=permission, idle_timeout=idle_timeout, subagents=subagents,
-        env_overrides=env_overrides, own_process_group=own_process_group,
-        execution_policy=_execution_policy(on_normal_completion), mcp_profile=mcp_profile)
+    sandboxes = []
+    cleanup_failed = False
+    try:
+        return await _shared_spawn.antigravity_spawner(agent, system_prompt, prompt, cwd, mcp_servers,
+            permission=permission, idle_timeout=idle_timeout, subagents=subagents,
+            env_overrides=env_overrides, own_process_group=own_process_group,
+            execution_policy=_execution_policy(on_normal_completion, agy_sandboxes=sandboxes),
+            mcp_profile=mcp_profile)
+    except SpawnCleanupError:
+        cleanup_failed = True
+        raise
+    finally:
+        _finish_agy_sandboxes(sandboxes, cleanup_failed)
 
 
 def _sum_usage(previous, current):
@@ -1190,41 +1199,75 @@ def _codex_options(agent, cwd, system_prompt, mcp_servers, home, permission, env
             "config_options": config_options, "thread_options": thread_options}
 
 
-def _antigravity_options(agent, agy, cwd, system_prompt, prompt, env_overrides, own_process_group, mcp_profile):
+def _antigravity_options(agent, agy, cwd, system_prompt, prompt, env_overrides, own_process_group,
+                        mcp_profile, *, sandboxes=None):
     score_only = bool((env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID"))
-    roots = _worktree_write_roots(cwd, profile=(env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
+    profile = (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE")
+    read_only = profile == "critic" or score_only
+    roots = _worktree_write_roots(cwd, profile=profile)
+    sandbox = None
+    if read_only:
+        if not own_process_group or sandboxes is None:
+            raise ValueError("Optimize AGY read-only turns require owned process cleanup")
+        from .optimize_agy_sandbox import prepare_sandbox
+        sandbox = prepare_sandbox(agy, cwd, _agent_env(agent, env_overrides=env_overrides))
+        sandboxes.append(sandbox)
+        sandbox.preflight()
+        import shlex
+        system_prompt += (
+            "\n\nREAD-ONLY SOURCE: This scoring or review turn cannot change source files. "
+            "Your process starts in a private runtime directory outside source. "
+            f"Use absolute paths for source reads. Run source commands with cd -- {shlex.quote(str(Path(cwd).resolve()))}. "
+            "Use the existing Forum tools to submit scores or the review verdict. "
+            "Do not create source startup files or change sandbox settings."
+        )
     if roots:
-        system_prompt += _worktree_prompt(cwd, profile="critic" if score_only else (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"))
+        system_prompt += _worktree_prompt(cwd, profile="critic" if score_only else profile)
     full = system_prompt + _codex_mcp_note(
-        mcp_profile, "critic" if score_only else (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE"),
+        mcp_profile, "critic" if score_only else profile,
     ) + "\n\n---\n\nTASK:\n" + prompt
     cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
            "--dangerously-skip-permissions", "--print-timeout", "72h"]
     pid_file = None
     if own_process_group and os.name == "posix":
-        group_dir = Path(tempfile.mkdtemp(prefix="unity-antigravity-group-"))
-        wrapped, pid_file = _process_group_wrapper(Path(agy), group_dir, "antigravity")
+        # The host receipt wrapper stays OUTSIDE Bubblewrap. Neither executable
+        # nor its retry plan may be writable inside the child's runtime mounts.
+        group_dir = sandbox.directory if sandbox else Path(tempfile.mkdtemp(prefix="unity-antigravity-group-"))
+        if sandbox:
+            wrapped, pid_file = _process_group_wrapper(sandbox.executable, group_dir,
+                                                      "antigravity", isolated=True)
+        else:
+            wrapped, pid_file = _process_group_wrapper(Path(agy), group_dir, "antigravity")
         cmd[0] = str(wrapped)
     if roots:
         # AG has no per-session editor/path hook. Its native terminal sandbox is
         # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
         cmd += ["--sandbox"]
         for root in roots:
-            if root == Path(cwd).resolve():
+            if root == Path(cwd).resolve() and not read_only:
                 continue
             cmd += ["--add-dir", str(root)]
-        _console.print(
-            f"[yellow]{agent.name}: Antigravity worktree isolation is best effort; "
-            "terminal sandbox enabled, editor writes rely on the worktree policy.[/yellow]"
-        )
+        if not read_only:
+            _console.print(
+                f"[yellow]{agent.name}: Antigravity worktree isolation is best effort; "
+                "terminal sandbox enabled, editor writes rely on the worktree policy.[/yellow]"
+            )
 
     return {"full": full, "cmd": cmd, "pid_file": pid_file}
 
 
-def _execution_policy(on_normal_completion=None, *, started_at=None):
+def _finish_agy_sandboxes(sandboxes, cleanup_failed):
+    if not cleanup_failed:
+        for sandbox in sandboxes:
+            sandbox.close()
+
+
+def _execution_policy(on_normal_completion=None, *, started_at=None, agy_sandboxes=None):
+    from functools import partial
     return ExecutionPolicy(
         hooks=sys.modules[__name__], claude_options=_claude_options, finish_claude=_finish_claude,
-        codex_options=_codex_options, antigravity_options=_antigravity_options,
+        codex_options=_codex_options,
+        antigravity_options=partial(_antigravity_options, sandboxes=agy_sandboxes),
         callback_error=_CompletionCallbackError,
         unsuccessful_error=_UnsuccessfulTurnError, cleanup_error=SpawnCleanupError,
         on_normal_completion=on_normal_completion,
@@ -1243,6 +1286,8 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                 on_normal_completion: CompletionCallback | None = None) -> str | None:
     started_at = time.monotonic()
     delegated = False
+    sandboxes = []
+    cleanup_failed = False
     try:
         if _stop_requested(cwd):
             return None
@@ -1262,13 +1307,17 @@ async def spawn(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
             worker_env = dict(os.environ)
             worker_env.update(_agent_env(agent, env_overrides=env_overrides))
             mcp_servers = optimize_mcp_with_runtime_env(mcp_servers, worker_env)
-        policy = _execution_policy(on_normal_completion, started_at=started_at)
+        policy = _execution_policy(on_normal_completion, started_at=started_at, agy_sandboxes=sandboxes)
         delegated = True
         return await _shared_spawn.spawn(agent, system_prompt, prompt, cwd, mcp_servers,
             permission=permission, idle_timeout=idle_timeout, subagents=subagents,
             interrupt_event=interrupt_event, log_context=log_context, env_overrides=env_overrides,
             own_process_group=own_process_group, mcp_profile=mcp_profile, execution_policy=policy)
+    except SpawnCleanupError:
+        cleanup_failed = True
+        raise
     finally:
+        _finish_agy_sandboxes(sandboxes, cleanup_failed)
         # Once delegated, shared dispatch accounts only after owned cleanup.
         if not delegated:
             _write_run_log(agent, cwd, time.monotonic() - started_at, log_context)

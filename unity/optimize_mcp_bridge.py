@@ -86,7 +86,8 @@ async def call_tool(server, tool, arguments, *, environ=None, cwd=None):
     from .optimize_workflow import mcp_servers
     servers = optimize_mcp_with_runtime_env(mcp_servers(paths, profile), env)
     server = "unity-forum" if server == "forum" else server
-    policy = _optimize_codex_tool_policy(servers, profile)
+    score_only = bool(env.get("UNITY_OPTIMIZE_SCORE_REQUEST_ID", "").strip())
+    policy = _optimize_codex_tool_policy(servers, profile, score_only=score_only)
     if server not in policy:
         raise ValueError("server is not exposed by this Optimize phase's configured MCP catalog. "
                          "Use exact forum server name 'unity-forum' or alias 'forum'. "
