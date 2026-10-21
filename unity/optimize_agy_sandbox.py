@@ -20,8 +20,9 @@ import tempfile
 
 _SHARED = ("forum", "artifacts", "logs", "jobs", "tmp")
 # Existing CLI runtime children, not a grant to the profile directory itself.
-# In particular, settings, auth storage, updater, binaries and absent siblings
-# remain read-only. An unsupported native storage arrangement fails closed.
+# Settings, auth storage, updater, binaries and absent siblings stay read-only.
+# The generated agentapi shell script uses a private file overlay, never a host
+# write grant. Unsupported native storage arrangements fail closed.
 _AGY_RUNTIME = ("cache", "crashes", "scratch", "presence", "knowledge",
                 "conversations", "implicit", "brain", "log")
 
@@ -91,6 +92,13 @@ def _validate_plan(plan):
         path = Path(raw)
         if path.resolve() != path or _identity(path) != (device, inode):
             raise ValueError("Optimize AGY sandbox binding changed")
+    for raw, target, device, inode, link_device, link_inode in plan.get("log_aliases", ()):
+        path = Path(raw)
+        link = path.lstat()
+        if (not path.is_symlink() or str(path.resolve()) != target
+                or _identity(path) != (device, inode)
+                or (link.st_dev, link.st_ino) != (link_device, link_inode)):
+            raise ValueError("Optimize AGY log binding changed")
     _check_hardlinks(tuple(map(Path, plan["writable"])), tuple(map(Path, plan["protected"])))
 
 
@@ -151,6 +159,7 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
         raise ValueError("Optimize AGY private worktree binding changed")
 
     writable = []
+    log_aliases = []
     for name in _SHARED:
         target = _exact(project / ".unity" / name)
         entry = unity / name
@@ -166,6 +175,7 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
 
     home = _exact(Path(env.get("HOME", str(Path.home()))).resolve())
     agy_root = home / ".gemini" / "antigravity-cli"
+    shell_helper = None
     if agy_root.exists() or agy_root.is_symlink():
         _exact(agy_root)
         for name in _AGY_RUNTIME:
@@ -173,8 +183,28 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
             if entry.exists() or entry.is_symlink():
                 writable.append(_exact(entry))
         log = agy_root / "cli.log"
-        if log.exists() or log.is_symlink():
+        if log.is_symlink():
+            # AGY keeps cli.log as a pointer into its existing log directory.
+            # That directory is already writable. Do not mount the alias or
+            # grant writes to the profile parent (settings and credentials).
+            log_directory = _exact(agy_root / "log")
+            target = _exact(log.resolve(), directory=False)
+            if not target.is_relative_to(log_directory):
+                raise ValueError("Optimize AGY log link is outside its log directory")
+            link = log.lstat()
+            log_aliases.append([str(log), str(target), *_identity(target),
+                                link.st_dev, link.st_ino])
+        elif log.exists():
             writable.append(_exact(log, directory=False))
+        helper = agy_root / "bin" / "agentapi"
+        if helper.exists() or helper.is_symlink():
+            _exact(helper.parent)
+            shell_helper = _exact(helper, directory=False)
+            info = shell_helper.stat()
+            if info.st_nlink != 1 or info.st_size > 65536:
+                raise ValueError("Optimize AGY shell helper is not a private runtime script")
+            if not shell_helper.read_bytes().startswith(b"#!"):
+                raise ValueError("Optimize AGY shell helper must be a runtime script")
 
     # Never place control executables in TMPDIR: the worker's normal TMPDIR is
     # a shared writable runtime directory. Bind only runner/tmp, not this parent.
@@ -194,6 +224,18 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
             raise ValueError("Optimize AGY Git metadata binding is unavailable")
         packages = source / ".lake" / "packages"
         source_roots = (source, *metadata, *((packages.resolve(),) if packages.exists() else ()))
+        overlays = []
+        if shell_helper is not None:
+            if (any(shell_helper.is_relative_to(root) for root in (project, *source_roots))
+                    or any(shell_helper.samefile(path) for path in
+                           (agy, bwrap, module, Path(sys.executable).resolve()))):
+                raise ValueError("Optimize AGY shell helper overlaps protected files")
+            # AGY rewrites this generated script before each run_command. Give
+            # it a turn-local inode at that pathname, not the host file or bin.
+            private_helper = runner / "agentapi"
+            shutil.copyfile(shell_helper, private_helper)
+            private_helper.chmod(0o700)
+            overlays.append((private_helper, shell_helper))
         protected = tuple(dict.fromkeys((source, project, agy, bwrap, module,
                                          Path(sys.executable).resolve(), home / ".gemini",
                                          home / ".gitconfig", *metadata,
@@ -210,18 +252,23 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
                   "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev"]
         for root in writable:
             prefix.extend(("--bind", str(root), str(root)))
+        for private, destination in overlays:
+            prefix.extend(("--bind", str(private), str(destination)))
         prefix.extend(("--chdir", str(runner), "--setenv", "PWD", str(runner)))
         for key in ("TMPDIR", "TMP", "TEMP"):
             prefix.extend(("--setenv", key, str(temporary)))
         # uvx can retain its installed tools, but a new cache write stays private.
         prefix.extend(("--setenv", "UV_CACHE_DIR", str(temporary / "uv-cache")))
         plan = {"prefix": prefix, "agy": str(agy),
+                "log_aliases": log_aliases,
                 "writable": list(map(str, writable)),
                 "protected": [str(p) for p in protected if p.exists()],
                 "control_identity": list(_identity(directory)),
                 "bindings": [[str(p), *_identity(p)] for p in
                              dict.fromkeys((source, project, unity, marker, agy, bwrap, module,
-                                            directory, *writable))]}
+                                            directory, *writable,
+                                            *(path for pair in overlays for path in pair),
+                                            *(target.parent for _, target in overlays)))]}
         plan_path = directory / "sandbox.json"
         plan_path.write_text(json.dumps(plan))
         plan_path.chmod(0o600)

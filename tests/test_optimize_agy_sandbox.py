@@ -57,6 +57,10 @@ class _Fixture:
             (self.profile / name).mkdir()
         (self.profile / "cli.log").write_text("retained log\n")
         (self.profile / "settings.json").write_text('{"fixture": "settings"}\n')
+        self.shell_helper = self.profile / "bin" / "agentapi"
+        self.shell_helper.parent.mkdir()
+        self.shell_helper.write_text("#!/bin/sh\nexit 0\n")
+        self.shell_helper.chmod(0o700)
         (self.home / ".gemini" / "oauth_creds.json").write_text('{"fixture": true}\n')
         (self.home / ".gitconfig").write_text("# fixture settings\n")
         self.agy = self.base / "fake agy"
@@ -110,7 +114,7 @@ class _Fixture:
             self.project / "Main.lean", self.project / "nested", self.git_common,
             self.project / ".unity" / "agents.yaml", self.project / ".unity" / "config.yaml",
             self.profile / "settings.json", self.home / ".gemini" / "oauth_creds.json",
-            self.home / ".gitconfig", self.agy,
+            self.home / ".gitconfig", self.agy, self.shell_helper,
         ]
 
     def _git(self, *args):
@@ -248,6 +252,123 @@ class OptimizeAgySandboxPolicyTests(_Fixture, unittest.TestCase):
         sandbox = self.prepare()
         self.assertFalse(self.profile.exists())
         self.assertFalse(any(Path(root).is_relative_to(self.profile) for root in sandbox.writable_roots))
+
+    def test_cli_log_link_uses_only_the_existing_log_directory_grant(self):
+        log = self.profile / "cli.log"
+        log.unlink()
+        target = self.profile / "log" / "cli-current.log"
+        target.write_text("retained log\n")
+        log.symlink_to(Path("log") / target.name)
+        sandbox = self.prepare()
+        self.assertIn(target.parent, sandbox.writable_roots)
+        self.assertNotIn(log, sandbox.writable_roots)
+        self.assertNotIn(target, sandbox.writable_roots)
+        self.assertNotIn(self.profile, sandbox.writable_roots)
+        sandbox.command(["--print", "fixture"])
+
+    def test_cli_log_link_cannot_grant_access_outside_the_log_directory(self):
+        log = self.profile / "cli.log"
+        log.unlink()
+        for target in (self.source / "Main.lean", self.profile / "settings.json",
+                       self.agy, self.profile / "log", self.profile / "log" / "missing"):
+            with self.subTest(target=target):
+                log.symlink_to(target)
+                try:
+                    with self.assertRaises(ValueError):
+                        self.prepare()
+                finally:
+                    log.unlink()
+
+    def test_cli_log_link_retarget_after_preparation_is_rejected(self):
+        log = self.profile / "cli.log"
+        log.unlink()
+        target = self.profile / "log" / "cli-current.log"
+        target.write_text("retained log\n")
+        log.symlink_to(target)
+        sandbox = self.prepare()
+        log.unlink()
+        log.symlink_to(self.source / "Main.lean")
+        with self.assertRaisesRegex(ValueError, "binding changed"):
+            sandbox.command(["--print", "fixture"])
+
+    def test_cli_log_target_cannot_escape_through_another_link_or_hardlink(self):
+        log = self.profile / "cli.log"
+        log.unlink()
+        target = self.profile / "log" / "cli-current.log"
+        log.symlink_to(target)
+        target.symlink_to(self.profile / "settings.json")
+        with self.assertRaises(ValueError):
+            self.prepare()
+        target.unlink()
+        os.link(self.profile / "settings.json", target)
+        with self.assertRaisesRegex(ValueError, "hardlink"):
+            self.prepare()
+
+    def test_cli_log_link_and_target_births_are_rechecked(self):
+        log = self.profile / "cli.log"
+        log.unlink()
+        target = self.profile / "log" / "cli-current.log"
+        target.write_text("retained log\n")
+        log.symlink_to(target)
+        sandbox = self.prepare()
+        retained_link = self.profile / "retained-link"
+        log.rename(retained_link)
+        log.symlink_to(target)
+        with self.assertRaisesRegex(ValueError, "binding changed"):
+            sandbox.command(["--print", "fixture"])
+        log.unlink()
+        retained_link.rename(log)
+        target.rename(target.with_name("retained-target"))
+        target.write_text("replacement log\n")
+        with self.assertRaisesRegex(ValueError, "binding changed"):
+            sandbox.command(["--print", "fixture"])
+
+    def test_shell_helper_overlay_has_a_private_inode_and_no_bin_write_grant(self):
+        sandbox = self.prepare()
+        private = sandbox.runner / "agentapi"
+        self.assertEqual(private.read_bytes(), self.shell_helper.read_bytes())
+        self.assertFalse(private.samefile(self.shell_helper))
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o700)
+        self.assertNotIn(self.shell_helper, sandbox.writable_roots)
+        self.assertNotIn(self.shell_helper.parent, sandbox.writable_roots)
+        command = sandbox.command(["--print", "fixture"])
+        self.assertIn(["--bind", str(private), str(self.shell_helper)],
+                      [command[i:i + 3] for i in range(len(command) - 2)])
+
+    def test_shell_helper_alias_hardlink_and_non_script_are_rejected(self):
+        self.shell_helper.unlink()
+        self.shell_helper.symlink_to(self.source / "Main.lean")
+        with self.assertRaises(ValueError):
+            self.prepare()
+        self.shell_helper.unlink()
+        os.link(self.source / "Main.lean", self.shell_helper)
+        with self.assertRaises(ValueError):
+            self.prepare()
+        self.shell_helper.unlink()
+        self.shell_helper.write_bytes(b"not a generated shell script")
+        with self.assertRaises(ValueError):
+            self.prepare()
+
+    def test_shell_helper_host_and_private_inodes_are_rechecked(self):
+        sandbox = self.prepare()
+        private = sandbox.runner / "agentapi"
+        for path in (self.shell_helper, private):
+            with self.subTest(path=path):
+                retained = path.with_name(path.name + "-retained")
+                path.rename(retained)
+                path.write_text("#!/bin/sh\nexit 1\n")
+                try:
+                    with self.assertRaisesRegex(ValueError, "binding changed"):
+                        sandbox.command(["--print", "fixture"])
+                finally:
+                    path.unlink()
+                    retained.rename(path)
+
+    def test_missing_shell_helper_is_not_created_on_the_host(self):
+        self.shell_helper.unlink()
+        sandbox = self.prepare()
+        self.assertFalse(self.shell_helper.exists())
+        self.assertFalse((sandbox.runner / "agentapi").exists())
 
     def test_exact_project_and_worktree_environment_bindings_are_required(self):
         for key in ("UNITY_OPTIMIZE_PROJECT_ROOT", "UNITY_OPTIMIZE_WORKTREE"):
@@ -511,6 +632,45 @@ class OptimizeAgyNativeSandboxTests(_Fixture, unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.source / ".gitconfig").exists())
         self.assert_unchanged()
+
+    def test_cli_log_alias_is_writable_but_profile_and_source_remain_readonly(self):
+        log = self.profile / "cli.log"
+        log.unlink()
+        target = self.profile / "log" / "cli-current.log"
+        target.write_text("retained log\n")
+        log.symlink_to(target)
+        self.sandbox = self.prepare(native=True)
+        self.sandbox.preflight()
+        result = self.run_fake(
+            "from pathlib import Path; "
+            f"Path({str(log)!r}).write_text('runtime log'); "
+            f"assert Path({str(target)!r}).read_text() == 'runtime log'"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for operation in (
+            f"Path({str(log)!r}).unlink()",
+            f"Path({str(self.profile / 'settings.json')!r}).write_text('changed')",
+            f"Path({str(self.source / 'Main.lean')!r}).write_text('changed')",
+        ):
+            result = self.run_fake("from pathlib import Path; " + operation)
+            self.assertNotEqual(result.returncode, 0)
+            self.assert_unchanged()
+
+    def test_generated_shell_helper_writes_affect_only_the_private_copy(self):
+        original_mode = stat.S_IMODE(self.shell_helper.stat().st_mode)
+        result = self.run_fake(
+            "from pathlib import Path; import os; "
+            f"helper = Path({str(self.shell_helper)!r}); "
+            "helper.write_text('#!/bin/sh\\nexit 7\\n'); helper.chmod(0o600); "
+            "assert helper.read_text() == '#!/bin/sh\\nexit 7\\n'"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(stat.S_IMODE(self.shell_helper.stat().st_mode), original_mode)
+        self.assert_unchanged()
+        for path in (self.shell_helper.parent / "new-helper", self.source / "Main.lean"):
+            result = self.run_fake(f"from pathlib import Path; Path({str(path)!r}).write_text('changed')")
+            self.assertNotEqual(result.returncode, 0)
+            self.assert_unchanged()
 
     def test_writable_runtime_symlink_cannot_write_source(self):
         alias = self.project / ".unity" / "logs" / "source-alias"
