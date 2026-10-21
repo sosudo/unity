@@ -60,6 +60,32 @@ original method must be returned unchanged. Qualitative comparisons require a
 judgment with `improved`, optional `regressed`, and an evidence-based `reason`.
 Undefined modularity requires `evidence.zero_denominator: true`.
 
+## Score input types
+
+Fresh score inputs use the frozen metric definition:
+
+- Built-in `length` and `completion` accept nonnegative whole numbers or numeric
+  text. For example, `18`, `18.0`, `"18"`, and `"18.0"` become integer `18`.
+  Fractional counts are rejected. They are never rounded or truncated.
+- Built-in `modularity` accepts finite numbers or numeric text in `[0, 1]`.
+  Fractional ratios remain floats. The existing `"undefined"` evidence rule
+  still applies.
+- Custom metrics retain their numeric or qualitative input type. For example,
+  `0.75` remains a float and `"0.75"` remains text. A metric name or comparison
+  direction does not declare an output type.
+
+Booleans, non-finite numbers, empty text, and containers are not scores.
+Numeric text is parsed only for the built-in numeric metrics. Count text is
+checked exactly before integer conversion. Ratio bounds are checked before
+float conversion; a nonzero ratio that would become zero is rejected.
+Normal finite float precision applies to accepted ratio text.
+
+Parsing applies only to new input. Sealed records, baseline hashes, source
+bindings, methods, and provenance rules remain unchanged. Verifier response
+artifacts retain the original evaluator output before parsing.
+
+## Execution evidence
+
 Combined stdout and stderr are limited to 2 MiB. The owned job is cancelled if
 that limit is exceeded. Cancellation and an explicitly configured deadline use
 the existing checked-job shutdown path. Successful exact output is retained as

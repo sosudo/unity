@@ -195,7 +195,8 @@ async def score_snapshot(root, *, metric, subjects, source_identity, build_resul
             bound_evidence["zero_denominator"] = True
         try:
             measurements[subject] = metrics.record_measurement(metric, subject=subject,
-                raw_value=row["raw_value"], source_identity=source_identity, method=method,
+                raw_value=metrics.parse_score_value(metric, row["raw_value"]),
+                source_identity=source_identity, method=method,
                 evidence=bound_evidence, evidence_kind=kind, units=row.get("units"))
         except (KeyError, TypeError, ValueError) as exc:
             raise ScoringError("scorer returned an invalid measurement record") from exc

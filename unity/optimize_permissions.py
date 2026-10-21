@@ -27,6 +27,11 @@ def claude_worktree_options(cwd: Path, writable_roots: tuple[Path, ...], *, read
     shared = tuple(dict.fromkeys(path.resolve() for path in writable_roots))
     if any(path != source_root and source_root.is_relative_to(path) for path in shared):
         raise ValueError("Claude worktree access cannot include an ancestor of its source tree")
+    if read_only:
+        # A read-only Claude turn starts outside source. Do not re-grant the
+        # source (or real cache children) through the sandbox's writable binds.
+        # Resolve first: shared runtime symlinks outside source keep their grants.
+        shared = tuple(path for path in shared if not path.is_relative_to(source_root))
     library = retrospective_library_root() if retrospective else None
     if library is not None and library not in shared:
         raise ValueError("Optimize retrospective library was not granted by the controller")

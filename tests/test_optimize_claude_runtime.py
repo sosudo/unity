@@ -348,6 +348,60 @@ class OptimizeClaudeRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.options[0].permission_mode, "bypassPermissions")
         self.assertEqual(self.created, [])
 
+    async def test_score_sdk_starts_in_runner_and_preserves_source_and_mcp_bindings(self):
+        self.runtime.update(UNITY_OPTIMIZE_SCORE_REQUEST_ID="score-1",
+                            UNITY_OPTIMIZE_WORKTREE=str(self.cwd.resolve()),
+                            UNITY_OPTIMIZE_SCRATCH="")
+        original_query = self.query
+
+        def check_query(*, prompt, options):
+            runner = Path(options.cwd)
+            self.assertEqual(runner, Path(options.env["TMPDIR"]).resolve() / "runner")
+            self.assertTrue(runner.is_dir())
+            self.assertFalse(runner.is_relative_to(self.cwd.resolve()))
+            self.assertEqual(options.env["UNITY_OPTIMIZE_WORKTREE"], str(self.cwd.resolve()))
+            self.assertEqual(options.env["PWD"], str(runner))
+            self.assertEqual(options.add_dirs, [])
+            self.assertIn(str(self.cwd.resolve()), options.mcp_servers["lean-lsp"]["args"])
+            return original_query(prompt=prompt, options=options)
+
+        with patch.object(claude_agent_sdk, "query", side_effect=check_query):
+            self.assertEqual(await self.run_worker(), "fixture result")
+        self.assertFalse(Path(self.options[0].cwd).exists())
+        self.assertFalse((self.cwd / ".gitconfig").exists())
+        self.assertEqual([event[0] for event in self.events], ["sdk-close", "group-close"])
+
+    async def test_score_cancellation_closes_owned_processes_before_removing_runner(self):
+        self.runtime["UNITY_OPTIMIZE_SCORE_REQUEST_ID"] = "score-1"
+        self.stream_gate = asyncio.Event()
+        task = asyncio.create_task(self.run_worker())
+        self.tasks.append(task)
+        async with asyncio.timeout(2):
+            while not self.options:
+                await asyncio.sleep(0)
+        runner = Path(self.options[0].cwd)
+        self.assertTrue(runner.is_dir())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(runner.exists())
+        self.assertEqual([event[0] for event in self.events], ["sdk-close", "group-close"])
+
+    async def test_score_cleanup_failure_retains_runner_for_owned_processes(self):
+        self.runtime["UNITY_OPTIMIZE_SCORE_REQUEST_ID"] = "score-1"
+        self.group_error = optimize_spawn.SpawnCleanupError("fixture unclosed group")
+        with self.assertRaises(optimize_spawn.SpawnCleanupError):
+            await self.run_worker()
+        self.assertTrue(Path(self.options[0].cwd).is_dir())
+
+    async def test_score_sdk_options_failure_removes_unstarted_runner(self):
+        self.runtime["UNITY_OPTIMIZE_SCORE_REQUEST_ID"] = "score-1"
+        with patch.object(claude_agent_sdk, "ClaudeAgentOptions", side_effect=ValueError("fixture options")):
+            with self.assertRaisesRegex(ValueError, "fixture options"):
+                await self.run_worker()
+        self.assertEqual(self.options, [])
+        self.assertTrue(all(not path.exists() for path in self.created))
+
     async def test_unsafe_encoded_socket_path_is_rejected_before_query(self):
         short_root = Path(tempfile.mkdtemp(prefix="ut-", dir="/tmp"))
         long_path = short_root / ("é" * 32)

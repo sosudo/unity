@@ -44,6 +44,8 @@ class ExecutionPolicy:
     """Explicit adapters around one shared set of Claude/Codex/AG loops.
 
     Preparation hooks return backend option dictionaries, not running workers.
+    Claude preparation may return `sdk_cwd` for a separate SDK startup directory.
+    It defaults to the caller cwd and does not change lifecycle/source bindings.
     `on_normal_completion` preserves an existing opt-in continuation API; normal
     pipeline callers and the Optimize controller do not enable it implicitly.
     """

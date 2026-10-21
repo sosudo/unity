@@ -9,6 +9,7 @@ from pathlib import Path
 import re
 
 from fastmcp import FastMCP
+from pydantic import StrictFloat, StrictInt, StrictStr
 
 from .. import artifacts, optimize_tasks as tasks
 from . import server as discussion
@@ -21,6 +22,9 @@ PROFILES = {"preparation", "architect", "exploration", "chunking", "optimizing",
 # Bound the actual JSON data before FastMCP copies it into text and structured
 # content. Full evidence stays in immutable artifacts and in workflow state.
 MAX_RESPONSE_BYTES = 64 * 1024
+# Preserve the received scalar type until metric-aware parsing. In particular,
+# bool must not be coerced to int by tool argument validation.
+ScoreValue = StrictInt | StrictFloat | StrictStr
 
 
 def configure(forum_dir: Path, project_root: Path, profile: str = "optimizing", author: str = "") -> None:
@@ -443,7 +447,7 @@ def submit_baseline_measurement(author: str, chunk_id: str, measurement: dict) -
     return {"advisory": True, "subject": chunk_id, "verification_required": True}
 
 
-def record_measurement(author: str, chunk_id: str, raw_value: int | float | str,
+def record_measurement(author: str, chunk_id: str, raw_value: ScoreValue,
                        method: dict, evidence: dict | list | str, evidence_kind: str = "agent_judged",
                        baseline: bool = False, assignment_id: str = "", units: str | None = None,
                        comparison_judgment: dict | None = None) -> dict:
@@ -466,12 +470,13 @@ def record_measurement(author: str, chunk_id: str, raw_value: int | float | str,
         except tasks.MeasurementValidationError as exc:
             raise _candidate_validation_error(exc, author, assignment_id, "record_measurement") from exc
     measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
-        raw_value=raw_value, source_identity=identity, method=method, evidence=evidence,
+        raw_value=optimize_metrics.parse_score_value(state["metric"], raw_value),
+        source_identity=identity, method=method, evidence=evidence,
         evidence_kind=evidence_kind, units=units)
     return submit_baseline_measurement(author, chunk_id, measurement)
 
 
-def measure_candidate(author: str, assignment_id: str, chunk_id: str, raw_value: int | float | str,
+def measure_candidate(author: str, assignment_id: str, chunk_id: str, raw_value: ScoreValue,
                       method: dict, evidence: dict | list | str, evidence_kind: str = "agent_judged",
                       units: str | None = None, comparison_judgment: dict | None = None) -> dict:
     """Record optional candidate advice; this never establishes a checked score."""
@@ -486,7 +491,7 @@ def _judgment(judgment: dict | None) -> None:
         raise ValueError("qualitative comparison judgment needs improved boolean and concrete reason")
 
 
-def record_current_measurement(author: str, chunk_id: str, raw_value: int | float | str,
+def record_current_measurement(author: str, chunk_id: str, raw_value: ScoreValue,
                                method: dict, evidence: dict | list | str,
                                evidence_kind: str = "agent_judged", units: str | None = None,
                                comparison_judgment: dict | None = None) -> dict:
@@ -504,7 +509,8 @@ def record_current_measurement(author: str, chunk_id: str, raw_value: int | floa
         previous = state["baseline"].get("measurements", {}).get(chunk_id)
         if previous is None: raise ValueError("chunk has no original baseline measurement")
         measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
-            raw_value=raw_value, source_identity=identity, method=method, evidence=evidence,
+            raw_value=optimize_metrics.parse_score_value(state["metric"], raw_value),
+            source_identity=identity, method=method, evidence=evidence,
             evidence_kind=evidence_kind, units=units)
         # Comparison validates method, units, metric and subject without inventing
         # an improvement judgment for custom qualitative values.
@@ -545,7 +551,7 @@ def scoring_request() -> dict:
         "records": {"request": _brief_artifact(state, "scoring_request", request)}})
 
 
-def submit_score_report(author: str, request_id: str, subject: str, raw_value: int | float | str,
+def submit_score_report(author: str, request_id: str, subject: str, raw_value: ScoreValue,
                         method: dict, evidence: dict | list | str, units: str | None = None,
                         comparison_judgment: dict | None = None) -> dict:
     """Report a read-only assessment; the verifier validates and seals the score."""

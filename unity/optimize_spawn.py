@@ -1060,18 +1060,54 @@ def _optimize_external_tools_prompt(mcp_servers: dict) -> str:
 
 def _claude_options(cwd, system_prompt, mcp_servers, permission, env_overrides):
     scratch = None
+    sdk_cwd = None
     isolation = {}
     profile = (env_overrides or {}).get("UNITY_OPTIMIZE_PROFILE")
     read_only = profile == "critic" or bool((env_overrides or {}).get("UNITY_OPTIMIZE_SCORE_REQUEST_ID"))
     roots = _worktree_write_roots(cwd, profile=profile)
+    if read_only and not roots:
+        raise ValueError("Optimize read-only Claude turns require private worktree isolation")
     if roots:
         from .optimize_permissions import claude_worktree_options
         scratch = _claude_sandbox_tmpdir()
         try:
+            if read_only:
+                import shlex
+
+                source = Path(cwd).resolve(strict=True)
+                runtime = scratch.resolve(strict=True)
+                if runtime.is_relative_to(source) or source.is_relative_to(runtime):
+                    raise ValueError("Claude startup scratch must be outside the source tree")
+                # Claude makes its startup cwd writable, then mounts protected
+                # dotfiles there. Those mount targets must never enter the bound
+                # score snapshot, even temporarily during a tool/report call.
+                sdk_cwd = runtime / "runner"
+                sdk_cwd.mkdir(mode=0o700)
+                sdk_cwd.chmod(0o700)
+                system_prompt += (
+                    "\n\nREAD-ONLY SOURCE ACCESS: Claude starts in a private runtime directory, "
+                    "not your source workspace. Use absolute paths for Read, Glob, Grep and Lean tools. "
+                    "For every source shell command or Unity shell-bridge call, start with "
+                    f"`cd -- {shlex.quote(str(source))} && ...`. "
+                    "Do not put source or planning files in the runtime directory."
+                )
+                # Stdio services used to inherit the source cwd. Preserve that
+                # contract explicitly; HTTP/in-process server specs are untouched.
+                # Launch the trusted stdlib-only adapter by absolute path in
+                # isolated Python: runner/PYTHONPATH must not supply its imports.
+                stdio_adapter = str(Path(__file__).with_name("optimize_stdio_cwd.py").resolve(strict=True))
+                mcp_servers = {
+                    name: ({**cfg, "command": sys.executable,
+                            "args": ["-I", stdio_adapter, "--cwd", str(source),
+                                     "--", cfg["command"], *cfg.get("args", [])]}
+                           if cfg.get("command") and not cfg.get("url") else cfg)
+                    for name, cfg in mcp_servers.items()
+                }
             isolation = claude_worktree_options(cwd, (*roots, scratch),
                 read_only=read_only, retrospective=profile == "retrospective")
             system_prompt += _worktree_prompt(cwd, profile="critic" if read_only else profile)
             env_overrides = {**(env_overrides or {}),
+                             **({"PWD": str(sdk_cwd)} if sdk_cwd is not None else {}),
                              **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(scratch))}
         except BaseException:
             _finish_claude(scratch, True, False)
@@ -1080,7 +1116,8 @@ def _claude_options(cwd, system_prompt, mcp_servers, permission, env_overrides):
     return {"system_prompt": system_prompt, "env_overrides": env_overrides,
             "mcp_servers": {name: ({"type": "http", **cfg} if cfg.get("url") else cfg)
                             for name, cfg in mcp_servers.items()},
-            "options": isolation, "scratch": scratch}
+            "options": isolation, "scratch": scratch,
+            **({"sdk_cwd": sdk_cwd} if sdk_cwd is not None else {})}
 
 
 def _finish_claude(scratch, sdk_closed, cleanup_failed):

@@ -317,6 +317,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
 
     try:
         isolation = {}
+        sdk_cwd = cwd
         if execution_policy is not None:
             prepared = execution_policy.claude_options(cwd, system_prompt, mcp_servers, permission, env_overrides)
             system_prompt = prepared["system_prompt"]
@@ -324,6 +325,9 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
             env_overrides = prepared["env_overrides"]
             isolation = prepared["options"]
             scratch = prepared["scratch"]
+            # Only the SDK process changes directory. Lifecycle hooks, source
+            # bindings and completion callbacks continue to use the caller cwd.
+            sdk_cwd = prepared.get("sdk_cwd", cwd)
 
         cli_path = None
         if own_process_group and os.name == "posix":
@@ -342,7 +346,7 @@ async def claude_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Pat
             system_prompt=system_prompt,
             mcp_servers=mcp_servers,
             agents=agents_def,
-            cwd=str(cwd),
+            cwd=str(sdk_cwd),
             permission_mode=isolation.pop("permission_mode", permission),
             model=agent.model,
             max_budget_usd=agent.budget,

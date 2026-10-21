@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from unity import optimize_jobs as jobs, optimize_metrics as m
+from unity import artifacts, optimize_jobs as jobs, optimize_metrics as m
 from unity import optimize_scoring as scoring, optimize_verification as v
 
 _REAL_JOB_RUN = jobs.run
@@ -106,6 +106,67 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["build"]["source_identity"], result["scoring"]["source_identity"])
         self.assertEqual(self.evaluations[1]["comparison_records"], result["comparison_measurements"])
         self.assertEqual(json.dumps(self.baseline, sort_keys=True), baseline_bytes)
+
+    async def test_verifier_parses_count_text_but_keeps_original_response_evidence(self):
+        baseline_bytes = json.dumps(self.baseline, sort_keys=True)
+        responses = []
+
+        async def textual(request):
+            response = await self.evaluate(request)
+            for row in response["measurements"].values():
+                row["raw_value"] = str(row["raw_value"]) + ".0"
+            responses.append(deepcopy(response))
+            return response
+
+        result = await self.check_candidate(self.candidate(), evaluator=textual)
+        self.assertTrue(result["passed"], result["issues"])
+        for row, expected, response in (
+                (result["comparison_measurements"]["first"], 3, responses[0]),
+                (result["measurements"]["first"], 1, responses[1])):
+            self.assertIs(type(row["raw_value"]), int)
+            self.assertEqual(row["raw_value"], expected)
+            self.assertEqual(row["method"], self.method)
+            self.assertEqual(row["evidence_kind"], "agent_judged")
+            evidence = artifacts.artifact_bytes(self.root / ".unity/artifacts",
+                row["evidence"]["artifact"]["artifact_id"])
+            self.assertEqual(evidence.decode(), scoring._json(response))
+            self.assertEqual(json.loads(evidence)["measurements"]["first"]["raw_value"], str(expected) + ".0")
+        self.assertEqual(json.dumps(self.baseline, sort_keys=True), baseline_bytes)
+
+    async def test_verifier_does_not_truncate_fractional_count_text_after_build(self):
+        baseline_bytes = json.dumps(self.baseline, sort_keys=True)
+
+        async def fractional(request):
+            response = await self.evaluate(request)
+            response["measurements"]["first"]["raw_value"] = "3.000000000000000001"
+            return response
+
+        with self.assertRaisesRegex(scoring.ScoringError, "invalid measurement record"):
+            await self.check_candidate(self.candidate(), evaluator=fractional)
+        self.assertTrue(self.build_calls)
+        self.assertEqual(json.dumps(self.baseline, sort_keys=True), baseline_bytes)
+
+    async def test_verifier_parses_ratio_text_and_keeps_undefined_evidence_gate(self):
+        folder = self.root / ".unity/metrics"
+        shutil.copyfile(Path(m.__file__).parent / "defaults/metrics/modularity.md", folder / "modularity.md")
+        metric = m.load_metric(self.root, "modularity")
+        method = {"description": "Explicit fixture ratio", "direction": "higher"}
+        for raw, expected, evidence in (("0.75", 0.75, {"reason": "fixture ratio"}),
+                ("undefined", "undefined", {"zero_denominator": True})):
+            with self.subTest(raw=raw):
+                async def ratio(_request):
+                    return {"measurements": {"first": {"raw_value": raw,
+                        "method": method, "evidence": evidence}}}
+
+                result = await v.score_source(self.root, metric=metric, scope=self.scope,
+                    subjects=["first"], original_methods={"first": method},
+                    evaluator=ratio, run_checked=self.checked)
+                row = result["measurements"]["first"]
+                self.assertEqual(row["raw_value"], expected)
+                self.assertIs(type(row["raw_value"]), type(expected))
+                self.assertEqual(row["evidence_kind"], "agent_judged")
+                if raw == "undefined":
+                    self.assertTrue(row["evidence"]["zero_denominator"])
 
     async def test_exact_cache_reused_but_changed_commit_forces_current_scoring(self):
         candidate = self.candidate()
@@ -317,6 +378,29 @@ class ScoringTests(unittest.IsolatedAsyncioTestCase):
             await scoring.score_snapshot(self.root, metric=metric, subjects=["first"],
                 source_identity=identity, build_result=build, original_methods={"first": self.method},
                 evaluator=scoring.executable_evaluator(metric, run_checked=excessive, project_root=self.root))
+
+    async def test_executable_custom_scores_preserve_float_and_text_types(self):
+        metric = self.executable_metric()
+        identity = v.file_identity(self.root, scope=self.scope)
+        build = v.build_scope(self.root, scope=self.scope, selected_files=["Example.lean"])
+        for raw in (0.75, -1.25, "0.75", "clearer"):
+            with self.subTest(raw=raw):
+                async def helper_job(_function, _owner, command, **kwargs):
+                    response = {"protocol": scoring.PROTOCOL, "measurements": {
+                        "first": {"raw_value": raw, "method": self.method,
+                                  "evidence": {"reason": "fixture output"}}}}
+                    output = json.dumps(response)
+                    kwargs["on_output"]("stdout", output)
+                    return subprocess.CompletedProcess(command, 0, output, "")
+
+                result = await scoring.score_snapshot(self.root, metric=metric, subjects=["first"],
+                    source_identity=identity, build_result=build, original_methods={"first": self.method},
+                    evaluator=scoring.executable_evaluator(metric, run_checked=helper_job, project_root=self.root))
+                row = result["measurements"]["first"]
+                self.assertIs(type(row["raw_value"]), type(raw))
+                self.assertEqual(row["raw_value"], raw)
+                self.assertEqual(row["evidence_kind"], "measured")
+                self.assertEqual(row["method"], self.method)
 
     def test_old_metric_hash_is_unchanged_without_explicit_evaluator(self):
         self.assertNotIn("evaluator", self.metric)

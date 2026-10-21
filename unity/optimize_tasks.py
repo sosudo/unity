@@ -367,6 +367,7 @@ def record_score_report(forum_dir: Path, author: str, request_id: str, subject: 
         if expected is not None and method != expected:
             raise ValueError("score report differs from the original measurement method")
         # Validate shape and units without treating a numeric report as a tool measurement.
+        raw_value = optimize_metrics.parse_score_value(state["metric"], raw_value)
         optimize_metrics.record_measurement(state["metric"], subject=subject, raw_value=raw_value,
             source_identity=request["source_identity"], method=method, evidence=evidence,
             evidence_kind="agent_judged", units=units)
@@ -885,6 +886,7 @@ def record_candidate_measurement(forum_dir: Path, author: str, assignment_id: st
         if chunk_id not in state["tasks"][row["task_id"]]["chunk_ids"]:
             raise MeasurementValidationError([{"code": "unassigned_measurement", "subject": chunk_id}])
         current, private = _candidate_identities(state, row)
+        raw_value = optimize_metrics.parse_score_value(state["metric"], raw_value)
         measurement = optimize_metrics.record_measurement(state["metric"], subject=chunk_id,
             raw_value=raw_value, source_identity=private, method=method, evidence=evidence,
             evidence_kind=evidence_kind, units=units)

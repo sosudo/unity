@@ -7,6 +7,7 @@ counter for proof length.
 from __future__ import annotations
 
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -98,6 +99,68 @@ def load_metric(root: Path, metric_name: str) -> dict:
             raise ValueError("metric evaluator timeout_seconds must be positive and finite")
         result["evaluator"] = evaluator
     return _sealed(result)
+
+
+def parse_score_value(metric: dict, raw_value):
+    """Normalize a fresh score using only the frozen builtin's numeric contract.
+
+    Never call this on sealed measurements. Custom metrics have no declared
+    result type, so preserve their numeric and qualitative inputs as supplied.
+    The existing measurement validator still checks evidence, units and binding.
+    """
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float, str)):
+        raise ValueError("raw metric must be a finite number or qualitative value")
+    if isinstance(raw_value, str):
+        if not raw_value.strip():
+            raise ValueError("qualitative metric value cannot be empty")
+    else:
+        try:
+            finite = math.isfinite(raw_value)
+        except OverflowError:
+            finite = False
+        if not finite:
+            raise ValueError("metric value must be finite")
+    builtin = metric.get("builtin")
+    if builtin not in {"length", "completion", "modularity"}:
+        return raw_value
+    if builtin == "modularity" and raw_value == "undefined":
+        return raw_value  # record_measurement requires zero-denominator evidence.
+    message = ("length/completion raw values are nonnegative integer counts"
+               if builtin in {"length", "completion"}
+               else "modularity raw value must be a ratio between zero and one")
+    if isinstance(raw_value, str):
+        text = raw_value.strip()
+        if not re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", text):
+            raise ValueError(message)
+        try:
+            number = Decimal(text)
+        except InvalidOperation as exc:
+            raise ValueError(message) from exc
+    else:
+        number = Decimal(raw_value)
+    if not number.is_finite():
+        raise ValueError(message)
+    if builtin in {"length", "completion"}:
+        # Match the existing finite-number validator, without allocating an
+        # enormous integer from hostile exponent text. Check exact integrality
+        # before conversion: float("18.000000000000000001") would lose evidence.
+        if number < 0 or number != number.to_integral_value():
+            raise ValueError(message)
+        # Use float only for the existing finite-range check, never to obtain
+        # the integer value. This also retains accepted native integer bounds.
+        if not math.isfinite(float(number)):
+            raise ValueError(message)
+        return int(number)
+    # Decimal bounds must precede float conversion: out-of-range text must not
+    # round into 0 or 1, and a positive ratio must not silently underflow to 0.
+    if not 0 <= number <= 1:
+        raise ValueError(message)
+    if not isinstance(raw_value, str):
+        return raw_value
+    parsed = float(number)
+    if parsed == 0 and number != 0:
+        raise ValueError("modularity ratio is too small to represent without becoming zero")
+    return parsed
 
 
 def record_measurement(metric: dict, *, subject: str, raw_value, source_identity: dict,
