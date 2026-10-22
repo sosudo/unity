@@ -247,11 +247,64 @@ class OptimizeAgySandboxPolicyTests(_Fixture, unittest.TestCase):
         self.assertIn(self.profile / "cli.log", roots)
         self.assertNotIn(self.profile / "settings.json", roots)
 
-    def test_missing_optional_profile_is_not_created(self):
+    def test_missing_profile_fails_closed_without_host_placeholders(self):
         shutil.rmtree(self.profile)
-        sandbox = self.prepare()
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            self.prepare()
         self.assertFalse(self.profile.exists())
-        self.assertFalse(any(Path(root).is_relative_to(self.profile) for root in sandbox.writable_roots))
+
+    def test_native_settings_overlay_keeps_exact_runtime_rules_and_host_bytes(self):
+        path = self.profile / "settings.json"
+        original = {"fixture": "preserved", "permissions": {
+            "allow": ["read_file(/existing)"], "deny": ["write_file(/restricted)"],
+            "ask": ["read_url(example.invalid)"]}, "toolPermission": "always-proceed"}
+        path.write_text(json.dumps(original))
+        before = path.read_bytes()
+        sandbox = self.prepare()
+        private = sandbox.directory / "agy-settings.json"
+        settings = json.loads(private.read_text())
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(settings["fixture"], "preserved")
+        self.assertEqual(settings["toolPermission"], "proceed-in-sandbox")
+        self.assertIs(settings["enableTerminalSandbox"], True)
+        self.assertEqual(settings["permissions"]["allow"], ["read_file(/existing)",
+            *(f"write_file({root})" for root in sandbox.writable_roots),
+            *(f"read_file({root})" for root in dict.fromkeys((Path(sys.prefix).resolve(),
+                Path(sys.base_prefix).resolve(), Path(optimize_agy_sandbox.__file__).resolve().parent.parent)))])
+        self.assertEqual(settings["permissions"]["deny"],
+                         ["write_file(/restricted)", "unsandboxed(*)"])
+        self.assertEqual(settings["permissions"]["ask"], ["read_url(example.invalid)"])
+        prefix = sandbox.plan["prefix"]
+        self.assertIn(["--ro-bind", str(private), str(path)],
+                      [prefix[index:index + 3] for index in range(len(prefix))])
+        self.assertFalse(any(private.is_relative_to(root) for root in sandbox.writable_roots))
+        self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+
+    def test_native_settings_reject_malformed_or_mutated_permissions(self):
+        path = self.profile / "settings.json"
+        for data in (b"bad", b"[]", b'{"permissions":[]}', b'{"permissions":{"deny":"no"}}',
+                     b'{"permissions":{"allow":[1]}}', b" " * (1024 * 1024 + 1)):
+            with self.subTest(size=len(data)):
+                path.write_bytes(data)
+                with self.assertRaises(ValueError):
+                    self.prepare()
+        path.write_text('{}')
+        sandbox = self.prepare()
+        path.write_text('{"changed": true}')
+        with self.assertRaisesRegex(ValueError, "settings binding changed"):
+            sandbox.command(["--print", "fixture"])
+
+    def test_private_settings_cannot_change_after_plan_creation(self):
+        sandbox = self.prepare()
+        (sandbox.directory / "agy-settings.json").write_text('{}')
+        with self.assertRaisesRegex(ValueError, "settings binding changed"):
+            sandbox.command(["--print", "fixture"])
+
+    def test_native_rule_cannot_be_injected_through_a_runtime_path(self):
+        for path in ("/tmp/with*glob", "/tmp/with?glob", "/tmp/with[glob]", "/tmp/with)paren",
+                     "/tmp/line\nbreak", "relative"):
+            with self.subTest(path=path), self.assertRaisesRegex(ValueError, "permission rule"):
+                optimize_agy_sandbox._readonly_settings(b'{}', (Path(path),))
 
     def test_cli_log_link_uses_only_the_existing_log_directory_grant(self):
         log = self.profile / "cli.log"
@@ -604,8 +657,8 @@ class OptimizeAgyNativeSandboxTests(_Fixture, unittest.TestCase):
         settings = self.profile / "settings.json"
         settings.unlink()  # Establish the missing-settings fixture before entering the sandbox.
         self.before = _snapshot(self.protected)
-        result = self.run_fake(f"from pathlib import Path; Path({str(settings)!r}).write_text('{{}}')")
-        self.assertNotEqual(result.returncode, 0)
+        with self.assertRaises((OSError, ValueError)):
+            self.run_fake(f"from pathlib import Path; Path({str(settings)!r}).write_text('{{}}')")
         self.assertFalse(settings.exists())
         self.assert_unchanged()
 

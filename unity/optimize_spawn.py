@@ -1226,8 +1226,10 @@ def _antigravity_options(agent, agy, cwd, system_prompt, prompt, env_overrides, 
     full = system_prompt + _codex_mcp_note(
         mcp_profile, "critic" if score_only else profile,
     ) + "\n\n---\n\nTASK:\n" + prompt
-    cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json",
-           "--dangerously-skip-permissions", "--print-timeout", "72h"]
+    cmd = [agy, "--print", full, "--model", agent.model, "--output-format", "stream-json"]
+    if not read_only:
+        cmd.append("--dangerously-skip-permissions")
+    cmd += ["--print-timeout", "72h"]
     pid_file = None
     if own_process_group and os.name == "posix":
         # The host receipt wrapper stays OUTSIDE Bubblewrap. Neither executable
@@ -1240,8 +1242,9 @@ def _antigravity_options(agent, agy, cwd, system_prompt, prompt, env_overrides, 
             wrapped, pid_file = _process_group_wrapper(Path(agy), group_dir, "antigravity")
         cmd[0] = str(wrapped)
     if roots:
-        # AG has no per-session editor/path hook. Its native terminal sandbox is
-        # best effort; keep headless tool approvals so shell-MCP is not soft-denied.
+        # Read-only turns use a private settings overlay with exact runtime
+        # write rules and an explicit sandbox-bypass denial. Writers retain
+        # their existing native sandbox and headless approval behavior.
         cmd += ["--sandbox"]
         for root in roots:
             if root == Path(cwd).resolve() and not read_only:

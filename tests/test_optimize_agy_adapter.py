@@ -91,6 +91,7 @@ class OptimizeAgyAdapterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result["cmd"][1], "--print")
                 self.assertEqual(result["cmd"][2], result["full"])
                 self.assertEqual(result["pid_file"], self.receipt)
+                self.assertNotIn("--dangerously-skip-permissions", result["cmd"])
                 self.assertEqual(result["cmd"][-5:],
                     ["--sandbox", "--add-dir", str(self.source), "--add-dir", str(self.shared_runtime)])
                 self.assertIn("private runtime directory outside source", result["full"])

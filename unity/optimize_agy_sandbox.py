@@ -8,6 +8,7 @@ isolate mutually distrustful workers' shared Forum state or external services.
 """
 
 from dataclasses import dataclass
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,6 +26,58 @@ _SHARED = ("forum", "artifacts", "logs", "jobs", "tmp")
 # write grant. Unsupported native storage arrangements fail closed.
 _AGY_RUNTIME = ("cache", "crashes", "scratch", "presence", "knowledge",
                 "conversations", "implicit", "brain", "log")
+_SETTINGS_LIMIT = 1024 * 1024
+
+
+def _settings_bytes(path: Path) -> bytes:
+    """Read a bounded, stable settings file without publishing private values."""
+    _exact(path, directory=False)
+    before = path.stat()
+    if before.st_nlink != 1:
+        raise ValueError("Optimize AGY settings has an unsupported hardlink")
+    if before.st_size > _SETTINGS_LIMIT:
+        raise ValueError("Optimize AGY settings file is unsupported")
+    with path.open("rb") as handle:
+        data = handle.read(_SETTINGS_LIMIT + 1)
+    after = path.stat()
+    stable = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, key) != getattr(after, key) for key in stable) or len(data) != before.st_size:
+        raise ValueError("Optimize AGY settings changed during startup")
+    return data
+
+
+def _readonly_settings(data: bytes, writable: tuple[Path, ...], readable: tuple[Path, ...] = ()) -> dict:
+    """Grant the inner terminal sandbox only the outer sandbox's runtime roots.
+
+    This is a turn-local overlay, not an edit to the user's saved AGY settings.
+    Preserve existing restrictions. Never auto-approve an unsandboxed command.
+    """
+    try:
+        settings = json.loads(data)
+    except (ValueError, UnicodeError):
+        raise ValueError("Optimize AGY settings are not valid JSON") from None
+    if not isinstance(settings, dict):
+        raise ValueError("Optimize AGY settings must be an object")
+    permissions = settings.setdefault("permissions", {})
+    if not isinstance(permissions, dict):
+        raise ValueError("Optimize AGY permissions must be an object")
+    for key in ("allow", "deny", "ask"):
+        rules = permissions.setdefault(key, [])
+        if not isinstance(rules, list) or any(not isinstance(rule, str) for rule in rules):
+            raise ValueError("Optimize AGY permission rules must be string lists")
+    for action, root in [("write_file", root) for root in writable] + [("read_file", root) for root in readable]:
+        # AGY rules use action(path), with '*' reserved for global matching.
+        # Do not let a pathname inject a rule or expand the exact write grant.
+        if not root.is_absolute() or any(c in str(root) for c in "()*?[]\\\r\n\x00"):
+            raise ValueError("Optimize AGY runtime path cannot be a permission rule")
+        rule = f"{action}({root})"
+        if rule not in permissions["allow"]:
+            permissions["allow"].append(rule)
+    if "unsandboxed(*)" not in permissions["deny"]:
+        permissions["deny"].append("unsandboxed(*)")
+    settings["enableTerminalSandbox"] = True
+    settings["toolPermission"] = "proceed-in-sandbox"
+    return settings
 
 
 def _exact(path: Path, *, directory=True) -> Path:
@@ -92,6 +145,9 @@ def _validate_plan(plan):
         path = Path(raw)
         if path.resolve() != path or _identity(path) != (device, inode):
             raise ValueError("Optimize AGY sandbox binding changed")
+    for raw, digest in plan.get("settings_snapshots", ()):
+        if hashlib.sha256(_settings_bytes(Path(raw))).hexdigest() != digest:
+            raise ValueError("Optimize AGY settings binding changed")
     for raw, target, device, inode, link_device, link_inode in plan.get("log_aliases", ()):
         path = Path(raw)
         link = path.lstat()
@@ -175,6 +231,11 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
 
     home = _exact(Path(env.get("HOME", str(Path.home()))).resolve())
     agy_root = home / ".gemini" / "antigravity-cli"
+    # The native terminal sandbox has its own filesystem policy. --add-dir is
+    # workspace context, not a substitute for its explicit runtime write rules.
+    # Require an existing regular settings file; do not create host placeholders.
+    settings_path = _exact(agy_root / "settings.json", directory=False)
+    settings_data = _settings_bytes(settings_path)
     shell_helper = None
     if agy_root.exists() or agy_root.is_symlink():
         _exact(agy_root)
@@ -216,6 +277,13 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
         writable.extend((runner, temporary))
         writable = tuple(dict.fromkeys(writable))
         module = Path(__file__).resolve()
+        # The bridge's absolute shebang and imports must exist in the inner
+        # sandbox as well. These are reads, never runtime/source write grants.
+        readable = tuple(dict.fromkeys(_exact(path.resolve()) for path in
+                         (Path(sys.prefix), Path(sys.base_prefix), module.parent.parent)))
+        private_settings = directory / "agy-settings.json"
+        private_settings.write_text(json.dumps(_readonly_settings(settings_data, writable, readable)))
+        private_settings.chmod(0o600)
         git = subprocess.run(
             ["git", "rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
             cwd=source, capture_output=True, text=True, timeout=10, check=True)
@@ -254,19 +322,23 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
             prefix.extend(("--bind", str(root), str(root)))
         for private, destination in overlays:
             prefix.extend(("--bind", str(private), str(destination)))
+        prefix.extend(("--ro-bind", str(private_settings), str(settings_path)))
         prefix.extend(("--chdir", str(runner), "--setenv", "PWD", str(runner)))
         for key in ("TMPDIR", "TMP", "TEMP"):
             prefix.extend(("--setenv", key, str(temporary)))
         # uvx can retain its installed tools, but a new cache write stays private.
         prefix.extend(("--setenv", "UV_CACHE_DIR", str(temporary / "uv-cache")))
         plan = {"prefix": prefix, "agy": str(agy),
+                "settings_snapshots": [[str(settings_path), hashlib.sha256(settings_data).hexdigest()],
+                                       [str(private_settings), hashlib.sha256(private_settings.read_bytes()).hexdigest()]],
                 "log_aliases": log_aliases,
                 "writable": list(map(str, writable)),
                 "protected": [str(p) for p in protected if p.exists()],
                 "control_identity": list(_identity(directory)),
                 "bindings": [[str(p), *_identity(p)] for p in
                              dict.fromkeys((source, project, unity, marker, agy, bwrap, module,
-                                            directory, *writable,
+                                            directory, settings_path, private_settings, *writable,
+                                            *readable,
                                             *(path for pair in overlays for path in pair),
                                             *(target.parent for _, target in overlays)))]}
         plan_path = directory / "sandbox.json"
