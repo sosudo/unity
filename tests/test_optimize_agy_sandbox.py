@@ -94,6 +94,11 @@ class _Fixture:
         (source_unity / "optimize-worktree.json").write_text(json.dumps({
             "schema": "optimize-worktree-v1", "project_root": str(self.project),
         }) + "\n")
+        self.bridge_root = self.project / ".unity" / "bin" / "optimize-workflow"
+        self.bridge_root.mkdir(parents=True)
+        self.bridge = self.bridge_root / "unity"
+        self.bridge.write_text("#!/bin/sh\nprintf 'optimize-bridge-fixture\\n'\n")
+        self.bridge.chmod(0o700)
         self.worker_tmp = self.project / ".unity" / "tmp" / "optimize" / "Fixture"
         for name in ("uv-tools", "uv-bin", "lake-cache"):
             (self.worker_tmp / name).mkdir(parents=True)
@@ -114,7 +119,7 @@ class _Fixture:
             self.project / "Main.lean", self.project / "nested", self.git_common,
             self.project / ".unity" / "agents.yaml", self.project / ".unity" / "config.yaml",
             self.profile / "settings.json", self.home / ".gemini" / "oauth_creds.json",
-            self.home / ".gitconfig", self.agy, self.shell_helper,
+            self.home / ".gitconfig", self.agy, self.shell_helper, self.bridge_root,
         ]
 
     def _git(self, *args):
@@ -270,7 +275,8 @@ class OptimizeAgySandboxPolicyTests(_Fixture, unittest.TestCase):
         self.assertEqual(settings["permissions"]["allow"], ["read_file(/existing)",
             *(f"write_file({root})" for root in sandbox.writable_roots),
             *(f"read_file({root})" for root in dict.fromkeys((Path(sys.prefix).resolve(),
-                Path(sys.base_prefix).resolve(), Path(optimize_agy_sandbox.__file__).resolve().parent.parent)))])
+                Path(sys.base_prefix).resolve(), Path(optimize_agy_sandbox.__file__).resolve().parent.parent,
+                self.bridge_root)))])
         self.assertEqual(settings["permissions"]["deny"],
                          ["write_file(/restricted)", "unsandboxed(*)"])
         self.assertEqual(settings["permissions"]["ask"], ["read_url(example.invalid)"])
@@ -279,6 +285,71 @@ class OptimizeAgySandboxPolicyTests(_Fixture, unittest.TestCase):
                       [prefix[index:index + 3] for index in range(len(prefix))])
         self.assertFalse(any(private.is_relative_to(root) for root in sandbox.writable_roots))
         self.assertEqual(stat.S_IMODE(private.stat().st_mode), 0o600)
+
+    def test_bridge_read_grant_is_exact_bound_and_never_writable(self):
+        before = _snapshot(self.protected)
+        sandbox = self.prepare()
+        settings = json.loads((sandbox.directory / "agy-settings.json").read_text())
+        allow = settings["permissions"]["allow"]
+        self.assertIn(f"read_file({self.bridge_root})", allow)
+        for parent in (self.project, self.project / ".unity", self.bridge_root.parent):
+            self.assertNotIn(f"read_file({parent})", allow)
+        for path in (self.bridge_root, self.bridge):
+            self.assertFalse(any(path.is_relative_to(root) for root in sandbox.writable_roots))
+            self.assertNotIn(f"write_file({path})", allow)
+            self.assertIn(str(path), [row[0] for row in sandbox.plan["bindings"]])
+        self.assertIn("unsandboxed(*)", settings["permissions"]["deny"])
+        self.assertEqual(_snapshot(self.protected), before)
+
+    def test_missing_bridge_directory_or_executable_fails_closed(self):
+        for path in (self.bridge_root, self.bridge):
+            with self.subTest(path=path):
+                retained = path.with_name(path.name + "-retained")
+                path.rename(retained)
+                try:
+                    with self.assertRaisesRegex(ValueError, "unavailable"):
+                        self.prepare()
+                    self.assertFalse(path.exists(), "sandbox must not create a bridge placeholder")
+                finally:
+                    retained.rename(path)
+
+    def test_bridge_directory_ancestors_and_executable_cannot_be_redirected(self):
+        for path in (self.bridge_root.parent, self.bridge_root, self.bridge):
+            with self.subTest(path=path):
+                retained = path.with_name(path.name + "-retained")
+                path.rename(retained)
+                path.symlink_to(retained, target_is_directory=retained.is_dir())
+                try:
+                    with self.assertRaisesRegex(ValueError, "exact absolute"):
+                        self.prepare()
+                finally:
+                    path.unlink()
+                    retained.rename(path)
+
+    def test_bridge_directory_and_executable_births_are_rechecked(self):
+        sandbox = self.prepare()
+        for path in (self.bridge_root, self.bridge):
+            with self.subTest(path=path):
+                retained = path.with_name(path.name + "-retained")
+                path.rename(retained)
+                if retained.is_dir():
+                    path.mkdir()
+                else:
+                    path.write_text("#!/bin/sh\nexit 1\n")
+                try:
+                    with self.assertRaisesRegex(ValueError, "binding changed"):
+                        sandbox.command(["--print", "fixture"])
+                finally:
+                    if path.is_dir():
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                    retained.rename(path)
+
+    def test_bridge_hardlink_in_writable_runtime_is_rejected(self):
+        os.link(self.bridge, self.profile / "cache" / "bridge-alias")
+        with self.assertRaisesRegex(ValueError, "hardlink"):
+            self.prepare()
 
     def test_native_settings_reject_malformed_or_mutated_permissions(self):
         path = self.profile / "settings.json"
@@ -647,11 +718,23 @@ class OptimizeAgyNativeSandboxTests(_Fixture, unittest.TestCase):
     def test_main_git_configuration_and_launcher_writes_are_denied(self):
         for path in (self.project / "Main.lean", self.git_common / "config",
                      self.source / ".unity" / "agents.yaml", self.profile / "settings.json",
-                     self.home / ".gemini" / "oauth_creds.json", self.sandbox.executable):
+                     self.home / ".gemini" / "oauth_creds.json", self.sandbox.executable,
+                     self.bridge, self.bridge_root / "replacement"):
             with self.subTest(path=path):
                 result = self.run_fake(f"from pathlib import Path; Path({str(path)!r}).write_text('changed')")
                 self.assertNotEqual(result.returncode, 0)
                 self.assert_unchanged()
+
+    def test_canonical_bridge_can_be_read_and_executed_without_becoming_writable(self):
+        result = self.run_fake(
+            "from pathlib import Path; import subprocess; "
+            f"bridge = Path({str(self.bridge)!r}); "
+            "assert bridge.read_text().startswith('#!/bin/sh'); "
+            "result = subprocess.run([str(bridge)], capture_output=True, text=True, check=True); "
+            "assert result.stdout == 'optimize-bridge-fixture\\n'"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_unchanged()
 
     def test_absent_settings_file_cannot_be_created(self):
         settings = self.profile / "settings.json"

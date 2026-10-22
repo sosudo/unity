@@ -213,6 +213,11 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
     if (binding.get("schema") != "optimize-worktree-v1"
             or binding.get("project_root") != str(project) or project == source):
         raise ValueError("Optimize AGY private worktree binding changed")
+    # runtime_env places the phase-scoped shell bridge in the canonical project,
+    # outside both the private source view and the installed Python read roots.
+    # Require the exact bridge; never fall through to an unrelated PATH command.
+    bridge_root = _exact(project / ".unity" / "bin" / "optimize-workflow")
+    bridge = _exact(bridge_root / "unity", directory=False)
 
     writable = []
     log_aliases = []
@@ -280,7 +285,7 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
         # The bridge's absolute shebang and imports must exist in the inner
         # sandbox as well. These are reads, never runtime/source write grants.
         readable = tuple(dict.fromkeys(_exact(path.resolve()) for path in
-                         (Path(sys.prefix), Path(sys.base_prefix), module.parent.parent)))
+                         (Path(sys.prefix), Path(sys.base_prefix), module.parent.parent, bridge_root)))
         private_settings = directory / "agy-settings.json"
         private_settings.write_text(json.dumps(_readonly_settings(settings_data, writable, readable)))
         private_settings.chmod(0o600)
@@ -337,6 +342,7 @@ def prepare_sandbox(agy: str | Path, cwd: Path, env: dict[str, str]) -> Sandbox:
                 "control_identity": list(_identity(directory)),
                 "bindings": [[str(p), *_identity(p)] for p in
                              dict.fromkeys((source, project, unity, marker, agy, bwrap, module,
+                                            bridge_root, bridge,
                                             directory, settings_path, private_settings, *writable,
                                             *readable,
                                             *(path for pair in overlays for path in pair),

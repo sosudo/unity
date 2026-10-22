@@ -7,6 +7,9 @@ Bubblewrap, Forum bridge, and process ownership are real.
 The separate real-AGY test is disabled unless UNITY_TEST_REAL_AGY=1 and
 UNITY_TEST_REAL_AGY_MODEL names an explicitly approved model. It uses existing
 CLI authentication and a disposable project, never an evaluation checkpoint.
+UNITY_TEST_AGY_FIXTURE_PARENT can name an existing absolute directory outside
+the imported Unity code and Python read roots. Staged code and fixtures must be
+siblings, not nested: an inherited code read grant must not expose the bridge.
 """
 
 import asyncio
@@ -27,7 +30,7 @@ from unittest.mock import patch
 
 from unity import optimize_metrics as metrics, optimize_tasks as tasks
 from unity import optimize_verification as verification, optimize_workflow as workflow
-from unity import optimize_spawn
+from unity import optimize_agy_sandbox, optimize_spawn
 from unity.roster import Agent, Roster
 
 
@@ -43,6 +46,36 @@ _TRANSCRIPT_ROWS = 4096
 def _require(condition, message):
     if not condition:
         raise AssertionError(message)
+
+
+def _incidental_read_roots():
+    """Use actual imported code, not an assumed checkout or installed layout."""
+    return tuple(dict.fromkeys(path.resolve() for path in (
+        _REPOSITORY, Path(optimize_agy_sandbox.__file__).parent.parent,
+        Path(sys.prefix), Path(sys.base_prefix))))
+
+
+def _assert_fixture_outside_read_roots(path):
+    path = path.resolve()
+    for root in _incidental_read_roots():
+        _require(not path.is_relative_to(root),
+                 f"AGY fixture is covered by an incidental code/Python read root: {root}")
+
+
+def _fixture_parent():
+    explicit = os.getenv("UNITY_TEST_AGY_FIXTURE_PARENT")
+    if explicit is not None:
+        parent = Path(explicit)
+        _require(parent.is_absolute() and parent.resolve() == parent and parent.is_dir(),
+                 "UNITY_TEST_AGY_FIXTURE_PARENT must be an existing exact absolute directory")
+        _assert_fixture_outside_read_roots(parent)
+        return parent
+    # A staging runner can set tempfile.tempdir to its code directory. Do not
+    # inherit that layout: it previously hid the missing project bridge grant.
+    for candidate in (Path(tempfile.gettempdir()).resolve(), Path("/tmp").resolve()):
+        if candidate.is_dir() and not any(candidate.is_relative_to(root) for root in _incidental_read_roots()):
+            return candidate
+    raise AssertionError("set UNITY_TEST_AGY_FIXTURE_PARENT outside code/Python read roots")
 
 
 def _transcript_paths(brain):
@@ -98,13 +131,25 @@ def _no_sandbox_bypass(value):
             _no_sandbox_bypass(item)
 
 
-def _denial_command(source):
-    program = ("import errno,json\nfrom pathlib import Path\n"
-        f"target=Path({str(source / 'Main.lean')!r})\n"
-        "try:\n    with target.open('a') as handle:\n        handle.write('UNAUTHORIZED STARTUP TEST WRITE\\n')\n"
-        "except OSError as exc:\n    assert exc.errno in (errno.EACCES,errno.EPERM,errno.EROFS)\n"
-        "    print(json.dumps({'fixture_source_write_denied':True}))\n"
-        "else:\n    raise SystemExit('source write was permitted')\n")
+def _denial_result(project):
+    return {"fixture_source_write_denied": True, "fixture_bridge_visible": True,
+            "fixture_bridge_write_denied": True, "fixture_bridge_directory_write_denied": True,
+            "fixture_bridge_path": str(project / ".unity/bin/optimize-workflow/unity")}
+
+
+def _denial_command(source, project):
+    bridge = project / ".unity/bin/optimize-workflow/unity"
+    program = ("import errno,json,shutil\nfrom pathlib import Path\n"
+        f"bridge=Path({str(bridge)!r})\n"
+        "assert shutil.which('unity') == str(bridge), 'PATH did not select the Optimize bridge'\n"
+        "original=bridge.read_bytes()\nassert original.startswith(b'#!')\n"
+        f"targets=[Path({str(source / 'Main.lean')!r}),bridge,bridge.parent/'.fixture-denied-create']\n"
+        "for target in targets:\n"
+        "    try:\n        with target.open('a') as handle:\n            handle.write('UNAUTHORIZED STARTUP TEST WRITE\\n')\n"
+        "    except OSError as exc:\n        assert exc.errno in (errno.EACCES,errno.EPERM,errno.EROFS)\n"
+        "    else:\n        raise SystemExit('protected write was permitted')\n"
+        "assert bridge.read_bytes() == original\n"
+        f"print(json.dumps({_denial_result(project)!r}))\n")
     return shlex.join([sys.executable, "-I", "-c", program])
 
 
@@ -195,7 +240,8 @@ def _audit_transcript(rows, *, full_prompt, source, project, request_id, subject
         _require(isinstance(output, dict), "AGY bridge result must be a JSON object")
         tool, arguments = pending
         if tool == "source_write_denial":
-            _require(output == {"fixture_source_write_denied": True}, "source write denial was not proved")
+            _require(output == _denial_result(project),
+                     "source/bridge write denial and exact bridge visibility were not proved")
         elif tool == "optimize_brief":
             _require(arguments == {} and output.get("root") == str(project)
                      and output.get("scoring_request_id") == request_id, "brief does not bind this test request")
@@ -249,7 +295,7 @@ def _fake_agy_program():
     # This consumes the actual generated CLI command and worker environment.
     # It does not call a task API directly or invent the scoring request ID.
     return f"#!{sys.executable}\n" + textwrap.dedent(r'''
-        import json, os, shutil, subprocess, sys
+        import json, os, shlex, shutil, subprocess, sys
         from pathlib import Path
 
         def main():
@@ -276,10 +322,13 @@ def _fake_agy_program():
             agentapi.chmod(0o700)
             assert agentapi.read_text() == replacement
             assert agentapi.stat().st_mode & 0o777 == 0o700
+            bridge_path = project / '.unity/bin/optimize-workflow/unity'
+            bridge_before = bridge_path.read_bytes()
 
             denied = []
             for target in (source / 'Main.lean', project / 'Main.lean',
                            project / '.git/config', source / '.unity/config.yaml',
+                           bridge_path, bridge_path.parent / '.fixture-denied-create',
                            profile / 'settings.json',
                            Path(os.environ['HOME']) / '.gemini/oauth_creds.json',
                            profile / 'bin/.unity-scoring-startup-sentinel'):
@@ -299,11 +348,16 @@ def _fake_agy_program():
             assert (source / 'Main.lean').read_text() == 'theorem fixture : True := by trivial\n'
             os.chdir(source)
             bridge = shutil.which('unity')
-            assert Path(bridge).parent == project / '.unity/bin/optimize-workflow'
+            assert bridge == str(bridge_path)
+            assert bridge_path.read_bytes() == bridge_before
 
             def call(tool, arguments):
-                result = subprocess.run([bridge, 'mcp', 'unity-forum', tool,
-                    json.dumps(arguments)], capture_output=True, text=True, timeout=45)
+                # Resolve the ordinary bare command in a shell, not an
+                # absolute-path workaround. Real AGY's inner sandbox is tested
+                # separately by the opt-in native transcript audit.
+                command = shlex.join(['unity', 'mcp', 'unity-forum', tool, json.dumps(arguments)])
+                result = subprocess.run(['/bin/sh', '-c', command],
+                    capture_output=True, text=True, timeout=45)
                 assert result.returncode == 0, (tool, result.returncode, result.stderr[-2000:])
                 return json.loads(result.stdout)
 
@@ -342,7 +396,8 @@ def _fake_agy_program():
 
 class _ScoringFixture:
     def setUp(self):
-        self.base = Path(tempfile.mkdtemp(prefix="optimize-agy-startup-")).resolve()
+        self.base = Path(tempfile.mkdtemp(prefix="optimize-agy-startup-", dir=_fixture_parent())).resolve()
+        _assert_fixture_outside_read_roots(self.base)
         self._safe_to_remove = False
         self._retain_success = self._testMethodName == "test_opt_in_real_agy_scoring_startup"
         self.addCleanup(self.cleanup_fixture)
@@ -357,6 +412,8 @@ class _ScoringFixture:
         self.git("commit", "--quiet", "-m", "scoring startup fixture")
         self.paths = workflow.paths_for(self.project)
         self.paths.unity.mkdir()
+        self.bridge = self.paths.unity / "bin/optimize-workflow/unity"
+        self.bridge_before = None
         (self.paths.unity / "agents.yaml").write_text("agents: []\n")
         (self.paths.unity / "config.yaml").write_text("{}\n")
         self.paths.unity_md.write_text(
@@ -429,8 +486,17 @@ class _ScoringFixture:
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         return env
 
+    def capture_bridge(self):
+        _assert_fixture_outside_read_roots(self.bridge)
+        self.assertTrue(self.bridge.is_file(), "normal runtime_env must create the bridge before dispatch")
+        self.assertIsNone(self.bridge_before, "the fixture must capture exactly one scoring dispatch")
+        self.bridge_before = _protected_snapshot([self.bridge])
+
     def assert_closed(self, before):
         self.assertEqual(_protected_snapshot(self.protected), before)
+        self.assertIsNotNone(self.bridge_before, "the test must bind the exact bridge before dispatch")
+        self.assertEqual(_protected_snapshot([self.bridge]), self.bridge_before)
+        self.assertFalse((self.bridge.parent / ".fixture-denied-create").exists())
         self.assertEqual(verification.file_identity(self.project, scope=self.scope),
                          self.request["source_identity"])
         state = tasks.load(self.paths.forum)
@@ -471,8 +537,57 @@ class OptimizeAgyStartupFixtureTests(_ScoringFixture, unittest.TestCase):
         self.assertEqual((tree / ".unity/forum").resolve(), self.paths.unity / "forum")
         self.assertEqual((profile / "cli.log").resolve(), profile / "log/cli-fixture.log")
         self.assertTrue((profile / "cli.log").is_symlink())
+        _assert_fixture_outside_read_roots(self.project)
+        _assert_fixture_outside_read_roots(tree)
+        self.capture_bridge()
+        self.assertEqual(shutil.which("unity", path=env["PATH"]), str(self.bridge))
         compile(_fake_agy_program(), "fake-agy-startup", "exec")
         self._safe_to_remove = True  # This fixture-only test starts no owned worker.
+
+
+class OptimizeAgyFixtureLocationTests(unittest.TestCase):
+    """Prevent code/import read grants from hiding missing project grants."""
+
+    def test_read_roots_use_the_actual_imported_sandbox_module(self):
+        roots = _incidental_read_roots()
+        self.assertIn(Path(optimize_agy_sandbox.__file__).resolve().parent.parent, roots)
+        self.assertIn(Path(sys.prefix).resolve(), roots)
+        self.assertIn(Path(sys.base_prefix).resolve(), roots)
+        self.assertIn(_REPOSITORY, roots)
+
+    def test_rejects_a_fixture_inside_each_incidental_read_root(self):
+        for root in _incidental_read_roots():
+            with self.subTest(root=root), self.assertRaisesRegex(AssertionError, "incidental"):
+                _assert_fixture_outside_read_roots(root / "fixtures/project/.unity/bin/optimize-workflow/unity")
+
+    def test_explicit_external_fixture_parent_is_used(self):
+        with tempfile.TemporaryDirectory(dir=Path("/tmp").resolve()) as directory:
+            parent = Path(directory).resolve()
+            with patch.dict(os.environ, UNITY_TEST_AGY_FIXTURE_PARENT=str(parent)):
+                self.assertEqual(_fixture_parent(), parent)
+
+    def test_explicit_fixture_parent_inside_imported_code_fails(self):
+        parent = Path(optimize_agy_sandbox.__file__).resolve().parent.parent
+        with patch.dict(os.environ, UNITY_TEST_AGY_FIXTURE_PARENT=str(parent)):
+            with self.assertRaisesRegex(AssertionError, "incidental"):
+                _fixture_parent()
+
+    def test_explicit_relative_missing_or_symlink_parent_fails(self):
+        with tempfile.TemporaryDirectory(dir=Path("/tmp").resolve()) as directory:
+            parent = Path(directory).resolve()
+            alias = parent / "alias"
+            alias.symlink_to(parent, target_is_directory=True)
+            for value in ("relative-fixtures", str(parent / "missing"), str(alias)):
+                with self.subTest(value=value), patch.dict(os.environ, UNITY_TEST_AGY_FIXTURE_PARENT=value):
+                    with self.assertRaisesRegex(AssertionError, "exact absolute directory"):
+                        _fixture_parent()
+
+    def test_inherited_tempdir_inside_code_does_not_cover_the_fixture(self):
+        with patch.dict(os.environ), patch.object(tempfile, "tempdir", str(_REPOSITORY)):
+            os.environ.pop("UNITY_TEST_AGY_FIXTURE_PARENT", None)
+            parent = _fixture_parent()
+            _assert_fixture_outside_read_roots(parent)
+            self.assertNotEqual(parent, _REPOSITORY)
 
 
 class OptimizeAgyTranscriptAuditTests(unittest.TestCase):
@@ -483,7 +598,7 @@ class OptimizeAgyTranscriptAuditTests(unittest.TestCase):
         self.project = Path("/fixture/project")
         self.bound = {"full_prompt": "exact unique fixture prompt", "source": self.source,
             "project": self.project, "request_id": "score-request-fixture", "subject": "fixture-subject",
-            "denial_command": _denial_command(self.source)}
+            "denial_command": _denial_command(self.source, self.project)}
         request = {"request_id": self.bound["request_id"], "root": str(self.source),
                    "subjects": [self.bound["subject"]]}
         artifact = {"artifact_id": "artifact-fixture", "offset": 0, "next_offset": None,
@@ -491,7 +606,7 @@ class OptimizeAgyTranscriptAuditTests(unittest.TestCase):
         record = {"artifact_id": "artifact-fixture"}
         self.rows = [{"source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
                       "content": "<USER_REQUEST>" + self.bound["full_prompt"] + "</USER_REQUEST>"}]
-        self.add_call(self.bound["denial_command"], {"fixture_source_write_denied": True})
+        self.add_call(self.bound["denial_command"], _denial_result(self.project))
         self.add_bridge("optimize_brief", {}, {"root": str(self.project),
             "scoring_request_id": self.bound["request_id"], "records": {"scoring_request": record}})
         self.add_bridge("scoring_request", {}, {**request, "records": {"request": record}})
@@ -524,6 +639,28 @@ class OptimizeAgyTranscriptAuditTests(unittest.TestCase):
     def test_accepts_complete_normal_path_and_source_write_denial(self):
         self.assertEqual(self.audit(), ["artifact_read", "optimize_brief", "scoring_request",
                                        "source_write_denial", "submit_score_report"])
+
+    def test_rejects_unproved_bridge_visibility_or_protection(self):
+        for key in _denial_result(self.project):
+            with self.subTest(key=key):
+                output = _denial_result(self.project)
+                output[key] = False
+                self.rows[2]["content"] = "Command exited with code 0.\n\nCommand output:\n" + json.dumps(output)
+                with self.assertRaisesRegex(AssertionError, "exact bridge visibility"):
+                    self.audit()
+
+    def test_rejects_absolute_bridge_workaround(self):
+        command = self.rows[3]["tool_calls"][0]["args"]["CommandLine"]
+        self.rows[3]["tool_calls"][0]["args"]["CommandLine"] = command.replace(
+            " && unity ", " && " + shlex.quote(str(self.project / ".unity/bin/optimize-workflow/unity")) + " ")
+        with self.assertRaisesRegex(AssertionError, "must be direct"):
+            self.audit()
+
+    def test_rejects_direct_internal_import_workaround(self):
+        self.rows[3]["tool_calls"][0]["args"]["CommandLine"] = shlex.join(
+            [sys.executable, "-c", "from unity.optimize_mcp_bridge import main; main()"])
+        with self.assertRaisesRegex(AssertionError, "unrequested shell command"):
+            self.audit()
 
     def test_rejects_bypass_even_if_score_report_was_successful(self):
         self.rows[9]["tool_calls"][0]["args"]["BypassSandbox"] = True
@@ -686,16 +823,23 @@ class OptimizeAgyNativeStartupTests(_ScoringFixture, unittest.IsolatedAsyncioTes
         env.update(HOME=str(home), PATH=str(binary) + os.pathsep + env.get("PATH", os.defpath),
                    UNITY_TEST_SCORE_METHOD=json.dumps(_METHOD))
         before = _protected_snapshot(self.protected)
-        with patch.dict(os.environ, env, clear=True):
+        prepare = optimize_spawn._antigravity_options
+
+        def capture_options(*args, **kwargs):
+            self.capture_bridge()
+            return prepare(*args, **kwargs)
+
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                optimize_spawn, "_antigravity_options", side_effect=capture_options):
             result = await asyncio.wait_for(self.controller("fixture-model").judge_snapshot(self.request), 120)
         request = self.assert_closed(before)
         self.assertEqual(set(result["measurements"]), {self.subject})
-        self.assertEqual(request["reports"][self.subject]["evidence"]["source_writes_denied"], 7)
+        self.assertEqual(request["reports"][self.subject]["evidence"]["source_writes_denied"], 9)
         self.assertTrue((profile / "cli.log").is_symlink())
         self.assertIn("native scoring startup fixture", (profile / "cli.log").read_text())
         marker = json.loads((self.paths.unity / "tmp/scoring-startup-complete.json").read_text())
         self.assertEqual(marker, {"request_id": request["request_id"],
-            "subjects": [self.subject], "source_writes_denied": 7})
+            "subjects": [self.subject], "source_writes_denied": 9})
         self._safe_to_remove = True  # All assertions and owned closure passed.
 
     @unittest.skipUnless(os.getenv("UNITY_TEST_REAL_AGY") == "1",
@@ -720,13 +864,16 @@ class OptimizeAgyNativeStartupTests(_ScoringFixture, unittest.IsolatedAsyncioTes
                             own_process_group, mcp_profile, **kwargs):
             self.assertFalse(bound, "this startup test requires exactly one AGY turn")
             source = Path(cwd).resolve()
-            denial = _denial_command(source)
+            _assert_fixture_outside_read_roots(source)
+            self.capture_bridge()
+            denial = _denial_command(source, self.project)
             instructions = (
                 "\n\nNATIVE STARTUP TEST REQUIREMENTS (this disposable fixture only):\n"
                 "Do not request BypassSandbox, change settings, or use a shell outside the sandbox.\n"
                 "Run exactly one native run_command call at a time. Wait for its completed output.\n"
                 "Use WaitMsBeforeAsync=10000. Do not use pipes, redirection, wrappers, or parallel calls.\n"
-                "First run this exact harmless source-write-denial test command:\n" + denial + "\n"
+                "First run this exact fixture check. It verifies normal PATH bridge visibility, "
+                "source and bridge write denial, and bridge-directory write denial:\n" + denial + "\n"
                 "Then use direct commands in this form: cd -- " + shlex.quote(str(source)) +
                 " && unity mcp unity-forum TOOL 'JSON_ARGUMENTS'.\n"
                 "Call optimize_brief with {}, then scoring_request with {}.\n"
@@ -762,6 +909,11 @@ class OptimizeAgyNativeStartupTests(_ScoringFixture, unittest.IsolatedAsyncioTes
         (self.base / "native-transcript-audit.json").write_text(json.dumps({
             "transcript_path": str(path), "sha256": hashlib.sha256(payload).hexdigest(),
             "bytes": len(payload), "request_id": bound["request_id"],
+            "fixture_project": str(self.project),
+            "incidental_read_roots": [str(root) for root in _incidental_read_roots()],
+            "fixture_outside_incidental_read_roots": True,
+            "exact_bridge_visible": True, "bridge_write_denied": True,
+            "bridge_directory_write_denied": True,
             "no_sandbox_bypass": True, "successful_normal_calls": checks}, indent=2) + "\n")
         self._safe_to_remove = True  # Real-AGY evidence is retained even on success.
 
