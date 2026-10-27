@@ -295,9 +295,11 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             state["tasks"][tid]["status"] = "submitted"
         scope = {**self.scope, "selected_modules": {"New": "New.lean", "B": "B.lean"}}
         setup = {"phase": "ready", "scope": scope, "modules": ["New"], "lake_args": [], "project_scope": "build"}
+        imports = bump_verification._parse_diagnostics("error: B.lean: bad import 'Missing.Module'\n", self.root)
+        self.assertEqual(imports[0]["kind"], "import")
         with patch.object(bump_setup, "prepare_environment", return_value=setup) as prepare, \
              patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
-             patch.object(bump_verification, "build", return_value=self.build_result([])):
+             patch.object(bump_verification, "build", return_value=self.build_result(imports)) as build:
             with bump_tasks.transaction(self.paths.forum) as state:
                 state["tasks"][tid]["requested_config"]["module_renames"] = {"A": "B"}
             rejected = self.controller.integrate(candidate)
@@ -305,6 +307,10 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("move", rejected["reason"])
             with bump_tasks.transaction(self.paths.forum) as state:
                 state["tasks"][tid]["requested_config"]["module_renames"] = {"A": "New"}
+            io_error = {"path": None, "severity": "error", "kind": "environment", "message": "disk I/O failure"}
+            build.return_value = {**self.build_result([*imports, io_error]), "unmapped": [io_error]}
+            self.assertFalse(self.controller.integrate(candidate)["accepted"])
+            build.return_value = self.build_result(imports)
             result = self.controller.integrate(candidate)
         self.assertTrue(result["accepted"], result)
         self.assertEqual(prepare.call_args.kwargs["modules"], ["New"])

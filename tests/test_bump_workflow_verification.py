@@ -182,6 +182,41 @@ class VerificationTests(unittest.TestCase):
         self.assertEqual(result["blocked_files"], ["Example.lean"])
 
     @patch.object(v.bump_jobs, "run")
+    def test_path_only_import_and_exact_missing_package_source_are_mapped(self, run):
+        module = "Mathlib.CategoryTheory.Missing"
+        missing = self.root / ".lake/packages/mathlib/Mathlib/CategoryTheory/Missing.lean"
+        output = (f"error: no such file or directory (error code: 2)\n  file: {missing}\n"
+                  f"error: Example.lean: bad import '{module}'\nerror: build failed\n")
+        def execute(root, args, **kw):
+            return self.run_tool(root, args, **kw) if args[-1] == "--version" else subprocess.CompletedProcess(args, 1, output, "")
+        run.side_effect = execute
+        result = v.build(self.root, scope=self.scope)
+        self.assertFalse(result["passed"])
+        self.assertEqual(result["unmapped"], [])
+        self.assertEqual(result["blocked_files"], ["Example.lean"])
+        diagnostic = result["errors"][0]
+        self.assertEqual((diagnostic["path"], diagnostic["line"], diagnostic["kind"], diagnostic["module"]),
+                         ("Example.lean", None, "import", module))
+        self.assertEqual(diagnostic["related_missing_files"], [str(missing)])
+        stored = v.artifacts.artifact_bytes(self.root / ".unity/artifacts", result["log_ref"]["artifact_id"])
+        self.assertIn(output.encode(), stored)
+
+    def test_missing_io_is_unmapped_unless_exact_local_import_matches(self):
+        module = "Mathlib.CategoryTheory.Missing"
+        valid = self.root / ".lake/packages/mathlib/Mathlib/CategoryTheory/Missing.lean"
+        other = self.root / ".lake/packages/mathlib/Mathlib/CategoryTheory/Other.lean"
+        outside = self.root.parent / ".lake/packages/mathlib/Mathlib/CategoryTheory/Missing.lean"
+        for filename, local in ((other, "Example.lean"), (outside, "Example.lean"),
+                                (valid, "Unknown.lean"), (valid, "../Example.lean")):
+            with self.subTest(filename=filename, local=local):
+                output = (f"error: no such file or directory (error code: 2)\n  file: {filename}\n"
+                          f"error: {local}: bad import '{module}'\n")
+                rows = v._parse_diagnostics(output, self.root)
+                self.assertTrue(any(row["path"] is None and "no such file" in row["message"] for row in rows))
+        rows = v._parse_diagnostics(f"error: Example.lean: bad import '{module}'\nerror: disk I/O failure\n", self.root)
+        self.assertEqual([row["kind"] for row in rows], ["import", "environment"])
+
+    @patch.object(v.bump_jobs, "run")
     def test_unlocated_failure_preserved(self, run):
         def execute(root, args, **kw):
             return self.run_tool(root, args, **kw) if args[-1] == "--version" else subprocess.CompletedProcess(args, 1, "", "")

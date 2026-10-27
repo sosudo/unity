@@ -245,10 +245,61 @@ def audit_sources(root: Path, base_sha: str, scope: dict | None = None) -> dict:
 
 
 def _parse_diagnostics(output: str, root: Path) -> list[dict]:
+    lines = _ANSI.sub("", output).splitlines()
+    root = Path(root).resolve()
+    path_import = re.compile(r"^error:\s*(.+?\.lean):\s*bad import '([A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*)'\s*$")
+    missing = "error: no such file or directory (error code: 2)"
+    imports = {}
+    # Lake reports the missing package file before the project import error.
+    # Associate only existing project sources with an explicit module name.
+    for index, line in enumerate(lines):
+        match = path_import.match(line)
+        if not match:
+            continue
+        path = Path(match[1])
+        try:
+            relative = path.relative_to(root) if path.is_absolute() else path
+            if (not relative.parts or ".." in relative.parts or any(part in _RUNTIME for part in relative.parts)
+                    or not (root / relative).resolve().is_relative_to(root)
+                    or not (root / relative).is_file()):
+                continue
+        except (ValueError, OSError):
+            continue
+        imports[index] = (relative.as_posix(), match[2])
+    related = {}
+    suppressed = set()
+    for index, line in enumerate(lines[:-1]):
+        if line.strip() != missing or not lines[index + 1].startswith("  file: "):
+            continue
+        filename = Path(lines[index + 1][len("  file: "):].strip())
+        if not filename.is_absolute() or ".." in filename.parts:
+            continue
+        try:
+            relative = filename.relative_to(root)
+        except ValueError:
+            continue
+        parts = relative.parts
+        if len(parts) < 5 or parts[:2] != (".lake", "packages"):
+            continue
+        module_file = Path(*parts[3:]).as_posix()
+        matches = [i for i, (_, module) in imports.items()
+                   if module_file == module.replace(".", "/") + ".lean"]
+        if matches:
+            suppressed.add(index)
+            for match_index in matches:
+                related.setdefault(match_index, []).append(str(filename))
     rows = []
-    for line in _ANSI.sub("", output).splitlines():
+    for index, line in enumerate(lines):
+        if index in suppressed:
+            continue
         match = _LOCATION.match(line)
-        if match:
+        if index in imports:
+            path, module = imports[index]
+            row = {"path": path, "line": None, "column": None, "severity": "error",
+                   "message": "bad import '" + module + "'", "kind": "import", "module": module}
+            if index in related:
+                row["related_missing_files"] = sorted(set(related[index]))
+        elif match:
             first, filename, number, column, second, message = match.groups()
             path = Path(filename)
             if path.is_absolute():
