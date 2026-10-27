@@ -583,7 +583,8 @@ class ToolchainTests(SetupFixture):
 
 class RecursiveWorkflowTests(SetupFixture):
     def environment(self):
-        return {"lake_args": [], "dependencies": {"dependency_candidates": [{"name": "dep", "repository": str(self.root),
+        return {"lake_args": [], "dependencies": {"status": "resolved", "returncode": 0,
+                    "dependency_candidates": [{"name": "dep", "repository": str(self.root),
                     "revision": self.git("rev-parse", "HEAD"), "version": VERSION}]}}
 
     def prepare_parent(self):
@@ -593,6 +594,51 @@ class RecursiveWorkflowTests(SetupFixture):
         environment = self.environment()
         self.requirement()
         return environment
+
+    def test_blocked_or_incomplete_resolution_never_starts_children_or_changes_registry(self):
+        environment = self.prepare_parent()
+        registry_path = self.paths.unity / "bump/dependencies.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        original = '{"retained": "old child evidence"}\n'
+        registry_path.write_text(original)
+        shared = {"retained": "shared evidence"}
+        async def migrate(*args, **kwargs):
+            self.fail("unresolved parent must not launch a child")
+        for status, code in (("blocked", 1), ("pending", None), ("resolved", None),
+                             ("resolved", 1), ("resolved", False)):
+            with self.subTest(status=status, returncode=code):
+                environment["dependencies"].update(status=status, returncode=code)
+                with patch.object(deps, "materialize_dependency") as materialize:
+                    changed = asyncio.run(recursive.run_children(self.paths, environment,
+                                                                migrate_child=migrate, registry=shared))
+                self.assertFalse(changed)
+                materialize.assert_not_called()
+                self.assertEqual(registry_path.read_text(), original)
+                self.assertEqual(shared, {"retained": "shared evidence"})
+
+    def test_removed_old_candidate_does_not_block_resolved_parent(self):
+        environment = self.prepare_parent()
+        environment["dependencies"]["dependency_candidates"] = []
+        registry_path = self.paths.unity / "bump/dependencies.json"
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        retained = {"schema": deps.SCHEMA, "tasks": {"old": {"status": "blocked", "repository": "old"}}}
+        registry_path.write_text(json.dumps(retained))
+        async def migrate(*args, **kwargs):
+            self.fail("removed candidate must not restart")
+        self.assertFalse(asyncio.run(recursive.run_children(self.paths, environment, migrate_child=migrate)))
+        self.assertEqual(json.loads(registry_path.read_text()), retained)
+
+    def test_resolved_parent_still_recurses_when_later_scope_is_blocked(self):
+        environment = self.prepare_parent()
+        environment.update(phase="blocked", pending_tasks=[{"step": "scope"}])
+        seen = []
+        async def migrate(paths, child_setup, **kwargs):
+            seen.append(paths.project_root)
+            return {"build_passed": True, "review_approved": True,
+                    "verified_commit": self.git("rev-parse", "HEAD", root=paths.project_root)}
+        with patch.object(setup, "prepare_environment", return_value={"phase": "ready", "schema": deps.SCHEMA}):
+            self.assertTrue(asyncio.run(recursive.run_children(self.paths, environment, migrate_child=migrate)))
+        self.assertEqual(len(seen), 1)
 
     def test_child_callback_is_same_workflow_and_success_is_persistently_deduplicated(self):
         environment = self.prepare_parent()

@@ -84,11 +84,18 @@ async def run_children(parent_paths: Paths, environment: dict, *, migrate_child,
     ordinary continuation rather than resetting it. Return whether any parent
     requirement changed; the caller then reruns resolution/scope discovery.
     """
+    # Failed updates can retain candidates from the previous manifest. Only a
+    # successful resolution identifies the dependency graph to migrate; keep
+    # existing child registry evidence untouched while the parent repairs it.
+    resolution = environment.get("dependencies", {})
+    if (not isinstance(resolution, dict) or resolution.get("status") != "resolved"
+            or type(resolution.get("returncode")) is not int or resolution["returncode"] != 0):
+        return False
     root = parent_paths.project_root.resolve()
     run_job = run_job or asyncio.to_thread
     registry = _load_registry(parent_paths, registry)
     changed = False
-    candidates = environment.get("dependencies", {}).get("dependency_candidates", [])
+    candidates = resolution.get("dependency_candidates", [])
     for candidate in candidates:
         repository = dependencies._repository(candidate["repository"]).rstrip("/")
         version = dependencies.normalize_version(candidate["version"])
