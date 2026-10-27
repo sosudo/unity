@@ -300,19 +300,36 @@ def _parse_diagnostics(output: str, root: Path) -> list[dict]:
         try:
             relative = filename.relative_to(root)
         except ValueError:
-            continue
-        parts = relative.parts
-        if len(parts) >= 5 and parts[:2] == (".lake", "packages"):
-            module_file = Path(*parts[3:]).as_posix()
-        elif parts and not any(part in _RUNTIME for part in parts) and relative.as_posix() not in _CONFIG:
-            try:
-                if not filename.resolve().is_relative_to(root):
-                    continue
-            except (OSError, RuntimeError):
+            # Source integration worktrees explicitly link this exact cache to
+            # the parent. Accept only paths inside its resolved target, never
+            # an arbitrary external .lake directory or a symlink escape.
+            cache_link = root / ".lake" / "packages"
+            if not cache_link.is_symlink():
                 continue
-            module_file = relative.as_posix()
+            try:
+                cache = cache_link.resolve(strict=True)
+                if not cache.is_dir():
+                    continue
+                package_path = filename.resolve().relative_to(cache)
+            except (ValueError, OSError, RuntimeError):
+                continue
+            parts = package_path.parts
+            if len(parts) < 2 or parts[0] in _RUNTIME:
+                continue
+            module_file = Path(*parts[1:]).as_posix()
         else:
-            continue
+            parts = relative.parts
+            if len(parts) >= 5 and parts[:2] == (".lake", "packages"):
+                module_file = Path(*parts[3:]).as_posix()
+            elif parts and not any(part in _RUNTIME for part in parts) and relative.as_posix() not in _CONFIG:
+                try:
+                    if not filename.resolve().is_relative_to(root):
+                        continue
+                except (OSError, RuntimeError):
+                    continue
+                module_file = relative.as_posix()
+            else:
+                continue
         matches = [i for i, (_, module) in imports.items()
                    if module_file == module.replace(".", "/") + ".lean"]
         if matches:

@@ -275,6 +275,33 @@ class VerificationTests(unittest.TestCase):
         stored = v.artifacts.artifact_bytes(self.root / ".unity/artifacts", result["log_ref"]["artifact_id"])
         self.assertIn(output.encode(), stored)
 
+    def test_shared_package_cache_requires_exact_symlink_target_and_module(self):
+        with tempfile.TemporaryDirectory(prefix="bump-cache-") as tmp:
+            outer = Path(tmp)
+            cache = outer / "parent/.lake/packages"
+            (cache / "mathlib").mkdir(parents=True)
+            (self.root / ".lake").mkdir(exist_ok=True)
+            (self.root / ".lake/packages").symlink_to(cache, target_is_directory=True)
+            missing = cache / "mathlib/Mathlib/CategoryTheory/Missing.lean"
+            output = (f"error: no such file or directory (error code: 2)\n  file: {missing}\n"
+                      "error: Example.lean: bad import 'Mathlib.CategoryTheory.Missing'\n")
+            rows = v._parse_diagnostics(output, self.root)
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["kind"], "import")
+            self.assertEqual(rows[0]["related_missing_files"], [str(missing)])
+            other = outer / "other/.lake/packages/mathlib/Mathlib/CategoryTheory/Missing.lean"
+            wrong = cache / "mathlib/Mathlib/CategoryTheory/Other.lean"
+            (outer / "escape").mkdir()
+            (cache / "escape").symlink_to(outer / "escape", target_is_directory=True)
+            symlink_escape = cache / "escape/Mathlib/CategoryTheory/Missing.lean"
+            for path in (other, wrong, symlink_escape):
+                with self.subTest(path=path):
+                    rows = v._parse_diagnostics(output.replace(str(missing), str(path)), self.root)
+                    self.assertTrue(any(row["path"] is None and str(path) in row["message"] for row in rows))
+            (self.root / ".lake/packages").unlink()
+            rows = v._parse_diagnostics(output, self.root)
+            self.assertTrue(any(row["path"] is None and str(missing) in row["message"] for row in rows))
+
     def test_missing_local_source_is_mapped_only_to_exact_project_import(self):
         module = "Project.Old.Module"
         missing = self.root / "Project/Old/Module.lean"
