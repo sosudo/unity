@@ -767,7 +767,7 @@ class WorkflowTaskTests(unittest.TestCase):
         root, directory, tid = prepare_task(self.tmp_path)
         forum.configure(directory, root)
         with tasks.transaction(directory) as state:
-            state["config"]["modules"] = ["test.basic"]
+            state["config"].update(modules=["test.basic"], scope={"selected_modules": {"test.basic": "test/basic.lean"}})
         result = forum.request_configuration_change("Alice", tid,
             ["test/basic.lean", "HoTTLeanTest/basic.lean"], "avoid collision", "move source",
             modules=["HoTTLeanTest.basic"], module_renames={"test.basic": "HoTTLeanTest.basic"})
@@ -784,7 +784,8 @@ class WorkflowTaskTests(unittest.TestCase):
         root = self.tmp_path / "project"
         forum.configure(directory, root)
         with tasks.transaction(directory) as state:
-            state["config"].update(modules=["Existing"], lake_args=["-Kmode=dev"])
+            state["config"].update(modules=["Existing", "Old"], lake_args=["-Kmode=dev"],
+                                   scope={"selected_modules": {"Old": "Old.lean"}})
             state["tasks"][tid]["requested_config"] = {"modules": ["Extra"], "module_renames": {"Old": "New"}}
         tasks.claim(directory, "Alice", tid)
         for _ in range(2):
@@ -805,7 +806,8 @@ class WorkflowTaskTests(unittest.TestCase):
         root = self.tmp_path / "project"
         forum.configure(directory, root)
         with tasks.transaction(directory) as state:
-            state["config"].update(modules=["Existing"], lake_args=[])
+            state["config"].update(modules=["Existing"], lake_args=[],
+                                   scope={"selected_modules": {"Existing": "Existing.lean"}})
         tasks.claim(directory, "Alice", tid)
         cases = [
             ("Alice", ["New.lean"], {}),
@@ -821,6 +823,66 @@ class WorkflowTaskTests(unittest.TestCase):
         state = tasks.load(directory)
         self.assertEqual(len(state["config_requests"]), len(cases))
         self.assertEqual(state["tasks"][tid]["attempts"], 1)
+
+    def test_unsupported_root_rename_is_rejected_before_queueing(self):
+        directory, _, tid, _ = prepare_environment_task(self.tmp_path)
+        forum.configure(directory, self.tmp_path / "project")
+        with tasks.transaction(directory) as state:
+            state["config"].update(modules=["test.basic"], scope={"selected_modules": {"test.basic": "test/basic.lean"}})
+        with self.raises(ValueError, match="selected supplemental modules: test"):
+            forum.request_configuration_change("Alice", tid, ["lakefile.lean"], "rename", "move root",
+                                               module_renames={"test": "HoTTLeanTest"})
+        self.assertEqual(tasks.load(directory)["config_requests"], {})
+
+    def test_active_owner_corrects_only_invalid_saved_rename_without_interrupt(self):
+        directory, _, tid, _ = prepare_environment_task(self.tmp_path)
+        forum.configure(directory, self.tmp_path / "project")
+        valid = {f"test.{name}": f"HoTTLeanTest.{name}" for name in ("basic", "hott0", "import", "unitt")}
+        original = {"test": "HoTTLeanTest", **valid}
+        with tasks.transaction(directory) as state:
+            state["config"].update(modules=list(valid), scope={"selected_modules": {name: name.replace(".", "/") + ".lean" for name in valid}})
+            state["tasks"][tid]["requested_config"] = {"module_renames": original}
+            state["config_requests"]["configuration-old"] = {"status": "scheduled", "requested_config": {"module_renames": original}}
+        assignment = tasks.claim(directory, "Alice", tid)
+        with self.raises(ValueError, match="retain every valid"):
+            forum.request_configuration_change("Alice", tid, ["lakefile.lean"], "correct", "keep coverage",
+                                               module_renames={k: v for k, v in valid.items() if k != "test.unitt"})
+        response = forum.request_configuration_change("Alice", tid, ["lakefile.lean"], "correct", "keep coverage",
+                                                       module_renames=valid)
+        self.assertEqual(response["status"], "corrected")
+        self.assertIn("removed", response["guidance"])
+        self.assertEqual(response["removed_rename_sources"], ["test"])
+        self.assertEqual(response["corrected_renames"], valid)
+        state = tasks.load(directory)
+        task = state["tasks"][tid]
+        self.assertEqual(task["requested_config"]["module_renames"], valid)
+        self.assertEqual(task["attempts"], assignment["attempts"])
+        self.assertEqual(task["revision"], assignment["revision"] + 1)
+        self.assertEqual(task["owner"], "Alice")
+        self.assertTrue(all(lease["task_revision"] == task["revision"] for lease in state["leases"].values()))
+        self.assertEqual(state["config_requests"]["configuration-old"]["requested_config"]["module_renames"], original)
+        event = next(e for e in state["events"] if e["kind"] == "configuration_rename_corrected")
+        self.assertEqual(event["original_renames"], original)
+        self.assertEqual(event["corrected_renames"], valid)
+        self.assertEqual(state["config"]["modules"], list(valid))
+        with tasks.transaction(directory) as current:
+            revised = current["tasks"][tid]
+            candidate = tasks._submit_candidate(current, "Alice", tid, commit_sha="fixture-commit",
+                base_main_sha=revised["base_main_sha"], task_revision=revised["revision"],
+                config_revision=revised["config_revision"], files=["lakefile.lean"])
+        self.assertEqual(candidate["task_revision"], assignment["revision"] + 1)
+
+    def test_owner_correction_with_new_coverage_still_queues_handoff(self):
+        directory, _, tid, _ = prepare_environment_task(self.tmp_path)
+        forum.configure(directory, self.tmp_path / "project")
+        with tasks.transaction(directory) as state:
+            state["config"].update(modules=["A", "B"], scope={"selected_modules": {"A": "A.lean", "B": "B.lean"}})
+            state["tasks"][tid]["requested_config"] = {"module_renames": {"Root": "NewRoot", "A": "NewA"}}
+        tasks.claim(directory, "Alice", tid)
+        response = forum.request_configuration_change("Alice", tid, ["lakefile.lean"], "correct", "extend",
+                                                       module_renames={"A": "NewA", "B": "NewB"})
+        self.assertEqual(response["status"], "pending")
+        self.assertIn("Root", tasks.load(directory)["tasks"][tid]["requested_config"]["module_renames"])
 
     def test_configuration_request_rejects_command_override_and_scope_drop(self):
         root, directory, tid = prepare_task(self.tmp_path)

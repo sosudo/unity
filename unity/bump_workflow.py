@@ -409,8 +409,17 @@ class Controller:
                 incoming = request.get("requested_config", {})
                 old_renames = old_options.get("module_renames", {})
                 new_renames = incoming.get("module_renames", {})
-                combined = {**old_renames, **new_renames}
-                conflict = (any(old in old_renames and old_renames[old] != new
+                eligible = set(state["config"].get("modules", [])) & set(
+                    state["config"].get("scope", {}).get("selected_modules", {}))
+                retained = {old: new for old, new in old_renames.items() if old in eligible}
+                invalid = set(old_renames) - eligible
+                correction = (bool(invalid) and "module_renames" in incoming
+                              and all(new_renames.get(old) == new for old, new in retained.items()))
+                base_renames = retained if correction else old_renames
+                combined = {**base_renames, **new_renames}
+                conflict = (bool(set(new_renames) - eligible)
+                            or (bool(invalid) and "module_renames" in incoming and not correction)
+                            or any(old in old_renames and old_renames[old] != new
                                 for old, new in new_renames.items())
                             or len(set(combined.values())) != len(combined)
                             or bool(set(combined) & set(combined.values())))
@@ -448,6 +457,11 @@ class Controller:
                     parent["revision"] += 1
                 if extension:
                     parent["attempts"] = 0
+                if correction:
+                    bump_tasks._event(state, "configuration_rename_corrected", "controller",
+                                      task_id=parent["task_id"], request_id=request["request_id"],
+                                      original_renames=deepcopy(old_renames), corrected_renames=deepcopy(combined),
+                                      reason=request["reason"], proposed_changes=request["proposed_changes"])
                 if child:
                     child.update(status="grouped", grouped_into=parent["task_id"])
                     for other in state["tasks"].values():

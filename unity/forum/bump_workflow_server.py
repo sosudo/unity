@@ -225,6 +225,18 @@ def request_configuration_change(author: str, task_id: str, files: list[str], re
         if "modules" in requested:
             requested["modules"] = sorted(set(requested["modules"]) | set(state["config"].get("modules", [])))
         task = state["tasks"][task_id]
+        eligible = set(state["config"].get("modules", [])) & set(state["config"].get("scope", {}).get("selected_modules", {}))
+        if "module_renames" in requested:
+            unsupported = set(requested["module_renames"]) - eligible
+            if unsupported:
+                raise ValueError("module rename sources must be selected supplemental modules: " + ", ".join(sorted(unsupported))
+                                 + "; other source moves can be made in leased files without a module rename")
+        old_renames = task.get("requested_config", {}).get("module_renames", {})
+        invalid_old = set(old_renames) - eligible
+        retained = {old: new for old, new in old_renames.items() if old in eligible}
+        if invalid_old and "module_renames" in requested and any(
+                requested["module_renames"].get(old) != new for old, new in retained.items()):
+            raise ValueError("rename correction must retain every valid existing mapping")
         effective = {**state["config"], **task.get("requested_config", {})}
         effective["modules"] = sorted(set(state["config"].get("modules", [])) |
                                       set(task.get("requested_config", {}).get("modules", [])))
@@ -239,12 +251,26 @@ def request_configuration_change(author: str, task_id: str, files: list[str], re
         if (task.get("kind") in {"configuration", "dependency", "scope_review"}
                 and task.get("owner") == author and task.get("status") == "running"
                 and owns_files and covered_options):
-            guidance = "Edit the leased files in your private worktree and call submit_repair."
+            corrected = bool(invalid_old and "module_renames" in requested and requested["module_renames"] == retained)
+            if corrected:
+                task["requested_config"]["module_renames"] = dict(retained)
+                task["revision"] += 1
+                for lease in state["leases"].values():
+                    if lease.get("task_id") == task_id:
+                        lease["task_revision"] = task["revision"]
+                tasks._event(state, "configuration_rename_corrected", author, task_id=task_id,
+                             original_renames=deepcopy(old_renames), corrected_renames=deepcopy(retained),
+                             reason=reason, proposed_changes=proposed_changes)
+            guidance = ("Invalid pending rename entries were removed. Continue editing leased files in your private worktree and call submit_repair."
+                        if corrected else "Edit the leased files in your private worktree and call submit_repair.")
             tasks._event(state, "configuration_already_assigned", author, task_id=task_id,
                          files=checked, reason=reason, proposed_changes=proposed_changes,
                          requested_config=requested)
-            return {"status": "already_assigned", "task_id": task_id, "files": checked,
-                    "requested_config": requested, "guidance": guidance}
+            response = {"status": "corrected" if corrected else "already_assigned", "task_id": task_id,
+                        "files": checked, "requested_config": requested, "guidance": guidance}
+            if corrected:
+                response.update(corrected_renames=deepcopy(retained), removed_rename_sources=sorted(invalid_old))
+            return response
         key = "configuration-" + str(len(state["config_requests"]) + 1)
         row = {"request_id": key, "task_id": task_id, "author": author, "files": checked,
                "reason": reason, "proposed_changes": proposed_changes, "status": "pending",

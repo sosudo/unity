@@ -211,6 +211,7 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_handoff_rejects_conflicting_and_chained_renames(self):
         tid = self.exhausted_configuration_task()
         with bump_tasks.transaction(self.paths.forum) as state:
+            state["config"].update(modules=["A", "B", "C"], scope={"selected_modules": {x: x + ".lean" for x in ("A", "B", "C")}})
             state["tasks"][tid]["requested_config"] = {"module_renames": {"A": "B"}}
         for number, mapping in enumerate(({"A": "C"}, {"C": "B"}, {"B": "C"}), 10):
             key = "configuration-" + str(number)
@@ -230,6 +231,7 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         key = "configuration-10"
         with bump_tasks.transaction(self.paths.forum) as state:
             state["config_requests"][tid] = {"status": "scheduled"}
+            state["config"].update(modules=["A"], scope={"selected_modules": {"A": "A.lean"}})
             state["tasks"][tid]["requested_config"] = {"module_renames": {"A": "B"}}
             state["tasks"][key] = bump_tasks._task(key, "configuration", [], ["A.lean"])
             state["tasks"]["dependent"] = bump_tasks._task("dependent", "repair", [], [])
@@ -243,6 +245,24 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tasks"][key]["grouped_into"], tid)
         self.assertEqual(state["tasks"]["dependent"]["dependencies"], [tid])
         self.assertEqual(state["tasks"][tid]["attempts"], 5)
+
+    async def test_queued_correction_removes_invalid_rename_and_keeps_new_coverage(self):
+        tid = self.exhausted_configuration_task()
+        original = {"Root": "NewRoot", "A": "NewA"}
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["config"].update(modules=["A", "B"], scope={"selected_modules": {"A": "A.lean", "B": "B.lean"}})
+            state["tasks"][tid]["requested_config"] = {"module_renames": original}
+            state["config_requests"]["configuration-10"] = {"request_id": "configuration-10", "task_id": tid,
+                "status": "pending", "files": ["A.lean"], "reason": "correct", "proposed_changes": "extend",
+                "requested_config": {"module_renames": {"A": "NewA", "B": "NewB"}}}
+        await self.controller.handle_requests()
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["requested_config"]["module_renames"], {"A": "NewA", "B": "NewB"})
+        self.assertEqual(state["tasks"][tid]["attempts"], 0)
+        event = next(e for e in state["events"] if e["kind"] == "configuration_rename_corrected")
+        self.assertEqual(event["original_renames"], original)
+        self.assertEqual(event["corrected_renames"], {"A": "NewA", "B": "NewB"})
+        self.assertEqual(state["config_requests"]["configuration-10"]["status"], "scheduled")
 
     async def test_handoff_waits_for_owner_and_submitted_candidate(self):
         tid = self.exhausted_configuration_task()
