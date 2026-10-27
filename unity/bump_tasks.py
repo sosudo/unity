@@ -389,10 +389,20 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
                            main_sha=main_sha, config_revision=config_revision)
         # Reconcile every status before rebuilding edges: task IDs/insertion
         # order must not leave stale prerequisites after indirect repairs.
+        modules = {p.removesuffix(".lean").replace("/", "."): p for p in state["files"]}
         for tid, task in state["tasks"].items():
             if task["kind"] not in {"repair", "command"}: continue
-            modules = {p.removesuffix(".lean").replace("/", "."): p for p in state["files"]}
-            imported = {modules[m] for p in task["files"] for m in state["files"].get(p, {}).get("imports", []) if m in modules}
+            # Include clean project files as bridges: they can import a failed
+            # ancestor even when no task is attached to the bridge itself.
+            visited, pending = set(task["files"]), list(task["files"])
+            while pending:
+                path = pending.pop()
+                for name in state["files"].get(path, {}).get("imports", []):
+                    imported = modules.get(name)
+                    if imported and imported not in visited:
+                        visited.add(imported)
+                        pending.append(imported)
+            imported = visited - set(task["files"])
             task["dependencies"] = sorted(other_id for other_id, other in state["tasks"].items()
                 if other_id != tid and other["status"] not in {"complete", "grouped"} and imported & set(other["files"]))
             # Lean source commands elaborate in order. Without compiled name
@@ -408,7 +418,7 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
                                    if cid in chunks and chunks[cid]["path"] == path), default=0)
                     if earlier < starts[path]:
                         task["dependencies"] = sorted(set(task["dependencies"]) | {other_id})
-            task["dependency_basis"] = "current imports and conservative source-command order"
+            task["dependency_basis"] = "current transitive project imports and conservative source-command order"
         state["review"] = {}
     return load(forum_dir)
 

@@ -163,6 +163,43 @@ class WorkflowTaskTests(unittest.TestCase):
             tasks.claim(directory, "Bob", by_file["B.lean"])
         tasks.claim(directory, "Alice", by_file["A.lean"])
 
+    def test_transitive_import_through_clean_bridge_blocks_and_recovers_on_restart(self):
+        root, directory = setup_state(self.tmp_path)
+        write_source(root, "A.lean", "def a := missing\n")
+        write_source(root, "Bridge.lean", "import A\ndef bridge := a\n")
+        write_source(root, "Down.lean", "import Bridge\ndef downstream := bridge\n")
+        inventory = tasks.scan_sources(root, ["A.lean", "Bridge.lean", "Down.lean"])
+        errors = [diagnostic("A.lean", 1), diagnostic("Down.lean", 2)]
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0)
+        by_file = {t["files"][0]: tid for tid, t in state["tasks"].items()}
+        self.assertNotIn("Bridge.lean", by_file)
+        self.assertEqual(state["tasks"][by_file["Down.lean"]]["dependencies"], [by_file["A.lean"]])
+        with self.raises(ValueError, match="unfinished dependencies"):
+            tasks.claim(directory, "Bob", by_file["Down.lean"])
+        # Simulate a checkpoint from before transitive edges were recorded.
+        with tasks.transaction(directory) as state:
+            state["tasks"][by_file["Down.lean"]]["dependencies"] = []
+        state = tasks.refresh(directory, inventory, errors, main_sha="base", config_revision=0)
+        self.assertEqual(state["tasks"][by_file["Down.lean"]]["dependencies"], [by_file["A.lean"]])
+        state = tasks.refresh(directory, inventory, [errors[1]], main_sha="base", config_revision=0,
+                              checked_files=["A.lean"])
+        self.assertEqual(state["tasks"][by_file["Down.lean"]]["dependencies"], [])
+        tasks.claim(directory, "Bob", by_file["Down.lean"])
+
+    def test_cyclic_import_traversal_terminates_without_self_dependencies(self):
+        root, directory = setup_state(self.tmp_path)
+        write_source(root, "A.lean", "import B\ndef a := missing\n")
+        write_source(root, "B.lean", "import A\ndef b := missing\n")
+        inventory = tasks.scan_sources(root, ["A.lean", "B.lean"])
+        state = tasks.refresh(directory, inventory, [diagnostic("A.lean", 2), diagnostic("B.lean", 2)],
+                              main_sha="base", config_revision=0)
+        rows = list(state["tasks"].values())
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(t["task_id"] not in t["dependencies"] for t in rows))
+        # Cyclic Lean imports retain their mutual prerequisites as before;
+        # resolving invalid source cycles is outside this scheduler change.
+        self.assertTrue(all(len(t["dependencies"]) == 1 for t in rows))
+
     def test_unknown_compiler_location_becomes_explicit_command_work(self):
         tmp_path = self.tmp_path
         root, directory = setup_state(tmp_path)

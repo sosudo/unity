@@ -429,6 +429,36 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await record["task"]
             await self.controller.reap_workers()
 
+    async def test_scheduler_waits_for_failed_import_through_clean_bridge(self):
+        (self.root / "Bridge.lean").write_text("import A\ndef bridge := a\n")
+        (self.root / "B.lean").write_text("import Bridge\ndef b := bridge\n")
+        self.git(self.root, "add", "Bridge.lean", "B.lean")
+        self.git(self.root, "commit", "-qm", "transitive imports fixture")
+        head = self.git(self.root, "rev-parse", "HEAD")
+        self.scope["selected_modules"]["Bridge"] = "Bridge.lean"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["main_sha"] = head
+            state["tasks"] = {}
+            state["config"]["scope"] = deepcopy(self.scope)
+        errors = [self.error("A.lean"), {**self.error("B.lean"), "line": 2}]
+        self.controller.refresh(self.build_result(errors))
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            records = list(self.controller.workers.values())
+            self.assertEqual(len(records), 1)
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][records[0]["task_id"]]["files"], ["A.lean"])
+            await records[0]["task"]
+            await self.controller.reap_workers()
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["tasks"][records[0]["task_id"]]["status"] = "complete"
+            self.controller.refresh(self.build_result([errors[1]], checked=["A.lean"]))
+            self.controller.launch_ready()
+            next_record = next(iter(self.controller.workers.values()))
+            self.assertEqual(self.controller.state()["tasks"][next_record["task_id"]]["files"], ["B.lean"])
+            await next_record["task"]
+            await self.controller.reap_workers()
+
     async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
         tid = self.exhausted_configuration_task()
         self.controller.max_attempts = 5
