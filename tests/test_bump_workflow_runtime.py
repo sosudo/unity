@@ -459,6 +459,109 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await next_record["task"]
             await self.controller.reap_workers()
 
+    def orphaned_repair_fixture(self):
+        state = self.controller.state()
+        tid = next(tid for tid, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        old_chunk = state["tasks"][tid]["chunk_ids"][0]
+        (self.root / "A.lean").write_text("def replacement := missingA\n")
+        self.git(self.root, "add", "A.lean")
+        self.git(self.root, "commit", "-qm", "replace old declaration")
+        head = self.git(self.root, "rev-parse", "HEAD")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["main_sha"] = head
+            state["tasks"][tid]["attempts"] = 3
+        self.controller.refresh(self.build_result([self.error("B.lean")]))
+        self.assertNotIn(old_chunk, self.controller.state()["chunks"])
+        return tid
+
+    def targeted_orphan_build(self, diagnostics=(), checked=()):
+        result = self.authoritative_build_result(list(diagnostics), checked=checked)
+        result["command"] = ["lake", "--rehash", "build", "+A"]
+        result["log_ref"] = {"artifact_id": "targeted-orphan-log"}
+        return result
+
+    async def test_orphaned_chunk_rechecked_by_controller_without_worker_attempt(self):
+        tid = self.orphaned_repair_fixture()
+        good = self.targeted_orphan_build(checked=["A.lean"])
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=good)) as build, \
+             patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertNotIn(tid, [row["task_id"] for row in self.controller.workers.values()])
+            records = list(self.controller.workers.values())
+            await asyncio.gather(*(row["task"] for row in records))
+            await self.controller.reap_workers()
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            build.assert_awaited_once_with(modules=["A"])
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][tid]["status"], "complete")
+            self.assertEqual(state["tasks"][tid]["attempts"], 3)
+            event = next(row for row in state["events"] if row["kind"] == "orphan_revalidated")
+            self.assertEqual(event["task_id"], tid)
+            self.assertEqual(event["log_ref"], {"artifact_id": "targeted-orphan-log"})
+            self.assertNotIn("A.lean", state["last_build"].get("checked_files", []))
+
+    async def test_one_targeted_build_revalidates_multiple_orphans_in_same_file(self):
+        tid = self.orphaned_repair_fixture()
+        second = "repair-old-second"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][second] = {**bump_tasks._task(second, "repair", ["missing-old-chunk"], ["A.lean"]),
+                "attempts": 4, "diagnostics": [{**self.error("A.lean"), "id": "old-second"}]}
+        good = self.targeted_orphan_build(checked=["A.lean"])
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=good)) as build:
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            build.assert_awaited_once_with(modules=["A"])
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertEqual(state["tasks"][second]["status"], "complete")
+        self.assertEqual(state["tasks"][second]["attempts"], 4)
+        self.assertEqual(len([e for e in state["events"] if e["kind"] == "orphan_revalidated"]), 2)
+
+    async def test_failed_orphan_recheck_schedules_new_diagnostic_and_does_not_loop(self):
+        tid = self.orphaned_repair_fixture()
+        error = {**self.error("A.lean"), "message": "replacement still fails"}
+        failed = self.targeted_orphan_build([error])
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=failed)) as build, \
+             patch.object(self.controller, "worker", new=AsyncMock()):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            build.assert_awaited_once()
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][tid]["status"], "pending")
+            self.assertEqual(state["tasks"][tid]["attempts"], 3)
+            event = next(row for row in state["events"] if row["kind"] == "orphan_recheck_incomplete")
+            self.assertEqual(event["log_ref"], {"artifact_id": "targeted-orphan-log"})
+            repair = next(task for key, task in state["tasks"].items()
+                          if key != tid and task["files"] == ["A.lean"] and task["kind"] == "repair")
+            self.assertNotIn(tid, repair["dependencies"])
+            self.assertEqual(repair["diagnostics"][0]["message"], "replacement still fails")
+            self.controller.launch_ready()
+            self.assertIn(repair["task_id"], [row["task_id"] for row in self.controller.workers.values()])
+            records = list(self.controller.workers.values())
+            await asyncio.gather(*(row["task"] for row in records))
+            await self.controller.reap_workers()
+
+    async def test_orphan_recheck_rejects_stale_build_identity(self):
+        tid = self.orphaned_repair_fixture()
+        good = self.targeted_orphan_build(checked=["A.lean"])
+        stale = {**good, "source_identity": {**good["source_identity"], "main_sha": "old"}}
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=stale)):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 3)
+        self.assertFalse(any(e["kind"] == "orphan_revalidated" for e in self.controller.state()["events"]))
+
+    async def test_missing_inventory_chunk_without_source_change_is_not_revalidated(self):
+        state = self.controller.state()
+        tid = next(tid for tid, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        cid = state["tasks"][tid]["chunk_ids"][0]
+        with bump_tasks.transaction(self.paths.forum) as state:
+            del state["chunks"][cid]
+        with patch.object(self.controller, "build", new=AsyncMock()) as build:
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            build.assert_not_awaited()
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+
     async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
         tid = self.exhausted_configuration_task()
         self.controller.max_attempts = 5

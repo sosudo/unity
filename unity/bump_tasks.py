@@ -411,7 +411,8 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
             starts = {path: min((chunks[cid]["start_line"] for cid in task["chunk_ids"]
                       if cid in chunks and chunks[cid]["path"] == path), default=0) for path in task["files"]}
             for other_id, other in state["tasks"].items():
-                if other_id == tid or other["status"] in {"complete", "grouped"}:
+                if (other_id == tid or other["status"] in {"complete", "grouped"}
+                        or orphaned_repair(other, chunks)):
                     continue
                 for path in set(task["files"]) & set(other["files"]):
                     earlier = min((chunks[cid]["start_line"] for cid in other["chunk_ids"]
@@ -421,6 +422,12 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
             task["dependency_basis"] = "current transitive project imports and conservative source-command order"
         state["review"] = {}
     return load(forum_dir)
+
+
+def orphaned_repair(task: dict, chunks: dict) -> bool:
+    """A deleted compiler assignment cannot be repaired by editing its old range."""
+    members = task.get("chunk_ids", [])
+    return task.get("kind") == "repair" and bool(members) and all(cid not in chunks for cid in members)
 
 
 def claim(forum_dir: Path, author: str, task_id: str, max_attempts: int = 5) -> dict:

@@ -158,6 +158,7 @@ class Controller:
         self.workers = {}
         self.initial_build = None
         self.build_cancel = Event()
+        self.orphan_checks = set()
         self.diagnostics_queue = asyncio.Queue()
         # All agents repair; the configured primary takes the final review turn.
         self.writers = roster.agents
@@ -335,6 +336,8 @@ class Controller:
                     continue
                 if item.get("status") not in {"pending", "needs_repair", "ready"}:
                     continue
+                if bump_tasks.orphaned_repair(item, state["chunks"]):
+                    continue
                 if any(state["tasks"].get(key, {}).get("status") not in {"complete", "clean", "merged"}
                        for key in item.get("dependencies", [])):
                     continue
@@ -355,6 +358,99 @@ class Controller:
                                            "tree": tree, "agent": agent}
                 state = self.state()
                 break
+
+    async def recheck_orphaned_repairs(self):
+        """Recheck deleted compiler ranges without spending a model attempt."""
+        from . import bump_tasks, bump_verification
+        state = self.state()
+        scope = state["config"].get("scope", {})
+        selected = scope.get("selected_modules", {})
+        for tid, task in sorted(state["tasks"].items()):
+            if (not bump_tasks.orphaned_repair(task, state["chunks"]) or task.get("owner")
+                    or task.get("status") not in {"pending", "ready", "needs_repair", "blocked"}
+                    or any(task.get(key) for key in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
+                    or not task.get("diagnostics") or any(d.get("kind") not in {None, "declaration"}
+                            or d.get("severity", "error") != "error" or d.get("path") not in task["files"]
+                            for d in task["diagnostics"])
+                    or any(state["tasks"].get(dep, {}).get("status") not in {"complete", "clean", "merged"}
+                           for dep in task.get("dependencies", []))
+                    or any(lease.get("task_id") == tid or path in task["files"] for path, lease in state["leases"].items())
+                    or any(c.get("task_id") == tid and c.get("status") in {"submitted", "merging"}
+                           for c in state["candidates"].values())):
+                continue
+            files = set(task["files"])
+            modules = sorted(name for name, path in selected.items() if path in files)
+            if not files or {selected[name] for name in modules} != files:
+                continue
+            try:
+                scanned = bump_tasks.scan_sources(self.paths.project_root, sorted(files))
+            except (OSError, ValueError):
+                continue
+            if any(cid in scanned["chunks"] for cid in task["chunk_ids"]):
+                continue  # An incomplete inventory is not evidence of removal.
+            source_hashes = {path: row["sha256"] for path, row in scanned["files"].items()}
+            key = (tuple(sorted(files)), state["main_sha"], state["config"]["revision"], tuple(sorted(source_hashes.items())))
+            if key in self.orphan_checks:
+                continue
+            self.orphan_checks.add(key)
+            result = await self.build(modules=modules)
+            current = self.state()
+            identity = result.get("source_identity") or {}
+            command = ["lake", *state["config"].get("lake_args", ()), "--rehash", "build", *["+" + m for m in modules]]
+            stable = (type(result.get("returncode")) is int and result["returncode"] >= 0
+                      and result.get("source_stable") is True and result.get("config_revision") == state["config"]["revision"]
+                      and result.get("command") == command and current["main_sha"] == state["main_sha"]
+                      and current["config"]["revision"] == state["config"]["revision"]
+                      and identity.get("main_sha") == state["main_sha"]
+                      and identity.get("scope") == scope and identity.get("lake_args") == list(state["config"].get("lake_args", ()))
+                      and identity.get("files") == bump_verification._files(self.paths.project_root, scope.get("build_dir", ".lake/build"))
+                      and all(identity.get("files", {}).get(path) == digest for path, digest in source_hashes.items()))
+            if not stable:
+                return True
+            errors = [row for row in result.get("diagnostics", []) if row.get("severity", "error") == "error"]
+            if (not result.get("unmapped") and files <= set(result.get("checked_files", []))
+                    and not any(row.get("path") in files or not row.get("path") for row in errors)):
+                with bump_tasks.transaction(self.paths.forum) as fresh:
+                    if fresh["main_sha"] == state["main_sha"] and fresh["config"]["revision"] == state["config"]["revision"]:
+                        for target_id, target in fresh["tasks"].items():
+                            if (set(target.get("files", [])) != files or target.get("owner")
+                                    or target.get("status") not in {"pending", "ready", "needs_repair", "blocked"}
+                                    or not bump_tasks.orphaned_repair(target, fresh["chunks"])
+                                    or any(cid in scanned["chunks"] for cid in target["chunk_ids"])
+                                    or any(target.get(k) for k in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
+                                    or not target.get("diagnostics") or any(d.get("kind") not in {None, "declaration"}
+                                         or d.get("severity", "error") != "error" or d.get("path") not in files
+                                         for d in target["diagnostics"])
+                                    or any(lease.get("task_id") == target_id or path in files for path, lease in fresh["leases"].items())
+                                    or any(c.get("task_id") == target_id and c.get("status") in {"submitted", "merging"}
+                                           for c in fresh["candidates"].values())):
+                                continue
+                            resolved = [d.get("id") or "diagnostic-" + bump_tasks.digest(d)[:20] for d in target["diagnostics"]]
+                            target.update(status="complete", diagnostics=[])
+                            bump_tasks._event(fresh, "orphan_revalidated", "controller", task_id=target_id,
+                                              main_sha=state["main_sha"], config_revision=state["config"]["revision"],
+                                              modules=modules, source_sha256=source_hashes,
+                                              resolved_diagnostic_ids=resolved, log_ref=deepcopy(result.get("log_ref")))
+                # Another same-file orphan may still be owned; let it receive
+                # a fresh check after its lease closes instead of stranding it.
+                self.orphan_checks.discard(key)
+            else:
+                with bump_tasks.transaction(self.paths.forum) as fresh:
+                    if fresh["main_sha"] == state["main_sha"] and fresh["config"]["revision"] == state["config"]["revision"]:
+                        bump_tasks._event(fresh, "orphan_recheck_incomplete", "controller", task_id=tid,
+                                          main_sha=state["main_sha"], config_revision=state["config"]["revision"],
+                                          modules=modules, source_sha256=source_hashes,
+                                          returncode=result["returncode"], log_ref=deepcopy(result.get("log_ref")))
+                if result.get("diagnostics"):
+                    # Keep unrelated whole-build diagnostics; add exact targeted
+                    # errors so newly exposed declarations become ordinary tasks.
+                    rows = list(current.get("diagnostics", []))
+                    seen = {bump_tasks.digest(row) for row in rows}
+                    rows.extend(row for row in result["diagnostics"] if bump_tasks.digest(row) not in seen)
+                    bump_tasks.refresh(self.paths.forum, self.inventory(current), rows,
+                        main_sha=current["main_sha"], config_revision=current["config"]["revision"], declaration_build={})
+            return True
+        return False
 
     async def reap_workers(self):
         from . import bump_tasks
@@ -1024,6 +1120,7 @@ class Controller:
                 await self.handle_requests()
                 if await self.integrate_ready():
                     continue
+                await self.recheck_orphaned_repairs()
                 self.launch_ready()
                 state = self.state()
                 pending = [task for task in state["tasks"].values()
