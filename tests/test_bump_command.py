@@ -140,7 +140,7 @@ class BumpCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(command.os, "kill") as kill, patch.object(command.os, "killpg") as killpg:
             result = await self.invoke("--continue")
         self.assertNotEqual(result.exit_code, 0)
-        kill.assert_called_once_with(12345, 0)
+        kill.assert_not_called()
         killpg.assert_not_called()
         self.terminate.assert_not_called()
         self.run.assert_not_awaited()
@@ -154,7 +154,8 @@ class BumpCommandTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(command.os, "kill", side_effect=ProcessLookupError), \
                 patch.object(command.os, "killpg", side_effect=ProcessLookupError):
             result = await self.invoke("--continue")
-        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("legacy Bump job", result.output)
         self.terminate.assert_not_called()
         self.assertTrue(record.exists())
 

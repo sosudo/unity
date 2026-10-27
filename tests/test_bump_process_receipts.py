@@ -37,6 +37,7 @@ class ProcessReceiptTests(unittest.IsolatedAsyncioTestCase):
     async def launch(self, code="import time; time.sleep(30)"):
         proc = await asyncio.create_subprocess_exec(str(self.wrapper), "-c", code,
             cwd=self.root, env={**os.environ, "UNITY_BUMP_PROCESS_RECEIPTS": str(self.directory),
+                                "UNITY_BUMP_WORKER_SESSION": "session-fixture",
                                 "PRIVATE_PROVIDER_KEY": "fixture-sensitive-value"},
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         self.procs.append(proc)
@@ -63,6 +64,7 @@ class ProcessReceiptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["sid"], proc.pid)
         self.assertEqual(record["cwd"], str(self.root))
         self.assertEqual(record["executable"], sys.executable)
+        self.assertEqual(record["worker_session"], "session-fixture")
         self.assertNotIn("argv", record)
         self.assertNotIn("env", record)
         self.assertNotIn("fixture-sensitive-value", path.read_text())
@@ -128,10 +130,12 @@ class ProcessReceiptTests(unittest.IsolatedAsyncioTestCase):
                    "unity-forum": {"command": sys.executable, "args": []}}
         rebound = bump_spawn.bump_mcp_with_runtime_env(servers, {
             "UNITY_BUMP_WORKFLOW": "compiler-migration-v2", "UNITY_BUMP_LAKE_ARGS": '["-Kenv=dev"]',
+            "UNITY_BUMP_WORKER_SESSION": "session-fixture",
             "PRIVATE_PROVIDER_KEY": "must-not-forward"})
         for name in servers:
             self.assertEqual(rebound[name]["env"]["UNITY_BUMP_WORKFLOW"], "compiler-migration-v2")
             self.assertEqual(rebound[name]["env"]["UNITY_BUMP_LAKE_ARGS"], '["-Kenv=dev"]')
+            self.assertEqual(rebound[name]["env"]["UNITY_BUMP_WORKER_SESSION"], "session-fixture")
             self.assertNotIn("PRIVATE_PROVIDER_KEY", rebound[name]["env"])
 
 

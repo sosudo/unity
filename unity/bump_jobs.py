@@ -8,6 +8,7 @@ jobs only; model shell commands are not treated as authoritative checks.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import signal
@@ -49,6 +50,36 @@ def check_cancelled() -> None:
     event = _cancellation.get()
     if event is not None and event.is_set():
         raise JobCancelled("bump verification cancelled")
+
+
+def process_identity(pid: int) -> dict | None:
+    """Linux PID namespace, boot and process birth; absent evidence is untrusted."""
+    try:
+        namespace = os.stat(f"/proc/{pid}/ns/pid").st_ino
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        ticks = int(fields[19])
+        if not boot:
+            return None
+        return {"pid_namespace": namespace, "boot_id": boot, "start_ticks": ticks}
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _live_owned_record(record: dict) -> bool:
+    """Never interpret a namespace-local or reused numeric PID as ours."""
+    try:
+        pid = int(record["pid"])
+        if pid <= 1:
+            return False
+        current_namespace = os.stat("/proc/self/ns/pid").st_ino
+        if record.get("pid_namespace") != current_namespace:
+            return False
+        identity = process_identity(pid)
+        return bool(identity and all(record.get(key) == value for key, value in identity.items())
+                    and (not record.get("pgid") or os.getpgid(pid) == record["pgid"]))
+    except (OSError, KeyError, TypeError, ValueError):
+        return False
 
 
 def _signal_process(proc, sig: int, *, client_group: bool = False) -> None:
@@ -225,6 +256,12 @@ def run(
             "cwd": str(cwd),
             "started_at": time.time(),
         }
+        identity = process_identity(proc.pid)
+        if identity:
+            record.update(identity)
+        session = os.environ.get("UNITY_BUMP_WORKER_SESSION", "")
+        if session:
+            record["worker_session"] = session
         if passthrough_stdio:
             record["passthrough_stdio"] = True
         try:
@@ -255,54 +292,73 @@ def run(
                 for pipe in (proc.stdin, proc.stdout, proc.stderr):
                     if pipe is not None:
                         pipe.close()
-            record_path.unlink(missing_ok=True)
+            # A detached job group can outlive the worker group. Record exact
+            # closure only after reaping the child and observing its group gone.
+            closed = proc.poll() is not None
+            if closed and os.name == "posix" and not client_group:
+                try:
+                    os.killpg(proc.pid, 0)
+                except ProcessLookupError:
+                    pass
+                except PermissionError:
+                    closed = False
+                else:
+                    closed = False
+            if closed and record_path.exists():
+                if not client_group and record.get("worker_session"):
+                    certificate_dir = record_path.parent / "closed"
+                    certificate_dir.mkdir(exist_ok=True)
+                    certificate = {"record_sha256": hashlib.sha256(record_path.read_bytes()).hexdigest(),
+                                   "job_id": job_id, "worker_session": record.get("worker_session"),
+                                   "group_empty": True, "closed_at": time.time()}
+                    destination = certificate_dir / (job_id + ".json")
+                    temporary = destination.with_suffix(".tmp")
+                    temporary.write_text(json.dumps(certificate, sort_keys=True))
+                    os.replace(temporary, destination)
+                record_path.unlink(missing_ok=True)
             record_path.with_suffix(".tmp").unlink(missing_ok=True)
 
 
 def terminate(project_root: Path, *, owner: str | None = None) -> int:
-    """Terminate registered jobs, optionally restricted to one worker owner."""
+    """Signal only live jobs with matching namespace, boot, birth and group.
+
+    Unverified, legacy, foreign and reused PID registrations are retained as
+    evidence. In particular, a sandbox-local PID is never a host signal target.
+    """
     directory = _jobs_dir(project_root)
-    records: list[tuple[Path, dict]] = []
+    records = []
     for path in directory.glob("*.json"):
+        if path.is_symlink():
+            continue
         try:
             record = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
-            path.unlink(missing_ok=True)
             continue
-        if owner is None or record.get("owner") == owner:
-            # LSP clients may SIGKILL their whole group, including the shim
-            # before its finally block runs. Prune that stale registration;
-            # never signal a different group after a PID has been reused.
-            if record.get("passthrough_stdio") and os.name == "posix":
-                try:
-                    live_group = os.getpgid(int(record["pid"]))
-                except ProcessLookupError:
-                    path.unlink(missing_ok=True)
-                    continue
-                if live_group != record.get("pgid"):
-                    path.unlink(missing_ok=True)
-                    continue
+        if (owner is None or record.get("owner") == owner) and _live_owned_record(record):
             records.append((path, record))
-
+    # A pidfd binds each signal to the same process even if its numeric PID is
+    # reused between validation and delivery. A saved PGID alone cannot be
+    # pinned, so never signal a saved group by number.
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        return 0
+    signalled = set()
     for sig in (signal.SIGTERM, signal.SIGKILL):
         for path, record in records:
-            # ``run`` removes the record after reaping the process. Avoid
-            # signalling a rapidly reused PID during the hard-kill pass.
-            if sig == signal.SIGKILL and not path.exists():
-                continue
-            pid = int(record.get("pid") or 0)
-            if pid <= 0:
+            if not path.exists() or not _live_owned_record(record):
                 continue
             try:
-                if os.name == "posix" and record.get("pgid"):
-                    os.killpg(int(record["pgid"]), sig)
-                else:
-                    os.kill(pid, sig)
+                fd = os.pidfd_open(int(record["pid"]), 0)
+            except OSError:
+                continue
+            try:
+                if not _live_owned_record(record):
+                    continue
+                signal.pidfd_send_signal(fd, sig)
+                signalled.add(str(path))
             except (ProcessLookupError, PermissionError):
                 pass
-        if sig == signal.SIGTERM and records:
+            finally:
+                os.close(fd)
+        if sig == signal.SIGTERM and signalled:
             time.sleep(0.25)
-
-    for path, _ in records:
-        path.unlink(missing_ok=True)
-    return len(records)
+    return len(signalled)

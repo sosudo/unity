@@ -116,6 +116,7 @@ _BUMP_MCP_ENV_KEYS = (
     "UNITY_BUMP_WORKFLOW",
     "UNITY_BUMP_LAKE_ARGS",
     "UNITY_BUMP_DRAFT_PATH",
+    "UNITY_BUMP_WORKER_SESSION",
     "UNITY_AGENT_NAME",
     "TMPDIR",
     "TMP",
@@ -330,11 +331,14 @@ def _process_group_wrapper(executable: Path, directory: Path, label: str) -> tup
         "    if sys.platform.startswith('linux'):\n"
         "        ticks = int(pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19])\n"
         "        birth = None\n"
+        "        pid_namespace = os.stat('/proc/self/ns/pid').st_ino\n"
+        "        boot_id = pathlib.Path('/proc/sys/kernel/random/boot_id').read_text().strip()\n"
         "    else:\n"
         "        birth = subprocess.run(['ps', '-o', 'lstart=', '-p', str(pid)], capture_output=True, text=True, check=True).stdout.strip()\n"
+        "        pid_namespace, boot_id = None, None\n"
         "        if not birth:\n"
         "            raise RuntimeError('owned process birth observation unavailable')\n"
-        f"    receipt = dict(schema_version=1, pid=pid, pgid=os.getpgrp(), sid=os.getsid(0), start_ticks=ticks, birth=birth, cwd=os.getcwd(), executable={str(executable)!r}, created_at=time.time())\n"
+        f"    receipt = dict(schema_version=1, pid=pid, pgid=os.getpgrp(), sid=os.getsid(0), start_ticks=ticks, birth=birth, cwd=os.getcwd(), executable={str(executable)!r}, created_at=time.time(), worker_session=os.environ.get('UNITY_BUMP_WORKER_SESSION'), pid_namespace=pid_namespace, boot_id=boot_id)\n"
         "    receipt_path = destination / (str(pid) + '-' + uuid.uuid4().hex + '.json')\n"
         "    with os.fdopen(os.open(receipt_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'w') as handle:\n"
         "        json.dump(receipt, handle, sort_keys=True)\n"

@@ -85,7 +85,7 @@ def mcp_servers(paths, profile):
     return servers
 
 
-def runtime_env(paths, author, task_id, profile, config):
+def runtime_env(paths, author, task_id, profile, config, *, session_token=None):
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", author)
     scratch = paths.unity / "tmp" / "bump" / safe
     scratch.mkdir(parents=True, exist_ok=True)
@@ -114,6 +114,8 @@ def runtime_env(paths, author, task_id, profile, config):
         "PATH": os.pathsep.join((str(bin_dir), str(Path(sys.executable).absolute().parent), os.environ.get("PATH", ""))),
         "PIP_REQUIRE_VIRTUALENV": "true", "PIP_DISABLE_PIP_VERSION_CHECK": "true",
     }
+    if session_token:
+        env["UNITY_BUMP_WORKER_SESSION"] = session_token
     if real_lake:
         env["UNITY_REAL_LAKE"] = str(Path(real_lake).absolute())
     return env
@@ -302,7 +304,8 @@ class Controller:
             return await spawn(agent, system, instruction, tree,
                 mcp_servers(self.paths, profile), own_process_group=True,
                 interrupt_event=interrupt, mcp_profile="bump",
-                env_overrides=runtime_env(self.paths, agent.name, task_id, profile, state["config"]),
+                env_overrides=runtime_env(self.paths, agent.name, task_id, profile, state["config"],
+                                          session_token=uuid.uuid4().hex),
                 log_context={"command": "bump", "run_id": state["run_id"],
                              "phase": profile, "task_id": task_id, "role": profile})
 
