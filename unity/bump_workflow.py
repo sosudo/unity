@@ -326,6 +326,8 @@ class Controller:
                 row.get("kind") not in {"configuration", "dependency", "imports"}, row["task_id"]))
             for item in ready:
                 configuration = item["kind"] in {"configuration", "dependency", "scope_review"}
+                if configuration and not item.get("files"):
+                    continue
                 if configuration_pending and (not configuration or self.workers):
                     continue
                 if item.get("status") not in {"pending", "needs_repair", "ready"}:
@@ -968,7 +970,11 @@ class Controller:
                     streamed += text
                 # Do not publish an unfinished diagnostic line.
                 complete_text = streamed.rpartition("\n")[0]
-                parsed = bump_verification._parse_diagnostics(complete_text, self.paths.project_root)
+                # Pathless streaming errors can precede the source diagnostic
+                # that explains them. Only the completed build may schedule an
+                # environment/configuration task from those provisional lines.
+                parsed = [row for row in bump_verification._parse_diagnostics(complete_text, self.paths.project_root)
+                          if row.get("path")]
                 if parsed and parsed != last_parsed:
                     bump_tasks.refresh(self.paths.forum, self.inventory(), parsed,
                         main_sha=self.state()["main_sha"], config_revision=self.state()["config"]["revision"], complete=False)

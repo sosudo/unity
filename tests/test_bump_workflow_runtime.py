@@ -322,6 +322,88 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(audit["passed"], audit["issues"])
         self.assertEqual(audit["inherited"][0]["baseline_path"], "A.lean")
 
+    async def test_streamed_environment_errors_wait_for_completed_build(self):
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"] = {}
+        observations = []
+        source = self.error("A.lean")
+        environment = {"path": None, "line": None, "column": None, "severity": "error",
+                       "kind": "environment", "message": "error: unrelated environment failure"}
+        async def streamed_build(*, stream=False):
+            self.assertTrue(stream)
+            await self.controller.diagnostics_queue.put(("stdout", "error: no such file or directory (error code: 2)\n"))
+            await asyncio.sleep(0.25)
+            self.assertEqual(observations, [])
+            await self.controller.diagnostics_queue.put(("stdout", "error: A.lean:1:1: unknown identifier\n"))
+            await asyncio.sleep(0.25)
+            self.assertTrue(observations)
+            return self.build_result([source, environment])
+        def observe_launch():
+            if self.controller.initial_build and not self.controller.initial_build.done():
+                observations.append(self.controller.state()["tasks"])
+        with patch.object(self.controller, "prepare", new=AsyncMock()), \
+             patch.object(self.controller, "build", side_effect=streamed_build), \
+             patch.object(self.controller, "launch_ready", side_effect=observe_launch):
+            with self.assertRaisesRegex(ValueError, "blocked or exhausted"):
+                await self.controller.run()
+        self.assertTrue(any(task["kind"] == "repair" for state in observations for task in state.values()))
+        self.assertFalse(any(task["kind"] == "configuration" for state in observations for task in state.values()))
+        self.assertTrue(any(task["kind"] == "configuration" for task in self.controller.state()["tasks"].values()))
+
+    async def test_empty_configuration_assignment_is_never_dispatched(self):
+        tid = "configuration-empty"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"] = {tid: bump_tasks._task(tid, "configuration", [], [])}
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertFalse(self.controller.workers)
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 0)
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["tasks"][tid]["files"] = ["lakefile.lean"]
+            self.controller.launch_ready()
+            record = next(iter(self.controller.workers.values()))
+            self.assertEqual(record["task_id"], tid)
+            await record["task"]
+            await self.controller.reap_workers()
+
+    async def test_saved_empty_configuration_waits_for_authoritative_reconciliation(self):
+        tid = self.exhausted_configuration_task()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid].update(files=[], attempts=2)
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertFalse(self.controller.workers)
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            self.controller.refresh(self.authoritative_build_result(), authoritative_full_build=True)
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][tid]["status"], "complete")
+            self.assertEqual(state["tasks"][tid]["attempts"], 2)
+            self.controller.launch_ready()
+            records = list(self.controller.workers.values())
+            self.assertTrue(records)
+            self.assertTrue(all(self.controller.state()["tasks"][row["task_id"]]["kind"] == "repair" for row in records))
+            await asyncio.gather(*(row["task"] for row in records))
+            await self.controller.reap_workers()
+
+    async def test_saved_empty_configuration_receives_files_when_error_persists(self):
+        tid = self.exhausted_configuration_task()
+        (self.root / "lakefile.toml").write_text('name = "Fixture"\n')
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid].update(files=[], attempts=1)
+        environment = {"path": None, "line": None, "severity": "error", "kind": "environment",
+                       "message": "error: A.lean: bad import 'Old.Module'"}
+        self.controller.refresh(self.authoritative_build_result([environment]), authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["status"], "pending")
+        self.assertEqual(state["tasks"][tid]["files"], ["lakefile.toml"])
+        self.assertEqual(state["tasks"][tid]["attempts"], 1)
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            record = next(iter(self.controller.workers.values()))
+            self.assertEqual(record["task_id"], tid)
+            await record["task"]
+            await self.controller.reap_workers()
+
     async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
         tid = self.exhausted_configuration_task()
         self.controller.max_attempts = 5
