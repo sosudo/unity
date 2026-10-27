@@ -39,6 +39,10 @@ local project with targeted diagnostics, then use `submit_repair`; do not run a 
 project-wide build or duplicate a successful unchanged check. Unity's main verification remains
 authoritative. Apply only relevant source edits within your granted file leases; do not weaken claims.
 
-Preparing agents investigate configuration/dependency/scope work; repairing agents repair their
-assigned declaration or module/API groups. Critics remain read-only and reuse current verification
-records unless there is a concrete reason for another check.
+Preparing agents investigate configuration/dependency/scope work. For an assigned configuration
+task, they edit leased configuration files in their private worktree and submit with `submit_repair`;
+the controller performs shared dependency updates, validation, builds, and integration. Use
+`request_configuration_change` when the needed files are not leased or to request added module
+coverage, renames, or Lake options. Repairing agents repair their assigned declaration or module/API
+groups. Critics remain read-only and reuse current verification records unless there is a concrete
+reason for another check.

@@ -142,6 +142,47 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             await record["task"]
             await self.controller.reap_workers()
 
+    async def test_owned_configuration_request_does_not_interrupt_worker(self):
+        tid = self.exhausted_configuration_task()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["attempts"] = 0
+        bump_tasks.claim(self.paths.forum, "Alice", tid, max_attempts=2)
+        forum.configure(self.paths.forum, self.root)
+        interrupt = asyncio.Event()
+        worker = asyncio.create_task(interrupt.wait())
+        self.controller.workers["Alice"] = {"task": worker, "task_id": tid, "interrupt": interrupt,
+                                             "tree": self.root, "agent": self.roster.primary}
+        response = forum.request_configuration_change("Alice", tid, ["lakefile.lean"],
+                                                       "update dependency", "edit lakefile")
+        self.assertEqual(response["status"], "already_assigned")
+        await self.controller.handle_requests()
+        self.assertFalse(interrupt.is_set())
+        self.assertFalse(worker.done())
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+        interrupt.set()
+        await worker
+        await self.controller.reap_workers()
+
+    async def test_startup_dispatch_waits_for_saved_configuration_request(self):
+        tid = self.exhausted_configuration_task()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["attempts"] = 1
+            state["config_requests"]["configuration-10"] = {
+                "request_id": "configuration-10", "task_id": tid, "status": "pending",
+                "files": [], "reason": "repeat", "proposed_changes": "continue", "requested_config": {}}
+        with patch.object(self.controller, "worker", new=AsyncMock()) as worker:
+            self.controller.launch_ready()  # The initial build may stream before requests are handled.
+            self.assertFalse(self.controller.workers)
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+            await self.controller.handle_requests()
+            self.controller.launch_ready()
+            record = next(iter(self.controller.workers.values()))
+            self.assertEqual(record["task_id"], tid)
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            await record["task"]
+            worker.assert_awaited_once()
+            await self.controller.reap_workers()
+
     async def test_handoff_budget_only_resets_for_new_scope(self):
         tid = self.exhausted_configuration_task()
         with bump_tasks.transaction(self.paths.forum) as state:

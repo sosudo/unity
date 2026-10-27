@@ -779,6 +779,49 @@ class WorkflowTaskTests(unittest.TestCase):
         with self.raises(ValueError):
             forum.request_configuration_change("Alice", tid, [], "reason", "change", module_renames={"A": "B"})
 
+    def test_configuration_owner_can_act_on_already_leased_files_without_handoff(self):
+        directory, _, tid, _ = prepare_environment_task(self.tmp_path)
+        root = self.tmp_path / "project"
+        forum.configure(directory, root)
+        with tasks.transaction(directory) as state:
+            state["config"].update(modules=["Existing"], lake_args=["-Kmode=dev"])
+            state["tasks"][tid]["requested_config"] = {"modules": ["Extra"], "module_renames": {"Old": "New"}}
+        tasks.claim(directory, "Alice", tid)
+        for _ in range(2):
+            response = forum.request_configuration_change("Alice", tid, ["lakefile.lean"],
+                "update dependency", "edit the leased lakefile", modules=["Extra"],
+                lake_args=["-Kmode=dev"], module_renames={"Old": "New"})
+            self.assertEqual(response["status"], "already_assigned")
+            self.assertIn("private worktree", response["guidance"])
+            self.assertIn("submit_repair", response["guidance"])
+        state = tasks.load(directory)
+        self.assertEqual(state["config_requests"], {})
+        self.assertEqual(state["tasks"][tid]["status"], "running")
+        self.assertEqual(state["tasks"][tid]["attempts"], 1)
+        self.assertEqual(len([event for event in state["events"] if event["kind"] == "configuration_already_assigned"]), 2)
+
+    def test_configuration_owner_novel_requests_and_other_authors_still_queue(self):
+        directory, _, tid, _ = prepare_environment_task(self.tmp_path)
+        root = self.tmp_path / "project"
+        forum.configure(directory, root)
+        with tasks.transaction(directory) as state:
+            state["config"].update(modules=["Existing"], lake_args=[])
+        tasks.claim(directory, "Alice", tid)
+        cases = [
+            ("Alice", ["New.lean"], {}),
+            ("Alice", ["lakefile.lean"], {"modules": ["Extra"]}),
+            ("Alice", ["lakefile.lean"], {"lake_args": ["-Kmode=dev"]}),
+            ("Alice", ["lakefile.lean"], {"project_scope": "all"}),
+            ("Alice", ["lakefile.lean"], {"module_renames": {"Existing": "New"}}),
+            ("Bob", ["lakefile.lean"], {}),
+        ]
+        for author, files, options in cases:
+            result = forum.request_configuration_change(author, tid, files, "needs coordination", "change", **options)
+            self.assertEqual(result["status"], "pending")
+        state = tasks.load(directory)
+        self.assertEqual(len(state["config_requests"]), len(cases))
+        self.assertEqual(state["tasks"][tid]["attempts"], 1)
+
     def test_configuration_request_rejects_command_override_and_scope_drop(self):
         root, directory, tid = prepare_task(self.tmp_path)
         forum.configure(directory, root)

@@ -224,6 +224,27 @@ def request_configuration_change(author: str, task_id: str, files: list[str], re
             raise ValueError("workers cannot drop required all-module build scope")
         if "modules" in requested:
             requested["modules"] = sorted(set(requested["modules"]) | set(state["config"].get("modules", [])))
+        task = state["tasks"][task_id]
+        effective = {**state["config"], **task.get("requested_config", {})}
+        effective["modules"] = sorted(set(state["config"].get("modules", [])) |
+                                      set(task.get("requested_config", {}).get("modules", [])))
+        covered_options = all(
+            (set(value) <= set(effective.get("modules", [])) if key == "modules" else
+             all(effective.get("module_renames", {}).get(old) == new for old, new in value.items())
+                 if key == "module_renames" else value == effective.get(key))
+            for key, value in requested.items())
+        owns_files = (set(checked) <= set(task["files"]) and all(
+            state["leases"].get(path, {}).get("task_id") == task_id
+            and state["leases"].get(path, {}).get("author") == author for path in checked))
+        if (task.get("kind") in {"configuration", "dependency", "scope_review"}
+                and task.get("owner") == author and task.get("status") == "running"
+                and owns_files and covered_options):
+            guidance = "Edit the leased files in your private worktree and call submit_repair."
+            tasks._event(state, "configuration_already_assigned", author, task_id=task_id,
+                         files=checked, reason=reason, proposed_changes=proposed_changes,
+                         requested_config=requested)
+            return {"status": "already_assigned", "task_id": task_id, "files": checked,
+                    "requested_config": requested, "guidance": guidance}
         key = "configuration-" + str(len(state["config_requests"]) + 1)
         row = {"request_id": key, "task_id": task_id, "author": author, "files": checked,
                "reason": reason, "proposed_changes": proposed_changes, "status": "pending",

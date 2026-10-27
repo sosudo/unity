@@ -311,6 +311,11 @@ class Controller:
         if stopped(self.paths):
             return
         state = self.state()
+        # A retained request must be reconciled before dispatch, including while
+        # the initial build streams diagnostics after a restart. Otherwise a
+        # writer can spend an attempt only to be stopped for that request.
+        if any(row.get("status") == "pending" for row in state.get("config_requests", {}).values()):
+            return
         configuration_pending = any(t["kind"] in {"configuration", "dependency", "scope_review"}
                                     and t["status"] not in {"complete", "grouped", "retired"}
                                     for t in state["tasks"].values())

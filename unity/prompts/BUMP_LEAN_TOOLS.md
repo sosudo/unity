@@ -32,8 +32,12 @@ Keep the controller-owned shared `.lake/packages` cache intact. Do not run `lake
 Use a targeted `lake build <target>` only when compiled local artifacts are needed; otherwise use
 MCP diagnostics or the permitted local fallback. Reuse successful checks of unchanged source.
 
-Preparing agents investigate configuration/dependency/scope work. Repairing agents edit leased files,
-request larger declaration/module/API assignments when needed, and submit with `submit_repair`.
+Preparing agents investigate configuration/dependency/scope work. For an assigned configuration task,
+they edit leased configuration files in their private worktree and submit with `submit_repair`; the
+controller performs shared dependency updates, validation, builds, and integration. Use
+`request_configuration_change` when the needed files are not leased or to request added module
+coverage, renames, or Lake options. Repairing agents edit leased files, request larger
+declaration/module/API assignments when needed, and submit with `submit_repair`.
 Do not weaken claims or add proof holes to make compilation pass. Critics remain read-only and reuse
 current verification records unless a concrete concern requires another check. External success
 never replaces validation in the actual local project.
