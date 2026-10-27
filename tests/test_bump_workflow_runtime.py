@@ -1140,6 +1140,78 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         snapshot["sha256"] = bump_verification.digest(snapshot)
         return snapshot
 
+    def yielded_assignment(self, *, yielded=True):
+        state = self.controller.state()
+        tid = next(tid for tid, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"] = {tid: state["tasks"][tid]}
+        self.controller.max_attempts = 5
+        bump_tasks.claim(self.paths.forum, "Alice", tid, max_attempts=5)
+        if yielded:
+            forum.configure(self.paths.forum, self.root)
+            forum.yield_task("Alice", tid, "need another perspective")
+        bump_tasks.release(self.paths.forum, "Alice", tid, "confirmed closed")
+        return tid
+
+    async def test_explicit_yield_prefers_other_available_writer_and_keeps_attempts(self):
+        tid = self.yielded_assignment()
+        self.assertEqual(self.controller.state()["tasks"][tid]["yield_handoff_from"], "Alice")
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Bob"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            await self.controller.workers["Bob"]["task"]
+            await self.controller.reap_workers()
+        self.assertTrue(any(event.get("kind") == "yield" and event.get("task_id") == tid
+                            for event in self.controller.state()["events"]))
+
+    async def test_saved_legacy_yield_still_rotates_after_same_writer_was_retried(self):
+        tid = self.yielded_assignment()
+        # Simulate the old dispatcher immediately reclaiming and stopping the
+        # same writer, leaving only the original release/yield history.
+        bump_tasks.claim(self.paths.forum, "Alice", tid, max_attempts=5)
+        bump_tasks.release(self.paths.forum, "Alice", tid, "interrupted without yield")
+        self.assertNotIn("yield_handoff_from", self.controller.state()["tasks"][tid])
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Bob"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 3)
+            await self.controller.workers["Bob"]["task"]
+            await self.controller.reap_workers()
+
+    async def test_stop_without_prior_yield_does_not_change_writer_preference(self):
+        tid = self.yielded_assignment(yielded=False)
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            await self.controller.workers["Alice"]["task"]
+            await self.controller.reap_workers()
+
+    async def test_single_writer_can_resume_explicitly_yielded_task(self):
+        tid = self.yielded_assignment()
+        self.controller.writers = [self.roster.agents[0]]
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            await self.controller.workers["Alice"]["task"]
+            await self.controller.reap_workers()
+
+    async def test_yielded_writer_waits_for_busy_teammate(self):
+        tid = self.yielded_assignment()
+        done = asyncio.Event()
+        busy = asyncio.create_task(done.wait())
+        self.controller.workers["Bob"] = {"task": busy, "task_id": "unrelated", "interrupt": asyncio.Event(),
+                                           "tree": self.root, "agent": self.roster.agents[1]}
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertNotIn("Alice", self.controller.workers)
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+        done.set()
+        await busy
+        self.controller.workers.pop("Bob")
+
     async def test_every_roster_agent_including_last_can_receive_repairs(self):
         with patch.object(self.controller, "worker", new=AsyncMock()) as worker:
             self.controller.launch_ready()

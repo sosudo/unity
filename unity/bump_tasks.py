@@ -445,6 +445,7 @@ def claim(forum_dir: Path, author: str, task_id: str, max_attempts: int = 5) -> 
         if task.get("owner") is not None:
             raise ValueError("previous writer closure must be recorded before reassignment")
         previous_yield = task.pop("yield_requested", None)
+        task.pop("yield_handoff_from", None)
         if previous_yield:
             _event(state, "yield_cleared", author, task_id=task_id, previous_yield=previous_yield)
         task.update(owner=author, status="running", attempts=task["attempts"] + 1, revision=task["revision"] + 1)
@@ -491,6 +492,8 @@ def release(forum_dir: Path, author: str, task_id: str, reason: str, closed: boo
         task["owner"] = None
         if task["status"] not in {"complete", "failed", "grouped"}: task["status"] = "pending"
         previous_yield = task.pop("yield_requested", None)
+        if previous_yield and task["status"] == "pending":
+            task["yield_handoff_from"] = author
         _event(state, "release", author, task_id=task_id, reason=reason, previous_yield=previous_yield)
         result = deepcopy(task)
     return result

@@ -310,6 +310,28 @@ class Controller:
                 log_context={"command": "bump", "run_id": state["run_id"],
                              "phase": profile, "task_id": task_id, "role": profile})
 
+    @staticmethod
+    def yield_handoff_from(state, task):
+        """Recover an unfulfilled explicit yield, including old checkpoints."""
+        if task.get("yield_handoff_from"):
+            return task["yield_handoff_from"]
+        actor = None
+        for event in reversed(state.get("events", [])):
+            if event.get("task_id") != task["task_id"]:
+                continue
+            kind, author = event.get("kind"), event.get("author")
+            if kind in {"candidate_submitted", "declaration_resolved", "orphan_revalidated"}:
+                break
+            if kind in {"claim", "release"}:
+                if actor is not None and actor != author:
+                    break
+                actor = author
+                if kind == "release" and event.get("previous_yield"):
+                    return author
+            elif kind == "yield" and actor == author:
+                return author
+        return None
+
     def launch_ready(self):
         from . import bump_tasks
         if stopped(self.paths):
@@ -338,6 +360,14 @@ class Controller:
                     continue
                 if bump_tasks.orphaned_repair(item, state["chunks"]):
                     continue
+                yielded_by = self.yield_handoff_from(state, item)
+                if yielded_by == agent.name:
+                    others = [other for other in self.writers if other.name != agent.name]
+                    # Prefer another available agent, or wait while another
+                    # owned worker is finishing. A lone roster still proceeds.
+                    if any(other.name not in self.workers and not self.agent_locks[other.name].locked()
+                           for other in others) or any(other.name in self.workers for other in others):
+                        continue
                 if any(state["tasks"].get(key, {}).get("status") not in {"complete", "clean", "merged"}
                        for key in item.get("dependencies", [])):
                     continue
