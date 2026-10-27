@@ -189,7 +189,8 @@ def request_repair_scope(author: str, task_id: str, chunk_ids: list[str], files:
 
 def request_configuration_change(author: str, task_id: str, files: list[str], reason: str,
                                  proposed_changes: str, modules: list[str] | None = None,
-                                 lake_args: list[str] | None = None, project_scope: str | None = None) -> dict:
+                                 lake_args: list[str] | None = None, project_scope: str | None = None,
+                                 module_renames: dict[str, str] | None = None) -> dict:
     """Queue changes for the controller's serialized configuration transaction."""
     author, task_id = _author(author), _task_id(task_id)
     if not reason.strip() or not proposed_changes.strip(): raise ValueError("configuration request needs rationale and proposed edits")
@@ -199,6 +200,18 @@ def request_configuration_change(author: str, task_id: str, files: list[str], re
         if any(not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_'.]*(?:\.[A-Za-z_][A-Za-z0-9_']*)*", m) for m in modules):
             raise ValueError("supplemental modules must be Lean module names")
         requested["modules"] = sorted(set(modules))
+    if module_renames is not None:
+        name = r"[A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*"
+        if (not isinstance(module_renames, dict) or any(
+                not isinstance(old, str) or not isinstance(new, str)
+                or not re.fullmatch(name, old) or not re.fullmatch(name, new) or old == new
+                for old, new in module_renames.items())
+                or len(set(module_renames.values())) != len(module_renames)
+                or bool(set(module_renames) & set(module_renames.values()))):
+            raise ValueError("module renames must be one-to-one Lean module names")
+        if module_renames and not checked:
+            raise ValueError("module renames require leased source paths")
+        requested["module_renames"] = dict(module_renames)
     if lake_args is not None:
         from ..bump_dependencies import checked_lake_args
         requested["lake_args"] = checked_lake_args(lake_args)

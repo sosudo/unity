@@ -79,7 +79,7 @@ def _local_path(root: Path, value: str, *, exists: bool = False) -> Path:
     return target
 
 
-def read_manifest(root: Path, *, required: bool = True) -> dict:
+def read_manifest(root: Path, *, required: bool = True, direct_names: frozenset[str] | None = None) -> dict:
     """Read Git or local-path packages; transitive changes are legitimate."""
     root = Path(root).resolve()
     path = root / "lake-manifest.json"
@@ -91,7 +91,7 @@ def read_manifest(root: Path, *, required: bool = True) -> dict:
     packages = data.get("packages")
     if not isinstance(packages, list):
         raise DependencyError("Lake manifest has no package list")
-    _local_path(root, data.get("packagesDir", ".lake/packages"))
+    packages_dir = _local_path(root, data.get("packagesDir", ".lake/packages"))
     seen = set()
     for row in packages:
         if not isinstance(row, dict) or not isinstance(row.get("name"), str) or not row["name"]:
@@ -108,7 +108,13 @@ def read_manifest(root: Path, *, required: bool = True) -> dict:
             if subdir:
                 _local_path(root, subdir)
         elif row.get("type") == "path":
-            _local_path(root, row.get("dir", row.get("path", "")), exists=True)
+            target = _local_path(root, row.get("dir", row.get("path", "")))
+            may_be_missing = (direct_names is not None and name not in direct_names and row.get("inherited") is True
+                              and target != packages_dir and target.is_relative_to(packages_dir)
+                              and all(not parent.exists() or parent.is_dir()
+                                      for parent in (target, *target.parents) if parent.is_relative_to(root)))
+            if not target.is_dir() and (not may_be_missing or target.exists()):
+                raise DependencyError("dependency path must be canonical, project-local and not a symlink")
         else:
             raise DependencyError("unsupported Lake dependency type")
     return data
@@ -305,13 +311,15 @@ def resolve_dependencies(root: Path, version: str, pins: dict[str, str], *, lake
                "explicit_pins": pins, "selected_releases": [], "dependency_candidates": [],
                "lake_args": list(lake_args), "rationale": "matching direct releases and their resolved transitive sets"}
     with configuration_transaction(root):
-        before = read_manifest(root, required=False)
-        receipt["before"] = before
-        old = {row["name"]: row for row in before["packages"]}
         requirements = direct_requirements(root)
         names = [row.get("name") for row in requirements]
         if len(set(names)) != len(names):
             raise DependencyError("duplicate direct dependency requirements")
+        # Only inherited packages that Lake has not fetched yet may be absent.
+        # Direct requirements must exist even if the old manifest says otherwise.
+        before = read_manifest(root, required=False, direct_names=frozenset(names))
+        receipt["before"] = before
+        old = {row["name"]: row for row in before["packages"]}
         unknown = set(pins) - (set(names) | set(old))
         if unknown:
             raise DependencyError("explicit pins name unknown dependencies: " + ", ".join(sorted(unknown)))

@@ -206,6 +206,51 @@ class ResolutionTests(SetupFixture):
         super().setUp()
         self.write("lean-toolchain", VERSION + "\n")
 
+    def test_inherited_path_is_materialized_by_update(self):
+        row = {"name": "checkdecls", "type": "path", "inherited": True,
+               "dir": ".lake/packages/Poly/vendor/checkdecls"}
+        self.manifest([row])
+        def run(root, command, **kwargs):
+            (root / row["dir"]).mkdir(parents=True)
+            return completed(command)
+        with patch.object(deps, "_run", side_effect=run):
+            result = deps.resolve_dependencies(self.root, VERSION, {})
+        self.assertEqual(result["status"], "resolved")
+
+    def test_missing_inherited_path_after_update_is_rejected(self):
+        self.manifest([{"name": "checkdecls", "type": "path", "inherited": True,
+                        "dir": ".lake/packages/Poly/vendor/checkdecls"}])
+        with patch.object(deps, "_run", return_value=completed()), self.assertRaises(deps.DependencyError):
+            deps.resolve_dependencies(self.root, VERSION, {})
+
+    def test_before_update_rejects_unsafe_or_direct_missing_paths(self):
+        cases = [
+            (".lake/packages/Poly/vendor/checkdecls", False),
+            ("vendor/checkdecls", True),
+            (".lake/packages/../escape", True),
+        ]
+        for directory, inherited in cases:
+            with self.subTest(directory=directory, inherited=inherited):
+                self.manifest([{"name": "checkdecls", "type": "path", "inherited": inherited, "dir": directory}])
+                with patch.object(deps, "_run") as run, self.assertRaises(deps.DependencyError):
+                    deps.resolve_dependencies(self.root, VERSION, {})
+                run.assert_not_called()
+        self.write("lakefile.toml", 'name = "Fixture"\n[[require]]\nname = "checkdecls"\npath = ".lake/packages/Poly/vendor/checkdecls"\n')
+        self.manifest([{"name": "checkdecls", "type": "path", "inherited": True,
+                        "dir": ".lake/packages/Poly/vendor/checkdecls"}])
+        with patch.object(deps, "_run") as run, self.assertRaises(deps.DependencyError):
+            deps.resolve_dependencies(self.root, VERSION, {})
+        run.assert_not_called()
+
+    def test_before_update_rejects_symlink_in_inherited_path(self):
+        (self.root / ".lake/packages").mkdir(parents=True)
+        (self.root / ".lake/packages/Poly").symlink_to(self.root)
+        self.manifest([{"name": "checkdecls", "type": "path", "inherited": True,
+                        "dir": ".lake/packages/Poly/vendor/checkdecls"}])
+        with patch.object(deps, "_run") as run, self.assertRaises(deps.DependencyError):
+            deps.resolve_dependencies(self.root, VERSION, {})
+        run.assert_not_called()
+
     def test_missing_manifest_resolves_exact_dependency_source_before_recursion(self):
         self.requirement()
         def run(root, command, **kwargs):

@@ -7,7 +7,7 @@ Coordinate through `forum_post` and `forum_read`, `publish_finding(author, task_
 Preparing/repairing agents also use:
 - `register_strategy(author, task_id, title, description)`, `claim_strategy`, `assist_strategy`, and `yield_task`.
 - `request_repair_scope(author, task_id, chunk_ids, files, reason, expected_revision)`: request necessary declaration/module/API grouping and file leases before editing.
-- `request_configuration_change(author, task_id, files, reason, proposed_changes, modules?, lake_args?, project_scope?)`: ask the controller for serialized configuration edits/update/validation. Optional modules add supplemental coverage; they cannot silently drop existing coverage. Supply consistent `-K` Lake arguments when needed. A scope-only request may use `files=[]`; the controller still owns the transaction. Do not change shared configuration directly.
+- `request_configuration_change(author, task_id, files, reason, proposed_changes, modules?, lake_args?, project_scope?, module_renames?)`: ask the controller for serialized configuration edits/update/validation. Optional modules add supplemental coverage; for a source move supply module_renames={old_module: new_module} and lease both source paths, so the controller can verify and transfer coverage; they cannot silently drop existing coverage. Supply consistent `-K` Lake arguments when needed. A scope-only request may use `files=[]`; the controller still owns the transaction. Do not change shared configuration directly.
 - `sync_from_main(author, task_id)`: refresh only when the controller permits the current task to synchronize.
 - `submit_repair(author, task_id, notes)`: submit useful, checked partial work; end your turn after submission so the owned session can close and integration can begin.
 

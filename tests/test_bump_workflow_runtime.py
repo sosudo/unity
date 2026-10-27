@@ -114,6 +114,163 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                  for tid, task in state["tasks"].items() if task["files"] == ["A.lean"]}
         return tasks, diagnostics[-1]
 
+    async def test_configuration_handoff_resumes_and_coalesces_saved_children(self):
+        tid = self.exhausted_configuration_task()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            parent = state["tasks"][tid]
+            parent.update(kind="configuration", worktree="/retained/worktree", attempts=5)
+            state["config_requests"][tid] = {"status": "scheduled"}
+            for n in (3, 4):
+                key = "configuration-" + str(n)
+                state["tasks"][key] = bump_tasks._task(key, "configuration", [], ["lakefile.lean"])
+                state["config_requests"][key] = {"request_id": key, "task_id": tid, "status": "scheduled",
+                    "files": ["lakefile.lean", "A.lean", "New.lean"], "reason": "rename",
+                    "proposed_changes": "move source", "requested_config": {"modules": ["A", "New"]}}
+        await self.controller.handle_requests()
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["attempts"], 0)
+        self.assertTrue({"A.lean", "New.lean"} <= set(state["tasks"][tid]["files"]))
+        self.assertEqual(state["tasks"]["configuration-3"]["grouped_into"], tid)
+        self.assertEqual(state["tasks"]["configuration-4"]["status"], "grouped")
+        self.controller.reconcile_configuration_handoffs()
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 0)
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            record = next(iter(self.controller.workers.values()))
+            self.assertEqual(record["task_id"], tid)
+            self.assertIn("/retained/worktree", self.controller.state()["tasks"][tid]["previous_worktrees"])
+            await record["task"]
+            await self.controller.reap_workers()
+
+    async def test_handoff_budget_only_resets_for_new_scope(self):
+        tid = self.exhausted_configuration_task()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["config"]["modules"] = ["A"]
+            state["tasks"][tid]["requested_config"] = {"modules": ["A"], "lake_args": []}
+        def add_request(key, options, files=()):
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["config_requests"][key] = {"request_id": key, "task_id": tid, "status": "pending",
+                    "files": list(files), "reason": "continue", "proposed_changes": "update", "requested_config": options}
+        for key, options in (("configuration-10", {"modules": ["A"], "lake_args": []}),
+                             ("configuration-11", {"lake_args": ["-Kmode=dev"]}),
+                             ("configuration-12", {"lake_args": []})):
+            add_request(key, options)
+            await self.controller.handle_requests()
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 5)
+        add_request("configuration-13", {"modules": ["A", "New"]}, ["New.lean"])
+        await self.controller.handle_requests()
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 0)
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["attempts"] = 5
+        add_request("configuration-14", {"modules": ["A", "New"]}, ["New.lean"])
+        await self.controller.handle_requests()
+        self.controller.reconcile_configuration_handoffs()
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 5)
+
+    async def test_handoff_rejects_conflicting_and_chained_renames(self):
+        tid = self.exhausted_configuration_task()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["requested_config"] = {"module_renames": {"A": "B"}}
+        for number, mapping in enumerate(({"A": "C"}, {"C": "B"}, {"B": "C"}), 10):
+            key = "configuration-" + str(number)
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["config_requests"][key] = {"request_id": key, "task_id": tid, "status": "pending",
+                    "files": ["A.lean"], "reason": "rename", "proposed_changes": "move",
+                    "requested_config": {"module_renames": mapping}}
+            await self.controller.handle_requests()
+            state = self.controller.state()
+            self.assertEqual(state["config_requests"][key]["status"], "rejected")
+            self.assertEqual(state["config_requests"][key]["requested_config"]["module_renames"], mapping)
+            self.assertEqual(state["tasks"][tid]["requested_config"]["module_renames"], {"A": "B"})
+            self.assertEqual(state["tasks"][tid]["attempts"], 5)
+
+    async def test_saved_conflicting_child_is_rejected_without_stranding_dependents(self):
+        tid = self.exhausted_configuration_task()
+        key = "configuration-10"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["config_requests"][tid] = {"status": "scheduled"}
+            state["tasks"][tid]["requested_config"] = {"module_renames": {"A": "B"}}
+            state["tasks"][key] = bump_tasks._task(key, "configuration", [], ["A.lean"])
+            state["tasks"]["dependent"] = bump_tasks._task("dependent", "repair", [], [])
+            state["tasks"]["dependent"]["dependencies"] = [key]
+            state["config_requests"][key] = {"request_id": key, "task_id": tid, "status": "scheduled",
+                "files": ["A.lean"], "reason": "rename", "proposed_changes": "move",
+                "requested_config": {"module_renames": {"A": "C"}}}
+        await self.controller.handle_requests()
+        state = self.controller.state()
+        self.assertEqual(state["config_requests"][key]["status"], "rejected")
+        self.assertEqual(state["tasks"][key]["grouped_into"], tid)
+        self.assertEqual(state["tasks"]["dependent"]["dependencies"], [tid])
+        self.assertEqual(state["tasks"][tid]["attempts"], 5)
+
+    async def test_handoff_waits_for_owner_and_submitted_candidate(self):
+        tid = self.exhausted_configuration_task()
+        key = "configuration-10"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid].update(owner="Alice", status="running")
+            state["config_requests"][key] = {"request_id": key, "task_id": tid, "status": "pending",
+                "files": ["A.lean"], "reason": "rename", "proposed_changes": "move", "requested_config": {}}
+        await self.controller.handle_requests()
+        state = self.controller.state()
+        self.assertEqual(state["config_requests"][key]["status"], "pending")
+        self.assertNotIn(key, state["tasks"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid].update(owner=None, status="pending")
+            state["candidates"]["candidate-1"] = {"task_id": tid, "status": "submitted"}
+        await self.controller.handle_requests()
+        state = self.controller.state()
+        self.assertEqual(state["config_requests"][key]["status"], "pending")
+        self.assertNotIn(key, state["tasks"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["candidates"]["candidate-1"]["status"] = "rejected"
+        await self.controller.handle_requests()
+        state = self.controller.state()
+        self.assertEqual(state["config_requests"][key]["status"], "scheduled")
+        self.assertIn("A.lean", state["tasks"][tid]["files"])
+
+    async def test_configuration_candidate_transfers_renamed_module_coverage(self):
+        (self.root / "lean-toolchain").write_text("leanprover/lean4:v4.34.1\n")
+        (self.root / "lake-manifest.json").write_text("{}\n")
+        self.git(self.root, "add", "lean-toolchain", "lake-manifest.json")
+        self.git(self.root, "commit", "-qm", "configuration fixture")
+        base = self.git(self.root, "rev-parse", "HEAD")
+        tid = "configuration-rename"
+        (self.paths.unity / "bump").mkdir(parents=True, exist_ok=True)
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["main_sha"] = base
+            state["config"].update(modules=["A"], scope=self.scope)
+            state["tasks"][tid] = {**bump_tasks._task(tid, "configuration", [], ["A.lean", "New.lean"]),
+                "requested_config": {"modules": ["A", "New"], "module_renames": {"A": "New"}}}
+        task = bump_tasks.claim(self.paths.forum, "Alice", tid)
+        tree = self.worktree(self.paths, "Alice", tid)
+        self.git(tree, "mv", "A.lean", "New.lean")
+        self.git(tree, "commit", "-qm", "rename source")
+        commit = self.git(tree, "rev-parse", "HEAD")
+        candidate = {"candidate_id": "candidate-rename", "task_id": tid, "author": "Alice",
+            "base_main_sha": base, "commit_sha": commit, "config_revision": task["config_revision"],
+            "task_revision": task["revision"], "status": "submitted"}
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["candidates"][candidate["candidate_id"]] = candidate
+            state["tasks"][tid]["status"] = "submitted"
+        scope = {**self.scope, "selected_modules": {"New": "New.lean", "B": "B.lean"}}
+        setup = {"phase": "ready", "scope": scope, "modules": ["New"], "lake_args": [], "project_scope": "build"}
+        with patch.object(bump_setup, "prepare_environment", return_value=setup) as prepare, \
+             patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+             patch.object(bump_verification, "build", return_value=self.build_result([])):
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["tasks"][tid]["requested_config"]["module_renames"] = {"A": "B"}
+            rejected = self.controller.integrate(candidate)
+            self.assertFalse(rejected["accepted"])
+            self.assertIn("move", rejected["reason"])
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["tasks"][tid]["requested_config"]["module_renames"] = {"A": "New"}
+            result = self.controller.integrate(candidate)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(prepare.call_args.kwargs["modules"], ["New"])
+        self.assertEqual(self.controller.state()["config"]["modules"], ["New"])
+        self.assertFalse((self.root / "A.lean").exists())
+        self.assertTrue((self.root / "New.lean").is_file())
+
     async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
         tid = self.exhausted_configuration_task()
         self.controller.max_attempts = 5

@@ -763,6 +763,22 @@ class WorkflowTaskTests(unittest.TestCase):
         self.assertEqual(tasks.load(directory)["config"]["lake_args"], [])
         self.assertEqual(result["status"], "pending")
 
+    def test_configuration_request_renames_are_explicit_and_one_to_one(self):
+        root, directory, tid = prepare_task(self.tmp_path)
+        forum.configure(directory, root)
+        with tasks.transaction(directory) as state:
+            state["config"]["modules"] = ["test.basic"]
+        result = forum.request_configuration_change("Alice", tid,
+            ["test/basic.lean", "HoTTLeanTest/basic.lean"], "avoid collision", "move source",
+            modules=["HoTTLeanTest.basic"], module_renames={"test.basic": "HoTTLeanTest.basic"})
+        self.assertEqual(result["requested_config"]["module_renames"], {"test.basic": "HoTTLeanTest.basic"})
+        self.assertEqual(result["requested_config"]["modules"], ["HoTTLeanTest.basic", "test.basic"])
+        for mapping in ({"A": "C", "B": "C"}, {"A": "A"}, {"invalid name": "B"}, {"A": "B", "B": "C"}):
+            with self.raises(ValueError):
+                forum.request_configuration_change("Alice", tid, ["A.lean"], "reason", "change", module_renames=mapping)
+        with self.raises(ValueError):
+            forum.request_configuration_change("Alice", tid, [], "reason", "change", module_renames={"A": "B"})
+
     def test_configuration_request_rejects_command_override_and_scope_drop(self):
         root, directory, tid = prepare_task(self.tmp_path)
         forum.configure(directory, root)

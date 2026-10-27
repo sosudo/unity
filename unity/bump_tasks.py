@@ -446,6 +446,11 @@ def configure_assignment(forum_dir: Path, author: str, task_id: str, worktree: P
     with transaction(forum_dir) as state:
         task = _owned(state, author, task_id)
         if base_main_sha != state["main_sha"]: raise ValueError("assignment base is stale")
+        previous = task.get("worktree")
+        if previous and previous != str(Path(worktree).resolve()):
+            task.setdefault("previous_worktrees", [])
+            if previous not in task["previous_worktrees"]:
+                task["previous_worktrees"].append(previous)
         task.update(worktree=str(Path(worktree).resolve()), base_main_sha=base_main_sha)
         result = deepcopy(task)
     return result

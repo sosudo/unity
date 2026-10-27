@@ -292,6 +292,10 @@ class Controller:
         instruction = (f"Your task is {task_id}. Read bump_task and bump_brief, communicate useful findings, "
                        "and work only on leased files. Submit a repair or yield with a concrete blocker. "
                        "Do not run Unity internals, edit controller state, or invoke another pipeline.")
+        previous = state["tasks"].get(task_id, {}).get("previous_worktrees", [])
+        if previous:
+            instruction += (" Earlier attempts are retained at " + ", ".join(previous) +
+                            ". Inspect and recover relevant partial work into your leased files if useful.")
         if profile == "critic":
             instruction = "As primary, review the current snapshot and full migration diff; submit_migration_verdict."
         async with self.agent_locks[agent.name]:
@@ -359,6 +363,95 @@ class Controller:
                     "Worker failed: " + type(error).__name__ if error else "Worker ended without a submitted repair", closed=True)
             self.workers.pop(author)
 
+    @staticmethod
+    def configuration_handoff_deferred(state, request):
+        parent = state["tasks"].get(request.get("task_id"))
+        if not parent or parent.get("kind") not in {"configuration", "dependency", "scope_review"}:
+            return False
+        return (bool(parent.get("owner")) or parent.get("status") in {"submitted", "merging"}
+                or any(c.get("task_id") == parent["task_id"] and c.get("status") in {"submitted", "merging"}
+                       for c in state["candidates"].values()))
+
+    def reconcile_configuration_handoffs(self):
+        """Fold queued configuration extensions into their original assignment.
+
+        Also repairs scheduled child tasks from older checkpoints. Leases and
+        submitted candidates must finish before an assignment can be changed.
+        """
+        from . import bump_tasks
+        with bump_tasks.transaction(self.paths.forum) as state:
+            for request in state.get("config_requests", {}).values():
+                if request.get("status") not in {"pending", "scheduled"}:
+                    continue
+                if request.get("scheduled_task_id") == request.get("task_id"):
+                    continue
+                # Existing first-generation assignments are independent work;
+                # only fold extensions made by a configuration assignment.
+                if (request.get("status") == "scheduled"
+                        and request.get("task_id") not in state["config_requests"]):
+                    continue
+                parent = state["tasks"].get(request.get("task_id"))
+                child = state["tasks"].get(request["request_id"])
+                if (not parent or parent.get("kind") not in {"configuration", "dependency", "scope_review"}
+                        or parent.get("owner") or parent.get("status") in {"complete", "grouped", "retired", "submitted", "merging"}
+                        or any(c.get("task_id") == parent["task_id"] and c.get("status") in {"submitted", "merging"}
+                               for c in state["candidates"].values())
+                        or (child and (child.get("owner") or child.get("status") not in {"pending", "ready", "needs_repair"}))):
+                    continue
+                old_options = parent.get("requested_config", {})
+                incoming = request.get("requested_config", {})
+                old_renames = old_options.get("module_renames", {})
+                new_renames = incoming.get("module_renames", {})
+                combined = {**old_renames, **new_renames}
+                conflict = (any(old in old_renames and old_renames[old] != new
+                                for old, new in new_renames.items())
+                            or len(set(combined.values())) != len(combined)
+                            or bool(set(combined) & set(combined.values())))
+                if conflict:
+                    request.update(status="rejected", rejection_reason="Conflicting or chained module renames")
+                    if child:
+                        child.update(status="grouped", grouped_into=parent["task_id"])
+                        for other in state["tasks"].values():
+                            if child["task_id"] in other.get("dependencies", []):
+                                other["dependencies"] = sorted((set(other["dependencies"]) - {child["task_id"]}) |
+                                                               ({parent["task_id"]} if other is not parent else set()))
+                    bump_tasks._event(state, "configuration_handoff_rejected", "controller",
+                                      request_id=request["request_id"], task_id=parent["task_id"],
+                                      reason=request["rejection_reason"])
+                    continue
+                options = {**old_options, **incoming}
+                if "modules" in old_options and "modules" in options:
+                    options["modules"] = sorted(set(old_options["modules"]) | set(options["modules"]))
+                if "module_renames" in old_options or "module_renames" in incoming:
+                    options["module_renames"] = combined
+                if old_options.get("project_scope") == "all":
+                    options["project_scope"] = "all"
+                files = sorted(set(parent["files"]) | set(request.get("files", [])) |
+                               set(child.get("files", []) if child else []))
+                # Only newly covered files, modules, or rename pairs earn a new
+                # retry budget. Reversible option changes cannot replenish it.
+                extension = (bool(set(files) - set(parent["files"]))
+                             or bool(set(options.get("modules", [])) -
+                                     (set(old_options.get("modules", [])) | set(state["config"].get("modules", []))))
+                             or bool(set(combined.items()) - set(old_renames.items())))
+                changed = files != parent["files"] or options != old_options
+                parent.update(files=files, requested_config=options,
+                              reason=request["reason"], proposed_changes=request["proposed_changes"])
+                if changed:
+                    parent["revision"] += 1
+                if extension:
+                    parent["attempts"] = 0
+                if child:
+                    child.update(status="grouped", grouped_into=parent["task_id"])
+                    for other in state["tasks"].values():
+                        if child["task_id"] in other.get("dependencies", []):
+                            other["dependencies"] = sorted((set(other["dependencies"]) - {child["task_id"]}) |
+                                                           ({parent["task_id"]} if other is not parent else set()))
+                request["status"] = "scheduled"
+                request["scheduled_task_id"] = parent["task_id"]
+                bump_tasks._event(state, "configuration_handoff", "controller", request_id=request["request_id"],
+                                  task_id=parent["task_id"], changed=changed, extension=extension)
+
     async def handle_requests(self):
         """Configuration work gets an exclusive writer and a drained environment."""
         from . import bump_tasks
@@ -369,6 +462,10 @@ class Controller:
             if requests or task.get("yield_requested"):
                 await stop_worker(record["task"], record["interrupt"])
         await self.reap_workers()
+        self.reconcile_configuration_handoffs()
+        state = self.state()
+        requests = [r for r in state.get("config_requests", {}).values()
+                    if r["status"] == "pending" and not self.configuration_handoff_deferred(state, r)]
         if requests:
             from . import bump_setup
             # A pure scope/Lake-option request needs no fabricated source patch.
@@ -629,12 +726,38 @@ class Controller:
             if applied.returncode:
                 return {"accepted": False, "reason": "Merge conflict; sync your worktree and resubmit"}
             config = {**state["config"], **task.get("requested_config", {})}
+            renames = config.pop("module_renames", {})
+            if renames:
+                selected = state["config"].get("scope", {}).get("selected_modules", {})
+                if not configuration or not set(renames) <= set(state["config"].get("modules", [])):
+                    return {"accepted": False, "reason": "Module renames must replace existing supplemental coverage"}
+                if any(old not in selected or (tree / selected[old]).exists()
+                       or selected[old] not in changed for old in renames):
+                    return {"accepted": False, "reason": "Module rename must remove the leased original source"}
+                config["modules"] = sorted((set(config["modules"]) - set(renames)) | set(renames.values()))
             if configuration:
                 setup = bump_setup.prepare_environment(tree, state["target_version"], config.get("pins", {}),
                     modules=config.get("modules", ()), project_scope=config.get("project_scope", "build"),
                     lake_args=config.get("lake_args", ()))
                 if setup.get("phase") != "ready":
                     return {"accepted": False, "reason": "Configuration still has setup blockers", "setup": setup}
+                if renames:
+                    names = git(paths.project_root, "diff", "--name-status", "--find-renames=50%", "-z",
+                                candidate["base_main_sha"], candidate["commit_sha"]).split("\0")
+                    moved = {}
+                    while names and names[0]:
+                        status, *names = names
+                        if status.startswith(("R", "C")):
+                            old_path, new_path, *names = names
+                            if status.startswith("R"):
+                                moved[old_path] = new_path
+                        else:
+                            _, *names = names
+                    for old, new in renames.items():
+                        path = setup.get("scope", {}).get("selected_modules", {}).get(new)
+                        if (not path or path not in changed or path not in task["files"]
+                                or not (tree / path).is_file() or moved.get(selected[old]) != path):
+                            return {"accepted": False, "reason": "Module rename must move its leased source to the replacement module"}
             else:
                 try:
                     scope = self.discover_scope(tree, config)
@@ -668,7 +791,12 @@ class Controller:
                                                            build, task, self.inventory(state)))
             if not result["accepted"]:
                 return {**result, "build": build}
-            git(tree, "add", "--", *changed)
+            # The patch is already staged, including removals. Re-stage only
+            # surviving paths after validation; deleted paths no longer exist in
+            # the index and git add rejects them as unknown pathspecs.
+            surviving = [path for path in changed if (tree / path).exists()]
+            if surviving:
+                git(tree, "add", "--", *surviving)
             if configuration:
                 git(tree, "add", "--", "lean-toolchain", "lake-manifest.json",
                     *[name for name in ("lakefile.lean", "lakefile.toml", "vendor") if (tree / name).exists()])
