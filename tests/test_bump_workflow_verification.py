@@ -275,6 +275,40 @@ class VerificationTests(unittest.TestCase):
         stored = v.artifacts.artifact_bytes(self.root / ".unity/artifacts", result["log_ref"]["artifact_id"])
         self.assertIn(output.encode(), stored)
 
+    def test_missing_local_source_is_mapped_only_to_exact_project_import(self):
+        module = "Project.Old.Module"
+        missing = self.root / "Project/Old/Module.lean"
+        output = (f"error: no such file or directory (error code: 2)\n  file: {missing}\n"
+                  f"error: Example.lean: bad import '{module}'\n")
+        rows = v._parse_diagnostics(output, self.root)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["kind"], "import")
+        self.assertEqual(rows[0]["path"], "Example.lean")
+        self.assertEqual(rows[0]["related_missing_files"], [str(missing)])
+        for filename in (self.root / "Project/Old/Other.lean", self.root / ".unity/Project/Old/Module.lean",
+                         self.root.parent / "Project/Old/Module.lean"):
+            with self.subTest(filename=filename):
+                unrelated = output.replace(str(missing), str(filename))
+                result = v._parse_diagnostics(unrelated, self.root)
+                unlocated = [row for row in result if row["path"] is None]
+                self.assertEqual(len(unlocated), 1)
+                self.assertIn("  file: " + str(filename), unlocated[0]["message"])
+
+    def test_missing_configuration_path_is_not_correlated_as_import(self):
+        missing = self.root / "lakefile.lean"
+        output = (f"error: no such file or directory (error code: 2)\n  file: {missing}\n"
+                  "error: Example.lean: bad import 'lakefile'\n")
+        rows = v._parse_diagnostics(output, self.root)
+        self.assertTrue(any(row["path"] is None and str(missing) in row["message"] for row in rows))
+
+    def test_missing_local_source_does_not_follow_symlink_outside_project(self):
+        (self.root / "Project").symlink_to(self.root.parent, target_is_directory=True)
+        missing = self.root / "Project/Old/Module.lean"
+        output = (f"error: no such file or directory (error code: 2)\n  file: {missing}\n"
+                  "error: Example.lean: bad import 'Project.Old.Module'\n")
+        rows = v._parse_diagnostics(output, self.root)
+        self.assertTrue(any(row["path"] is None and str(missing) in row["message"] for row in rows))
+
     def test_missing_io_is_unmapped_unless_exact_local_import_matches(self):
         module = "Mathlib.CategoryTheory.Missing"
         valid = self.root / ".lake/packages/mathlib/Mathlib/CategoryTheory/Missing.lean"

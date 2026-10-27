@@ -317,8 +317,13 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
             state["tasks"][tid]["status"] = "submitted"
         scope = {**self.scope, "selected_modules": {"New": "New.lean", "B": "B.lean"}}
         setup = {"phase": "ready", "scope": scope, "modules": ["New"], "lake_args": [], "project_scope": "build"}
-        imports = bump_verification._parse_diagnostics("error: B.lean: bad import 'Missing.Module'\n", self.root)
+        missing_source = self.root / "Missing/Module.lean"
+        imports = bump_verification._parse_diagnostics(
+            f"error: no such file or directory (error code: 2)\n  file: {missing_source}\n"
+            "error: B.lean: bad import 'Missing.Module'\n", self.root)
+        self.assertEqual(len(imports), 1)
         self.assertEqual(imports[0]["kind"], "import")
+        self.assertEqual(imports[0]["related_missing_files"], [str(missing_source)])
         with patch.object(bump_setup, "prepare_environment", return_value=setup) as prepare, \
              patch.object(bump_verification, "build", return_value=self.build_result(imports)) as build:
             with bump_tasks.transaction(self.paths.forum) as state:

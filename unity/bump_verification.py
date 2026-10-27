@@ -273,7 +273,7 @@ def _parse_diagnostics(output: str, root: Path) -> list[dict]:
     path_import = re.compile(r"^error:\s*(.+?\.lean):\s*bad import '([A-Za-z_][A-Za-z0-9_']*(?:\.[A-Za-z_][A-Za-z0-9_']*)*)'\s*$")
     missing = "error: no such file or directory (error code: 2)"
     imports = {}
-    # Lake reports the missing package file before the project import error.
+    # Lake reports missing source files before the project import error.
     # Associate only existing project sources with an explicit module name.
     for index, line in enumerate(lines):
         match = path_import.match(line)
@@ -302,9 +302,17 @@ def _parse_diagnostics(output: str, root: Path) -> list[dict]:
         except ValueError:
             continue
         parts = relative.parts
-        if len(parts) < 5 or parts[:2] != (".lake", "packages"):
+        if len(parts) >= 5 and parts[:2] == (".lake", "packages"):
+            module_file = Path(*parts[3:]).as_posix()
+        elif parts and not any(part in _RUNTIME for part in parts) and relative.as_posix() not in _CONFIG:
+            try:
+                if not filename.resolve().is_relative_to(root):
+                    continue
+            except (OSError, RuntimeError):
+                continue
+            module_file = relative.as_posix()
+        else:
             continue
-        module_file = Path(*parts[3:]).as_posix()
         matches = [i for i, (_, module) in imports.items()
                    if module_file == module.replace(".", "/") + ".lean"]
         if matches:
@@ -336,7 +344,11 @@ def _parse_diagnostics(output: str, root: Path) -> list[dict]:
                    "severity": second or first or "error", "message": message,
                    "kind": "import" if any(s in message.lower() for s in ("unknown module", "unknown package", "object file")) else "declaration"}
         elif line.startswith(("error:", "fatal error:", "PANIC", "uncaught exception")) and line.strip() not in {"error: build failed", "error: Lean exited with code 1"}:
-            row = {"path": None, "line": None, "column": None, "severity": "error", "message": line, "kind": "environment"}
+            message = line
+            if (line.strip() == missing and index + 1 < len(lines)
+                    and lines[index + 1].startswith("  file: ")):
+                message += "\n" + lines[index + 1]
+            row = {"path": None, "line": None, "column": None, "severity": "error", "message": message, "kind": "environment"}
         else:
             continue
         row["id"] = "diagnostic-" + digest(row)[:20]
