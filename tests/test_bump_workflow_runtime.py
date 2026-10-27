@@ -911,6 +911,48 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
                                              "tree": worker, "agent": self.roster.primary}
         return finished
 
+    async def test_resolved_import_merges_and_exposed_declaration_remains_open(self):
+        (self.root / "A.lean").write_text("import Old.Missing\ndef a := missingA\n")
+        self.git(self.root, "add", "A.lean")
+        self.git(self.root, "commit", "-qm", "import blocker fixture")
+        self.base = self.git(self.root, "rev-parse", "HEAD")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state.update(base_sha=self.base, main_sha=self.base, tasks={})
+        old = {"id": "old-import", "path": "A.lean", "line": None, "column": None,
+               "severity": "error", "kind": "import", "message": "bad import 'Old.Missing'"}
+        self.controller.refresh(self.build_result([old]))
+        state = self.controller.state()
+        tid = next(key for key, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        self.assertEqual(state["tasks"][tid]["kind"], "command")
+        self.assertEqual(state["tasks"][tid]["chunk_ids"], [])
+        bump_tasks.claim(self.paths.forum, "Alice", tid)
+        worker = self.worktree(self.paths, "Alice", tid)
+        bump_tasks.configure_assignment(self.paths.forum, "Alice", tid, worker, self.base)
+        (worker / "A.lean").write_text("-- fixed import\ndef a := missingA\n")
+        forum.configure(self.paths.forum, self.root)
+        candidate = forum.submit_repair("Alice", tid, "fixed import")
+        self.active_worker(tid, worker)
+        error = {**self.error("A.lean"), "line": 2, "message": "declaration still fails"}
+        import hashlib
+        result = {**self.build_result([error]), "source_identity": {"files": {
+            "A.lean": hashlib.sha256((worker / "A.lean").read_bytes()).hexdigest()}}}
+        with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+             patch.object(bump_verification, "build", return_value=result) as compiler, \
+             patch.object(self.controller, "build", new=AsyncMock(return_value=result)):
+            compiler.return_value = {**result, "source_identity": {"files": {"A.lean": "stale"}}}
+            self.assertFalse(self.controller.integrate(candidate)["accepted"])
+            compiler.return_value = result
+            self.assertTrue(await self.controller.integrate_ready())
+        state = self.controller.state()
+        self.assertEqual(state["candidates"][candidate["candidate_id"]]["status"], "merged")
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        repairs = [task for task in state["tasks"].values() if task["kind"] == "repair" and task["files"] == ["A.lean"]]
+        self.assertEqual(len(repairs), 1)
+        self.assertEqual(repairs[0]["status"], "pending")
+        self.assertEqual(repairs[0]["diagnostics"][0]["message"], "declaration still fails")
+        self.assertTrue(all(state["chunks"][cid]["status"] == "needs_repair" for cid in repairs[0]["chunk_ids"]))
+        self.assertFalse(state["leases"])
+
     async def test_useful_partial_candidate_merges_while_sibling_still_fails(self):
         tid, candidate, worker = self.submit()
         finished = self.active_worker(tid, worker)

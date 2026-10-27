@@ -628,6 +628,55 @@ class VerificationTests(unittest.TestCase):
         build = {"passed": False, "errors": [error], "checked_files": [], "unmapped": []}
         self.assertFalse(v.candidate_progress([old], build, task, inventory)["accepted"])
 
+    def test_resolved_import_with_reached_declaration_is_provisional_progress(self):
+        old = {"id": "import-old", "path": "Example.lean", "kind": "import", "severity": "error",
+               "line": None, "message": "bad import 'Old.Module'"}
+        task = {"kind": "command", "files": ["Example.lean"], "chunk_ids": []}
+        inventory = {"files": {"Example.lean": {"imports": []}},
+                     "chunks": {"c": {"path": "Example.lean", "kind": "theorem", "name": "next",
+                                        "start_line": 10, "end_line": 15}}}
+        body = {"path": "Example.lean", "kind": "declaration", "severity": "error", "line": 12,
+                "message": "newly exposed proof error"}
+        build = {"passed": False, "errors": [body], "checked_files": [], "unmapped": [], "source_stable": True}
+        result = v.candidate_progress([old], build, task, inventory, candidate_chunks=inventory["chunks"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["import_reach_evidence"]["Example.lean"]["error_line"], 12)
+        self.assertEqual(result["resolved_diagnostic_ids"], ["import-old"])
+        self.assertEqual(result["remaining_errors"], [body])
+        self.assertFalse(build["passed"])
+        # A main-checkout inventory alone cannot establish candidate reach.
+        self.assertFalse(v.candidate_progress([old], build, task, inventory)["accepted"])
+
+    def test_resolved_import_needs_real_reached_declaration_and_full_guards(self):
+        old = {"id": "import-old", "path": "Example.lean", "kind": "import", "severity": "error",
+               "line": None, "message": "bad import 'Old.Module'"}
+        task = {"kind": "command", "files": ["Example.lean"], "chunk_ids": []}
+        chunk = {"path": "Example.lean", "kind": "theorem", "name": "next", "start_line": 10, "end_line": 15}
+        inventory = {"files": {"Example.lean": {"imports": []}}, "chunks": {"c": chunk}}
+        body = {"path": "Example.lean", "kind": "declaration", "severity": "error", "line": 12,
+                "message": "newly exposed proof error"}
+        good = {"passed": False, "errors": [body], "checked_files": [], "unmapped": [], "source_stable": True}
+        cases = {
+            "disappeared_only": ({**good, "errors": []}, task, inventory, [old]),
+            "before_declaration": ({**good, "errors": [{**body, "line": 9}]}, task, inventory, [old]),
+            "after_declaration_range": ({**good, "errors": [{**body, "line": 16}]}, task, inventory, [old]),
+            "not_located": ({**good, "errors": [{**body, "line": None}]}, task, inventory, [old]),
+            "warning": ({**good, "errors": [{**body, "severity": "warning"}]}, task, inventory, [old]),
+            "import_still_blocked": ({**good, "errors": [body, old]}, task, inventory, [old]),
+            "unmapped": ({**good, "unmapped": [{"message": "I/O"}]}, task, inventory, [old]),
+            "unstable": ({**good, "source_stable": False}, task, inventory, [old]),
+            "stability_unknown": ({k:v for k,v in good.items() if k != "source_stable"}, task, inventory, [old]),
+            "excluded": (good, task, {**inventory, "chunks": {"c": {**chunk, "scope_excluded": True}}}, [old]),
+            "after_exit": (good, task, {**inventory, "chunks": {"c": {**chunk, "after_exit": True}}}, [old]),
+            "no_declaration": (good, task, {**inventory, "chunks": {}}, [old]),
+            "unrelated_regression": ({**good, "errors": [body, {**body, "path": "Other.lean"}]}, task, inventory, [old]),
+            "not_import": (good, task, inventory, [{**old, "kind": "declaration"}]),
+            "not_command": (good, {**task, "kind": "repair"}, inventory, [old]),
+        }
+        for label, (build, assignment, indexed, before) in cases.items():
+            with self.subTest(label=label):
+                self.assertFalse(v.candidate_progress(before, build, assignment, indexed, candidate_chunks=indexed["chunks"])["accepted"])
+
     def test_unreached_chunk_cannot_be_marked_repaired(self):
         old, task, inventory = self.candidate()
         build = {"passed": False, "errors": [], "checked_files": [], "unmapped": []}

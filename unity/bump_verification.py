@@ -598,7 +598,7 @@ def _diagnostic_key(row):
     return row.get("path"), row.get("kind"), row.get("message")
 
 
-def candidate_progress(before_diagnostics, after_build: dict, task: dict, inventory: dict) -> dict:
+def candidate_progress(before_diagnostics, after_build: dict, task: dict, inventory: dict, *, candidate_chunks=None) -> dict:
     before = before_diagnostics.get("diagnostics", []) if isinstance(before_diagnostics, dict) else before_diagnostics
     before = [d for d in before if d.get("severity", "error") == "error"]
     after = after_build.get("errors", [d for d in after_build.get("diagnostics", []) if d.get("severity") == "error"])
@@ -637,10 +637,38 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
         end = chunk.get("end_line", chunk.get("range", {}).get("end_line"))
         if path and end and any(d.get("path") == path and d.get("kind") != "import" and (d.get("line") or 0) >= end for d in after):
             reached.add(path)
+    import_reach = {}
+    if (not task.get("chunk_ids") and task.get("kind") in {"command", "module_repair", "imports"}
+            and after_build.get("source_stable") is True and isinstance(candidate_chunks, dict)):
+        for resolved_import in resolved:
+            path = resolved_import.get("path")
+            if resolved_import.get("kind") != "import" or path not in files:
+                continue
+            for chunk in candidate_chunks.values():
+                start, end = chunk.get("start_line"), chunk.get("end_line")
+                if (chunk.get("path") != path or chunk.get("kind") not in {
+                        "theorem", "lemma", "def", "abbrev", "opaque", "axiom", "constant", "instance",
+                        "inductive", "structure", "class", "example", "initialize"}
+                        or chunk.get("after_exit") or chunk.get("scope_excluded")
+                        or chunk.get("status") == "excluded" or str(chunk.get("name", "")).startswith("<unparsed-")
+                        or type(start) is not int or type(end) is not int or start <= 0 or end < start):
+                    continue
+                for error in after:
+                    line = error.get("line")
+                    if (error.get("path") == path and error.get("kind") == "declaration"
+                            and error.get("severity", "error") == "error" and type(line) is int
+                            and start <= line <= end):
+                        reached.add(path)
+                        import_reach[path] = {"declaration": chunk.get("name"), "start_line": start,
+                                              "end_line": end, "error_line": line}
+                        break
+                if path in import_reach:
+                    break
     eligible = after_build.get("source_stable", True) and not after_build.get("unmapped") and not (blocked & files) and not regressions
     accepted = bool(eligible and (after_build.get("passed") or (resolved and files <= reached)))
     return {"accepted": accepted, "made_progress": accepted, "resolved_diagnostic_ids": [d.get("id") for d in resolved],
             "remaining_errors": after, "regressions": regressions, "exposed_downstream_errors": exposed,
+            "import_reach_evidence": import_reach,
             "blocked_files": sorted(p for p in blocked if p),
             "reason": "checked repair with unrelated failures retained" if accepted else "no safely demonstrated repair progress",
             "qualification": "Provisional compiler progress, not final migration acceptance."}

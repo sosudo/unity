@@ -809,10 +809,28 @@ class Controller:
                                             project_root=paths.project_root)
             # A validated environment can expose ordinary Lean repair work.
             # Requiring all source to compile here deadlocks configuration fixes.
-            result = ({"accepted": bool(build.get("source_stable", True) and not build.get("unmapped")),
-                       "reason": "configuration resolved; current compiler diagnostics retained"} if configuration else
-                      bump_verification.candidate_progress(state.get("last_build", {}),
-                                                           build, task, self.inventory(state)))
+            if configuration:
+                result = {"accepted": bool(build.get("source_stable", True) and not build.get("unmapped")),
+                          "reason": "configuration resolved; current compiler diagnostics retained"}
+            else:
+                candidate_chunks = None
+                if not task.get("chunk_ids") and task.get("kind") in {"command", "module_repair", "imports"}:
+                    selected = set(scope.get("selected_modules", {}).values())
+                    sources = set(bump_setup.current_source_files(tree, scope.get("build_dir", ".lake/build")))
+                    try:
+                        scanned = bump_tasks.scan_sources(tree, sorted(set(task["files"]) & sources & selected))
+                        identity = build.get("source_identity") or {}
+                        built_files = identity.get("files", {}) if isinstance(identity, dict) else {}
+                        if not isinstance(built_files, dict):
+                            built_files = {}
+                        # The later lexical scan must describe the same bytes
+                        # that the compiler actually checked.
+                        candidate_chunks = {cid: chunk for cid, chunk in scanned["chunks"].items()
+                                            if scanned["files"][chunk["path"]]["sha256"] == built_files.get(chunk["path"])}
+                    except (ValueError, OSError):
+                        candidate_chunks = {}  # Invalid source cannot prove declaration reach.
+                result = bump_verification.candidate_progress(state.get("last_build", {}), build, task,
+                                                               self.inventory(state), candidate_chunks=candidate_chunks)
             if not result["accepted"]:
                 return {**result, "build": build}
             # The patch is already staged, including removals. Re-stage only
