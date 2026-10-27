@@ -272,13 +272,15 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
     async def test_configuration_candidate_transfers_renamed_module_coverage(self):
         (self.root / "lean-toolchain").write_text("leanprover/lean4:v4.34.1\n")
         (self.root / "lake-manifest.json").write_text("{}\n")
-        self.git(self.root, "add", "lean-toolchain", "lake-manifest.json")
+        (self.root / "A.lean").write_text("theorem inherited : True := by sorry\n")
+        self.git(self.root, "add", "lean-toolchain", "lake-manifest.json", "A.lean")
         self.git(self.root, "commit", "-qm", "configuration fixture")
         base = self.git(self.root, "rev-parse", "HEAD")
         tid = "configuration-rename"
         (self.paths.unity / "bump").mkdir(parents=True, exist_ok=True)
         with bump_tasks.transaction(self.paths.forum) as state:
             state["main_sha"] = base
+            state["base_sha"] = base
             state["config"].update(modules=["A"], scope=self.scope)
             state["tasks"][tid] = {**bump_tasks._task(tid, "configuration", [], ["A.lean", "New.lean"]),
                 "requested_config": {"modules": ["A", "New"], "module_renames": {"A": "New"}}}
@@ -298,7 +300,6 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         imports = bump_verification._parse_diagnostics("error: B.lean: bad import 'Missing.Module'\n", self.root)
         self.assertEqual(imports[0]["kind"], "import")
         with patch.object(bump_setup, "prepare_environment", return_value=setup) as prepare, \
-             patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
              patch.object(bump_verification, "build", return_value=self.build_result(imports)) as build:
             with bump_tasks.transaction(self.paths.forum) as state:
                 state["tasks"][tid]["requested_config"]["module_renames"] = {"A": "B"}
@@ -317,6 +318,9 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.controller.state()["config"]["modules"], ["New"])
         self.assertFalse((self.root / "A.lean").exists())
         self.assertTrue((self.root / "New.lean").is_file())
+        audit = bump_verification.audit_sources(self.root, base, scope)
+        self.assertTrue(audit["passed"], audit["issues"])
+        self.assertEqual(audit["inherited"][0]["baseline_path"], "A.lean")
 
     async def test_finished_failing_build_clears_exhausted_configuration_and_dispatches_repairs(self):
         tid = self.exhausted_configuration_task()

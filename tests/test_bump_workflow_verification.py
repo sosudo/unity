@@ -106,6 +106,80 @@ class VerificationTests(unittest.TestCase):
         self.assertFalse(audit["passed"])
         self.assertTrue(any(i["kind"] == "newly_skipped_declaration" for i in audit["issues"]))
 
+    def rename_fixture(self):
+        self.write("Example.lean", "axiom inherited : True\ntheorem first : True := by sorry\ntheorem second : True := by trivial\n")
+        self.git("add", "Example.lean")
+        self.git("commit", "-qm", "baseline holes")
+        base = self.git("rev-parse", "HEAD")
+        self.git("mv", "Example.lean", "Renamed.lean")
+        scope = {**self.scope, "default_modules": {"Renamed": "Renamed.lean"},
+                 "selected_modules": {"Renamed": "Renamed.lean"}}
+        return base, scope
+
+    def test_git_rename_discloses_inherited_holes_for_staged_and_committed_move(self):
+        base, scope = self.rename_fixture()
+        for committed in (False, True):
+            if committed:
+                self.git("commit", "-qm", "move module")
+            audit = v.audit_sources(self.root, base, scope)
+            self.assertTrue(audit["passed"], audit["issues"])
+            self.assertEqual(audit["renamed_files"], [{"from": "Example.lean", "to": "Renamed.lean"}])
+            self.assertEqual({row["kind"] for row in audit["inherited"]}, {"axiom", "sorry"})
+            self.assertTrue(all(row["baseline_path"] == "Example.lean" for row in audit["inherited"]))
+            self.assertEqual(audit["removed_files"], [])
+
+    def test_git_rename_does_not_hide_new_hole(self):
+        base, scope = self.rename_fixture()
+        with (self.root / "Renamed.lean").open("a") as file:
+            file.write("theorem fresh : True := by sorry\n")
+        self.git("add", "Renamed.lean")
+        audit = v.audit_sources(self.root, base, scope)
+        self.assertEqual(audit["renamed_files"], [{"from": "Example.lean", "to": "Renamed.lean"}])
+        self.assertTrue(any(item["kind"] == "introduced_sorry" for item in audit["issues"]))
+
+    def test_git_rename_does_not_hide_early_exit(self):
+        base, scope = self.rename_fixture()
+        target = self.root / "Renamed.lean"
+        target.write_text("#exit\n" + target.read_text())
+        self.git("add", "Renamed.lean")
+        audit = v.audit_sources(self.root, base, scope)
+        self.assertEqual(audit["renamed_files"], [{"from": "Example.lean", "to": "Renamed.lean"}])
+        self.assertTrue(any(item["kind"] == "newly_skipped_declaration" for item in audit["issues"]))
+
+    def test_existing_vendor_rename_cannot_hide_new_hole(self):
+        self.write("vendor/Dep/Old.lean", "theorem inherited : True := by sorry\n"
+                   "theorem safe : True := by trivial\n")
+        self.git("add", "vendor/Dep/Old.lean")
+        self.git("commit", "-qm", "baseline vendor")
+        base = self.git("rev-parse", "HEAD")
+        self.git("mv", "vendor/Dep/Old.lean", "vendor/Dep/New.lean")
+        with (self.root / "vendor/Dep/New.lean").open("a") as file:
+            file.write("theorem fresh : True := by sorry\n")
+        self.git("add", "vendor/Dep/New.lean")
+        audit = v.audit_sources(self.root, base, self.scope)
+        self.assertEqual(audit["renamed_files"], [{"from": "vendor/Dep/Old.lean", "to": "vendor/Dep/New.lean"}])
+        self.assertTrue(any(row["kind"] == "introduced_sorry" and row["path"] == "vendor/Dep/New.lean"
+                            for row in audit["issues"]))
+        self.assertTrue(any(row.get("baseline_path") == "vendor/Dep/Old.lean" for row in audit["inherited"]))
+
+    def test_git_rename_still_requires_current_scope_coverage(self):
+        base, _ = self.rename_fixture()
+        audit = v.audit_sources(self.root, base, self.scope)
+        self.assertTrue(any(item["kind"] == "unclassified_source_module" and item["path"] == "Renamed.lean"
+                            for item in audit["issues"]))
+
+    def test_copy_does_not_inherit_and_deletion_is_still_reported(self):
+        self.write("Copy.lean", (self.root / "Example.lean").read_text())
+        self.git("add", "Copy.lean")
+        scope = {**self.scope, "selected_modules": {"Example": "Example.lean", "Copy": "Copy.lean"}}
+        audit = v.audit_sources(self.root, self.base, scope)
+        self.assertEqual(audit["renamed_files"], [])
+        self.assertTrue(any(item["kind"] == "introduced_sorry" and item["path"] == "Copy.lean"
+                            for item in audit["issues"]))
+        self.git("rm", "--quiet", "-f", "Copy.lean")
+        (self.root / "Example.lean").unlink()
+        self.assertIn("Example.lean", v.audit_sources(self.root, self.base, scope)["removed_files"])
+
     def test_removed_source_not_silent(self):
         (self.root / "Example.lean").unlink()
         self.assertEqual(v.audit_sources(self.root, self.base, self.scope)["removed_files"], ["Example.lean"])

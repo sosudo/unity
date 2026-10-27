@@ -171,6 +171,23 @@ def audit_sources(root: Path, base_sha: str, scope: dict | None = None) -> dict:
     root, scope = Path(root).resolve(), scope or {}
     base_paths = _git(root, "ls-tree", "-r", "--name-only", base_sha).splitlines()
     current_files = _files(root, scope.get("build_dir", ".lake/build"))
+    # Use Git's actual baseline-to-current one-to-one rename detection. New
+    # paths must be staged or committed; copies and plain deletions do not
+    # transfer the baseline's hole identity.
+    entries = _git(root, "diff", "--name-status", "--find-renames=50%", "-z", base_sha, "--").split("\0")
+    renames = {}
+    while entries and entries[0]:
+        status, *entries = entries
+        if status.startswith(("R", "C")):
+            old, new, *entries = entries
+            if (status.startswith("R") and old.endswith(".lean") and new.endswith(".lean")
+                    and old in base_paths and old not in current_files and new in current_files
+                    and new not in base_paths and not any(part in _RUNTIME for part in Path(old).parts + Path(new).parts)
+                    and old.startswith("vendor/") == new.startswith("vendor/")):
+                renames[old] = new
+        else:
+            _, *entries = entries
+    baseline_path = {new: old for old, new in renames.items()}
     before, after, issues, removed, skipped, limitations = [], [], [], [], [], []
     before_declarations, after_declarations = {}, {}
     for path in sorted(set(base_paths) | set(current_files)):
@@ -199,14 +216,18 @@ def audit_sources(root: Path, base_sha: str, scope: dict | None = None) -> dict:
                 rows, decls = _source_tokens(file.read_text(), path, strict=False)
             after.extend(rows)
             after_declarations[path] = decls
-        elif path in base_paths:
+        elif path in base_paths and path not in renames:
             removed.append(path)
-    baseline_keys = {_token_key(row) for row in before}
+    baseline_keys = {_token_key({**row, "path": renames.get(row["path"], row["path"])}) for row in before}
     inherited = [row for row in after if _token_key(row) in baseline_keys]
+    for row in inherited:
+        if row["path"] in baseline_path:
+            row["baseline_path"] = baseline_path[row["path"]]
     # New dependency checkouts bring their own disclosed unfinished source;
     # existing vendored source is still checked for newly inserted holes.
     introduced = [row for row in after if _token_key(row) not in baseline_keys
-                  and (not row["path"].startswith("vendor/") or row["path"] in base_paths)]
+                  and (not row["path"].startswith("vendor/")
+                       or baseline_path.get(row["path"], row["path"]) in base_paths)]
     dependency_holes = [row for row in after if row["path"].startswith("vendor/")]
     issues.extend({**row, "kind": "introduced_" + row["kind"].lstrip("#"), "token": row["kind"]} for row in introduced)
     selected_paths = set(_module_paths(scope).values()) | set(_module_paths(scope, "default_modules").values())
@@ -217,8 +238,9 @@ def audit_sources(root: Path, base_sha: str, scope: dict | None = None) -> dict:
         if row["kind"] != "#exit":
             continue
         path = row["path"]
-        old_exits = [r["line"] for r in before if r["path"] == path and r["kind"] == "#exit"]
-        previously_reached = {(d["name"], d["ordinal"]) for d in before_declarations.get(path, [])
+        old_path = baseline_path.get(path, path)
+        old_exits = [r["line"] for r in before if r["path"] == old_path and r["kind"] == "#exit"]
+        previously_reached = {(d["name"], d["ordinal"]) for d in before_declarations.get(old_path, [])
                               if not old_exits or d["line"] < min(old_exits)}
         now_skipped = [d for d in after_declarations.get(path, []) if d["line"] > row["line"]]
         skipped.extend({"path": path, "name": d["name"], "line": d["line"]} for d in now_skipped)
@@ -239,7 +261,8 @@ def audit_sources(root: Path, base_sha: str, scope: dict | None = None) -> dict:
                         "selected" if row["path"] in selected_paths else "excluded_or_unselected")
     return {"passed": not issues, "baseline": before, "current": after, "inherited": inherited,
             "introduced": introduced, "dependency_holes": dependency_holes, "skipped_declarations": skipped,
-            "removed_files": removed, "excluded_files": deepcopy(excluded), "issues": issues,
+            "removed_files": removed, "renamed_files": [{"from": old, "to": new} for old, new in sorted(renames.items())],
+            "excluded_files": deepcopy(excluded), "issues": issues,
             "limitations": limitations,
             "qualification": "Source token and scope audit; not transitive axiom certification or semantic equivalence."}
 
