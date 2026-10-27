@@ -94,7 +94,19 @@ def bump_brief() -> dict:
 def bump_task(task_id: str) -> dict:
     state = tasks.load(FORUM_DIR)
     task = state["tasks"][task_id]
+    available = []
+    for cid, row in state["chunks"].items():
+        if (row["path"] not in task["files"] or row.get("scope_excluded") or row.get("after_exit")
+                or row.get("status") == "excluded"):
+            continue
+        owners = [other.get("owner") for other in state["tasks"].values()
+                  if cid in other.get("chunk_ids", []) and other.get("owner")]
+        lease_owner = state["leases"].get(row["path"], {}).get("author")
+        available.append({"chunk_id": cid, "path": row["path"], "name": row["name"],
+                          "status": row["status"], "owner": owners[0] if owners else lease_owner})
+    available.sort(key=lambda row: (row["path"], state["chunks"][row["chunk_id"]]["start_line"], row["chunk_id"]))
     return {"task": task, "chunks": [state["chunks"][cid] for cid in task["chunk_ids"] if cid in state["chunks"]],
+            "available_file_chunks": available,
             "strategies": [s for s in state["strategies"].values() if s["task_id"] == task_id]}
 
 
@@ -183,8 +195,9 @@ def yield_task(author: str, task_id: str, reason: str) -> dict:
 
 
 def request_repair_scope(author: str, task_id: str, chunk_ids: list[str], files: list[str],
-                         reason: str, expected_revision: int) -> dict:
-    return tasks.request_scope(FORUM_DIR, _author(author), _task_id(task_id), chunk_ids, files, reason, expected_revision)
+                         reason: str, expected_revision: int, include_file_chunks: bool = False) -> dict:
+    return tasks.request_scope(FORUM_DIR, _author(author), _task_id(task_id), chunk_ids, files, reason,
+                               expected_revision, include_file_chunks=include_file_chunks)
 
 
 def request_configuration_change(author: str, task_id: str, files: list[str], reason: str,

@@ -236,6 +236,77 @@ class WorkflowTaskTests(unittest.TestCase):
         with tasks.transaction(directory) as state: state["tasks"][first]["status"] = "complete"
         tasks.claim(directory, "Bob", second)
 
+    def test_file_chunk_discovery_precise_group_and_explicit_whole_file(self):
+        root, directory = setup_state(self.tmp_path)
+        write_source(root, "A.lean", "def first := missing\ndef second := missing\ndef third := missing\n#exit\ndef skipped := missing\n")
+        inventory = tasks.scan_sources(root, ["A.lean"])
+        state = tasks.refresh(directory, inventory, [diagnostic("A.lean", n) for n in (1, 2, 3)],
+                              main_sha="base", config_revision=0)
+        chunks = {row["name"]: cid for cid, row in state["chunks"].items()}
+        first = next(tid for tid, task in state["tasks"].items() if chunks["first"] in task["chunk_ids"])
+        second = next(tid for tid, task in state["tasks"].items() if chunks["second"] in task["chunk_ids"])
+        third = next(tid for tid, task in state["tasks"].items() if chunks["third"] in task["chunk_ids"])
+        with tasks.transaction(directory) as current:
+            current["tasks"][second]["attempts"] = 3
+            current["chunk_attempts"][chunks["second"]] = 3
+        assignment = tasks.claim(directory, "Alice", first)
+        forum.configure(directory, root)
+        brief = forum.bump_task(first)
+        self.assertEqual([item["name"] for item in brief["available_file_chunks"]], ["first", "second", "third"])
+        self.assertTrue(all(item["owner"] == "Alice" for item in brief["available_file_chunks"]))
+        unchanged = forum.request_repair_scope("Alice", first, [], ["A.lean"], "file lease", assignment["revision"])
+        self.assertEqual(unchanged["chunk_ids"], [chunks["first"]])
+        precise = forum.request_repair_scope("Alice", first, [chunks["second"]], [], "related declarations", unchanged["revision"])
+        self.assertEqual(set(precise["chunk_ids"]), {chunks["first"], chunks["second"]})
+        self.assertEqual(precise["attempts"], 3)
+        state = tasks.load(directory)
+        self.assertEqual(state["tasks"][second]["grouped_into"], first)
+        self.assertEqual(state["tasks"][third]["status"], "pending")
+        self.assertEqual(state["chunk_attempts"][chunks["second"]], 3)
+        grouped = forum.request_repair_scope("Alice", first, [], ["A.lean"], "whole file", precise["revision"],
+                                             include_file_chunks=True)
+        self.assertEqual(set(grouped["chunk_ids"]), {chunks["first"], chunks["second"], chunks["third"]})
+        self.assertNotIn(chunks["skipped"], grouped["chunk_ids"])
+        self.assertEqual(tasks.load(directory)["tasks"][third]["grouped_into"], first)
+
+    def test_whole_file_grouping_uses_explicit_files_and_respects_active_leases(self):
+        root, directory = setup_state(self.tmp_path)
+        write_source(root, "A.lean", "def first := missing\ndef second := 1\n")
+        write_source(root, "B.lean", "def other := missing\ndef later := 1\n")
+        state = tasks.refresh(directory, tasks.scan_sources(root, ["A.lean", "B.lean"]),
+                              [diagnostic("A.lean", 1), diagnostic("B.lean", 1)], main_sha="base", config_revision=0)
+        by_file = {task["files"][0]: tid for tid, task in state["tasks"].items()}
+        a, b = by_file["A.lean"], by_file["B.lean"]
+        assigned = tasks.claim(directory, "Alice", a)
+        tasks.claim(directory, "Bob", b)
+        forum.configure(directory, root)
+        before = tasks.load(directory)
+        with self.raises(ValueError, match="conflict"):
+            forum.request_repair_scope("Alice", a, [], ["B.lean"], "whole file", assigned["revision"], include_file_chunks=True)
+        self.assertEqual(tasks.load(directory), before)
+        with self.raises(ValueError, match="explicit files"):
+            forum.request_repair_scope("Alice", a, [], [], "whole file", assigned["revision"], include_file_chunks=True)
+        with self.raises(ValueError, match="stale"):
+            forum.request_repair_scope("Alice", a, [], ["A.lean"], "whole file", assigned["revision"] - 1, include_file_chunks=True)
+        tasks.release(directory, "Bob", b, "closed")
+        both = forum.request_repair_scope("Alice", a, [], ["B.lean"], "lease only", assigned["revision"])
+        grouped = forum.request_repair_scope("Alice", a, [], ["A.lean"], "group one file", both["revision"], include_file_chunks=True)
+        state = tasks.load(directory)
+        self.assertTrue(all(state["chunks"][cid]["path"] == "A.lean" for cid in grouped["chunk_ids"]))
+        self.assertEqual(state["leases"]["B.lean"]["author"], "Alice")
+        self.assertNotEqual(state["tasks"][b]["status"], "grouped")
+
+    def test_whole_file_grouping_excludes_scope_excluded_chunks(self):
+        root, directory, tid = prepare_task(self.tmp_path)
+        with tasks.transaction(directory) as state:
+            other = next(cid for cid in state["chunks"] if cid not in state["tasks"][tid]["chunk_ids"])
+            state["chunks"][other]["scope_excluded"] = True
+        assigned = tasks.claim(directory, "Alice", tid)
+        forum.configure(directory, root)
+        self.assertNotIn(other, {row["chunk_id"] for row in forum.bump_task(tid)["available_file_chunks"]})
+        grouped = forum.request_repair_scope("Alice", tid, [], ["A.lean"], "whole file", assigned["revision"], include_file_chunks=True)
+        self.assertNotIn(other, grouped["chunk_ids"])
+
     def test_scope_groups_module_without_resetting_budgets(self):
         tmp_path = self.tmp_path
         root, directory, first = prepare_task(tmp_path)

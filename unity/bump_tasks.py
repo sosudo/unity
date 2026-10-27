@@ -490,20 +490,28 @@ def release(forum_dir: Path, author: str, task_id: str, reason: str, closed: boo
 
 
 def request_scope(forum_dir: Path, author: str, task_id: str, chunk_ids: list[str],
-                  files: list[str], reason: str, expected_revision: int) -> dict:
+                  files: list[str], reason: str, expected_revision: int, *, include_file_chunks: bool = False) -> dict:
     if not reason.strip(): raise ValueError("scope changes require a reason")
+    if type(include_file_chunks) is not bool: raise ValueError("include_file_chunks must be boolean")
+    explicit_files = {relative_path(path) for path in files}
+    if include_file_chunks and not explicit_files: raise ValueError("whole-file grouping requires explicit files")
     with transaction(forum_dir) as state:
         task = _owned(state, author, task_id)
         if task["status"] != "running" or task["revision"] != expected_revision:
             raise ValueError("stale or submitted assignment")
         members = set(task["chunk_ids"]) | set(chunk_ids)
         if not members <= state["chunks"].keys(): raise ValueError("unknown chunk")
-        paths = sorted(set(task["files"]) | {relative_path(p) for p in files} | {state["chunks"][c]["path"] for c in members})
+        if include_file_chunks:
+            members.update(cid for cid, row in state["chunks"].items()
+                           if row["path"] in explicit_files and not row.get("scope_excluded")
+                           and not row.get("after_exit") and row.get("status") != "excluded")
+        paths = sorted(set(task["files"]) | explicit_files | {state["chunks"][c]["path"] for c in members})
         if task["kind"] not in {"configuration", "dependency", "scope_review"} and any(
             Path(p).name in {"lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json"}
             or "vendor" in Path(p).parts for p in paths):
             raise ValueError("configuration and vendored dependency edits need a controller configuration assignment")
-        if any(state["chunks"][cid].get("scope_excluded") or state["chunks"][cid].get("after_exit") for cid in members):
+        if any(state["chunks"][cid].get("scope_excluded") or state["chunks"][cid].get("after_exit")
+               or state["chunks"][cid].get("status") == "excluded" for cid in members):
             raise ValueError("changing compiled scope requires controller review")
         for path in paths:
             if path in state["leases"] and state["leases"][path]["task_id"] != task_id:
@@ -522,6 +530,9 @@ def request_scope(forum_dir: Path, author: str, task_id: str, chunk_ids: list[st
                     raise ValueError("scope conflicts with another active writer")
                 if path not in paths: paths.append(path)
             other.update(status="grouped", grouped_into=task_id)
+        if any(state["chunks"][cid].get("scope_excluded") or state["chunks"][cid].get("after_exit")
+               or state["chunks"][cid].get("status") == "excluded" for cid in members):
+            raise ValueError("changing compiled scope requires controller review")
         absorbed_ids = {other["task_id"] for other in absorbed}
         for other in state["tasks"].values():
             other["dependencies"] = sorted((set(other["dependencies"]) - absorbed_ids) |
