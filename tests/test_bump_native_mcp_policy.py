@@ -222,7 +222,7 @@ class BumpShellEnvironmentTests(unittest.TestCase):
                 self.assertEqual(config["shell_environment_policy"]["set"], self.runtime(phase))
                 self.assertEqual(config["mcp_servers"]["unity-forum"]["enabled_tools"],
                     [tool.__name__ for tool in (bump_workflow_server.PROFILE_TOOLS[phase]
-                     if phase in {"preparing", "repairing"} else bump_server.PROFILE_TOOLS[phase])])
+                     if phase in {"preparing", "repairing", "assisting"} else bump_server.PROFILE_TOOLS[phase])])
                 self.assertEqual(client.thread_start.call_args.kwargs["approval_mode"], "never")
                 client.close.assert_awaited_once()
 

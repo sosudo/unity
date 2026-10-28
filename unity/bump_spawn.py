@@ -121,6 +121,7 @@ _BUMP_MCP_ENV_KEYS = (
     "UNITY_BUMP_LAKE_ARGS",
     "UNITY_BUMP_DRAFT_PATH",
     "UNITY_BUMP_WORKER_SESSION",
+    "UNITY_BUMP_ASSISTANCE_REQUEST",
     "UNITY_AGENT_NAME",
     "TMPDIR",
     "TMP",
@@ -200,7 +201,7 @@ def _bump_codex_tool_policy(mcp_servers: dict, phase: str) -> dict[str, tuple[st
     workflow = len(forum_args) >= 2 and forum_args[:2] == ["-m", "unity.forum.bump_workflow_server"]
     # The legacy module is also a supported state-dispatching facade. Its two
     # new-only phases expose the workflow catalog even through that transport.
-    if workflow or phase in {"preparing", "repairing"}:
+    if workflow or phase in {"preparing", "repairing", "assisting"}:
         from .forum.bump_workflow_server import PROFILE_TOOLS
     else:
         from .forum.bump_server import PROFILE_TOOLS

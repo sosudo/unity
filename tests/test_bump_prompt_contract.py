@@ -10,7 +10,7 @@ from unity.forum import bump_workflow_server as server
 
 
 PROMPTS = Path(__file__).resolve().parents[1] / "unity/prompts"
-ROLES = ("PREPARING", "REPAIRING", "CRITIC", "RETROSPECTIVE")
+ROLES = ("PREPARING", "REPAIRING", "CRITIC", "RETROSPECTIVE", "ASSISTING")
 
 
 class BumpPromptContractTests(unittest.TestCase):
@@ -117,7 +117,7 @@ class BumpPromptContractTests(unittest.TestCase):
         self.assertIn("not a fresh formalization", self.phase("REPAIRING"))
 
     def test_separate_project_and_workflow_records_remain_evidence_backed(self):
-        for role in ROLES:
+        for role in (role for role in ROLES if role != "ASSISTING"):
             text = self.phase(role)
             self.assertTrue("record_workflow_change" in text or "workflow-change" in text)
         retrospective = self.phase("RETROSPECTIVE")

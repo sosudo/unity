@@ -26,7 +26,7 @@ def agent_worktree(project_path: Path, name: str) -> Path:
     return _shared.agent_worktree(project_path, _name(name))
 
 
-def create_worktree(name: str, project_path: Path) -> Path:
+def create_worktree(name: str, project_path: Path, *, base: str | None = None) -> Path:
     path = agent_worktree(project_path, name)
     branch = agent_branch(name)
     if path.exists() or path.is_symlink() or _shared._git(
@@ -35,7 +35,7 @@ def create_worktree(name: str, project_path: Path) -> Path:
         raise ValueError("existing Bump work must be recovered, not overwritten")
     _shared.ensure_git_excludes(project_path, (".worktrees", ".unity/"))
     path.parent.mkdir(parents=True, exist_ok=True)
-    _shared._git(project_path, "worktree", "add", "-b", branch, str(path), check=True)
+    _shared._git(project_path, "worktree", "add", "-b", branch, str(path), *([base] if base else []), check=True)
     link_runtime_state(path, project_path)
     return path
 

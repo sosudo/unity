@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 
 from fastmcp import FastMCP
 
@@ -18,7 +19,7 @@ from . import server as discussion
 FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
 PROFILE = "repairing"
-PROFILES = {"preparing", "repairing", "critic", "retrospective"}
+PROFILES = {"preparing", "repairing", "critic", "retrospective", "assisting"}
 _CONFIG_FILES = {"lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json"}
 
 
@@ -78,7 +79,7 @@ def bump_status() -> dict:
         "task_counts": counts, "tasks": list(state["tasks"].values()), "candidates": list(state["candidates"].values())}
 
 
-_REVIEW_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance"}
+_REVIEW_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance", "assistance_request"}
 
 
 def bump_review_context(snapshot_id: str, offset: int = 0, limit: int = 20,
@@ -207,6 +208,7 @@ def _candidate_outcomes(state: dict, task_id: str, files: list[str]) -> dict:
 
 
 def bump_task(task_id: str) -> dict:
+    if PROFILE == "assisting": _task_id(task_id)
     state = tasks.load(FORUM_DIR)
     task = state["tasks"][task_id]
     available = []
@@ -226,13 +228,13 @@ def bump_task(task_id: str) -> dict:
             "strategies": [s for s in state["strategies"].values() if s["task_id"] == task_id]}
 
 
-_TASK_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance", "yield"}
+_TASK_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance", "assistance_request", "yield"}
 
 
 def bump_task_context(task_id: str, offset: int = 0, limit: int = 20,
                       event_cutoff: int | None = None) -> dict:
     """Page collaboration reports tied to this exact Bump task."""
-    if PROFILE not in {"preparing", "repairing"}:
+    if PROFILE not in {"preparing", "repairing", "assisting"}:
         raise ValueError("task context is available only to Bump workers")
     if not isinstance(task_id, str) or not task_id.strip():
         raise ValueError("task context needs a task ID")
@@ -244,6 +246,16 @@ def bump_task_context(task_id: str, offset: int = 0, limit: int = 20,
     state = tasks.load(FORUM_DIR)
     if task_id not in state.get("tasks", {}):
         raise ValueError("unknown Bump task")
+    if PROFILE == "assisting":
+        bound = os.getenv("UNITY_BUMP_TASK_ID", "").strip()
+        cursor, seen = task_id, set()
+        while cursor != bound and cursor not in seen:
+            seen.add(cursor)
+            node = state["tasks"].get(cursor, {})
+            if node.get("status") != "grouped": break
+            cursor = node.get("grouped_into")
+        if not bound or cursor != bound:
+            raise ValueError("task context is not a grouped predecessor of the bound assignment")
     all_events = state.get("events", [])
     if event_cutoff is None:
         event_cutoff = len(all_events)
@@ -388,6 +400,70 @@ def answer_question(author: str, question_id: str, answer: str) -> dict:
     question = next((e for e in state["events"] if e["event_id"] == question_id and e["kind"] == "question"), None)
     if not question: raise ValueError("unknown question")
     return _communication("answer", author, question["task_id"], answer, question_id=question_id)
+
+
+def _assistance_current(state: dict, request: dict) -> bool:
+    task = state.get("tasks", {}).get(request.get("task_id"), {})
+    return (task.get("status") == "running" and not task.get("yield_requested")
+            and task.get("owner") == request.get("author")
+            and task.get("revision") == request.get("task_revision")
+            and task.get("attempts") == request.get("attempt")
+            and task.get("base_main_sha") == request.get("base_main_sha")
+            and task.get("config_revision") == request.get("config_revision")
+            and state.get("config", {}).get("revision") == request.get("config_revision")
+            and not any(r.get("status") == "pending" for r in state.get("config_requests", {}).values())
+            and bool(task.get("files")) and all(
+                state.get("leases", {}).get(path, {}).get("task_id") == request.get("task_id")
+                and state["leases"][path].get("author") == request.get("author")
+                and state["leases"][path].get("task_revision") == request.get("task_revision")
+                for path in task.get("files", [])))
+
+
+def request_assistance(author: str, task_id: str, question: str) -> dict:
+    """Request one bounded advisory turn for this owned assignment."""
+    if PROFILE != "repairing": raise ValueError("assistance requests require a repair worker")
+    author, task_id = _author(author), _task_id(task_id)
+    if not isinstance(question, str) or not question.strip() or len(question) > 12000:
+        raise ValueError("provide a focused question and relevant uncommitted context")
+    with tasks.transaction(FORUM_DIR) as state:
+        task = tasks._owned(state, author, task_id)
+        request = {"task_id": task_id, "author": author, "task_revision": task.get("revision"),
+                   "attempt": task.get("attempts"), "base_main_sha": task.get("base_main_sha"),
+                   "config_revision": task.get("config_revision")}
+        if not _assistance_current(state, request): raise ValueError("assignment is not eligible for assistance")
+        if any(e.get("kind") == "assistance_request" and e.get("task_id") == task_id
+               and e.get("task_revision") == task["revision"] for e in state["events"]):
+            raise ValueError("assistance already requested for this assignment")
+        event = tasks._event(state, "assistance_request", author, content=question, **{k: v for k, v in request.items() if k != "author"})
+    return event
+
+
+def artifact_read(artifact_id: str, offset: int = 0, limit: int = artifacts.DEFAULT_READ_LIMIT) -> dict:
+    """Read a bounded page of immutable Bump evidence or compacted tool output."""
+    return artifacts.read_artifact(_root() / ".unity" / "artifacts", artifact_id, offset=offset, limit=limit)
+
+
+def answer_assistance(author: str, request_id: str, answer: str) -> dict:
+    """Publish advisory findings only for the controller-assigned active request."""
+    author = _author(author)
+    if PROFILE != "assisting" or request_id != os.getenv("UNITY_BUMP_ASSISTANCE_REQUEST", ""):
+        raise ValueError("answer does not match the bound assistance request")
+    if not isinstance(answer, str) or not answer.strip() or len(answer) > 12000:
+        raise ValueError("answer must be nonempty and bounded")
+    with tasks.transaction(FORUM_DIR) as state:
+        request = next ( (e for e in state["events"] if e.get("event_id") == request_id and e.get("kind") == "assistance_request"), None)
+        started = next((e for e in state["events"] if e.get("kind") == "assistance_started" and e.get("request_id") == request_id), None)
+        if (not request or not started or started.get("helper") != author
+                or not isinstance(started.get("deadline_at"), (int, float))
+                or time.time() >= started["deadline_at"]
+                or any(e.get("kind") in {"assistance_stopping", "assistance_finished"}
+                       and e.get("request_id") == request_id for e in state["events"])
+                or _task_id(request["task_id"]) != request["task_id"]
+                or not _assistance_current(state, request)
+                or any(e.get("kind") == "answer" and e.get("question_id") == request_id for e in state["events"])):
+            raise ValueError("assistance request is no longer active or assigned")
+        result = tasks._event(state, "answer", author, task_id=request["task_id"], question_id=request_id, content=answer)
+    return result
 
 
 def yield_task(author: str, task_id: str, reason: str) -> dict:
@@ -654,9 +730,10 @@ COMMON = (bump_status, bump_brief, bump_task, forum_post, forum_read, publish_fi
 WORK = (register_strategy, claim_strategy, assist_strategy, yield_task, request_repair_scope,
         request_configuration_change, submit_repair, sync_from_main)
 TASK_CONTEXT = (bump_task_context,)
-PROFILE_TOOLS = {"preparing": COMMON + TASK_CONTEXT + WORK, "repairing": COMMON + TASK_CONTEXT + WORK,
+PROFILE_TOOLS = {"preparing": COMMON + TASK_CONTEXT + WORK, "repairing": COMMON + TASK_CONTEXT + WORK + (request_assistance,),
                  "critic": COMMON + (bump_review_context, request_review_repair, submit_migration_verdict,),
-                 "retrospective": COMMON}
+                 "retrospective": COMMON,
+                 "assisting": (bump_brief, bump_task, bump_task_context, artifact_read, answer_assistance)}
 
 
 def build_server(profile: str) -> FastMCP:

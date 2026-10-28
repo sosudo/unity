@@ -37,7 +37,7 @@ from . import server as discussion
 FORUM_DIR = Path("forum")
 PROJECT_ROOT: Path | None = None
 PROFILE = "chunking"
-PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair", "representation_review", "preparing", "repairing"}
+PROFILES = {"chunking", "formalizing", "critic", "retrospective", "source_repair", "representation_review", "preparing", "repairing", "assisting"}
 _COMPILER_WORKFLOW = False
 
 

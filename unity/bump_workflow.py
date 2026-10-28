@@ -25,6 +25,7 @@ from copy import deepcopy
 
 CONFIG_FILES = ("lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json")
 _CAPACITY_COOLDOWN_SECONDS = 60.0
+_ASSISTANCE_SECONDS = 300.0
 
 from . import artifacts, bump_jobs, bump_worktree
 from .bump_spawn import BumpProviderCapacityError, SpawnCleanupError, spawn
@@ -213,6 +214,7 @@ class Controller:
         self.ancestors = ancestors
         self.resume_checkpoint = resume_checkpoint
         self.workers = {}
+        self.helpers = {}
         self.capacity_cooldowns = {}
         self.initial_build = None
         self.build_cancel = Event()
@@ -229,7 +231,7 @@ class Controller:
         return self.capacity_cooldowns.get(author, 0) > time.monotonic()
 
     def all_available_writers_cooling(self):
-        available = [agent for agent in self.writers if agent.name not in self.workers
+        available = [agent for agent in self.writers if agent.name not in self.workers and agent.name not in self.helpers
                      and not self.agent_locks[agent.name].locked()]
         return bool(available) and all(self.capacity_cooling(agent.name) for agent in available)
 
@@ -529,6 +531,46 @@ class Controller:
                       if event.get("kind") == "claim" and event.get("task_id") == task["task_id"]}
         return min(writers, key=lambda writer: last_claim.get(writer.name, -1)).name
 
+    def writer_eligible(self, state, item, agent, *, free_helper=None):
+        """Apply the same dispatch rules when considering helper preemption."""
+        from . import bump_tasks
+        helpers = set(self.helpers) - ({free_helper} if free_helper else set())
+        if (stopped(self.paths) or any(r.get("status") == "pending" for r in state.get("config_requests", {}).values())
+                or agent.name in self.workers or agent.name in helpers
+                or (agent.name != free_helper and self.agent_locks[agent.name].locked())
+                or self.capacity_cooling(agent.name)):
+            return False
+        configuration = item.get("kind") in {"configuration", "dependency", "scope_review"}
+        configuration_pending = any(t["kind"] in {"configuration", "dependency", "scope_review"}
+                                    and t["status"] not in {"complete", "grouped", "retired"}
+                                    for t in state["tasks"].values())
+        if ((configuration and not item.get("files"))
+                or (configuration_pending and (not configuration or self.workers))
+                or item.get("status") not in {"pending", "needs_repair", "ready"}
+                or bump_tasks.orphaned_repair(item, state["chunks"])):
+            return False
+        if item.get("kind") == "command" and any(
+                not (self.paths.project_root / path).is_file() for path in item.get("files", [])):
+            return False
+        yielded_by = self.yield_handoff_from(state, item)
+        if not yielded_by:
+            preferred = self.continuation_author(state, item)
+            if (preferred and preferred != agent.name and any(w.name == preferred for w in self.writers)
+                    and preferred not in self.workers and preferred not in helpers
+                    and not self.capacity_cooling(preferred)
+                    and (preferred == free_helper or not self.agent_locks[preferred].locked())):
+                return False
+        else:
+            others = [other for other in self.writers if other.name != yielded_by]
+            idle = [other for other in others if other.name not in self.workers and other.name not in helpers
+                    and (other.name == free_helper or not self.agent_locks[other.name].locked())
+                    and not self.capacity_cooling(other.name)]
+            if idle and agent.name != self.handoff_preference(state, item, idle): return False
+            if agent.name == yielded_by and not idle and any(other.name in self.workers for other in others):
+                return False
+        return all(state["tasks"].get(key, {}).get("status") in {"complete", "clean", "merged"}
+                   for key in item.get("dependencies", []))
+
     def launch_ready(self):
         from . import bump_tasks
         if stopped(self.paths):
@@ -539,51 +581,14 @@ class Controller:
         # writer can spend an attempt only to be stopped for that request.
         if any(row.get("status") == "pending" for row in state.get("config_requests", {}).values()):
             return
-        configuration_pending = any(t["kind"] in {"configuration", "dependency", "scope_review"}
-                                    and t["status"] not in {"complete", "grouped", "retired"}
-                                    for t in state["tasks"].values())
         for agent in self.writers:
-            if (agent.name in self.workers or self.agent_locks[agent.name].locked()
+            if (agent.name in self.workers or agent.name in self.helpers or self.agent_locks[agent.name].locked()
                     or self.capacity_cooling(agent.name)):
                 continue
             ready = sorted(state["tasks"].values(), key=lambda row: (
                 row.get("kind") not in {"configuration", "dependency", "imports"}, row["task_id"]))
             for item in ready:
-                configuration = item["kind"] in {"configuration", "dependency", "scope_review"}
-                if configuration and not item.get("files"):
-                    continue
-                if configuration_pending and (not configuration or self.workers):
-                    continue
-                if item.get("status") not in {"pending", "needs_repair", "ready"}:
-                    continue
-                if bump_tasks.orphaned_repair(item, state["chunks"]):
-                    continue
-                if item.get("kind") == "command" and any(
-                        not (self.paths.project_root / path).is_file() for path in item.get("files", [])):
-                    continue  # Missing paths require controller reconciliation, never a worker lease.
-                yielded_by = self.yield_handoff_from(state, item)
-                if not yielded_by:
-                    preferred = self.continuation_author(state, item)
-                    if (preferred and preferred != agent.name
-                            and any(writer.name == preferred for writer in self.writers)
-                            and preferred not in self.workers
-                            and not self.capacity_cooling(preferred)
-                            and not self.agent_locks[preferred].locked()):
-                        continue
-                if yielded_by:
-                    others = [other for other in self.writers if other.name != yielded_by]
-                    idle_others = [other for other in others if other.name not in self.workers
-                                   and not self.agent_locks[other.name].locked()
-                                   and not self.capacity_cooling(other.name)]
-                    # Prefer another available agent, or wait while another
-                    # owned worker is finishing. A lone roster still proceeds.
-                    if idle_others and agent.name != self.handoff_preference(state, item, idle_others):
-                        continue
-                    if (agent.name == yielded_by and not idle_others
-                            and any(other.name in self.workers for other in others)):
-                        continue
-                if any(state["tasks"].get(key, {}).get("status") not in {"complete", "clean", "merged"}
-                       for key in item.get("dependencies", [])):
+                if not self.writer_eligible(state, item, agent):
                     continue
                 try:
                     assignment = bump_tasks.claim(self.paths.forum, agent.name, item["task_id"],
@@ -602,6 +607,120 @@ class Controller:
                                            "tree": tree, "agent": agent}
                 state = self.state()
                 break
+
+    async def assistance_worker(self, agent, request, tree, interrupt):
+        """A helper has no source lease or candidate authority."""
+        state = self.state()
+        system = (Path(__file__).with_name("prompts") / "bump" / "ASSISTING.md").read_text()
+        if self.paths.unity_md.is_file():
+            system += "\n\nProject-specific instructions:\n" + self.paths.unity_md.read_text()
+        system += ("\nYou are " + agent.name + ". Team: " + ", ".join(a.name for a in self.roster.agents)
+                   + ". Primary: " + self.roster.primary.name + ".")
+        instruction = (f"Help with request {request['event_id']} for task {request['task_id']}. "
+                       f"Question and supplied context: {request['content']}\n"
+                       "Read the task and its context, investigate in your private checkout, and call "
+                       "answer_assistance with actionable findings and evidence. Do not claim a repair.")
+        async with self.agent_locks[agent.name]:
+            env = runtime_env(self.paths, agent.name, request["task_id"], "assisting", state["config"],
+                              session_token=uuid.uuid4().hex)
+            env["UNITY_BUMP_ASSISTANCE_REQUEST"] = request["event_id"]
+            servers = mcp_servers(self.paths, "assisting")
+            servers = {name: servers[name] for name in ("unity-forum", "lean-lsp")}
+            return await spawn(agent, system, instruction, tree, servers,
+                own_process_group=True, interrupt_event=interrupt, mcp_profile="bump", env_overrides=env,
+                log_context={"command": "bump", "run_id": state["run_id"], "phase": "assisting",
+                             "task_id": request["task_id"], "role": "assisting"})
+
+    def launch_assistance(self):
+        from . import bump_tasks
+        from .forum.bump_workflow_server import _assistance_current
+        if stopped(self.paths): return
+        state = self.state()
+        if any(t.get("kind") in {"configuration", "dependency", "scope_review"}
+               and t.get("status") not in {"complete", "grouped", "retired"} for t in state["tasks"].values()):
+            return
+        requests = [e for e in state["events"] if e.get("kind") == "assistance_request"]
+        started = {e.get("request_id") for e in state["events"] if e.get("kind") == "assistance_started"}
+        for request in requests:
+            if request["event_id"] in started or not _assistance_current(state, request): continue
+            owner = next((a for a in self.roster.agents if a.name == request["author"]), None)
+            available = [a for a in self.roster.agents if a.name != request["author"]
+                         and a.name not in self.workers and a.name not in self.helpers
+                         and not self.agent_locks[a.name].locked() and not self.capacity_cooling(a.name)]
+            if not available: continue
+            available.sort(key=lambda a: (getattr(a, "model", None) == getattr(owner, "model", None), a.name))
+            agent = available[0]
+            with bump_tasks.transaction(self.paths.forum) as current:
+                if (not _assistance_current(current, request) or any(e.get("kind") == "assistance_started"
+                        and e.get("request_id") == request["event_id"] for e in current["events"])):
+                    continue
+                bump_tasks._event(current, "assistance_started", "controller", task_id=request["task_id"],
+                                  request_id=request["event_id"], helper=agent.name,
+                                  deadline_at=time.time() + _ASSISTANCE_SECONDS)
+            started.add(request["event_id"])
+            try:
+                base = request["base_main_sha"]
+                if not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40,64}", base):
+                    raise ValueError("invalid assistance base commit")
+                if git(self.paths.project_root, "rev-parse", "--verify", base + "^{commit}") != base:
+                    raise ValueError("assistance base commit unavailable")
+                safe = re.sub(r"[^A-Za-z0-9_-]", "_", agent.name)
+                tree = bump_worktree.create_worktree(safe + "-help-" + uuid.uuid4().hex[:12],
+                                                   self.paths.project_root, base=base)
+                bump_worktree.symlink_lake_cache(tree, self.paths.project_root)
+            except (ValueError, OSError) as exc:
+                with bump_tasks.transaction(self.paths.forum) as current:
+                    bump_tasks._event(current, "assistance_finished", "controller", task_id=request["task_id"],
+                                      request_id=request["event_id"], helper=agent.name, reason=str(exc))
+                continue
+            interrupt = asyncio.Event()
+            task = asyncio.create_task(self.assistance_worker(agent, request, tree, interrupt))
+            self.helpers[agent.name] = {"task": task, "interrupt": interrupt, "request": request,
+                                        "deadline": time.monotonic() + _ASSISTANCE_SECONDS}
+
+    async def reconcile_helpers(self, *, drain=False, preempt=False):
+        from . import bump_tasks
+        from .forum.bump_workflow_server import _assistance_current
+        state = self.state()
+        # Check dispatch and claim rules as if this one helper had finished.
+        preempt_author = None
+        if preempt:
+            for agent in self.writers:
+                if agent.name not in self.helpers or self.helpers[agent.name]["task"].done(): continue
+                for item in state["tasks"].values():
+                    try:
+                        for path in item.get("files", []): bump_tasks.relative_path(path)
+                    except ValueError:
+                        continue
+                    if (self.writer_eligible(state, item, agent, free_helper=agent.name)
+                            and item.get("status") == "pending" and item.get("owner") is None
+                            and item.get("attempts", 0) < self.max_attempts
+                            and all(state.get("chunk_attempts", {}).get(c, 0) < self.max_attempts
+                                    for c in item.get("chunk_ids", []))
+                            and not any(p in state["leases"] for p in item.get("files", []))
+                            and all(state["tasks"].get(d, {}).get("status") == "complete"
+                                    for d in item.get("dependencies", []))):
+                        preempt_author = agent.name
+                        break
+                if preempt_author: break
+        for author, record in list(self.helpers.items()):
+            task, request = record["task"], record["request"]
+            should_preempt = author == preempt_author
+            if not task.done() and (drain or stopped(self.paths) or not _assistance_current(state, request)
+                                    or time.monotonic() >= record["deadline"] or should_preempt):
+                with bump_tasks.transaction(self.paths.forum) as current:
+                    bump_tasks._event(current, "assistance_stopping", "controller", task_id=request["task_id"],
+                                      request_id=request["event_id"], helper=author)
+                await stop_worker(task, record["interrupt"])
+            if not task.done(): continue
+            error = task.exception() if not task.cancelled() else None
+            if isinstance(error, SpawnCleanupError): raise error
+            if isinstance(error, BumpProviderCapacityError): self.record_capacity(author, request["task_id"])
+            with bump_tasks.transaction(self.paths.forum) as current:
+                bump_tasks._event(current, "assistance_finished", "controller", task_id=request["task_id"],
+                                  request_id=request["event_id"], helper=author,
+                                  reason=type(error).__name__ if error else "finished or stopped")
+            self.helpers.pop(author)
 
     async def recheck_orphaned_repairs(self):
         """Recheck deleted compiler ranges without spending a model attempt."""
@@ -863,6 +982,7 @@ class Controller:
     async def handle_requests(self):
         """Configuration work gets an exclusive writer and a drained environment."""
         from . import bump_tasks
+        await self.reconcile_helpers()
         state = self.state()
         requests = [r for r in state.get("config_requests", {}).values() if r["status"] == "pending"]
         for author, record in list(self.workers.items()):
@@ -1099,6 +1219,10 @@ class Controller:
     async def drain(self):
         self.build_cancel.set()
         errors = []
+        try:
+            await self.reconcile_helpers(drain=True)
+        except SpawnCleanupError as exc:
+            errors.append(exc)
         for author, record in list(self.workers.items()):
             try:
                 await stop_worker(record["task"], record["interrupt"])
@@ -1266,6 +1390,7 @@ class Controller:
         for candidate in self.state()["candidates"].values():
             if candidate.get("status") != "submitted":
                 continue
+            await self.reconcile_helpers(drain=True)
             owners = [(name, record) for name, record in self.workers.items()
                       if record["task_id"] == candidate["task_id"]]
             configuration = self.state()["tasks"][candidate["task_id"]]["kind"] in {"configuration", "dependency", "scope_review"}
@@ -1444,6 +1569,9 @@ class Controller:
                     continue
                 await self.recheck_orphaned_repairs()
                 self.launch_ready()
+                await self.reconcile_helpers(preempt=True)
+                self.launch_ready()
+                self.launch_assistance()
                 state = self.state()
                 pending = [task for task in state["tasks"].values()
                            if task.get("status") not in {"complete", "clean", "merged", "retired", "grouped"}]
@@ -1453,6 +1581,7 @@ class Controller:
                             await asyncio.sleep(0.1)
                             continue
                         raise ValueError("Bump has blocked or exhausted repairs; inspect Forum task evidence")
+                    await self.reconcile_helpers(drain=True)
                     if await self.review():
                         return True
                 await asyncio.sleep(0.1)
