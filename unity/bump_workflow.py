@@ -302,13 +302,87 @@ class Controller:
         if profile == "critic":
             instruction = "As primary, review the current snapshot and full migration diff; submit_migration_verdict."
         async with self.agent_locks[agent.name]:
-            return await spawn(agent, system, instruction, tree,
-                mcp_servers(self.paths, profile), own_process_group=True,
-                interrupt_event=interrupt, mcp_profile="bump",
-                env_overrides=runtime_env(self.paths, agent.name, task_id, profile, state["config"],
-                                          session_token=uuid.uuid4().hex),
-                log_context={"command": "bump", "run_id": state["run_id"],
-                             "phase": profile, "task_id": task_id, "role": profile})
+            env = runtime_env(self.paths, agent.name, task_id, profile, state["config"],
+                              session_token=uuid.uuid4().hex)
+            options = {"own_process_group": True, "interrupt_event": interrupt, "mcp_profile": "bump",
+                       "env_overrides": env, "log_context": {"command": "bump", "run_id": state["run_id"],
+                       "phase": profile, "task_id": task_id, "role": profile}}
+            result = await spawn(agent, system, instruction, tree, mcp_servers(self.paths, profile), **options)
+            if profile == "critic" or stopped(self.paths) or interrupt.is_set():
+                return result
+            assignment = state["tasks"].get(task_id)
+            if not assignment:
+                return result
+            verified = self._submission_followup_needed(agent.name, task_id, tree, assignment)
+            if not verified:
+                return result
+            # The prior spawn has completed its process cleanup. A single new
+            # turn keeps the same leased tree and logical attempt, and asks the
+            # worker—not the controller—to decide whether to submit or yield.
+            from . import bump_tasks
+            with bump_tasks.transaction(self.paths.forum) as current:
+                task = current["tasks"].get(task_id, {})
+                if (stopped(self.paths) or interrupt.is_set() or task.get("owner") != agent.name
+                        or task.get("status") != "running" or task.get("yield_requested")
+                        or task.get("revision") != verified.get("revision")
+                        or task.get("base_main_sha") != assignment.get("base_main_sha")
+                        or task.get("worktree") != str(Path(tree).resolve())
+                        or task.get("config_revision") != assignment.get("config_revision")
+                        or task.get("config_revision") != current["config"]["revision"]
+                        or any(row.get("status") == "pending" for row in current.get("config_requests", {}).values())
+                        or any(current["leases"].get(path, {}).get("task_id") != task_id
+                               or current["leases"].get(path, {}).get("author") != agent.name
+                               or current["leases"].get(path, {}).get("task_revision") != task.get("revision")
+                               for path in task.get("files", []))
+                        or any(c.get("task_id") == task_id and c.get("task_revision") == task.get("revision")
+                               for c in current["candidates"].values())):
+                    return result
+                bump_tasks._event(current, "submission_followup", "controller", task_id=task_id,
+                                  worker=agent.name, worktree=str(tree))
+            if stopped(self.paths) or interrupt.is_set():
+                return result
+            instruction = (f"Your task {task_id} still has leased source edits and no submitted candidate. "
+                           "Inspect the retained private worktree. Call submit_repair and report its returned "
+                           "candidate_id, or call yield_task with a concrete blocker. Do not claim a submission "
+                           "unless the tool returns a candidate_id.")
+            followup_options = {**options, "env_overrides": {**env, "UNITY_BUMP_WORKER_SESSION": uuid.uuid4().hex}}
+            return await spawn(agent, system, instruction, tree, mcp_servers(self.paths, profile), **followup_options)
+
+    def _submission_followup_needed(self, author, task_id, tree, assignment):
+        """Only a still-owned, unchanged assignment with leased source edits qualifies."""
+        current = self.state()
+        task = current["tasks"].get(task_id, {})
+        if (task.get("owner") != author or task.get("status") != "running" or task.get("yield_requested")
+                or type(task.get("revision")) is not int or type(assignment.get("revision")) is not int
+                or task["revision"] < assignment["revision"]
+                or task.get("base_main_sha") != assignment.get("base_main_sha")
+                or task.get("config_revision") != assignment.get("config_revision")
+                or task.get("config_revision") != current["config"]["revision"]
+                or any(row.get("status") == "pending" for row in current.get("config_requests", {}).values())
+                or task.get("worktree") != str(Path(tree).resolve())
+                or any(current["leases"].get(path, {}).get("task_id") != task_id
+                       or current["leases"].get(path, {}).get("author") != author
+                       or current["leases"].get(path, {}).get("task_revision") != task["revision"]
+                       for path in task.get("files", []))
+                or any(c.get("task_id") == task_id and c.get("task_revision") == task.get("revision")
+                       for c in current["candidates"].values())):
+            return False
+        sources = {p for p in task.get("files", []) if p.endswith(".lean") and Path(p).name not in CONFIG_FILES
+                   and current["leases"].get(p, {}).get("task_id") == task_id
+                   and current["leases"].get(p, {}).get("author") == author}
+        if not sources or not task.get("base_main_sha"):
+            return False
+        changed = set()
+        commands = [("diff", "--name-only", "--no-renames", "-z", task["base_main_sha"], "HEAD"),
+                    ("diff", "--name-only", "--no-renames", "-z", "HEAD"),
+                    ("diff", "--cached", "--name-only", "--no-renames", "-z"),
+                    ("ls-files", "--others", "--exclude-standard", "-z")]
+        for command in commands:
+            result = git(tree, *command, check=False)
+            if result.returncode:
+                return False
+            changed.update(filter(None, result.stdout.split("\0")))
+        return task if sources & changed else False
 
     @staticmethod
     def yield_handoff_from(state, task):

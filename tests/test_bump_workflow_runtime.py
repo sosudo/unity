@@ -1177,6 +1177,156 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         snapshot["sha256"] = bump_verification.digest(snapshot)
         return snapshot
 
+    def submission_followup_fixture(self):
+        state = self.controller.state()
+        tid = next(key for key, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        bump_tasks.claim(self.paths.forum, "Alice", tid)
+        tree = self.worktree(self.paths, "Alice", tid)
+        bump_tasks.configure_assignment(self.paths.forum, "Alice", tid, tree, self.base)
+        forum.configure(self.paths.forum, self.root)
+        return tid, tree
+
+    async def test_one_submission_followup_keeps_attempt_tree_and_real_receipt(self):
+        tid, tree = self.submission_followup_fixture()
+        calls = []
+        async def fake_spawn(agent, system, instruction, cwd, servers, **kwargs):
+            calls.append((instruction, cwd, kwargs["env_overrides"]["UNITY_BUMP_WORKER_SESSION"]))
+            if len(calls) == 1:
+                (tree / "A.lean").write_text("def a := 1\n")
+                return "Submitted the repair"  # No tool receipt was actually created.
+            self.assertIn("submit_repair", instruction)
+            self.assertIn("candidate_id", instruction)
+            receipt = forum.submit_repair("Alice", tid, "follow-up submission")
+            return receipt["candidate_id"]
+        with patch.object(bump_workflow, "spawn", side_effect=fake_spawn):
+            answer = await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][1], calls[1][1])
+        self.assertNotEqual(calls[0][2], calls[1][2])
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["attempts"], 1)
+        self.assertEqual(state["candidates"][answer]["status"], "submitted")
+        self.assertEqual(sum(e["kind"] == "submission_followup" for e in state["events"]), 1)
+
+    async def test_followup_once_only_even_if_second_turn_does_not_submit(self):
+        tid, tree = self.submission_followup_fixture()
+        async def fake_spawn(*args, **kwargs):
+            (tree / "A.lean").write_text("def a := 1\n")
+            return "no receipt"
+        with patch.object(bump_workflow, "spawn", side_effect=fake_spawn) as spawn:
+            await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+        self.assertEqual(spawn.await_count, 2)
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "running")
+
+    async def test_followup_accepts_explicit_scope_revision_with_matching_leases(self):
+        tid, tree = self.submission_followup_fixture()
+        calls = []
+        async def fake_spawn(*args, **kwargs):
+            calls.append(True)
+            if len(calls) == 1:
+                state = self.controller.state()
+                bump_tasks.request_scope(self.paths.forum, "Alice", tid, [], ["New.lean"],
+                                         "expand source", state["tasks"][tid]["revision"])
+                (tree / "New.lean").write_text("def new := 1\n")
+            return "finished"
+        with patch.object(bump_workflow, "spawn", side_effect=fake_spawn):
+            await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+
+    async def test_failed_or_cancelled_spawn_never_triggers_followup(self):
+        tid, tree = self.submission_followup_fixture()
+        (tree / "A.lean").write_text("def a := 1\n")
+        for failure in (asyncio.CancelledError(), SpawnCleanupError("not closed")):
+            with self.subTest(error=type(failure).__name__):
+                with patch.object(bump_workflow, "spawn", side_effect=failure) as spawn:
+                    with self.assertRaises(type(failure)):
+                        await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+                    self.assertEqual(spawn.await_count, 1)
+        self.assertFalse(any(e["kind"] == "submission_followup" for e in self.controller.state()["events"]))
+
+    async def test_no_submission_followup_for_unrelated_untracked_file(self):
+        tid, tree = self.submission_followup_fixture()
+        async def fake_spawn(*args, **kwargs):
+            (tree / "Scratch.lean").write_text("def scratch := 1\n")
+            return "finished"
+        with patch.object(bump_workflow, "spawn", side_effect=fake_spawn) as spawn:
+            await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+        self.assertEqual(spawn.await_count, 1)
+        self.assertFalse(any(e["kind"] == "submission_followup" for e in self.controller.state()["events"]))
+
+    async def test_no_submission_followup_after_yield_or_submission(self):
+        tid, tree = self.submission_followup_fixture()
+        async def fake_spawn(*args, **kwargs):
+            (tree / "A.lean").write_text("def a := 1\n")
+            forum.yield_task("Alice", tid, "needs input")
+            return "yielded"
+        with patch.object(bump_workflow, "spawn", side_effect=fake_spawn) as spawn:
+            await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+        self.assertEqual(spawn.await_count, 1)
+        self.assertIsNotNone(self.controller.state()["tasks"][tid].get("yield_requested"))
+
+    async def test_no_submission_followup_after_real_receipt(self):
+        tid, tree = self.submission_followup_fixture()
+        async def fake_spawn(*args, **kwargs):
+            (tree / "A.lean").write_text("def a := 1\n")
+            return forum.submit_repair("Alice", tid, "submitted")["candidate_id"]
+        with patch.object(bump_workflow, "spawn", side_effect=fake_spawn) as spawn:
+            await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+        self.assertEqual(spawn.await_count, 1)
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "submitted")
+
+    async def test_no_submission_followup_after_stop_interrupt_or_stale_assignment(self):
+        for mode in ("stop", "interrupt", "stale", "pending_request"):
+            with self.subTest(mode=mode):
+                tid, tree = self.submission_followup_fixture()
+                interrupt = asyncio.Event()
+                async def fake_spawn(*args, **kwargs):
+                    (tree / "A.lean").write_text("def a := 1\n")
+                    if mode == "stop":
+                        (self.paths.unity / "stop-requested").touch()
+                    elif mode == "interrupt":
+                        interrupt.set()
+                    elif mode == "stale":
+                        with bump_tasks.transaction(self.paths.forum) as state:
+                            state["tasks"][tid]["revision"] += 1
+                    else:
+                        with bump_tasks.transaction(self.paths.forum) as state:
+                            state["config_requests"]["configuration-test"] = {"status": "pending"}
+                    return "finished"
+                with patch.object(bump_workflow, "spawn", side_effect=fake_spawn) as spawn:
+                    await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", interrupt)
+                self.assertEqual(spawn.await_count, 1)
+                (self.paths.unity / "stop-requested").unlink(missing_ok=True)
+                if mode == "pending_request":
+                    with bump_tasks.transaction(self.paths.forum) as state:
+                        state["config_requests"].pop("configuration-test")
+                bump_tasks.release(self.paths.forum, "Alice", tid, "test cleanup")
+
+    async def test_followup_detects_local_commit_and_staged_or_untracked_leased_source(self):
+        for mode in ("commit", "staged", "untracked"):
+            with self.subTest(mode=mode):
+                tid, tree = self.submission_followup_fixture()
+                if mode == "untracked":
+                    state = self.controller.state()
+                    bump_tasks.request_scope(self.paths.forum, "Alice", tid, [], ["New.lean"], "new source", state["tasks"][tid]["revision"])
+                calls = []
+                async def fake_spawn(*args, **kwargs):
+                    calls.append(True)
+                    if len(calls) == 1:
+                        if mode == "untracked":
+                            (tree / "New.lean").write_text("def new := 1\n")
+                        else:
+                            (tree / "A.lean").write_text("def a := 1\n")
+                            self.git(tree, "add", "A.lean")
+                            if mode == "commit": self.git(tree, "commit", "-qm", "local partial")
+                    return "finished"
+                with patch.object(bump_workflow, "spawn", side_effect=fake_spawn) as spawn:
+                    await self.controller.worker(self.roster.agents[0], tid, tree, "repairing", asyncio.Event())
+                self.assertEqual(spawn.await_count, 2)
+                bump_tasks.release(self.paths.forum, "Alice", tid, "test cleanup")
+
     def yielded_assignment(self, *, yielded=True):
         state = self.controller.state()
         tid = next(tid for tid, task in state["tasks"].items() if task["files"] == ["A.lean"])

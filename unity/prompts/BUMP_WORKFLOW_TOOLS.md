@@ -1,5 +1,7 @@
 # Compiler-driven Bump forum tools
 
+A repair is submitted only when `submit_repair` returns a `candidate_id`; report that ID in your final response. Publishing a finding alone does not submit a repair.
+
 Read `bump_brief()`, `bump_status()`, and `bump_task(task_id)` first. Status includes current configuration, tasks, candidates and the exact review snapshot. Read the supplied project/evidence files for details; bounded summaries are not complete source audits.
 
 Coordinate through `forum_post` and `forum_read`, `publish_finding(author, task_id, finding, evidence)`, `report_obstacle(author, task_id, obstacle, evidence)`, `ask_question` and `answer_question`.
