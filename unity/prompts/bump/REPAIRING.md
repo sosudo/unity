@@ -10,6 +10,8 @@ Prefer direct API migrations and explicit typed equations/projection lemmas when
 
 Use the supplied Lake arguments consistently. Request shared configuration changes through `request_configuration_change`; do not run shared `lake update` or change toolchain/dependencies yourself. Workers may test affected modules and dependent modules; compilation of every unrelated declaration is not a prerequisite to submitting useful progress.
 
+Batch known mechanical API fixes within the same leased declaration or tightly coupled proof block, and run one targeted check before submission. Submit useful partial progress when the remaining work needs a different proof strategy, fresh compiler evidence, or a scope change.
+
 Submit with `submit_repair(author, task_id, notes)`, stating what changed, exact checks/results, remaining failures and limitations. Submission records the worktree commit; it does not itself mean final acceptance. End the turn after submission so owned processes can be closed before serialized integration. Never mark a declaration clean merely because its diagnostic disappeared behind a failed import or an unreached build branch.
 
 Record evidence-backed workflow adjustments with `record_workflow_change`. Keep project changes separate from workflow changes. Final target builds, accurate source-hole/scope reporting, portable patch replay and the configured primary's review of the actual diff are controller-owned completion checks.
