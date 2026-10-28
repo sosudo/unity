@@ -294,6 +294,48 @@ def _declaration_resolution(task: dict, inventory: dict, rows: list, build: dict
     return evidence
 
 
+def _import_command_resolution(task: dict, inventory: dict, rows: list, build: dict, scope: dict) -> dict | None:
+    """Retire only a compiler-generated import task after positive body reach."""
+    files = task.get("files", [])
+    if (not build or build.get("source_stable") is not True or build.get("diagnostics") != rows
+            or build.get("unmapped") != [] or task.get("kind") != "command"
+            or task.get("status") not in {"pending", "ready", "needs_repair"}
+            or task.get("chunk_ids") or len(files) != 1 or not task.get("diagnostics")
+            or any(task.get(key) for key in ("reason", "proposed_changes", "requested_config", "grouped_review_feedback"))):
+        return None
+    path = files[0]
+    if (task.get("task_id") != "command-" + digest([path, "import"])[:16]
+            or path not in scope.get("selected_modules", {}).values()
+            or path in scope.get("excluded_files", {})
+            or any(d.get("path") != path or d.get("kind") != "import"
+                   or d.get("line") is not None or d.get("severity", "error") != "error"
+                   for d in task["diagnostics"])):
+        return None
+    source_hash = inventory.get("files", {}).get(path, {}).get("sha256")
+    if not source_hash or source_hash != (build.get("source_identity") or {}).get("files", {}).get(path):
+        return None
+    errors = [d for d in rows if d.get("severity", "error") == "error"]
+    if any(not d.get("path") or (d.get("path") == path and d.get("kind") == "import") for d in errors):
+        return None
+    for error in errors:
+        line = error.get("line")
+        if error.get("path") != path or error.get("kind") != "declaration" or type(line) is not int or line <= 0:
+            continue
+        matching = [c for c in inventory.get("chunks", {}).values()
+                    if c.get("path") == path and not c.get("after_exit") and not c.get("scope_excluded")
+                    and not c.get("scope_unclassified") and c.get("status") not in {"excluded", "skipped"}
+                    and c.get("kind") in _DECL and isinstance(c.get("name"), str) and bool(c["name"])
+                    and not any(part.startswith("<unparsed-") for part in c["name"].split("."))
+                    and type(c.get("start_line")) is int and type(c.get("end_line")) is int
+                    and 0 < c["start_line"] <= line <= c["end_line"]]
+        if len(matching) == 1:
+            chunk = matching[0]
+            return {"path": path, "chunk_id": chunk["chunk_id"], "declaration": chunk.get("name"),
+                    "start_line": chunk["start_line"], "end_line": chunk["end_line"],
+                    "error_line": line, "error_id": error.get("id")}
+    return None
+
+
 def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
             config_revision: int, checked_files=(), complete: bool = False,
             reconcile_environment: bool = False, declaration_build: dict | None = None) -> dict:
@@ -374,6 +416,20 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
                     _event(state, "declaration_resolved", "controller", task_id=tid,
                            main_sha=main_sha, config_revision=config_revision,
                            resolved_diagnostic_ids=resolved, evidence=resolution,
+                           source_sha256=declaration_build.get("source_sha256"),
+                           log_ref=deepcopy(declaration_build.get("log_ref")))
+                elif (declaration_build and not review_repair and task.get("owner") is None
+                        and not any(lease.get("task_id") == tid or path in task["files"]
+                                    for path, lease in state["leases"].items())
+                        and not any(candidate.get("task_id") == tid
+                                    and candidate.get("status") in {"submitted", "merging"}
+                                    for candidate in state["candidates"].values())
+                        and (import_reach := _import_command_resolution(
+                            task, inventory, rows, declaration_build, state["config"].get("scope", {}))) is not None):
+                    task["status"] = "complete"
+                    _event(state, "import_command_resolved", "controller", task_id=tid,
+                           main_sha=main_sha, config_revision=config_revision,
+                           diagnostics=deepcopy(task["diagnostics"]), evidence=import_reach,
                            source_sha256=declaration_build.get("source_sha256"),
                            log_ref=deepcopy(declaration_build.get("log_ref")))
                 elif (not review_repair and task["files"] and set(task["files"]) <= checked

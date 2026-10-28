@@ -95,6 +95,97 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result["source_identity"]["sha256"] = bump_verification.digest(result["source_identity"])
         return result
 
+    def stale_import_command_fixture(self):
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"] = {}
+        old = {"id": "old-import", "path": "A.lean", "line": None, "kind": "import",
+               "severity": "error", "message": "bad import 'Old'"}
+        self.controller.refresh(self.build_result([old]))
+        return "command-" + bump_tasks.digest(["A.lean", "import"])[:16], old
+
+    async def test_authoritative_body_reach_retires_import_command_keeps_repair(self):
+        tid, old = self.stale_import_command_fixture()
+        error = {**self.error("A.lean"), "id": "current-declaration"}
+        result = self.authoritative_build_result([error], checked=["B.lean"])
+        result["log_ref"] = {"artifact_id": "full-build"}
+        self.controller.refresh(result, authoritative_full_build=True)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertEqual(state["tasks"][tid]["diagnostics"], [old])
+        event = next(e for e in state["events"] if e["kind"] == "import_command_resolved")
+        self.assertEqual(event["diagnostics"], [old])
+        self.assertEqual(event["evidence"]["error_id"], "current-declaration")
+        repair = next(t for t in state["tasks"].values() if t["kind"] == "repair" and t["files"] == ["A.lean"])
+        self.assertEqual(repair["status"], "pending")
+        self.assertEqual(repair["diagnostics"], [error])
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertIn(repair["task_id"], [w["task_id"] for w in self.controller.workers.values()])
+            await asyncio.gather(*(w["task"] for w in self.controller.workers.values()))
+            await self.controller.reap_workers()
+
+    async def test_import_retirement_rejects_uncertain_or_active_obligations(self):
+        tid, old = self.stale_import_command_fixture()
+        original = deepcopy(self.controller.state())
+        error = {**self.error("A.lean"), "id": "current-declaration"}
+        good = self.authoritative_build_result([error])
+        cases = ("no_error", "stale_head", "stale_config", "stale_source", "partial_command", "unmapped",
+                 "pathless", "excluded", "mixed", "manual", "active_owner", "lease", "candidate", "merging", "unmatched")
+        for case in cases:
+            with self.subTest(case=case):
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    for key in ("tasks", "chunks", "files", "leases", "candidates", "config"):
+                        state[key] = deepcopy(original[key])
+                    if case == "mixed": state["tasks"][tid]["diagnostics"].append(error)
+                    if case == "manual": state["tasks"][tid]["reason"] = "additional requested work"
+                    if case == "active_owner": state["tasks"][tid]["owner"] = "Alice"
+                    if case == "lease": state["leases"]["A.lean"] = {"task_id": "other", "author": "Bob"}
+                    if case == "candidate": state["candidates"]["c"] = {"task_id": tid, "status": "submitted"}
+                    if case == "merging": state["candidates"]["c"] = {"task_id": tid, "status": "merging"}
+                    if case == "excluded": state["config"]["scope"]["excluded_files"]["A.lean"] = "excluded"
+                result = deepcopy(good)
+                if case == "no_error": result["diagnostics"] = result["errors"] = []
+                if case == "stale_head": result["source_identity"]["main_sha"] = "old"
+                if case == "stale_config": result["config_revision"] += 1
+                if case == "stale_source": result["source_identity"]["files"]["A.lean"] = "old"
+                if case == "partial_command": result["command"] = ["lake", "--rehash", "build", "+A"]
+                if case == "unmapped": result["unmapped"] = [{"path": None}]
+                if case == "pathless": result["diagnostics"].append({"path": None, "severity": "error", "kind": "environment"})
+                if case == "unmatched": result["diagnostics"][0]["line"] = 99
+                if case == "excluded": result["source_identity"]["scope"] = deepcopy(self.controller.state()["config"]["scope"])
+                self.controller.refresh(result, authoritative_full_build=True)
+                state = self.controller.state()
+                self.assertEqual(state["tasks"][tid]["status"], "pending")
+                self.assertEqual(state["tasks"][tid]["diagnostics"][0], old)
+
+    async def test_import_retirement_never_uses_new_bad_import_or_ambiguous_chunk(self):
+        tid, _ = self.stale_import_command_fixture()
+        before = deepcopy(self.controller.state())
+        old = {"path": "A.lean", "line": None, "kind": "import", "severity": "error", "message": "bad import"}
+        result = self.authoritative_build_result([old, self.error("A.lean")])
+        self.controller.refresh(result, authoritative_full_build=True)
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            for key in ("tasks", "chunks", "files", "leases", "candidates", "config"):
+                state[key] = deepcopy(before[key])
+        inventory = self.controller.inventory()
+        chunk = next(row for row in inventory["chunks"].values() if row["path"] == "A.lean")
+        inventory["chunks"]["ambiguous"] = {**chunk, "chunk_id": "ambiguous"}
+        with patch.object(self.controller, "inventory", return_value=inventory):
+            self.controller.refresh(self.authoritative_build_result([self.error("A.lean")]), authoritative_full_build=True)
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+
+    async def test_import_retirement_rejects_qualified_unparsed_declaration(self):
+        tid, _ = self.stale_import_command_fixture()
+        inventory = self.controller.inventory()
+        chunk = next(row for row in inventory["chunks"].values() if row["path"] == "A.lean")
+        chunk["name"] = "Some.Namespace.<unparsed-def>"
+        build = self.authoritative_build_result([self.error("A.lean")])
+        self.assertEqual(inventory["files"]["A.lean"]["sha256"], build["source_identity"]["files"]["A.lean"])
+        with patch.object(self.controller, "inventory", return_value=inventory):
+            self.controller.refresh(build, authoritative_full_build=True)
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+
     def same_file_declaration_tasks(self, *, import_b=False):
         """A helper failure also breaks its wrapper, before unrelated later work."""
         prefix = "import B\n" if import_b else ""
