@@ -2,9 +2,11 @@
 
 A repair is submitted only when `submit_repair` returns a `candidate_id`; report that ID in your final response. Publishing a finding alone does not submit a repair.
 
-Read `bump_brief()`, `bump_status()`, and `bump_task(task_id)` first. Status includes current configuration, tasks, candidates and the exact review snapshot. Read the supplied project/evidence files for details; bounded summaries are not complete source audits.
+Read `bump_brief()`, `bump_status()`, and `bump_task(task_id)` first. Status includes current configuration, tasks, candidates and the exact review snapshot. Read the supplied project/evidence files for details; bounded summaries are not complete source audits. For a repair assignment or when helping another task, read every page from `bump_task_context(task_id, offset, limit, event_cutoff)` for the requested task before retrying a previous approach. Omit `event_cutoff` on the first call, then pass the returned cutoff unchanged with each `next_offset` until it is null. This shows reports tied to that exact task, including prior findings, obstacles, questions and answers, assistance, and yield reasons. If it returns explicit `grouped_predecessor_task_ids`, read each predecessor separately using its own task ID; never infer a relationship from shared filenames. These are agent reports, not verified findings or a status ledger. Read the cited source/compiler evidence and check the current task before acting; do not repeat a reported failed approach without new evidence.
 
 Coordinate through `forum_post` and `forum_read`, `publish_finding(author, task_id, finding, evidence)`, `report_obstacle(author, task_id, obstacle, evidence)`, `ask_question` and `answer_question`.
+
+- `bump_task_context(task_id, offset?, limit?, event_cutoff?)`: read the immutable event prefix for any existing task in bounded pages. `limit` defaults to 20 and cannot exceed 50. It returns direct `grouped_into` predecessor task IDs as metadata, without merging their reports into the requested task's pages. It is read-only and reports are explicitly agent-reported context, not workflow status.
 
 Preparing/repairing agents also use:
 - `register_strategy(author, task_id, title, description)`, `claim_strategy`, `assist_strategy`, and `yield_task`.

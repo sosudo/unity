@@ -178,6 +178,72 @@ def bump_task(task_id: str) -> dict:
             "strategies": [s for s in state["strategies"].values() if s["task_id"] == task_id]}
 
 
+_TASK_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance", "yield"}
+
+
+def bump_task_context(task_id: str, offset: int = 0, limit: int = 20,
+                      event_cutoff: int | None = None) -> dict:
+    """Page collaboration reports tied to this exact Bump task."""
+    if PROFILE not in {"preparing", "repairing"}:
+        raise ValueError("task context is available only to Bump workers")
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ValueError("task context needs a task ID")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("task context offset must be a nonnegative integer")
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("task context limit must be between 1 and 50")
+
+    state = tasks.load(FORUM_DIR)
+    if task_id not in state.get("tasks", {}):
+        raise ValueError("unknown Bump task")
+    grouped_predecessor_task_ids = sorted(
+        other_id for other_id, other in state["tasks"].items()
+        if other.get("status") == "grouped" and other.get("grouped_into") == task_id
+    )
+    all_events = state.get("events", [])
+    if event_cutoff is None:
+        event_cutoff = len(all_events)
+    elif type(event_cutoff) is not int or not 0 <= event_cutoff <= len(all_events):
+        raise ValueError("task context event cutoff is invalid")
+
+    strategies = state.get("strategies", {})
+    rows = []
+    for event in all_events[:event_cutoff]:
+        if event.get("kind") not in _TASK_CONTEXT_KINDS:
+            continue
+        event_task_id = event.get("task_id")
+        if not event_task_id and event.get("kind") == "assistance":
+            event_task_id = (strategies.get(event.get("strategy_id")) or {}).get("task_id")
+        if event_task_id != task_id:
+            continue
+        rows.append({
+            "event_id": event.get("event_id"),
+            "question_id": event.get("question_id"),
+            "strategy_id": event.get("strategy_id"),
+            "task_id": task_id,
+            "author": event.get("author"),
+            "kind": event.get("kind"),
+            "content": event.get("content", event.get("contribution", "")),
+            "evidence": event.get("evidence", ""),
+            "reason": event.get("reason", ""),
+            "at": event.get("at"),
+        })
+
+    page = rows[offset:offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < len(rows) else None
+    return {
+        "task_id": task_id,
+        "grouped_predecessor_task_ids": grouped_predecessor_task_ids,
+        "event_cutoff": event_cutoff,
+        "offset": offset,
+        "limit": limit,
+        "total": len(rows),
+        "next_offset": next_offset,
+        "items": page,
+        "qualification": "Agent-reported task context, not verified findings or workflow status.",
+    }
+
+
 def forum_post(thread_id: str, author: str, content: str, reply_to: list[str] | None = None) -> dict:
     author = _author(author)
     tid = _thread(thread_id)
@@ -514,7 +580,8 @@ COMMON = (bump_status, bump_brief, bump_task, forum_post, forum_read, publish_fi
           report_obstacle, ask_question, answer_question, record_workflow_change)
 WORK = (register_strategy, claim_strategy, assist_strategy, yield_task, request_repair_scope,
         request_configuration_change, submit_repair, sync_from_main)
-PROFILE_TOOLS = {"preparing": COMMON + WORK, "repairing": COMMON + WORK,
+TASK_CONTEXT = (bump_task_context,)
+PROFILE_TOOLS = {"preparing": COMMON + TASK_CONTEXT + WORK, "repairing": COMMON + TASK_CONTEXT + WORK,
                  "critic": COMMON + (bump_review_context, request_review_repair, submit_migration_verdict,),
                  "retrospective": COMMON}
 
