@@ -42,6 +42,60 @@ def git(root, *args, check=True, input=None):
     return result.stdout.strip() if check else result
 
 
+def accepted_rename_paths(root, state, task):
+    """Find a recorded, integrated Git move for an obsolete command task."""
+    if task.get("kind") != "command" or task.get("chunk_ids"):
+        return {}
+    selected = state["config"].get("scope", {}).get("selected_modules", {})
+    missing = {path for path in task.get("files", []) if not (root / path).is_file()}
+    if not missing:
+        return {}
+    aliases = {}
+    for candidate in state.get("candidates", {}).values():
+        parent = state["tasks"].get(candidate.get("task_id"), {})
+        merged = candidate.get("merged_sha")
+        if (candidate.get("status") != "merged" or not merged
+                or parent.get("kind") not in {"configuration", "dependency", "scope_review"}
+                or parent.get("revision") != candidate.get("task_revision")
+                or git(root, "merge-base", "--is-ancestor", merged, state["main_sha"], check=False).returncode):
+            continue
+        mapping = parent.get("requested_config", {}).get("module_renames", {})
+        if not isinstance(mapping, dict):
+            continue
+        diff = git(root, "diff", "--name-status", "--find-renames=50%", "-z",
+                   merged + "^", merged, check=False)
+        if diff.returncode:
+            continue
+        entries = iter(diff.stdout.split("\0"))
+        moves = {}
+        try:
+            for status in entries:
+                if not status:
+                    break
+                old = next(entries)
+                if status.startswith(("R", "C")):
+                    new = next(entries)
+                    if status.startswith("R"):
+                        moves[old] = new
+        except StopIteration:
+            continue
+        for old, new in mapping.items():
+            if not isinstance(old, str) or not isinstance(new, str):
+                continue
+            old_path = old.replace(".", "/") + ".lean"
+            new_path = selected.get(new)
+            if (old_path in missing and new_path and new_path in task["files"]
+                    and moves.get(old_path) == new_path and (root / new_path).is_file()):
+                evidence = {"path": new_path, "candidate_id": candidate["candidate_id"],
+                            "merged_sha": merged, "old_module": old, "new_module": new}
+                if old_path in aliases and aliases[old_path] != evidence:
+                    return {}
+                aliases[old_path] = evidence
+    if len({item["path"] for item in aliases.values()}) != len(aliases):
+        return {}
+    return aliases if set(aliases) == missing else {}
+
+
 def write_json(path, value):
     artifacts._atomic_write(Path(path), (json.dumps(value, sort_keys=True, indent=2) + "\n").encode())
 
@@ -434,6 +488,9 @@ class Controller:
                     continue
                 if bump_tasks.orphaned_repair(item, state["chunks"]):
                     continue
+                if item.get("kind") == "command" and any(
+                        not (self.paths.project_root / path).is_file() for path in item.get("files", [])):
+                    continue  # Missing paths require controller reconciliation, never a worker lease.
                 yielded_by = self.yield_handoff_from(state, item)
                 if yielded_by == agent.name:
                     others = [other for other in self.writers if other.name != agent.name]
@@ -470,7 +527,11 @@ class Controller:
         scope = state["config"].get("scope", {})
         selected = scope.get("selected_modules", {})
         for tid, task in sorted(state["tasks"].items()):
-            if (not bump_tasks.orphaned_repair(task, state["chunks"]) or task.get("owner")
+            if task.get("status") not in {"pending", "ready", "needs_repair", "blocked"}:
+                continue
+            aliases = accepted_rename_paths(self.paths.project_root, state, task)
+            renamed = bool(aliases)
+            if ((not renamed and not bump_tasks.orphaned_repair(task, state["chunks"])) or task.get("owner")
                     or task.get("status") not in {"pending", "ready", "needs_repair", "blocked"}
                     or any(task.get(key) for key in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
                     or not task.get("diagnostics") or any(d.get("kind") not in {None, "declaration", "import"}
@@ -482,7 +543,7 @@ class Controller:
                     or any(c.get("task_id") == tid and c.get("status") in {"submitted", "merging"}
                            for c in state["candidates"].values())):
                 continue
-            files = set(task["files"])
+            files = {aliases.get(path, {}).get("path", path) for path in task["files"]}
             modules = sorted(name for name, path in selected.items() if path in files)
             if not files or {selected[name] for name in modules} != files:
                 continue
@@ -490,10 +551,12 @@ class Controller:
                 scanned = bump_tasks.scan_sources(self.paths.project_root, sorted(files))
             except (OSError, ValueError):
                 continue
-            if any(cid in scanned["chunks"] for cid in task["chunk_ids"]):
+            if not renamed and any(cid in scanned["chunks"] for cid in task["chunk_ids"]):
                 continue  # An incomplete inventory is not evidence of removal.
             source_hashes = {path: row["sha256"] for path, row in scanned["files"].items()}
             key = (tuple(sorted(files)), state["main_sha"], state["config"]["revision"], tuple(sorted(source_hashes.items())))
+            if renamed:
+                key = ("renamed_command", tid, bump_tasks.digest(aliases), *key)
             if key in self.orphan_checks:
                 continue
             self.orphan_checks.add(key)
@@ -516,6 +579,23 @@ class Controller:
                     and not any(row.get("path") in files or not row.get("path") for row in errors)):
                 with bump_tasks.transaction(self.paths.forum) as fresh:
                     if fresh["main_sha"] == state["main_sha"] and fresh["config"]["revision"] == state["config"]["revision"]:
+                        if renamed:
+                            target = fresh["tasks"].get(tid)
+                            provenance_unchanged = all(
+                                fresh["candidates"].get(item["candidate_id"]) == state["candidates"].get(item["candidate_id"])
+                                and fresh["tasks"].get(state["candidates"][item["candidate_id"]]["task_id"])
+                                    == state["tasks"].get(state["candidates"][item["candidate_id"]]["task_id"])
+                                for item in aliases.values())
+                            if (target == task and provenance_unchanged
+                                    and not any(lease.get("task_id") == tid or path in task["files"]
+                                    for path, lease in fresh["leases"].items())
+                                    and not any(c.get("task_id") == tid and c.get("status") in {"submitted", "merging"}
+                                                for c in fresh["candidates"].values())):
+                                target["status"] = "complete"
+                                bump_tasks._event(fresh, "renamed_command_revalidated", "controller", task_id=tid,
+                                    main_sha=state["main_sha"], config_revision=state["config"]["revision"],
+                                    aliases=deepcopy(aliases), diagnostics=deepcopy(task["diagnostics"]),
+                                    modules=modules, source_sha256=source_hashes, log_ref=deepcopy(result.get("log_ref")))
                         for target_id, target in fresh["tasks"].items():
                             if (set(target.get("files", [])) != files or target.get("owner")
                                     or target.get("status") not in {"pending", "ready", "needs_repair", "blocked"}

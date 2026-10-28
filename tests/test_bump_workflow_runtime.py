@@ -480,6 +480,152 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result["log_ref"] = {"artifact_id": "targeted-orphan-log"}
         return result
 
+    def renamed_command_fixture(self):
+        self.git(self.root, "mv", "A.lean", "New.lean")
+        self.git(self.root, "commit", "-qm", "accepted module rename")
+        merged = self.git(self.root, "rev-parse", "HEAD")
+        self.scope["selected_modules"] = {"New": "New.lean", "B": "B.lean"}
+        self.scope["default_modules"] = {"New": "New.lean", "B": "B.lean"}
+        old = "command-old-import"
+        current = "command-new-import"
+        diagnostic = {"id": "old-import", "path": "A.lean", "kind": "import", "line": None,
+                      "severity": "error", "message": "bad import 'Old'"}
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["main_sha"] = merged
+            state["config"].update(scope=deepcopy(self.scope), revision=4, modules=["New"])
+            state["tasks"] = {
+                old: {**bump_tasks._task(old, "command", [], ["A.lean", "New.lean"]),
+                      "attempts": 3, "diagnostics": [diagnostic]},
+                current: {**bump_tasks._task(current, "command", [], ["New.lean"]),
+                          "diagnostics": [{**diagnostic, "id": "new-import", "path": "New.lean"}]},
+                "config": {**bump_tasks._task("config", "configuration", [], ["A.lean", "New.lean"]),
+                           "status": "complete", "revision": 11,
+                           "requested_config": {"module_renames": {"A": "New"}}},
+            }
+            state["candidates"] = {"candidate-move": {"candidate_id": "candidate-move", "task_id": "config",
+                "task_revision": 11, "status": "merged", "merged_sha": merged}}
+        return old, current
+
+    def renamed_target_build(self, diagnostics=(), checked=()):
+        result = self.authoritative_build_result(list(diagnostics), checked=checked)
+        result["command"] = ["lake", "--rehash", "build", "+New"]
+        result["log_ref"] = {"artifact_id": "renamed-target-log"}
+        return result
+
+    async def test_accepted_move_rechecks_destination_and_preserves_other_task(self):
+        old, current = self.renamed_command_fixture()
+        good = self.renamed_target_build(checked=["New.lean"])
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=good)) as build, \
+                patch.object(self.controller, "worker", new=AsyncMock()):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            build.assert_awaited_once_with(modules=["New"])
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][old]["status"], "complete")
+            self.assertEqual(state["tasks"][old]["attempts"], 3)
+            self.assertEqual(state["tasks"][current]["status"], "pending")
+            self.assertEqual(state["tasks"][current]["diagnostics"][0]["id"], "new-import")
+            event = next(e for e in state["events"] if e["kind"] == "renamed_command_revalidated")
+            self.assertEqual(event["diagnostics"][0]["id"], "old-import")
+            self.assertEqual(event["aliases"]["A.lean"]["candidate_id"], "candidate-move")
+            self.assertEqual(event["log_ref"]["artifact_id"], "renamed-target-log")
+
+    async def test_rename_rechecks_do_not_share_cached_incomplete_orphan_check(self):
+        old, _ = self.renamed_command_fixture()
+        other = "command-old-import-2"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][other] = {**deepcopy(state["tasks"][old]), "task_id": other, "attempts": 4}
+            state["tasks"]["a-orphan"] = {
+                **bump_tasks._task("a-orphan", "repair", ["missing-chunk"], ["New.lean"]),
+                "diagnostics": [{**self.error("New.lean"), "id": "orphan-error"}],
+            }
+        unchecked = self.renamed_target_build()
+        good = self.renamed_target_build(checked=["New.lean"])
+        with patch.object(self.controller, "build", new=AsyncMock(side_effect=[unchecked, good, good])) as build:
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertEqual(build.await_count, 3)
+        state = self.controller.state()
+        self.assertEqual(state["tasks"]["a-orphan"]["status"], "complete")
+        for tid, attempts in ((old, 3), (other, 4)):
+            self.assertEqual(state["tasks"][tid]["status"], "complete")
+            self.assertEqual(state["tasks"][tid]["attempts"], attempts)
+        self.assertEqual(len([e for e in state["events"] if e["kind"] == "renamed_command_revalidated"]), 2)
+
+    async def test_failed_renamed_target_does_not_close_or_dispatch_old_task(self):
+        old, _ = self.renamed_command_fixture()
+        error = {**self.error("New.lean"), "kind": "import"}
+        result = self.renamed_target_build([error])
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=result)), \
+                patch.object(self.controller, "worker", new=AsyncMock()):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            self.controller.launch_ready()
+            self.assertNotIn(old, [r["task_id"] for r in self.controller.workers.values()])
+            self.assertEqual(self.controller.state()["tasks"][old]["status"], "pending")
+            self.assertEqual(self.controller.state()["tasks"][old]["attempts"], 3)
+            await asyncio.gather(*(r["task"] for r in self.controller.workers.values()))
+            await self.controller.reap_workers()
+
+    async def test_renamed_target_requires_checked_file_and_current_source_identity(self):
+        old, _ = self.renamed_command_fixture()
+        unchecked = self.renamed_target_build()
+        stale = self.renamed_target_build(checked=["New.lean"])
+        stale["source_identity"]["main_sha"] = "old"
+        for result in (unchecked, stale):
+            self.controller.orphan_checks.clear()
+            with patch.object(self.controller, "build", new=AsyncMock(return_value=result)):
+                self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            self.assertEqual(self.controller.state()["tasks"][old]["status"], "pending")
+            self.assertEqual(self.controller.state()["tasks"][old]["attempts"], 3)
+
+    async def test_renamed_target_rejects_changed_provenance_during_build(self):
+        old, _ = self.renamed_command_fixture()
+        result = self.renamed_target_build(checked=["New.lean"])
+        async def build(**kwargs):
+            with bump_tasks.transaction(self.paths.forum) as state:
+                state["candidates"]["candidate-move"]["status"] = "rejected"
+            return result
+        with patch.object(self.controller, "build", new=build):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+        self.assertEqual(self.controller.state()["tasks"][old]["status"], "pending")
+
+    async def test_missing_path_without_accepted_move_never_rechecked_or_dispatched(self):
+        for invalid in ("unmerged", "different_revision", "wrong_mapping", "no_mapping"):
+            with self.subTest(invalid=invalid):
+                old, _ = self.renamed_command_fixture() if invalid == "unmerged" else ("command-old-import", "command-new-import")
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    c, t = state["candidates"]["candidate-move"], state["tasks"]["config"]
+                    c["status"], c["task_revision"] = "merged", 11
+                    t["requested_config"]["module_renames"] = {"A": "New"}
+                    if invalid == "unmerged": c["status"] = "rejected"
+                    if invalid == "different_revision": c["task_revision"] = 10
+                    if invalid == "wrong_mapping": t["requested_config"]["module_renames"] = {"A": "B"}
+                    if invalid == "no_mapping": t["requested_config"]["module_renames"] = {}
+                with patch.object(self.controller, "build", new=AsyncMock()) as build, \
+                        patch.object(self.controller, "worker", new=AsyncMock()):
+                    self.assertFalse(await self.controller.recheck_orphaned_repairs())
+                    build.assert_not_awaited()
+                    self.controller.launch_ready()
+                    self.assertNotIn(old, [r["task_id"] for r in self.controller.workers.values()])
+                    self.assertEqual(self.controller.state()["tasks"][old]["status"], "pending")
+                    await asyncio.gather(*(r["task"] for r in self.controller.workers.values()))
+                    await self.controller.reap_workers()
+
+    async def test_missing_rename_destination_never_rechecked_or_dispatched(self):
+        old, _ = self.renamed_command_fixture()
+        (self.root / "New.lean").unlink()
+        with patch.object(self.controller, "build", new=AsyncMock()) as build, \
+                patch.object(self.controller, "worker", new=AsyncMock()):
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            build.assert_not_awaited()
+            self.controller.launch_ready()
+            self.assertNotIn(old, [r["task_id"] for r in self.controller.workers.values()])
+            self.assertEqual(self.controller.state()["tasks"][old]["status"], "pending")
+            self.assertEqual(self.controller.state()["tasks"][old]["attempts"], 3)
+            await asyncio.gather(*(r["task"] for r in self.controller.workers.values()))
+            await self.controller.reap_workers()
+
     async def test_orphaned_chunk_rechecked_by_controller_without_worker_attempt(self):
         tid = self.orphaned_repair_fixture()
         good = self.targeted_orphan_build(checked=["A.lean"])
