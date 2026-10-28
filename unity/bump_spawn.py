@@ -1093,6 +1093,30 @@ async def _codex_notifications(
             await _drain_spawn_cleanup(drain_stream())
 
 
+def _bump_codex_reasoning_effort(agent_name: str, value: str | None) -> str | None:
+    """Resolve the optional BUMP effort from a scalar or agent-name JSON map."""
+    if value is None or not value.strip():
+        return None
+    from openai_codex.types import ReasoningEffort
+
+    allowed = {effort.value for effort in ReasoningEffort}
+    value = value.strip()
+    if value.startswith("{"):
+        try:
+            mapping = json.loads(value)
+        except ValueError as exc:
+            raise ValueError("UNITY_BUMP_CODEX_REASONING_EFFORT must be an effort or JSON map") from exc
+        if (not isinstance(mapping, dict) or any(
+            not isinstance(name, str) or not name or not isinstance(effort, str)
+            or effort not in allowed for name, effort in mapping.items()
+        )):
+            raise ValueError("UNITY_BUMP_CODEX_REASONING_EFFORT contains an invalid agent or effort")
+        return mapping.get(agent_name, mapping.get("*"))
+    if value not in allowed:
+        raise ValueError("UNITY_BUMP_CODEX_REASONING_EFFORT contains an invalid effort")
+    return value
+
+
 async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path,
                         mcp_servers: dict, *, permission: str = "bypassPermissions",
                         idle_timeout: float = 600.0, subagents=(),
@@ -1102,6 +1126,13 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         mcp_profile: str = "bump",
                         on_normal_completion: CompletionCallback | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
+
+    effort = None
+    if mcp_profile == "bump":
+        value = (env_overrides or {}).get(
+            "UNITY_BUMP_CODEX_REASONING_EFFORT", os.environ.get("UNITY_BUMP_CODEX_REASONING_EFFORT")
+        )
+        effort = _bump_codex_reasoning_effort(agent.name, value)
 
     system_prompt = system_prompt + _codex_mcp_note(
         mcp_profile, (env_overrides or {}).get("UNITY_BUMP_PROFILE"),
@@ -1167,6 +1198,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 config_kwargs.get("config_overrides", ())
                 + _bump_codex_shell_overrides(agent_env)
                 + _bump_codex_policy_overrides(policy, mcp_servers)
+                + (("model_reasoning_effort=" + json.dumps(effort),) if effort is not None else ())
             )
         cfg = CodexConfig(
             cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,

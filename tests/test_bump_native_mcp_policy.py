@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import AsyncMock, Mock, patch
 
+from openai_codex.types import ReasoningEffort
 from unity import bump_spawn
 from unity.forum import bump_server, bump_workflow_server
 from unity.roster import Agent
@@ -224,6 +225,77 @@ class BumpShellEnvironmentTests(unittest.TestCase):
                      if phase in {"preparing", "repairing"} else bump_server.PROFILE_TOOLS[phase])])
                 self.assertEqual(client.thread_start.call_args.kwargs["approval_mode"], "never")
                 client.close.assert_awaited_once()
+
+
+class BumpCodexReasoningTests(unittest.TestCase):
+    def test_resolves_scalar_and_agent_map_with_optional_default(self):
+        resolve = bump_spawn._bump_codex_reasoning_effort
+        self.assertIsNone(resolve("Terra", None))
+        self.assertIsNone(resolve("Terra", "  "))
+        self.assertEqual(resolve("Terra", "high"), "high")
+        self.assertEqual(resolve("Terra", '{"Terra":"high","*":"medium"}'), "high")
+        self.assertEqual(resolve("Luna", '{"Terra":"high","*":"medium"}'), "medium")
+        self.assertIsNone(resolve("Luna", '{"Terra":"high"}'))
+        for effort in ReasoningEffort:
+            self.assertEqual(resolve("Terra", effort.value), effort.value)
+
+    def test_invalid_scalar_or_any_invalid_mapping_entry_fails(self):
+        for value in ('bogus', '["high"]', '{', '{"Terra":"high","Luna":"bogus"}',
+                      '{"Terra":null}', '{"":"high"}'):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "UNITY_BUMP_CODEX_REASONING_EFFORT"):
+                bump_spawn._bump_codex_reasoning_effort("Terra", value)
+
+    def test_spawner_sets_override_only_for_bump_and_only_when_selected(self):
+        cases = [
+            ("bump", None, None, None),
+            ("bump", "high", None, "high"),
+            ("bump", '{"Luna1":"high","*":"medium"}', None, "high"),
+            ("bump", '{"*":"medium"}', None, "medium"),
+            ("bump", '{"Other":"high"}', None, None),
+            ("bump", None, "medium", "medium"),
+            ("bump", "high", "medium", "high"),
+            ("solve", "bogus", None, None),
+        ]
+        for profile, value, inherited, expected in cases:
+            with self.subTest(profile=profile, value=value, inherited=inherited), tempfile.TemporaryDirectory() as directory:
+                worker = Path(directory) / "worker"
+                home = Path(directory) / "isolated"
+                client = SimpleNamespace(thread_start=AsyncMock(return_value=SimpleNamespace()), close=AsyncMock())
+                config_ctor = Mock(side_effect=lambda **kwargs: SimpleNamespace(**kwargs))
+                sdk = SimpleNamespace(AsyncCodex=Mock(return_value=client), CodexConfig=config_ctor,
+                    Sandbox=SimpleNamespace(workspace_write="workspace-write", full_access="full-access"),
+                    ApprovalMode=SimpleNamespace(deny_all="never"))
+                env = {"UNITY_BUMP_PROFILE": "repairing"}
+                if value is not None:
+                    env["UNITY_BUMP_CODEX_REASONING_EFFORT"] = value
+                inherited_env = {} if inherited is None else {"UNITY_BUMP_CODEX_REASONING_EFFORT": inherited}
+                with patch.dict(os.environ, inherited_env, clear=True), patch.dict(sys.modules, {"openai_codex": sdk}), \
+                        patch.object(bump_spawn.tempfile, "mkdtemp", return_value=str(home)), \
+                        patch.object(bump_spawn, "_worktree_write_roots", return_value=(worker,)), \
+                        patch.object(bump_spawn, "_stop_requested", return_value=True), \
+                        patch.object(Path, "home", return_value=Path(directory)):
+                    asyncio.run(bump_spawn.codex_spawner(agent(), "system", "task", worker,
+                        servers_for("repairing"), env_overrides=env, mcp_profile=profile))
+                config = tomllib.loads("\n".join(config_ctor.call_args.kwargs["config_overrides"]))
+                self.assertEqual(config.get("model_reasoning_effort"), expected)
+
+    def test_invalid_bump_configuration_fails_before_launch(self):
+        with patch.dict(os.environ, {"UNITY_BUMP_CODEX_REASONING_EFFORT": "invalid"}):
+            with self.assertRaisesRegex(ValueError, "UNITY_BUMP_CODEX_REASONING_EFFORT"):
+                asyncio.run(bump_spawn.codex_spawner(agent(), "system", "task", Path("/fixture"),
+                    servers_for("repairing"), env_overrides={"UNITY_BUMP_PROFILE": "repairing"}))
+
+    def test_non_codex_backend_does_not_validate_or_use_setting(self):
+        worker = Agent("Terra", "fixture", "anthropic", "claude_code", 1., None, None, None, None, True)
+        backend = AsyncMock(return_value="done")
+        with patch.dict(os.environ, {"UNITY_BUMP_CODEX_REASONING_EFFORT": "invalid"}), \
+                patch.object(bump_spawn, "claude_spawner", backend), \
+                patch.object(bump_spawn, "_stop_requested", return_value=False), \
+                patch.object(bump_spawn, "_write_run_log"):
+            result = asyncio.run(bump_spawn.spawn(worker, "system", "task", Path("/fixture"), {},
+                env_overrides={"UNITY_BUMP_PROFILE": "repairing"}))
+        self.assertEqual(result, "done")
+        backend.assert_awaited_once()
 
 
 if __name__ == "__main__":
