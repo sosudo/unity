@@ -480,6 +480,87 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         result["log_ref"] = {"artifact_id": "targeted-orphan-log"}
         return result
 
+    async def test_authoritative_failed_build_skips_only_matching_orphan_recheck(self):
+        tid = self.orphaned_repair_fixture()
+        error = self.error("A.lean")
+        full = self.authoritative_build_result([error])
+        full.update(attempted_files=["A.lean"], log_ref={"artifact_id": "full-failure"})
+        self.controller.refresh(full, authoritative_full_build=True)
+        state = self.controller.state()
+        receipt = deepcopy(state["orphan_failure_receipt"])
+        self.assertEqual(receipt["log_ref"]["artifact_id"], "full-failure")
+        before = deepcopy(state["tasks"][tid])
+        with patch.object(self.controller, "build", new=AsyncMock()) as build:
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            build.assert_not_awaited()
+        self.assertEqual(self.controller.state()["tasks"][tid], before)
+
+        invalid = {}
+        for name in ("sha", "config", "file_hash", "commands", "attempts", "no_error", "unmapped", "pathless", "missing_file"):
+            invalid[name] = deepcopy(receipt)
+        invalid["sha"]["source_identity"]["main_sha"] = "old"
+        invalid["config"]["config_revision"] += 1
+        invalid["file_hash"]["source_identity"]["files"]["A.lean"] = "old"
+        invalid["commands"]["commands"] = [["lake", "build", "+A"]]
+        invalid["attempts"]["attempted_files"] = []
+        invalid["no_error"]["errors"] = []
+        invalid["unmapped"]["unmapped"] = [{"path": None}]
+        invalid["pathless"]["errors"].append({"path": None})
+        del invalid["missing_file"]["source_identity"]["files"]["A.lean"]
+        stale_target = self.targeted_orphan_build()
+        stale_target["source_identity"]["main_sha"] = "stale"
+        for name, bad in invalid.items():
+            with self.subTest(name=name):
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    state["orphan_failure_receipt"] = bad
+                self.controller.orphan_checks.clear()
+                with patch.object(self.controller, "build", new=AsyncMock(return_value=stale_target)) as build:
+                    self.assertTrue(await self.controller.recheck_orphaned_repairs())
+                    build.assert_awaited_once_with(modules=["A"])
+                self.assertEqual(self.controller.state()["tasks"][tid], before)
+
+    async def test_non_authoritative_or_partial_build_never_creates_failure_receipt(self):
+        tid = self.orphaned_repair_fixture()
+        full = self.authoritative_build_result([self.error("A.lean")])
+        full["attempted_files"] = ["A.lean"]
+        for result, authoritative in ((full, False), ({**full, "command": ["lake", "build", "+A"]}, True)):
+            self.controller.refresh(result, authoritative_full_build=authoritative)
+            self.assertIsNone(self.controller.state().get("orphan_failure_receipt"))
+            self.controller.orphan_checks.clear()
+            with patch.object(self.controller, "build", new=AsyncMock(return_value=self.targeted_orphan_build())) as build:
+                self.assertTrue(await self.controller.recheck_orphaned_repairs())
+                build.assert_awaited_once_with(modules=["A"])
+            self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+
+    async def test_each_orphan_file_must_have_its_own_mapped_failure(self):
+        tid = self.orphaned_repair_fixture()
+        full = self.authoritative_build_result([self.error("A.lean")])
+        full["attempted_files"] = ["A.lean", "B.lean"]
+        self.controller.refresh(full, authoritative_full_build=True)
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["files"] = ["A.lean", "B.lean"]
+            state["tasks"][tid]["dependencies"] = []
+        stale = self.targeted_orphan_build()
+        stale["source_identity"]["main_sha"] = "old"
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=stale)) as build:
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+            build.assert_awaited_once_with(modules=["A", "B"])
+        self.assertEqual(self.controller.state()["tasks"][tid]["status"], "pending")
+
+    async def test_rename_failure_receipt_uses_current_destination(self):
+        tid, current = self.renamed_command_fixture()
+        error = {**self.error("New.lean"), "kind": "import", "line": None}
+        full = self.authoritative_build_result([error])
+        full["attempted_files"] = ["New.lean"]
+        self.controller.refresh(full, authoritative_full_build=True)
+        before = deepcopy(self.controller.state()["tasks"][tid])
+        with patch.object(self.controller, "build", new=AsyncMock()) as build:
+            self.assertFalse(await self.controller.recheck_orphaned_repairs())
+            build.assert_not_awaited()
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid], before)
+        self.assertEqual(state["tasks"][current]["status"], "pending")
+
     def renamed_command_fixture(self):
         self.git(self.root, "mv", "A.lean", "New.lean")
         self.git(self.root, "commit", "-qm", "accepted module rename")

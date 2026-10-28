@@ -299,6 +299,19 @@ class Controller:
                     {key: value for key, value in item.items()
                      if key not in {"output", "stdout", "stderr", "source_identity"}}
                     for item in result["builds"] if isinstance(item, dict)]
+            # Keep only compact, source-bound evidence; it can suppress a
+            # redundant failing recheck, never establish successful repair.
+            state["orphan_failure_receipt"] = None
+            if declaration_build and returncode > 0:
+                errors = [row for row in result.get("diagnostics", [])
+                          if row.get("severity", "error") == "error"]
+                state["orphan_failure_receipt"] = {
+                    "source_identity": deepcopy(identity), "config_revision": state["config"]["revision"],
+                    "commands": deepcopy(expected_commands), "returncode": returncode,
+                    "attempted_files": deepcopy(result.get("attempted_files")),
+                    "errors": [{"path": row.get("path"), "id": row.get("id")} for row in errors],
+                    "unmapped": deepcopy(result.get("unmapped")), "log_ref": deepcopy(result.get("log_ref")),
+                }
             for task in state["tasks"].values():
                 if task["kind"] == "configuration" and not task["files"]:
                     task["files"] = [name for name in CONFIG_FILES if (self.paths.project_root / name).exists()]
@@ -554,6 +567,25 @@ class Controller:
             if not renamed and any(cid in scanned["chunks"] for cid in task["chunk_ids"]):
                 continue  # An incomplete inventory is not evidence of removal.
             source_hashes = {path: row["sha256"] for path, row in scanned["files"].items()}
+            receipt = state.get("orphan_failure_receipt") or {}
+            evidence = receipt.get("source_identity") or {}
+            attempted, errors = receipt.get("attempted_files"), receipt.get("errors")
+            if (type(receipt.get("returncode")) is int and receipt["returncode"] > 0
+                    and receipt.get("config_revision") == state["config"]["revision"]
+                    and receipt.get("commands") == bump_verification.scope_build_commands(
+                        scope, state["config"].get("lake_args", ()))
+                    and evidence.get("main_sha") == state["main_sha"]
+                    and git(self.paths.project_root, "rev-parse", "HEAD") == state["main_sha"]
+                    and evidence.get("scope") == scope
+                    and evidence.get("lake_args") == list(state["config"].get("lake_args", ()))
+                    and evidence.get("files") == bump_verification._files(
+                        self.paths.project_root, scope.get("build_dir", ".lake/build"))
+                    and all(evidence.get("files", {}).get(path) == digest for path, digest in source_hashes.items())
+                    and isinstance(attempted, list) and files <= set(attempted)
+                    and isinstance(errors, list) and errors and all(isinstance(row, dict) and row.get("path") for row in errors)
+                    and files <= {row["path"] for row in errors}
+                    and receipt.get("unmapped") == []):
+                continue
             key = (tuple(sorted(files)), state["main_sha"], state["config"]["revision"], tuple(sorted(source_hashes.items())))
             if renamed:
                 key = ("renamed_command", tid, bump_tasks.digest(aliases), *key)
