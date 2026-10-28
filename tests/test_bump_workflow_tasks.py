@@ -307,6 +307,85 @@ class WorkflowTaskTests(unittest.TestCase):
         grouped = forum.request_repair_scope("Alice", tid, [], ["A.lean"], "whole file", assigned["revision"], include_file_chunks=True)
         self.assertNotIn(other, grouped["chunk_ids"])
 
+    def test_regroup_splits_mixed_overlapping_task_and_preserves_orphan_history(self):
+        root, directory = setup_state(self.tmp_path)
+        write_source(root, "A.lean", "def first := missing\ndef second := missing\n")
+        state = tasks.refresh(directory, tasks.scan_sources(root, ["A.lean"]),
+                              [diagnostic("A.lean", 1), diagnostic("A.lean", 2)], main_sha="base", config_revision=0)
+        first = next(key for key, task in state["tasks"].items() if task["diagnostics"][0]["line"] == 1)
+        second = next(key for key, task in state["tasks"].items() if task["diagnostics"][0]["line"] == 2)
+        valid = state["tasks"][second]["chunk_ids"][0]
+        with tasks.transaction(directory) as state:
+            state["tasks"][second]["chunk_ids"].append("stale-missing-chunk")
+            state["tasks"][second]["attempts"] = 3
+            state["chunk_attempts"]["stale-missing-chunk"] = 2
+        assigned = tasks.claim(directory, "Alice", first)
+        forum.configure(directory, root)
+        result = forum.request_repair_scope("Alice", first, [valid], ["A.lean"], "group", assigned["revision"])
+        state = tasks.load(directory)
+        self.assertIn(valid, result["chunk_ids"])
+        self.assertNotIn("stale-missing-chunk", result["chunk_ids"])
+        self.assertEqual(result["attempts"], 3)
+        orphan = state["tasks"][second]
+        self.assertEqual(orphan["chunk_ids"], ["stale-missing-chunk"])
+        self.assertEqual(orphan["status"], "pending")
+        self.assertEqual(orphan["attempts"], 3)
+        self.assertEqual(state["chunk_attempts"]["stale-missing-chunk"], 2)
+        self.assertTrue(tasks.orphaned_repair(orphan, state["chunks"]))
+        self.assertEqual(orphan["diagnostics"][0]["line"], 2)
+        self.assertEqual(state["leases"]["A.lean"]["author"], "Alice")
+        event = next(e for e in state["events"] if e["kind"] == "scope_split_stale")
+        self.assertEqual(event["orphan_task_id"], second)
+        self.assertEqual(event["missing_chunk_ids"], ["stale-missing-chunk"])
+
+    def test_mixed_regroup_never_absorbs_an_active_owner_or_excluded_chunk(self):
+        root, directory = setup_state(self.tmp_path)
+        write_source(root, "A.lean", "def first := missing\ndef second := missing\ndef protected := missing\n")
+        state = tasks.refresh(directory, tasks.scan_sources(root, ["A.lean"]),
+                              [diagnostic("A.lean", 1), diagnostic("A.lean", 2)], main_sha="base", config_revision=0)
+        first = next(key for key, task in state["tasks"].items() if task["diagnostics"][0]["line"] == 1)
+        second = next(key for key, task in state["tasks"].items() if task["diagnostics"][0]["line"] == 2)
+        valid = state["tasks"][second]["chunk_ids"][0]
+        protected = next(cid for cid, chunk in state["chunks"].items() if chunk["name"] == "protected")
+        with tasks.transaction(directory) as state:
+            state["tasks"][second]["chunk_ids"].append("stale-missing-chunk")
+        assigned = tasks.claim(directory, "Alice", first)
+        forum.configure(directory, root)
+        with tasks.transaction(directory) as state:
+            state["tasks"][second]["owner"] = "Bob"
+        before = tasks.load(directory)
+        with self.raises(ValueError, match="another owned assignment"):
+            forum.request_repair_scope("Alice", first, [valid], ["A.lean"], "group", assigned["revision"])
+        self.assertEqual(tasks.load(directory), before)
+        with tasks.transaction(directory) as state:
+            state["tasks"][second]["owner"] = None
+            state["tasks"][second]["chunk_ids"].append(protected)
+            state["chunks"][protected]["scope_excluded"] = True
+        before = tasks.load(directory)
+        with self.raises(ValueError, match="compiled scope"):
+            forum.request_repair_scope("Alice", first, [valid], ["A.lean"], "group", assigned["revision"])
+        self.assertEqual(tasks.load(directory), before)
+
+    def test_regroup_preserves_own_stale_ids_and_rejects_new_unknown_ids(self):
+        root, directory, tid = prepare_task(self.tmp_path)
+        with tasks.transaction(directory) as state:
+            state["tasks"][tid]["chunk_ids"].append("old-unavailable")
+            state["chunk_attempts"]["old-unavailable"] = 2
+        assigned = tasks.claim(directory, "Alice", tid)
+        forum.configure(directory, root)
+        before = tasks.load(directory)
+        with self.raises(ValueError, match="unknown chunk"):
+            forum.request_repair_scope("Alice", tid, ["new-unknown"], ["A.lean"], "group", assigned["revision"])
+        self.assertEqual(tasks.load(directory), before)
+        result = forum.request_repair_scope("Alice", tid, [], ["A.lean"], "group", assigned["revision"])
+        state = tasks.load(directory)
+        orphan = next(task for task in state["tasks"].values() if task.get("orphaned_from") == tid)
+        self.assertEqual(orphan["chunk_ids"], ["old-unavailable"])
+        self.assertNotIn("old-unavailable", result["chunk_ids"])
+        self.assertEqual(orphan["attempts"], 1)
+        self.assertEqual(state["chunk_attempts"]["old-unavailable"], 3)
+        self.assertEqual(state["leases"]["A.lean"]["author"], "Alice")
+
     def test_scope_groups_module_without_resetting_budgets(self):
         tmp_path = self.tmp_path
         root, directory, first = prepare_task(tmp_path)

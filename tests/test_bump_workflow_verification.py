@@ -743,6 +743,26 @@ class VerificationTests(unittest.TestCase):
         self.assertFalse(v.candidate_progress([first, second], blocked, task, inventory, candidate_chunks=current)["accepted"])
         self.assertFalse(v.candidate_progress([first, second], build, task, inventory, candidate_chunks={"c1": current["c1"]})["accepted"])
 
+    def test_mixed_inherited_missing_chunks_do_not_mask_live_declaration_progress(self):
+        old = {"id": "old-goal", "path": "Example.lean", "kind": "declaration", "severity": "error",
+               "line": 3, "message": "unsolved goals"}
+        task = {"kind": "command", "files": ["Example.lean"], "chunk_ids": ["live", "inherited-missing"]}
+        original = {"path": "Example.lean", "kind": "theorem", "name": "owned", "start_line": 1, "end_line": 5}
+        current = {**original, "end_line": 8}
+        inventory = {"files": {"Example.lean": {"imports": []}}, "chunks": {"live": original}}
+        later = {**old, "id": "later", "line": 12}
+        build = {"passed": False, "errors": [later], "checked_files": [], "unmapped": [], "source_stable": True}
+        result = v.candidate_progress([old], build, task, inventory, candidate_chunks={"live": current})
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["resolved_diagnostic_ids"], ["old-goal"])
+        self.assertEqual(result["inherited_missing_chunk_ids"], ["inherited-missing"])
+        self.assertFalse(v.candidate_progress([old], build, task, inventory, candidate_chunks={})["accepted"])
+        self.assertFalse(v.candidate_progress([old], {**build, "passed": True}, task, inventory, candidate_chunks={})["accepted"])
+        blocked = {**build, "errors": [{**later, "line": 7}]}
+        self.assertFalse(v.candidate_progress([old], blocked, task, inventory, candidate_chunks={"live": current})["accepted"])
+        changed_inside = {**build, "errors": [later, {**later, "line": 7, "message": "new failure"}]}
+        self.assertFalse(v.candidate_progress([old], changed_inside, task, inventory, candidate_chunks={"live": current})["accepted"])
+
     def test_fallback_cannot_use_stale_range_for_another_owned_file(self):
         old = {"id": "old", "path": "A.lean", "kind": "declaration", "severity": "error", "line": 1,
                "message": "unsolved goals"}

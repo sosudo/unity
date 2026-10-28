@@ -638,12 +638,16 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
         if path and end and any(d.get("path") == path and d.get("kind") != "import" and (d.get("line") or 0) >= end for d in after):
             reached.add(path)
     declaration_reach = {}
+    inherited_missing = ([cid for cid in task.get("chunk_ids", []) if cid not in chunks]
+                         if isinstance(chunks, dict) else list(task.get("chunk_ids", [])))
+    pairs = {}
     if (task.get("chunk_ids") and after_build.get("source_stable") is True
             and isinstance(candidate_chunks, dict) and isinstance(chunks, dict)):
-        pairs = {}
         for cid in task["chunk_ids"]:
             old_chunk, new_chunk = chunks.get(cid), candidate_chunks.get(cid)
-            if (not old_chunk or not new_chunk or old_chunk.get("path") != new_chunk.get("path")
+            if not old_chunk:
+                continue  # Separately retained inherited orphan, never resolved here.
+            if (not new_chunk or old_chunk.get("path") != new_chunk.get("path")
                     or old_chunk.get("name") != new_chunk.get("name") or old_chunk.get("kind") != new_chunk.get("kind")
                     or new_chunk.get("after_exit") or new_chunk.get("scope_excluded")
                     or new_chunk.get("status") == "excluded" or new_chunk.get("scope_unclassified")
@@ -654,6 +658,10 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
                 pairs = {}
                 break
             pairs[cid] = (old_chunk, new_chunk)
+        if inherited_missing:
+            # Mixed groups require candidate-range proof for each resolved
+            # declaration; a changed message inside it is not evidence of a fix.
+            resolved = []
         if pairs:
             for old in assigned:
                 if old in resolved or old.get("kind") != "declaration" or type(old.get("line")) is not int:
@@ -705,7 +713,9 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
                         break
                 if path in import_reach:
                     break
-    eligible = after_build.get("source_stable", True) and not after_build.get("unmapped") and not (blocked & files) and not regressions
+    eligible = (after_build.get("source_stable", True) and not after_build.get("unmapped")
+                and not (blocked & files) and not regressions
+                and (not inherited_missing or bool(pairs)))
     # When the new declaration-aware fallback supplies progress, require
     # candidate-bound reach for every leased file, rather than letting old
     # pre-edit ranges prove another file was reached.
@@ -724,6 +734,7 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
     return {"accepted": accepted, "made_progress": accepted, "resolved_diagnostic_ids": [d.get("id") for d in resolved],
             "remaining_errors": after, "regressions": regressions, "exposed_downstream_errors": exposed,
             "import_reach_evidence": import_reach, "declaration_reach_evidence": declaration_reach,
+            "inherited_missing_chunk_ids": inherited_missing,
             "blocked_files": sorted(p for p in blocked if p),
             "reason": "checked repair with unrelated failures retained" if accepted else "no safely demonstrated repair progress",
             "qualification": "Provisional compiler progress, not final migration acceptance."}

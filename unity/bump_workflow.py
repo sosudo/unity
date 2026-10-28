@@ -473,7 +473,7 @@ class Controller:
             if (not bump_tasks.orphaned_repair(task, state["chunks"]) or task.get("owner")
                     or task.get("status") not in {"pending", "ready", "needs_repair", "blocked"}
                     or any(task.get(key) for key in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
-                    or not task.get("diagnostics") or any(d.get("kind") not in {None, "declaration"}
+                    or not task.get("diagnostics") or any(d.get("kind") not in {None, "declaration", "import"}
                             or d.get("severity", "error") != "error" or d.get("path") not in task["files"]
                             for d in task["diagnostics"])
                     or any(state["tasks"].get(dep, {}).get("status") not in {"complete", "clean", "merged"}
@@ -522,7 +522,7 @@ class Controller:
                                     or not bump_tasks.orphaned_repair(target, fresh["chunks"])
                                     or any(cid in scanned["chunks"] for cid in target["chunk_ids"])
                                     or any(target.get(k) for k in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
-                                    or not target.get("diagnostics") or any(d.get("kind") not in {None, "declaration"}
+                                    or not target.get("diagnostics") or any(d.get("kind") not in {None, "declaration", "import"}
                                          or d.get("severity", "error") != "error" or d.get("path") not in files
                                          for d in target["diagnostics"])
                                     or any(lease.get("task_id") == target_id or path in files for path, lease in fresh["leases"].items())
@@ -880,6 +880,25 @@ class Controller:
                     state["config"][key] = journal["config"].get(key, state["config"].get(key))
                 state["setup"] = journal["config"]
                 state["dependencies"] = journal["config"].get("dependencies", state.get("dependencies", {}))
+            # A mixed assignment can make genuine progress on live chunks,
+            # but unavailable inherited chunks remain an independent B15
+            # obligation and must not be marked complete with the candidate.
+            missing = sorted(set(task.get("chunk_ids", [])) - state["chunks"].keys())
+            if missing and task.get("kind") in {"repair", "command"}:
+                orphan_id = "orphan-" + bump_tasks.digest([task["task_id"], row["candidate_id"], missing])[:16]
+                if orphan_id in state["tasks"]:
+                    raise ValueError("orphan obligation already exists")
+                orphan = {**bump_tasks._task(orphan_id, "repair", missing, list(task["files"])),
+                          "attempts": task["attempts"], "diagnostics": deepcopy(task.get("diagnostics", [])),
+                          "dependencies": [dep for dep in task.get("dependencies", []) if dep != task["task_id"]],
+                          "orphaned_from": task["task_id"], "source_candidate_id": row["candidate_id"],
+                          "reason": "Unavailable chunks retained after partial candidate integration"}
+                for key in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"):
+                    if task.get(key): orphan[key] = deepcopy(task[key])
+                state["tasks"][orphan_id] = orphan
+                task["chunk_ids"] = sorted(set(task["chunk_ids"]) - set(missing))
+                bump_tasks._event(state, "integration_orphaned_chunks", "controller", task_id=task["task_id"],
+                                  orphan_task_id=orphan_id, missing_chunk_ids=missing, candidate_id=row["candidate_id"])
             state["main_sha"] = head
             row.update(status="merged", merged_sha=head)
             task["status"] = "complete"

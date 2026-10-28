@@ -517,6 +517,20 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["tasks"][second]["attempts"], 4)
         self.assertEqual(len([e for e in state["events"] if e["kind"] == "orphan_revalidated"]), 2)
 
+    async def test_command_orphan_with_import_diagnostic_requires_positive_target_check(self):
+        tid = self.orphaned_repair_fixture()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["kind"] = "command"
+            state["tasks"][tid]["diagnostics"] = [{"id": "old-import", "path": "A.lean", "kind": "import",
+                                                    "line": None, "severity": "error", "message": "bad import"}]
+        good = self.targeted_orphan_build(checked=["A.lean"])
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=good)):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        event = next(e for e in state["events"] if e["kind"] == "orphan_revalidated" and e["task_id"] == tid)
+        self.assertEqual(event["resolved_diagnostic_ids"], ["old-import"])
+
     async def test_failed_orphan_recheck_schedules_new_diagnostic_and_does_not_loop(self):
         tid = self.orphaned_repair_fixture()
         error = {**self.error("A.lean"), "message": "replacement still fails"}
@@ -1051,6 +1065,49 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(remaining[0]["status"], "pending")
         self.assertFalse(state["leases"])
 
+    async def test_mixed_partial_merge_leaves_later_error_and_missing_obligation(self):
+        (self.root / "A.lean").write_text("def a := missingA\ndef later := missingLater\n")
+        self.git(self.root, "add", "A.lean")
+        self.git(self.root, "commit", "-qm", "same-message fixture")
+        self.base = self.git(self.root, "rev-parse", "HEAD")
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state.update(base_sha=self.base, main_sha=self.base, tasks={})
+        old = {**self.error("A.lean"), "id": "old-owned", "line": 1, "message": "unsolved goals"}
+        later = {**self.error("A.lean"), "id": "later", "line": 2, "message": "unsolved goals"}
+        self.controller.refresh(self.build_result([old, later]))
+        state = self.controller.state()
+        tid = next(key for key, task in state["tasks"].items() if old in task.get("diagnostics", []))
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["chunk_ids"].append("inherited-missing")
+        bump_tasks.claim(self.paths.forum, "Alice", tid)
+        worker = self.worktree(self.paths, "Alice", tid)
+        bump_tasks.configure_assignment(self.paths.forum, "Alice", tid, worker, self.base)
+        (worker / "A.lean").write_text("def a := 1\ndef later := missingLater\n")
+        forum.configure(self.paths.forum, self.root)
+        candidate = forum.submit_repair("Alice", tid, "repair first declaration")
+        self.active_worker(tid, worker)
+        import hashlib
+        build = {**self.build_result([later]), "source_identity": {"files": {
+            "A.lean": hashlib.sha256((worker / "A.lean").read_bytes()).hexdigest()}}}
+        with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+             patch.object(bump_verification, "build", return_value=build) as compiler, \
+             patch.object(self.controller, "build", new=AsyncMock(return_value=build)):
+            compiler.return_value = {**build, "source_identity": {"files": {"A.lean": "stale"}}}
+            self.assertFalse(self.controller.integrate(candidate)["accepted"])
+            compiler.return_value = build
+            self.assertTrue(await self.controller.integrate_ready())
+        state = self.controller.state()
+        self.assertEqual(state["candidates"][candidate["candidate_id"]]["status"], "merged")
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        remaining = [task for key, task in state["tasks"].items() if key != tid and later in task.get("diagnostics", [])]
+        self.assertEqual(len(remaining), 1)
+        self.assertEqual(remaining[0]["status"], "pending")
+        orphan = next(task for task in state["tasks"].values() if task.get("orphaned_from") == tid)
+        self.assertEqual(orphan["chunk_ids"], ["inherited-missing"])
+        self.assertEqual(orphan["status"], "pending")
+        self.assertNotIn("inherited-missing", state["tasks"][tid]["chunk_ids"])
+        self.assertFalse(state["leases"])
+
     async def test_resolved_import_merges_and_exposed_declaration_remains_open(self):
         (self.root / "A.lean").write_text("import Old.Missing\ndef a := missingA\n")
         self.git(self.root, "add", "A.lean")
@@ -1109,6 +1166,37 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(state["leases"])
         self.assertEqual(state["tasks"][tid]["status"], "complete")
         self.assertTrue(any(t["files"] == ["B.lean"] and t["status"] == "pending" for t in state["tasks"].values()))
+
+    async def test_mixed_candidate_merge_retains_missing_chunks_as_recheckable_orphan(self):
+        state = self.controller.state()
+        tid = next(key for key, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["chunk_ids"].append("inherited-missing")
+            state["chunk_attempts"]["inherited-missing"] = 2
+        tid, candidate, worker = self.submit()
+        self.active_worker(tid, worker)
+        import hashlib
+        result = {**self.build_result([], checked=["A.lean"]), "source_identity": {"files": {
+            "A.lean": hashlib.sha256((worker / "A.lean").read_bytes()).hexdigest()}}}
+        with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
+             patch.object(bump_verification, "build", return_value=result), \
+             patch.object(self.controller, "build", new=AsyncMock(return_value=result)):
+            self.assertTrue(await self.controller.integrate_ready())
+        state = self.controller.state()
+        self.assertEqual(state["candidates"][candidate["candidate_id"]]["status"], "merged")
+        self.assertEqual(state["tasks"][tid]["status"], "complete")
+        self.assertNotIn("inherited-missing", state["tasks"][tid]["chunk_ids"])
+        orphan = next(t for t in state["tasks"].values() if t.get("orphaned_from") == tid)
+        self.assertEqual(orphan["chunk_ids"], ["inherited-missing"])
+        self.assertEqual(orphan["status"], "pending")
+        self.assertEqual(orphan["attempts"], 1)
+        self.assertEqual(state["chunk_attempts"]["inherited-missing"], 3)
+        self.assertTrue(bump_tasks.orphaned_repair(orphan, state["chunks"]))
+        target = self.authoritative_build_result([], checked=["A.lean"])
+        target["command"] = ["lake", "--rehash", "build", "+A"]
+        with patch.object(self.controller, "build", new=AsyncMock(return_value=target)):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+        self.assertEqual(self.controller.state()["tasks"][orphan["task_id"]]["status"], "complete")
 
     async def test_rejected_candidate_releases_only_after_worker_closed(self):
         tid, candidate, worker = self.submit()

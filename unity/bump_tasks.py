@@ -427,7 +427,7 @@ def refresh(forum_dir: Path, inventory: dict, diagnostics, *, main_sha: str,
 def orphaned_repair(task: dict, chunks: dict) -> bool:
     """A deleted compiler assignment cannot be repaired by editing its old range."""
     members = task.get("chunk_ids", [])
-    return task.get("kind") == "repair" and bool(members) and all(cid not in chunks for cid in members)
+    return task.get("kind") in {"repair", "command"} and bool(members) and all(cid not in chunks for cid in members)
 
 
 def claim(forum_dir: Path, author: str, task_id: str, max_attempts: int = 5) -> dict:
@@ -509,8 +509,25 @@ def request_scope(forum_dir: Path, author: str, task_id: str, chunk_ids: list[st
         task = _owned(state, author, task_id)
         if task["status"] != "running" or task["revision"] != expected_revision:
             raise ValueError("stale or submitted assignment")
-        members = set(task["chunk_ids"]) | set(chunk_ids)
-        if not members <= state["chunks"].keys(): raise ValueError("unknown chunk")
+        requested = set(chunk_ids)
+        if not requested <= state["chunks"].keys(): raise ValueError("unknown chunk")
+        owned_missing = set(task["chunk_ids"]) - state["chunks"].keys()
+        new_orphan = None
+        if owned_missing:
+            # Keep missing obligations separately; never pretend an unavailable
+            # declaration was selected, checked, or resolved by this writer.
+            orphan_id = "orphan-" + digest([task_id, sorted(owned_missing), task["revision"]])[:16]
+            if orphan_id in state["tasks"]: raise ValueError("orphan obligation already exists")
+            new_orphan = {**_task(orphan_id, "repair", sorted(owned_missing), list(task["files"])),
+                          "attempts": task["attempts"], "diagnostics": deepcopy(task.get("diagnostics", [])),
+                          "dependencies": [dep for dep in task.get("dependencies", []) if dep != task_id],
+                          "orphaned_from": task_id, "reason": "Unavailable chunks retained during scope regrouping"}
+            for key in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"):
+                if task.get(key): new_orphan[key] = deepcopy(task[key])
+            state["tasks"][orphan_id] = new_orphan
+            _event(state, "scope_orphaned", author, task_id=task_id, orphan_task_id=orphan_id,
+                   missing_chunk_ids=sorted(owned_missing))
+        members = (set(task["chunk_ids"]) - owned_missing) | requested
         if include_file_chunks:
             members.update(cid for cid, row in state["chunks"].items()
                            if row["path"] in explicit_files and not row.get("scope_excluded")
@@ -528,27 +545,42 @@ def request_scope(forum_dir: Path, author: str, task_id: str, chunk_ids: list[st
                 raise ValueError("scope conflicts with another active writer")
         absorbed = [other for key, other in state["tasks"].items() if key != task_id
                     and set(other["chunk_ids"]) & members and other["status"] != "grouped"]
+        fully_absorbed, split = set(), set()
         for other in absorbed:
             if other.get("owner"): raise ValueError("scope includes another owned assignment")
             feedback = {key: deepcopy(other[key]) for key in (
                 "audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback") if other.get(key)}
             if feedback:
                 task.setdefault("grouped_review_feedback", []).append({"task_id": other["task_id"], **feedback})
-            members.update(other["chunk_ids"])
+            old_members = set(other["chunk_ids"])
+            missing = old_members - state["chunks"].keys()
+            members.update(old_members - missing)
             for path in other["files"]:
                 if path in state["leases"] and state["leases"][path]["task_id"] != task_id:
                     raise ValueError("scope conflicts with another active writer")
                 if path not in paths: paths.append(path)
-            other.update(status="grouped", grouped_into=task_id)
+            if missing:
+                # The original task retains the unavailable IDs, diagnostics,
+                # attempts and history as a separately recheckable obligation.
+                other["chunk_ids"] = sorted(missing)
+                other["revision"] += 1
+                split.add(other["task_id"])
+                _event(state, "scope_split_stale", author, task_id=task_id, orphan_task_id=other["task_id"],
+                       missing_chunk_ids=sorted(missing), moved_chunk_ids=sorted(old_members - missing))
+            else:
+                other.update(status="grouped", grouped_into=task_id)
+                fully_absorbed.add(other["task_id"])
         if any(state["chunks"][cid].get("scope_excluded") or state["chunks"][cid].get("after_exit")
                or state["chunks"][cid].get("status") == "excluded" for cid in members):
             raise ValueError("changing compiled scope requires controller review")
-        absorbed_ids = {other["task_id"] for other in absorbed}
-        for other in state["tasks"].values():
-            other["dependencies"] = sorted((set(other["dependencies"]) - absorbed_ids) |
-                ({task_id} if set(other["dependencies"]) & absorbed_ids and other["task_id"] != task_id else set()))
-        task["dependencies"] = sorted(set(task["dependencies"]) | {
-            dep for other in absorbed for dep in other["dependencies"] if dep != task_id and dep not in absorbed_ids})
+        for other_id, other in state["tasks"].items():
+            if other_id == task_id: continue
+            previous = set(other["dependencies"])
+            other["dependencies"] = sorted((previous - fully_absorbed) |
+                ({task_id} if previous & (fully_absorbed | split) else set()))
+        task["dependencies"] = sorted((set(task["dependencies"]) - fully_absorbed - split) | {
+            dep for other in absorbed for dep in other["dependencies"]
+            if dep != task_id and dep not in fully_absorbed and dep not in split})
         task.update(chunk_ids=sorted(members), files=sorted(paths), revision=task["revision"] + 1,
                     reason=reason, attempts=max([task["attempts"], *[other["attempts"] for other in absorbed]]))
         for path in paths: state["leases"][path] = {"task_id": task_id, "author": author, "task_revision": task["revision"]}
