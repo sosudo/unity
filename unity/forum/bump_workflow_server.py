@@ -159,6 +159,53 @@ def bump_brief() -> dict:
                       "Record workflow adjustments with evidence and observed results."]}
 
 
+def _candidate_outcomes(state: dict, task_id: str, files: list[str]) -> dict:
+    """Bounded exact-task summaries; worker notes and controller feedback stay distinct."""
+    def short(value, limit=400):
+        if not isinstance(value, str):
+            return None
+        return value if len(value) <= limit else value[:limit] + "…"
+
+    def preview(rows):
+        if not isinstance(rows, list):
+            return {"count": None, "items": []}
+        relevant = [row for row in rows if isinstance(row, dict) and row.get("path") in files]
+        other = [row for row in rows if isinstance(row, dict) and row.get("path") not in files]
+        return {"count": len(rows), "relevant_count": len(relevant), "items": [
+            {"path": short(row.get("path")), "line": row.get("line") if type(row.get("line")) is int else None,
+             "column": row.get("column") if type(row.get("column")) is int else None,
+             "kind": short(row.get("kind"), 80), "message": short(row.get("message"))}
+            for row in (relevant + other)[:3]]}
+
+    candidates = [row for row in state.get("candidates", {}).values() if row.get("task_id") == task_id]
+    candidates.sort(key=lambda row: (str(row.get("submitted") or ""), str(row.get("candidate_id") or "")), reverse=True)
+    items = []
+    for row in candidates[:3]:
+        feedback = row.get("feedback") if isinstance(row.get("feedback"), dict) else None
+        summary = None
+        if feedback is not None:
+            build = feedback.get("build") if isinstance(feedback.get("build"), dict) else {}
+            log = build.get("log_ref") if isinstance(build.get("log_ref"), dict) else {}
+            command = build.get("command")
+            resolved = feedback.get("resolved_diagnostic_ids")
+            summary = {"accepted": feedback.get("accepted") if type(feedback.get("accepted")) is bool else None,
+                       "made_progress": feedback.get("made_progress") if type(feedback.get("made_progress")) is bool else None,
+                       "reason": short(feedback.get("reason")),
+                       "resolved_diagnostic_count": len(resolved) if isinstance(resolved, list) else None,
+                       "remaining_errors": preview(feedback.get("remaining_errors")),
+                       "regressions": preview(feedback.get("regressions")),
+                       "build_command": [short(part) for part in command[:12]] if isinstance(command, list) else None,
+                       "build_command_omitted": max(0, len(command) - 12) if isinstance(command, list) else None,
+                       "build_log_ref": {key: short(log.get(key)) for key in ("artifact_id", "sha256") if key in log}}
+        items.append({"candidate_id": short(row.get("candidate_id")), "author": short(row.get("author")),
+                      "status": short(row.get("status")), "submitted": short(row.get("submitted")),
+                      "base_main_sha": short(row.get("base_main_sha")), "commit_sha": short(row.get("commit_sha")),
+                      "diff_sha256": short(row.get("diff_sha256")), "worker_notes": short(row.get("notes")),
+                      "controller_feedback": summary})
+    return {"total": len(candidates), "omitted": max(0, len(candidates) - len(items)), "items": items,
+            "qualification": "Exact-task snapshot; worker notes are reports. Controller feedback is candidate-specific; merged partial progress is not final acceptance."}
+
+
 def bump_task(task_id: str) -> dict:
     state = tasks.load(FORUM_DIR)
     task = state["tasks"][task_id]
@@ -175,6 +222,7 @@ def bump_task(task_id: str) -> dict:
     available.sort(key=lambda row: (row["path"], state["chunks"][row["chunk_id"]]["start_line"], row["chunk_id"]))
     return {"task": task, "chunks": [state["chunks"][cid] for cid in task["chunk_ids"] if cid in state["chunks"]],
             "available_file_chunks": available,
+            "candidate_outcomes": _candidate_outcomes(state, task_id, task["files"]),
             "strategies": [s for s in state["strategies"].values() if s["task_id"] == task_id]}
 
 
