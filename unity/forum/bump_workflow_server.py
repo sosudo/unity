@@ -196,10 +196,6 @@ def bump_task_context(task_id: str, offset: int = 0, limit: int = 20,
     state = tasks.load(FORUM_DIR)
     if task_id not in state.get("tasks", {}):
         raise ValueError("unknown Bump task")
-    grouped_predecessor_task_ids = sorted(
-        other_id for other_id, other in state["tasks"].items()
-        if other.get("status") == "grouped" and other.get("grouped_into") == task_id
-    )
     all_events = state.get("events", [])
     if event_cutoff is None:
         event_cutoff = len(all_events)
@@ -208,12 +204,15 @@ def bump_task_context(task_id: str, offset: int = 0, limit: int = 20,
 
     strategies = state.get("strategies", {})
     rows = []
+    report_counts = {}
     for event in all_events[:event_cutoff]:
         if event.get("kind") not in _TASK_CONTEXT_KINDS:
             continue
         event_task_id = event.get("task_id")
         if not event_task_id and event.get("kind") == "assistance":
             event_task_id = (strategies.get(event.get("strategy_id")) or {}).get("task_id")
+        if event_task_id:
+            report_counts[event_task_id] = report_counts.get(event_task_id, 0) + 1
         if event_task_id != task_id:
             continue
         rows.append({
@@ -229,11 +228,37 @@ def bump_task_context(task_id: str, offset: int = 0, limit: int = 20,
             "at": event.get("at"),
         })
 
+    grouped_children = {}
+    for child_id, child in state["tasks"].items():
+        parent_id = child.get("grouped_into")
+        if child.get("status") == "grouped" and isinstance(parent_id, str):
+            grouped_children.setdefault(parent_id, []).append(child_id)
+    grouped_predecessor_task_ids = set()
+    visited = {task_id}
+    pending = [task_id]
+    omitted_empty_grouped_predecessor_count = 0
+    while pending:
+        parent_id = pending.pop()
+        for child_id in grouped_children.get(parent_id, []):
+            if child_id in visited:
+                continue
+            visited.add(child_id)
+            pending.append(child_id)
+            if report_counts.get(child_id, 0):
+                grouped_predecessor_task_ids.add(child_id)
+            else:
+                omitted_empty_grouped_predecessor_count += 1
+
     page = rows[offset:offset + limit]
     next_offset = offset + len(page) if offset + len(page) < len(rows) else None
     return {
         "task_id": task_id,
-        "grouped_predecessor_task_ids": grouped_predecessor_task_ids,
+        "grouped_predecessor_task_ids": sorted(grouped_predecessor_task_ids),
+        "omitted_empty_grouped_predecessor_count": omitted_empty_grouped_predecessor_count,
+        "grouped_predecessor_qualification": (
+            "Only explicitly grouped descendants with communication reports in this event prefix are listed; "
+            "empty grouped nodes were traversed to find reporting descendants."
+        ),
         "event_cutoff": event_cutoff,
         "offset": offset,
         "limit": limit,

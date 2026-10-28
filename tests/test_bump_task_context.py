@@ -23,6 +23,10 @@ class BumpTaskContextTests(unittest.TestCase):
             state["tasks"]["task-b"] = {"task_id": "task-b", "files": ["Shared.lean"]}
             state["tasks"]["task-c"] = {"task_id": "task-c", "files": ["Other.lean"],
                                          "status": "grouped", "grouped_into": "task-a"}
+            state["tasks"]["task-d"] = {"task_id": "task-d", "files": ["Empty.lean"],
+                                         "status": "grouped", "grouped_into": "task-a"}
+            state["tasks"]["task-e"] = {"task_id": "task-e", "files": ["Descendant.lean"],
+                                         "status": "grouped", "grouped_into": "task-d"}
             state["strategies"]["strategy-a"] = {
                 "strategy_id": "strategy-a", "task_id": "task-a",
             }
@@ -43,6 +47,8 @@ class BumpTaskContextTests(unittest.TestCase):
             bump_tasks._event(state, "claim", "Sol", task_id="task-a")
             bump_tasks._event(state, "obstacle", "Terra", task_id="task-c",
                               content="Earlier task report.", evidence="preserve by explicit grouping")
+            bump_tasks._event(state, "finding", "Sol", task_id="task-e",
+                              content="Nested grouped report.", evidence="descendant remains reachable")
 
     def call(self, task_id="task-a", **kwargs):
         with patch.object(forum, "FORUM_DIR", self.forum_dir), \
@@ -55,9 +61,10 @@ class BumpTaskContextTests(unittest.TestCase):
         before = state_path.read_bytes()
         first = self.call(limit=2)
         self.assertEqual(state_path.read_bytes(), before)
-        self.assertEqual(first["event_cutoff"], 9)
+        self.assertEqual(first["event_cutoff"], 10)
         self.assertEqual(first["total"], 6)
-        self.assertEqual(first["grouped_predecessor_task_ids"], ["task-c"])
+        self.assertEqual(first["grouped_predecessor_task_ids"], ["task-c", "task-e"])
+        self.assertEqual(first["omitted_empty_grouped_predecessor_count"], 1)
         self.assertEqual(first["items"][0]["evidence"], "Lean error at line 42")
 
         with bump_tasks.transaction(self.forum_dir) as state:
@@ -85,6 +92,26 @@ class BumpTaskContextTests(unittest.TestCase):
         unrelated = self.call("task-b")
         self.assertEqual([row["content"] for row in unrelated["items"]],
                          ["Different task, same file."])
+
+    def test_empty_intermediates_and_cutoff_filter_grouped_predecessors(self):
+        before_nested_report = self.call(event_cutoff=9)
+        self.assertEqual(before_nested_report["grouped_predecessor_task_ids"], ["task-c"])
+        self.assertEqual(before_nested_report["omitted_empty_grouped_predecessor_count"], 2)
+        after_nested_report = self.call()
+        self.assertEqual(after_nested_report["grouped_predecessor_task_ids"], ["task-c", "task-e"])
+        self.assertIn("event prefix", after_nested_report["grouped_predecessor_qualification"])
+
+    def test_grouped_cycles_terminate_and_preserve_reporting_node(self):
+        with bump_tasks.transaction(self.forum_dir) as state:
+            state["tasks"]["cycle-a"] = {"task_id": "cycle-a", "status": "grouped",
+                                           "grouped_into": "cycle-b"}
+            state["tasks"]["cycle-b"] = {"task_id": "cycle-b", "status": "grouped",
+                                           "grouped_into": "cycle-a"}
+            bump_tasks._event(state, "finding", "Terra", task_id="cycle-b",
+                              content="Cycle node report.", evidence="reachable once")
+        context = self.call("cycle-a")
+        self.assertEqual(context["grouped_predecessor_task_ids"], ["cycle-b"])
+        self.assertEqual(context["omitted_empty_grouped_predecessor_count"], 0)
 
     def test_requires_current_worker_task_and_valid_page_bounds(self):
         self.assertIn(forum.bump_task_context, forum.PROFILE_TOOLS["preparing"])
