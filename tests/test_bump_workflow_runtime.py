@@ -1954,6 +1954,59 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.get("kind") == "yield" and event.get("task_id") == tid
                             for event in self.controller.state()["events"]))
 
+    async def test_yield_rotation_uses_exact_task_history_and_never_tried_first(self):
+        tid = self.yielded_assignment()
+        carol = SimpleNamespace(name="Carol")
+        self.controller.writers.append(carol)
+        self.controller.agent_locks["Carol"] = asyncio.Lock()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            bump_tasks._event(state, "claim", "Carol", task_id="unrelated")
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Bob"})
+            forum.yield_task("Bob", tid, "need a third perspective")
+            await self.finish_continuation_workers()
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Carol"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 3)
+            await self.finish_continuation_workers()
+
+    async def test_yield_ranking_skips_cooling_or_locked_alternatives(self):
+        tid = self.yielded_assignment()
+        carol = SimpleNamespace(name="Carol")
+        self.controller.writers.append(carol)
+        self.controller.agent_locks["Carol"] = asyncio.Lock()
+        self.controller.capacity_cooldowns["Bob"] = bump_workflow.time.monotonic() + 60
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Carol"})
+            forum.yield_task("Carol", tid, "need another perspective")
+            await self.finish_continuation_workers()
+            self.controller.capacity_cooldowns.clear()
+            await self.controller.agent_locks["Bob"].acquire()
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            self.controller.agent_locks["Bob"].release()
+            await self.finish_continuation_workers()
+
+    async def test_restart_handoff_uses_least_recent_exact_task_claim_when_all_tried(self):
+        tid = self.yielded_assignment()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["events"] = [e for e in state["events"]
+                               if not (e.get("task_id") == tid and e.get("kind") == "claim")]
+            bump_tasks._event(state, "claim", "Carol", task_id=tid)
+            bump_tasks._event(state, "claim", "Bob", task_id=tid)
+            bump_tasks._event(state, "claim", "Carol", task_id="unrelated")
+            bump_tasks._event(state, "claim", "Alice", task_id=tid)
+        agents = [SimpleNamespace(name=name) for name in ("Alice", "Bob", "Carol")]
+        roster = SimpleNamespace(agents=agents, primary=agents[0])
+        self.controller = bump_workflow.Controller(self.paths, roster, max_attempts=5)
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Carol"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            await self.finish_continuation_workers()
+
     async def test_capacity_releases_lease_and_hands_task_to_other_writer(self):
         tid = self.continuation_fixture()
         # Force Alice first; the prior merged Bob preference is unrelated here.

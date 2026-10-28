@@ -521,6 +521,14 @@ class Controller:
                 return None
         return None  # No submission event to bind the saved candidate to its attempt.
 
+    @staticmethod
+    def handoff_preference(state, task, writers):
+        """Choose the least recently assigned eligible writer for this task."""
+        last_claim = {event.get("author"): index
+                      for index, event in enumerate(state.get("events", []))
+                      if event.get("kind") == "claim" and event.get("task_id") == task["task_id"]}
+        return min(writers, key=lambda writer: last_claim.get(writer.name, -1)).name
+
     def launch_ready(self):
         from . import bump_tasks
         if stopped(self.paths):
@@ -562,13 +570,17 @@ class Controller:
                             and not self.capacity_cooling(preferred)
                             and not self.agent_locks[preferred].locked()):
                         continue
-                if yielded_by == agent.name:
-                    others = [other for other in self.writers if other.name != agent.name]
+                if yielded_by:
+                    others = [other for other in self.writers if other.name != yielded_by]
+                    idle_others = [other for other in others if other.name not in self.workers
+                                   and not self.agent_locks[other.name].locked()
+                                   and not self.capacity_cooling(other.name)]
                     # Prefer another available agent, or wait while another
                     # owned worker is finishing. A lone roster still proceeds.
-                    if any(other.name not in self.workers and not self.agent_locks[other.name].locked()
-                           and not self.capacity_cooling(other.name)
-                           for other in others) or any(other.name in self.workers for other in others):
+                    if idle_others and agent.name != self.handoff_preference(state, item, idle_others):
+                        continue
+                    if (agent.name == yielded_by and not idle_others
+                            and any(other.name in self.workers for other in others)):
                         continue
                 if any(state["tasks"].get(key, {}).get("status") not in {"complete", "clean", "merged"}
                        for key in item.get("dependencies", [])):
