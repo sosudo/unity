@@ -473,6 +473,33 @@ class Controller:
                 return author
         return None
 
+    @staticmethod
+    def continuation_author(state, task):
+        """Prefer the last merged contributor only until another task attempt."""
+        if task.get("kind") not in {"repair", "command"}:
+            return None
+        candidates = [row for row in state.get("candidates", {}).values()
+                      if row.get("task_id") == task.get("task_id")]
+        if not candidates:
+            return None
+        latest = max(candidates, key=lambda row: (str(row.get("submitted") or ""),
+                                                   str(row.get("candidate_id") or "")))
+        if latest.get("status") != "merged" or not latest.get("author"):
+            return None
+        for event in reversed(state.get("events", [])):
+            if event.get("task_id") != task["task_id"]:
+                continue
+            kind = event.get("kind")
+            if kind == "candidate_submitted":
+                return latest["author"] if event.get("candidate_id") == latest.get("candidate_id") else None
+            if kind in {"claim", "yield"}:
+                return None
+            if kind == "release" and (event.get("author") != latest["author"]
+                                       or event.get("reason") != "Recovered integrated repair"
+                                       or event.get("previous_yield")):
+                return None
+        return None  # No submission event to bind the saved candidate to its attempt.
+
     def launch_ready(self):
         from . import bump_tasks
         if stopped(self.paths):
@@ -505,6 +532,13 @@ class Controller:
                         not (self.paths.project_root / path).is_file() for path in item.get("files", [])):
                     continue  # Missing paths require controller reconciliation, never a worker lease.
                 yielded_by = self.yield_handoff_from(state, item)
+                if not yielded_by:
+                    preferred = self.continuation_author(state, item)
+                    if (preferred and preferred != agent.name
+                            and any(writer.name == preferred for writer in self.writers)
+                            and preferred not in self.workers
+                            and not self.agent_locks[preferred].locked()):
+                        continue
                 if yielded_by == agent.name:
                     others = [other for other in self.writers if other.name != agent.name]
                     # Prefer another available agent, or wait while another

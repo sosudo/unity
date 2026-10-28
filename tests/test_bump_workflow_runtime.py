@@ -1655,6 +1655,128 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         bump_tasks.release(self.paths.forum, "Alice", tid, "confirmed closed")
         return tid
 
+    def continuation_fixture(self, *, keep_other=False):
+        state = self.controller.state()
+        tid = next(tid for tid, task in state["tasks"].items() if task["files"] == ["A.lean"])
+        with bump_tasks.transaction(self.paths.forum) as state:
+            if not keep_other:
+                state["tasks"] = {tid: state["tasks"][tid]}
+            state["tasks"][tid]["attempts"] = 1
+            state["candidates"]["merged"] = {"candidate_id": "merged", "task_id": tid,
+                "status": "merged", "author": "Bob", "submitted": "2026-01-02"}
+            bump_tasks._event(state, "candidate_submitted", "Bob", task_id=tid, candidate_id="merged")
+            bump_tasks._event(state, "release", "Bob", task_id=tid, reason="Recovered integrated repair")
+        self.controller.max_attempts = 5
+        return tid
+
+    async def finish_continuation_workers(self):
+        await asyncio.gather(*(row["task"] for row in self.controller.workers.values()))
+        await self.controller.reap_workers()
+
+    async def test_merged_candidate_author_gets_exact_pending_task_without_budget_reset(self):
+        tid = self.continuation_fixture()
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Bob"})
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 2)
+            self.assertEqual(self.controller.workers["Bob"]["task_id"], tid)
+            await self.finish_continuation_workers()
+
+    async def test_preferred_writer_busy_or_absent_does_not_block_other_writer(self):
+        tid = self.continuation_fixture()
+        for mode in ("locked", "busy", "absent"):
+            with self.subTest(mode=mode):
+                if mode == "locked": await self.controller.agent_locks["Bob"].acquire()
+                if mode == "absent": self.controller.writers = [self.roster.agents[0]]
+                if mode == "busy":
+                    gate = asyncio.Event()
+                    busy = asyncio.create_task(gate.wait())
+                    self.controller.workers["Bob"] = {"task": busy}
+                with patch.object(self.controller, "worker", new=AsyncMock()):
+                    self.controller.launch_ready()
+                    self.assertEqual(self.controller.workers["Alice"]["task_id"], tid)
+                    if mode == "busy":
+                        gate.set()
+                        await busy
+                        self.controller.workers.pop("Bob")
+                    await self.finish_continuation_workers()
+                if mode == "locked": self.controller.agent_locks["Bob"].release()
+                self.controller.writers = self.roster.agents
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    # Restore the fixture's prior candidate/attempt boundary for each case.
+                    state["events"] = [e for e in state["events"]
+                                       if not (e.get("task_id") == tid and e.get("author") == "Alice")]
+                    state["tasks"][tid]["attempts"] = 1
+
+    async def test_later_rejection_or_worker_exit_disables_old_preference(self):
+        for mode in ("rejected", "submitted", "claim", "failed_release"):
+            with self.subTest(mode=mode):
+                tid = self.continuation_fixture() if mode == "rejected" else tid
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    state["candidates"] = {"merged": state["candidates"]["merged"]}
+                    state["events"] = [e for e in state["events"] if e.get("task_id") != tid]
+                    bump_tasks._event(state, "candidate_submitted", "Bob", task_id=tid, candidate_id="merged")
+                    bump_tasks._event(state, "release", "Bob", task_id=tid, reason="Recovered integrated repair")
+                    if mode in {"rejected", "submitted"}:
+                        state["candidates"]["later"] = {"candidate_id": "later", "task_id": tid,
+                            "status": mode, "author": "Bob", "submitted": "2026-01-03"}
+                    elif mode == "claim": bump_tasks._event(state, "claim", "Bob", task_id=tid)
+                    else: bump_tasks._event(state, "release", "Bob", task_id=tid, reason="Worker failed: Error")
+                self.assertIsNone(self.controller.continuation_author(self.controller.state(), self.controller.state()["tasks"][tid]))
+                with patch.object(self.controller, "worker", new=AsyncMock()):
+                    self.controller.launch_ready()
+                    self.assertIn("Alice", self.controller.workers)
+                    if mode == "submitted":
+                        with bump_tasks.transaction(self.paths.forum) as state:
+                            state["candidates"]["later"]["status"] = "rejected"
+                    await self.finish_continuation_workers()
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    state["tasks"][tid]["attempts"] = 1
+
+    async def test_yield_takes_precedence_over_previously_merged_author(self):
+        tid = self.continuation_fixture()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["yield_handoff_from"] = "Bob"
+            bump_tasks._event(state, "claim", "Bob", task_id=tid)
+            bump_tasks._event(state, "yield", "Bob", task_id=tid)
+            bump_tasks._event(state, "release", "Bob", task_id=tid, reason="Worker ended without a submitted repair",
+                              previous_yield={"reason": "need help"})
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            await self.finish_continuation_workers()
+
+    async def test_preference_does_not_block_other_task_or_transfer_to_it(self):
+        tid = self.continuation_fixture(keep_other=True)
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice", "Bob"})
+            self.assertEqual(self.controller.workers["Bob"]["task_id"], tid)
+            self.assertNotEqual(self.controller.workers["Alice"]["task_id"], tid)
+            await self.finish_continuation_workers()
+
+    async def test_continuation_does_not_override_exhaustion(self):
+        tid = self.continuation_fixture()
+        self.controller.max_attempts = 1
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+        self.assertFalse(self.controller.workers)
+        self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+
+    def test_continuation_is_exact_task_recent_candidate_and_repair_kind_only(self):
+        tid = self.continuation_fixture()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["candidates"]["z"] = {"candidate_id": "z", "task_id": tid, "status": "rejected",
+                "author": "Alice", "submitted": "2026-01-02"}
+            state["candidates"]["new-other"] = {"candidate_id": "new-other", "task_id": "other",
+                "status": "merged", "author": "Alice", "submitted": "2027-01-01"}
+        state = self.controller.state()
+        self.assertIsNone(self.controller.continuation_author(state, state["tasks"][tid]))
+        del state["candidates"]["z"]
+        self.assertEqual(self.controller.continuation_author(state, state["tasks"][tid]), "Bob")
+        state["tasks"][tid]["kind"] = "configuration"
+        self.assertIsNone(self.controller.continuation_author(state, state["tasks"][tid]))
+
     async def test_explicit_yield_prefers_other_available_writer_and_keeps_attempts(self):
         tid = self.yielded_assignment()
         self.assertEqual(self.controller.state()["tasks"][tid]["yield_handoff_from"], "Alice")
