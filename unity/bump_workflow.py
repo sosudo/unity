@@ -203,12 +203,13 @@ async def stop_worker(task, interrupt, *, grace=5.0, hard=35.0):
 
 class Controller:
     def __init__(self, paths, roster, *, max_attempts=5, agent_locks=None,
-                 dependency_runs=None, ancestors=()):
+                 dependency_runs=None, ancestors=(), resume_checkpoint=False):
         self.paths, self.roster, self.max_attempts = paths, roster, max_attempts
         self.agent_locks = agent_locks if agent_locks is not None else {
             agent.name: asyncio.Lock() for agent in roster.agents}
         self.dependency_runs = dependency_runs if dependency_runs is not None else {}
         self.ancestors = ancestors
+        self.resume_checkpoint = resume_checkpoint
         self.workers = {}
         self.initial_build = None
         self.build_cancel = Event()
@@ -315,6 +316,7 @@ class Controller:
             for task in state["tasks"].values():
                 if task["kind"] == "configuration" and not task["files"]:
                     task["files"] = [name for name in CONFIG_FILES if (self.paths.project_root / name).exists()]
+        return bool(declaration_build)
 
     async def build(self, *, modules=(), stream=False):
         from . import bump_verification
@@ -1379,11 +1381,14 @@ class Controller:
                     bump_tasks.refresh(self.paths.forum, self.inventory(), parsed,
                         main_sha=self.state()["main_sha"], config_revision=self.state()["config"]["revision"], complete=False)
                     last_parsed = parsed
-                    self.launch_ready()
+                    if not self.resume_checkpoint:
+                        self.launch_ready()
                 await self.reap_workers()
                 await asyncio.sleep(0.1)
-            self.refresh(await self.initial_build, authoritative_full_build=True)
+            authoritative = self.refresh(await self.initial_build, authoritative_full_build=True)
             self.initial_build = None
+            if self.resume_checkpoint and not authoritative:
+                raise ValueError("Resumed Bump needs a current authoritative initial build before repair dispatch")
             while not stopped(self.paths):
                 await self.reap_workers()
                 await self.handle_requests()
@@ -1441,7 +1446,7 @@ async def run(paths, roster, *, max_attempts=5, setup=None, **controller_options
                 raise ValueError("Completed migration changed since its accepted report")
             bump_verification.completion_report(state)
             return True
-    controller = Controller(paths, roster, max_attempts=max_attempts, **controller_options)
+    controller = Controller(paths, roster, max_attempts=max_attempts, resume_checkpoint=existing, **controller_options)
     try:
         return await controller.run()
     finally:

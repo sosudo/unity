@@ -466,6 +466,80 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(any(task["kind"] == "configuration" for state in observations for task in state.values()))
         self.assertTrue(any(task["kind"] == "configuration" for task in self.controller.state()["tasks"].values()))
 
+    async def test_resumed_stream_waits_for_full_refresh_before_dispatching_dependencies(self):
+        (self.root / "B.lean").write_text("import A\ndef b := missingB\n")
+        (self.root / "C.lean").write_text("def c := missingC\n")
+        self.git(self.root, "add", "B.lean", "C.lean")
+        self.git(self.root, "commit", "-qm", "resumed dependency fixture")
+        head = self.git(self.root, "rev-parse", "HEAD")
+        self.scope["selected_modules"]["C"] = "C.lean"
+        self.scope["default_modules"]["C"] = "C.lean"
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["main_sha"] = head
+            state["config"]["scope"] = deepcopy(self.scope)
+            state["tasks"] = {}
+        errors = [self.error("A.lean"), {**self.error("B.lean"), "line": 2}, self.error("C.lean")]
+        self.controller.refresh(self.build_result(errors))
+        state = self.controller.state()
+        ids = {t["files"][0]: tid for tid, t in state["tasks"].items() if len(t["files"]) == 1}
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][ids["A.lean"]]["status"] = "complete"
+        self.controller.resume_checkpoint = True
+        gate = asyncio.Event()
+        saw_stream = asyncio.Event()
+        stop = {"requested": False}
+        dispatches = []
+        async def streamed_build(*, stream=False):
+            await self.controller.diagnostics_queue.put(("stdout", "error: B.lean:2:1: unknown identifier\n"))
+            saw_stream.set()
+            await gate.wait()
+            return self.authoritative_build_result(errors)
+        launch = self.controller.launch_ready
+        def capture_launch():
+            launch()
+            dispatches.append({name: row["task_id"] for name, row in self.controller.workers.items()})
+            if self.controller.initial_build is None:
+                stop["requested"] = True
+        with patch.object(self.controller, "prepare", new=AsyncMock()), \
+             patch.object(self.controller, "build", side_effect=streamed_build), \
+             patch.object(self.controller, "worker", new=AsyncMock()), \
+             patch.object(self.controller, "launch_ready", side_effect=capture_launch), \
+             patch.object(bump_workflow, "stopped", side_effect=lambda _: stop["requested"]):
+            running = asyncio.create_task(self.controller.run())
+            await saw_stream.wait()
+            await asyncio.sleep(0.25)
+            self.assertEqual(dispatches, [])
+            self.assertEqual(self.controller.state()["tasks"][ids["B.lean"]]["attempts"], 0)
+            gate.set()
+            self.assertFalse(await running)
+        self.assertEqual(set(dispatches[0].values()), {ids["A.lean"], ids["C.lean"]})
+        self.assertEqual(self.controller.state()["tasks"][ids["B.lean"]]["attempts"], 0)
+        self.assertIn(ids["A.lean"], self.controller.state()["tasks"][ids["B.lean"]]["dependencies"])
+
+    async def test_resumed_stale_initial_build_fails_closed_before_dispatch(self):
+        self.controller.resume_checkpoint = True
+        bad = self.authoritative_build_result()
+        bad["source_identity"]["main_sha"] = "stale"
+        with patch.object(self.controller, "prepare", new=AsyncMock()), \
+             patch.object(self.controller, "build", new=AsyncMock(return_value=bad)), \
+             patch.object(self.controller, "launch_ready") as launch:
+            with self.assertRaisesRegex(ValueError, "current authoritative initial build"):
+                await self.controller.run()
+            launch.assert_not_called()
+
+    async def test_existing_checkpoint_enables_initial_dispatch_barrier(self):
+        from unity import bump_processes
+        directory = self.paths.unity / "bump"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "migration.json").write_text(json.dumps({"run_id": "test", "target_version": "v4.34.1"}))
+        controller = SimpleNamespace(run=AsyncMock(return_value=False))
+        with patch.object(bump_processes, "assert_closed"), \
+             patch.object(bump_workflow, "Controller", return_value=controller) as factory, \
+             patch.object(bump_workflow, "phase"), \
+             patch.object(bump_verification, "persist_report"):
+            self.assertFalse(await bump_workflow.run(self.paths, self.roster, setup={"phase": "ready"}))
+        self.assertIs(factory.call_args.kwargs["resume_checkpoint"], True)
+
     async def test_empty_configuration_assignment_is_never_dispatched(self):
         tid = "configuration-empty"
         with bump_tasks.transaction(self.paths.forum) as state:
