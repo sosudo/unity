@@ -11,6 +11,7 @@ from unittest.mock import patch
 from concurrent.futures import ThreadPoolExecutor
 
 from unity import bump_tasks as tasks
+from unity import bump_verification as verification
 from unity.forum import bump_workflow_server as forum
 
 
@@ -105,6 +106,115 @@ class WorkflowTaskTests(unittest.TestCase):
 
     def raises(self, exception, match=None):
         return self.assertRaisesRegex(exception, match) if match else self.assertRaises(exception)
+
+    def test_nested_tactic_options_do_not_end_structure_declarations(self):
+        root, directory = setup_state(self.tmp_path)
+        source = """namespace Test
+def first : Unit where
+  map_id := by
+    intro x
+    set_option trace.Meta.synthInstance true in
+      exact x
+  map_comp := by
+    set_option trace.Meta.synthInstance true in
+      exact x
+set_option autoImplicit false in
+  def wrapped := by
+    set_option trace.Meta.synthInstance true in
+      exact 1
+def after := 2
+end Test
+#exit
+def ignored := 3
+"""
+        write_source(root, "A.lean", source)
+        inv = tasks.scan_sources(root, ["A.lean"])
+        by_name = {row["name"]: row for row in inv["chunks"].values()}
+        self.assertEqual((by_name["Test.first"]["start_line"], by_name["Test.first"]["end_line"]), (2, 9))
+        self.assertEqual((by_name["Test.wrapped"]["start_line"], by_name["Test.wrapped"]["end_line"]), (11, 13))
+        self.assertEqual((by_name["Test.after"]["start_line"], by_name["Test.after"]["end_line"]), (14, 14))
+        self.assertTrue(by_name["ignored"]["after_exit"])
+        error = {**diagnostic(line=8), "kind": "declaration"}
+        state = tasks.refresh(directory, inv, [error], main_sha="base", config_revision=0)
+        first = by_name["Test.first"]["chunk_id"]
+        self.assertTrue(any(first in task["chunk_ids"] for task in state["tasks"].values()))
+
+    def test_top_level_option_boundary_and_rescan_preserves_existing_chunk_ids(self):
+        root, directory = setup_state(self.tmp_path)
+        source = """namespace Test
+def first := by
+  exact 1
+set_option autoImplicit false
+def second := 2
+end Test
+"""
+        write_source(root, "A.lean", source)
+        initial = tasks.scan_sources(root, ["A.lean"])
+        first = next(row for row in initial["chunks"].values() if row["name"] == "Test.first")
+        self.assertEqual(first["end_line"], 3)
+        state = tasks.refresh(directory, initial, [diagnostic(line=3)], main_sha="base", config_revision=0)
+        tid = next(iter(state["tasks"]))
+        write_source(root, "A.lean", source.replace("  exact 1", "  set_option autoImplicit false in\n    exact 1"))
+        rescanned = tasks.scan_sources(root, ["A.lean"])
+        moved = rescanned["chunks"][first["chunk_id"]]
+        self.assertEqual(moved["end_line"], 4)
+        state = tasks.refresh(directory, rescanned, [diagnostic(line=4)], main_sha="base", config_revision=0)
+        self.assertIn(first["chunk_id"], state["tasks"][tid]["chunk_ids"])
+
+    def test_indented_section_option_wrapper_is_a_real_boundary(self):
+        root, _ = setup_state(self.tmp_path)
+        write_source(root, "A.lean", """section
+  def first := by
+    exact 1
+  set_option autoImplicit false in
+    def wrapped := 2
+  def last := 3
+end
+""")
+        inv = tasks.scan_sources(root, ["A.lean"])
+        rows = {row["name"]: row for row in inv["chunks"].values()}
+        self.assertEqual((rows["first"]["start_line"], rows["first"]["end_line"]), (2, 3))
+        self.assertEqual((rows["wrapped"]["start_line"], rows["wrapped"]["end_line"]), (5, 5))
+        self.assertEqual((rows["last"]["start_line"], rows["last"]["end_line"]), (6, 6))
+
+    def test_structure_field_progress_uses_owned_ranges_without_claiming_file_clean(self):
+        root, _ = setup_state(self.tmp_path)
+        baseline = """def iso.hom : Unit where
+  map_id := by
+    set_option autoImplicit false in
+      exact 1
+  map_comp := by missing_hom
+def iso.inv : Unit where
+  map_id := by
+    set_option autoImplicit false in
+      exact 1
+  map_comp := by missing_inv
+def later := missing_later
+"""
+        write_source(root, "A.lean", baseline)
+        before = tasks.scan_sources(root, ["A.lean"])
+        owned = [cid for cid, row in before["chunks"].items() if row["name"] in {"iso.hom", "iso.inv"}]
+        self.assertEqual(len(owned), 2)
+        old = [{"id": "hom", "path": "A.lean", "line": 5, "kind": "declaration",
+                "severity": "error", "message": "missing_hom"},
+               {"id": "inv", "path": "A.lean", "line": 10, "kind": "declaration",
+                "severity": "error", "message": "missing_inv"}]
+        later = {"id": "later", "path": "A.lean", "line": 11, "kind": "declaration",
+                 "severity": "error", "message": "missing_later"}
+        write_source(root, "A.lean", baseline.replace("missing_hom", "fixed_hom").replace("missing_inv", "fixed_inv"))
+        candidate = tasks.scan_sources(root, ["A.lean"])
+        build = {"passed": False, "source_stable": True, "unmapped": [], "checked_files": [],
+                 "errors": [later], "diagnostics": [later]}
+        task = {"kind": "command", "files": ["A.lean"], "chunk_ids": owned}
+        result = verification.candidate_progress(old + [later], build, task, before, candidate_chunks=candidate["chunks"])
+        self.assertTrue(result["accepted"])
+        self.assertEqual(set(result["resolved_diagnostic_ids"]), {"hom", "inv"})
+        self.assertEqual(result["remaining_errors"], [later])
+        self.assertFalse(build["passed"])
+        self.assertEqual(build["checked_files"], [])
+        still_broken = {**build, "errors": old + [later], "diagnostics": old + [later]}
+        self.assertFalse(verification.candidate_progress(old + [later], still_broken, task, before,
+                                                        candidate_chunks=candidate["chunks"])["accepted"])
 
     def test_scanner_all_declarations_comments_strings_quotes_and_anonymous(self):
         tmp_path = self.tmp_path

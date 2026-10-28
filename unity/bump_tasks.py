@@ -172,8 +172,23 @@ def scan_sources(root: Path, files) -> dict:
         source = source_path.read_text()
         masked = mask_source(source)
         lines = masked.splitlines()
-        commands = [(number, match) for number, line in enumerate(lines, 1)
-                    if (match := _COMMAND.match(line))]
+        commands, tactic_indents = [], []
+        for number, line in enumerate(lines, 1):
+            if not line.strip():
+                continue
+            indent = len(line) - len(line.lstrip())
+            while tactic_indents and indent <= tactic_indents[-1]:
+                tactic_indents.pop()
+            match = _COMMAND.match(line)
+            # A locally scoped option inside a `by` block is a tactic, not a
+            # source-command boundary. Keep #exit and all other boundaries
+            # conservative; this lexical scanner is not a Lean parser.
+            nested_option = (match and match["kind"] == "set_option" and tactic_indents
+                             and re.search(r"\bin\s*$", match["rest"]))
+            if match and not nested_option:
+                commands.append((number, match))
+            if re.search(r"\bby\s*$", line):
+                tactic_indents.append(indent)
         imports, namespace, blocks, mutual, counts = [], [], [], None, {}
         exit_line = next((n for n, m in commands if m["kind"] == "#exit"), None)
         for index, (line, match) in enumerate(commands):
