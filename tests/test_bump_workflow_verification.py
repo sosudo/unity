@@ -677,6 +677,84 @@ class VerificationTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertFalse(v.candidate_progress(before, build, assignment, indexed, candidate_chunks=indexed["chunks"])["accepted"])
 
+    def test_same_message_in_later_declaration_does_not_mask_owned_fix(self):
+        old = {"id": "old-goal", "path": "Example.lean", "kind": "declaration", "severity": "error",
+               "line": 3, "message": "unsolved goals"}
+        task = {"kind": "repair", "files": ["Example.lean"], "chunk_ids": ["c"]}
+        original = {"path": "Example.lean", "kind": "theorem", "name": "owned", "start_line": 1, "end_line": 5}
+        current = {**original, "end_line": 8}
+        inventory = {"files": {"Example.lean": {"imports": []}}, "chunks": {"c": original}}
+        later = {**old, "id": "later", "line": 12}
+        build = {"passed": False, "errors": [later], "checked_files": [], "unmapped": [], "source_stable": True}
+        result = v.candidate_progress([old], build, task, inventory, candidate_chunks={"c": current})
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["resolved_diagnostic_ids"], ["old-goal"])
+        self.assertEqual(result["remaining_errors"], [later])
+        self.assertFalse(build["passed"])
+
+    def test_owned_resolution_requires_current_declaration_and_later_reach(self):
+        old = {"id": "old-goal", "path": "Example.lean", "kind": "declaration", "severity": "error",
+               "line": 3, "message": "unsolved goals"}
+        task = {"kind": "repair", "files": ["Example.lean"], "chunk_ids": ["c"]}
+        original = {"path": "Example.lean", "kind": "theorem", "name": "owned", "start_line": 1, "end_line": 5}
+        current = {**original, "end_line": 8}
+        inventory = {"files": {"Example.lean": {"imports": []}}, "chunks": {"c": original}}
+        later = {**old, "id": "later", "line": 12}
+        good = {"passed": False, "errors": [later], "checked_files": [], "unmapped": [], "source_stable": True}
+        cases = {
+            "missing_candidate": (good, None),
+            "removed_declaration": (good, {}),
+            "changed_kind": (good, {"c": {**current, "kind": "axiom"}}),
+            "after_exit": (good, {"c": {**current, "after_exit": True}}),
+            "excluded": (good, {"c": {**current, "scope_excluded": True}}),
+            "still_inside_owned_range": ({**good, "errors": [{**later, "line": 7}]}, {"c": current}),
+            "changed_error_inside_owned_range": ({**good, "errors": [later, {**later, "line": 7, "message": "new failure"}]}, {"c": current}),
+            "unlocated_same_file": ({**good, "errors": [later, {**later, "line": None}]}, {"c": current}),
+            "import_block": ({**good, "errors": [later, {**later, "kind": "import", "line": 1}]}, {"c": current}),
+            "unmapped": ({**good, "unmapped": [{"message": "I/O"}]}, {"c": current}),
+            "unstable": ({**good, "source_stable": False}, {"c": current}),
+            "stability_unknown": ({k:v for k,v in good.items() if k != "source_stable"}, {"c": current}),
+            "outside_regression": ({**good, "errors": [later, {**later, "path": "Other.lean", "message": "new error"}]}, {"c": current}),
+        }
+        for label, (build, indexed) in cases.items():
+            with self.subTest(label=label):
+                self.assertFalse(v.candidate_progress([old], build, task, inventory, candidate_chunks=indexed)["accepted"])
+
+    def test_shifted_candidate_range_and_partial_multiple_chunks(self):
+        first = {"id": "first", "path": "Example.lean", "kind": "declaration", "severity": "error",
+                 "line": 3, "message": "unsolved goals"}
+        second = {**first, "id": "second", "line": 9}
+        task = {"kind": "repair", "files": ["Example.lean"], "chunk_ids": ["c1", "c2"]}
+        original = {"c1": {"path": "Example.lean", "kind": "theorem", "name": "first", "start_line": 1, "end_line": 5},
+                    "c2": {"path": "Example.lean", "kind": "theorem", "name": "second", "start_line": 7, "end_line": 10}}
+        current = {"c1": {**original["c1"], "start_line": 4, "end_line": 8},
+                   "c2": {**original["c2"], "start_line": 10, "end_line": 14}}
+        inventory = {"files": {"Example.lean": {"imports": []}}, "chunks": original}
+        remaining = {**second, "line": 12}
+        build = {"passed": False, "errors": [remaining], "checked_files": [], "unmapped": [], "source_stable": True}
+        result = v.candidate_progress([first, second], build, task, inventory, candidate_chunks=current)
+        self.assertTrue(result["accepted"])
+        self.assertEqual(result["resolved_diagnostic_ids"], ["first"])
+        self.assertEqual(set(result["declaration_reach_evidence"]), {"c1"})
+        self.assertEqual(result["remaining_errors"], [remaining])
+        # Baseline end was line 5, but a candidate failure at 7 is still inside
+        # the shifted first declaration and must not count as reaching past it.
+        blocked = {**build, "errors": [{**first, "line": 7}, remaining]}
+        self.assertFalse(v.candidate_progress([first, second], blocked, task, inventory, candidate_chunks=current)["accepted"])
+        self.assertFalse(v.candidate_progress([first, second], build, task, inventory, candidate_chunks={"c1": current["c1"]})["accepted"])
+
+    def test_fallback_cannot_use_stale_range_for_another_owned_file(self):
+        old = {"id": "old", "path": "A.lean", "kind": "declaration", "severity": "error", "line": 1,
+               "message": "unsolved goals"}
+        task = {"kind": "repair", "files": ["A.lean", "B.lean"], "chunk_ids": ["a", "b"]}
+        a = {"path": "A.lean", "kind": "theorem", "name": "a", "start_line": 1, "end_line": 3}
+        b = {"path": "B.lean", "kind": "theorem", "name": "b", "start_line": 1, "end_line": 3}
+        inventory = {"files": {"A.lean": {"imports": []}, "B.lean": {"imports": []}}, "chunks": {"a": a, "b": b}}
+        current = {"a": a, "b": {**b, "end_line": 10}}
+        after = [{**old, "id": "later", "line": 12}, {**old, "path": "B.lean", "line": 5, "message": "still broken"}]
+        build = {"passed": False, "errors": after, "checked_files": [], "unmapped": [], "source_stable": True}
+        self.assertFalse(v.candidate_progress([old], build, task, inventory, candidate_chunks=current)["accepted"])
+
     def test_unreached_chunk_cannot_be_marked_repaired(self):
         old, task, inventory = self.candidate()
         build = {"passed": False, "errors": [], "checked_files": [], "unmapped": []}

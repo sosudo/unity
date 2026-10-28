@@ -637,6 +637,47 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
         end = chunk.get("end_line", chunk.get("range", {}).get("end_line"))
         if path and end and any(d.get("path") == path and d.get("kind") != "import" and (d.get("line") or 0) >= end for d in after):
             reached.add(path)
+    declaration_reach = {}
+    if (task.get("chunk_ids") and after_build.get("source_stable") is True
+            and isinstance(candidate_chunks, dict) and isinstance(chunks, dict)):
+        pairs = {}
+        for cid in task["chunk_ids"]:
+            old_chunk, new_chunk = chunks.get(cid), candidate_chunks.get(cid)
+            if (not old_chunk or not new_chunk or old_chunk.get("path") != new_chunk.get("path")
+                    or old_chunk.get("name") != new_chunk.get("name") or old_chunk.get("kind") != new_chunk.get("kind")
+                    or new_chunk.get("after_exit") or new_chunk.get("scope_excluded")
+                    or new_chunk.get("status") == "excluded" or new_chunk.get("scope_unclassified")
+                    or type(old_chunk.get("start_line")) is not int or type(old_chunk.get("end_line")) is not int
+                    or not 0 < old_chunk["start_line"] <= old_chunk["end_line"]
+                    or type(new_chunk.get("start_line")) is not int or type(new_chunk.get("end_line")) is not int
+                    or not 0 < new_chunk["start_line"] <= new_chunk["end_line"]):
+                pairs = {}
+                break
+            pairs[cid] = (old_chunk, new_chunk)
+        if pairs:
+            for old in assigned:
+                if old in resolved or old.get("kind") != "declaration" or type(old.get("line")) is not int:
+                    continue
+                owners = [(cid, new) for cid, (prior, new) in pairs.items()
+                          if old.get("path") == prior.get("path")
+                          and prior.get("start_line", 0) <= old["line"] <= prior.get("end_line", 0)]
+                if len(owners) != 1:
+                    continue
+                cid, current = owners[0]
+                local = [d for d in after if d.get("path") == old["path"]
+                         and d.get("severity", "error") == "error"]
+                if any(d.get("kind") != "declaration" or type(d.get("line")) is not int for d in local):
+                    continue
+                if any(current["start_line"] <= d["line"] <= current["end_line"] for d in local):
+                    continue
+                later = [d["line"] for d in local if d["line"] > current["end_line"]]
+                if old["path"] not in checked and not later:
+                    continue
+                resolved.append(old)
+                reached.add(old["path"])
+                declaration_reach[cid] = {"path": old["path"], "declaration": current.get("name"),
+                    "start_line": current["start_line"], "end_line": current["end_line"],
+                    "first_later_error_line": min(later) if later else None}
     import_reach = {}
     if (not task.get("chunk_ids") and task.get("kind") in {"command", "module_repair", "imports"}
             and after_build.get("source_stable") is True and isinstance(candidate_chunks, dict)):
@@ -665,10 +706,24 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
                 if path in import_reach:
                     break
     eligible = after_build.get("source_stable", True) and not after_build.get("unmapped") and not (blocked & files) and not regressions
-    accepted = bool(eligible and (after_build.get("passed") or (resolved and files <= reached)))
+    # When the new declaration-aware fallback supplies progress, require
+    # candidate-bound reach for every leased file, rather than letting old
+    # pre-edit ranges prove another file was reached.
+    fallback_reached = set(checked)
+    if declaration_reach:
+        fallback_reached.update(row["path"] for row in declaration_reach.values())
+        for _, chunk in pairs.values():
+            path, end = chunk.get("path"), chunk.get("end_line")
+            if (path in files and type(end) is int and any(
+                    d.get("path") == path and d.get("kind") == "declaration"
+                    and d.get("severity", "error") == "error" and type(d.get("line")) is int
+                    and d["line"] > end for d in after)):
+                fallback_reached.add(path)
+    reached_enough = files <= reached and (not declaration_reach or files <= fallback_reached)
+    accepted = bool(eligible and (after_build.get("passed") or (resolved and reached_enough)))
     return {"accepted": accepted, "made_progress": accepted, "resolved_diagnostic_ids": [d.get("id") for d in resolved],
             "remaining_errors": after, "regressions": regressions, "exposed_downstream_errors": exposed,
-            "import_reach_evidence": import_reach,
+            "import_reach_evidence": import_reach, "declaration_reach_evidence": declaration_reach,
             "blocked_files": sorted(p for p in blocked if p),
             "reason": "checked repair with unrelated failures retained" if accepted else "no safely demonstrated repair progress",
             "qualification": "Provisional compiler progress, not final migration acceptance."}

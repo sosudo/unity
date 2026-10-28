@@ -940,7 +940,7 @@ class Controller:
                           "reason": "configuration resolved; current compiler diagnostics retained"}
             else:
                 candidate_chunks = None
-                if not task.get("chunk_ids") and task.get("kind") in {"command", "module_repair", "imports"}:
+                if task.get("chunk_ids") or task.get("kind") in {"command", "module_repair", "imports"}:
                     selected = set(scope.get("selected_modules", {}).values())
                     sources = set(bump_setup.current_source_files(tree, scope.get("build_dir", ".lake/build")))
                     try:
