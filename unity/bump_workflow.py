@@ -18,14 +18,16 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from threading import Event
 import uuid
 from copy import deepcopy
 
 CONFIG_FILES = ("lean-toolchain", "lakefile.lean", "lakefile.toml", "lake-manifest.json")
+_CAPACITY_COOLDOWN_SECONDS = 60.0
 
 from . import artifacts, bump_jobs, bump_worktree
-from .bump_spawn import SpawnCleanupError, spawn
+from .bump_spawn import BumpProviderCapacityError, SpawnCleanupError, spawn
 from .config import Paths
 
 
@@ -211,6 +213,7 @@ class Controller:
         self.ancestors = ancestors
         self.resume_checkpoint = resume_checkpoint
         self.workers = {}
+        self.capacity_cooldowns = {}
         self.initial_build = None
         self.build_cancel = Event()
         self.orphan_checks = set()
@@ -221,6 +224,22 @@ class Controller:
     def state(self):
         from . import bump_tasks
         return bump_tasks.load(self.paths.forum)
+
+    def capacity_cooling(self, author):
+        return self.capacity_cooldowns.get(author, 0) > time.monotonic()
+
+    def all_available_writers_cooling(self):
+        available = [agent for agent in self.writers if agent.name not in self.workers
+                     and not self.agent_locks[agent.name].locked()]
+        return bool(available) and all(self.capacity_cooling(agent.name) for agent in available)
+
+    def record_capacity(self, author, task_id):
+        from . import bump_tasks
+        self.capacity_cooldowns[author] = time.monotonic() + _CAPACITY_COOLDOWN_SECONDS
+        with bump_tasks.transaction(self.paths.forum) as state:
+            bump_tasks._event(state, "provider_capacity", "controller", task_id=task_id,
+                              worker=author, reason="Selected model is at capacity",
+                              cooldown_seconds=_CAPACITY_COOLDOWN_SECONDS)
 
     def inventory(self, state=None):
         from . import bump_tasks, bump_setup
@@ -516,7 +535,8 @@ class Controller:
                                     and t["status"] not in {"complete", "grouped", "retired"}
                                     for t in state["tasks"].values())
         for agent in self.writers:
-            if agent.name in self.workers or self.agent_locks[agent.name].locked():
+            if (agent.name in self.workers or self.agent_locks[agent.name].locked()
+                    or self.capacity_cooling(agent.name)):
                 continue
             ready = sorted(state["tasks"].values(), key=lambda row: (
                 row.get("kind") not in {"configuration", "dependency", "imports"}, row["task_id"]))
@@ -539,6 +559,7 @@ class Controller:
                     if (preferred and preferred != agent.name
                             and any(writer.name == preferred for writer in self.writers)
                             and preferred not in self.workers
+                            and not self.capacity_cooling(preferred)
                             and not self.agent_locks[preferred].locked()):
                         continue
                 if yielded_by == agent.name:
@@ -546,6 +567,7 @@ class Controller:
                     # Prefer another available agent, or wait while another
                     # owned worker is finishing. A lone roster still proceeds.
                     if any(other.name not in self.workers and not self.agent_locks[other.name].locked()
+                           and not self.capacity_cooling(other.name)
                            for other in others) or any(other.name in self.workers for other in others):
                         continue
                 if any(state["tasks"].get(key, {}).get("status") not in {"complete", "clean", "merged"}
@@ -713,6 +735,8 @@ class Controller:
             error = task.exception() if not task.cancelled() else None
             if isinstance(error, SpawnCleanupError):
                 raise error
+            if isinstance(error, BumpProviderCapacityError):
+                self.record_capacity(author, record["task_id"])
             state = self.state()
             pending = any(row["task_id"] == record["task_id"] and row.get("status") in {"submitted", "merging"}
                           for row in state["candidates"].values())
@@ -997,6 +1021,9 @@ class Controller:
                     return
             self.launch_ready()
             if not self.workers:
+                if self.all_available_writers_cooling():
+                    await asyncio.sleep(0.1)
+                    continue
                 raise ValueError("Bump setup repairs are blocked or exhausted; inspect the Forum")
             await asyncio.sleep(0.1)
         raise bump_jobs.JobCancelled("Bump stopped during preparation")
@@ -1287,20 +1314,29 @@ class Controller:
         phase(self.paths, "critic")
         attempt = 0
         while attempt < self.max_attempts:
-            attempt += 1
             if stopped(self.paths):
                 return False
+            if self.capacity_cooling(agent.name):
+                await asyncio.sleep(0.1)
+                continue
+            attempt += 1
             tree = task_worktree(self.paths, agent.name + "-critic", "critic")
             interrupt = asyncio.Event()
             worker = asyncio.create_task(self.worker(agent, "critic", tree, "critic", interrupt))
+            capacity = False
             try:
                 while not worker.done():
                     if stopped(self.paths):
                         return False
                     await asyncio.sleep(0.1)
                 await worker
+            except BumpProviderCapacityError:
+                self.record_capacity(agent.name, "critic")
+                capacity = True
             finally:
                 await stop_worker(worker, interrupt)
+            if capacity:
+                continue
             current = self.state()
             verdict = current.get("review", {}).get("verdict")
             if not verdict:
@@ -1401,6 +1437,9 @@ class Controller:
                            if task.get("status") not in {"complete", "clean", "merged", "retired", "grouped"}]
                 if not self.workers:
                     if pending:
+                        if self.all_available_writers_cooling():
+                            await asyncio.sleep(0.1)
+                            continue
                         raise ValueError("Bump has blocked or exhausted repairs; inspect Forum task evidence")
                     if await self.review():
                         return True

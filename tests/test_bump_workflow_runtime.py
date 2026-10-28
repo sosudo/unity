@@ -1954,6 +1954,115 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(event.get("kind") == "yield" and event.get("task_id") == tid
                             for event in self.controller.state()["events"]))
 
+    async def test_capacity_releases_lease_and_hands_task_to_other_writer(self):
+        tid = self.continuation_fixture()
+        # Force Alice first; the prior merged Bob preference is unrelated here.
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["candidates"] = {}
+        async def fail_capacity(agent, *args):
+            if agent.name == "Alice":
+                raise bump_workflow.BumpProviderCapacityError("Selected model is at capacity")
+        with patch.object(self.controller, "worker", side_effect=fail_capacity):
+            self.controller.launch_ready()
+            record = self.controller.workers["Alice"]
+            await asyncio.gather(record["task"], return_exceptions=True)
+            old_tree = str(record["tree"])
+            await self.controller.reap_workers()
+            state = self.controller.state()
+            self.assertIsNone(state["tasks"][tid]["owner"])
+            self.assertFalse(state["leases"])
+            self.assertTrue(self.controller.capacity_cooling("Alice"))
+            self.assertTrue(any(e["kind"] == "provider_capacity" and e["worker"] == "Alice" for e in state["events"]))
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Bob"})
+            state = self.controller.state()
+            self.assertEqual(state["tasks"][tid]["attempts"], 3)
+            self.assertIn(old_tree, state["tasks"][tid]["previous_worktrees"])
+            await self.controller.workers["Bob"]["task"]
+            await self.controller.reap_workers()
+
+    async def test_cooldown_does_not_block_yield_or_successful_continuation_fallback(self):
+        tid = self.yielded_assignment()
+        self.controller.capacity_cooldowns["Bob"] = bump_workflow.time.monotonic() + 60
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            await self.controller.workers["Alice"]["task"]
+            await self.controller.reap_workers()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["tasks"][tid]["yield_handoff_from"] = None
+            state["events"] = [e for e in state["events"] if e.get("task_id") != tid]
+            state["candidates"]["m"] = {"candidate_id": "m", "task_id": tid, "author": "Bob",
+                                        "status": "merged", "submitted": "2026-01-01"}
+            bump_tasks._event(state, "candidate_submitted", "Bob", task_id=tid, candidate_id="m")
+            bump_tasks._event(state, "release", "Bob", task_id=tid, reason="Recovered integrated repair")
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            await self.controller.workers["Alice"]["task"]
+            await self.controller.reap_workers()
+
+    async def test_all_cooling_writers_wait_without_declaring_exhaustion(self):
+        self.controller.capacity_cooldowns = {agent.name: bump_workflow.time.monotonic() + 30
+                                              for agent in self.roster.agents}
+        stop = {"requested": False}
+        with patch.object(self.controller, "prepare", new=AsyncMock()), \
+             patch.object(self.controller, "build", new=AsyncMock(return_value=self.build_result([]))), \
+             patch.object(bump_workflow, "stopped", side_effect=lambda _: stop["requested"]):
+            running = asyncio.create_task(self.controller.run())
+            await asyncio.sleep(0.3)
+            self.assertFalse(running.done())
+            self.assertFalse(self.controller.workers)
+            stop["requested"] = True
+            self.assertFalse(await asyncio.wait_for(running, 2))
+
+    async def test_lone_writer_resumes_only_after_cooldown(self):
+        tid = self.continuation_fixture()
+        self.controller.writers = [self.roster.agents[0]]
+        self.controller.capacity_cooldowns["Alice"] = bump_workflow.time.monotonic() + 60
+        with patch.object(self.controller, "worker", new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertFalse(self.controller.workers)
+            self.assertEqual(self.controller.state()["tasks"][tid]["attempts"], 1)
+            self.controller.capacity_cooldowns["Alice"] = bump_workflow.time.monotonic() - 1
+            self.controller.launch_ready()
+            self.assertEqual(set(self.controller.workers), {"Alice"})
+            await self.controller.workers["Alice"]["task"]
+            await self.controller.reap_workers()
+
+    async def test_cleanup_failure_still_retains_owned_lease(self):
+        tid = self.continuation_fixture()
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["candidates"] = {}
+        with patch.object(self.controller, "worker", new=AsyncMock(side_effect=SpawnCleanupError("not closed"))):
+            self.controller.launch_ready()
+            await asyncio.gather(self.controller.workers["Alice"]["task"], return_exceptions=True)
+            with self.assertRaises(SpawnCleanupError):
+                await self.controller.reap_workers()
+        state = self.controller.state()
+        self.assertEqual(state["tasks"][tid]["owner"], "Alice")
+        self.assertEqual(state["leases"]["A.lean"]["task_id"], tid)
+        self.assertFalse(self.controller.capacity_cooldowns)
+        self.controller.workers.clear()
+
+    async def test_capacity_review_waits_and_retries_only_primary(self):
+        snapshot = self.passed_snapshot()
+        seen = []
+        async def critic(agent, task_id, tree, profile, interrupt):
+            seen.append(agent.name)
+            if len(seen) == 1:
+                raise bump_workflow.BumpProviderCapacityError("selected model is at capacity")
+            forum.configure(self.paths.forum, self.root, "critic")
+            forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], True, "offline fixture review")
+        with patch.object(bump_workflow, "_CAPACITY_COOLDOWN_SECONDS", 0.05), \
+             patch.object(bump_verification, "verify_final", return_value=deepcopy(snapshot)), \
+             patch.object(bump_verification, "source_identity", return_value=snapshot["source_identity"]), \
+             patch.object(self.controller, "worker", side_effect=critic):
+            self.assertTrue(await asyncio.wait_for(self.controller.review(), 3))
+        self.assertEqual(seen, ["Alice", "Alice"])
+        self.assertTrue(any(e["kind"] == "provider_capacity" and e["task_id"] == "critic"
+                            for e in self.controller.state()["events"]))
+
     async def test_saved_legacy_yield_still_rotates_after_same_writer_was_retried(self):
         tid = self.yielded_assignment()
         # Simulate the old dispatcher immediately reclaiming and stopping the

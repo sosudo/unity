@@ -30,6 +30,10 @@ class _UnsuccessfulTurnError(RuntimeError):
     """A terminal session failure, not a transient transport exception to retry."""
 
 
+class BumpProviderCapacityError(RuntimeError):
+    """Bump worker's selected Codex model temporarily has no capacity."""
+
+
 class SpawnCleanupError(RuntimeError):
     """Owned execution could not be closed; never reschedule it as a retry."""
 
@@ -1318,6 +1322,9 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         or (interrupt_event is not None and interrupt_event.is_set())):
                     return final
                 if not successful:
+                    if (mcp_profile == "bump"
+                            and "selected model is at capacity" in failure_detail.lower()):
+                        raise BumpProviderCapacityError(failure_detail)
                     # Codex can report provider errors as a terminal notification
                     # rather than raising from the stream. Route those through
                     # the same inherited transport retry cap and backoff.
@@ -1333,6 +1340,8 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
         except _CompletionCallbackError as exc:
             raise exc.error
         except SpawnCleanupError:
+            raise
+        except BumpProviderCapacityError:
             raise
         except _UnsuccessfulTurnError:
             raise

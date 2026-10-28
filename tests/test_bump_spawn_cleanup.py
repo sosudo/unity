@@ -104,7 +104,8 @@ class _Handle:
         yield SimpleNamespace(method='turn/completed', payload=SimpleNamespace(
             turn=SimpleNamespace(status=self.client.outcome,
                                  error=SimpleNamespace(message=(None if self.client.outcome == 'completed'
-                                                               else '429 fixture failure')))))
+                                      else 'Selected model is at capacity. Please try a different model.'
+                                      if self.client.outcome == 'capacity' else '429 fixture failure')))))
 
 
 class _Client:
@@ -291,6 +292,25 @@ class BumpSpawnCleanupTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(self.start())
         self.assertEqual(len(self.clients), 1)
         self.assertEqual(self.clients[0].close_calls, 1)
+
+    async def test_bump_capacity_reaps_owned_processes_before_return_without_retry_sleep(self):
+        self.outcomes = ['capacity']
+        with patch.object(bump_spawn, '_bump_codex_tool_policy', return_value={}), \
+                patch.object(bump_spawn, '_retry_sleep') as retry_sleep:
+            task = asyncio.create_task(bump_spawn.codex_spawner(
+                self.agent, 'system', 'task', self.root, {}, own_process_group=True,
+                mcp_profile='bump', env_overrides={'UNITY_BUMP_PROFILE': 'repairing'}))
+            self.tasks.append(task)
+            with self.assertRaises(bump_spawn.BumpProviderCapacityError):
+                await asyncio.wait_for(task, timeout=2)
+            retry_sleep.assert_not_called()
+        self.assertEqual(len(self.clients), 1)
+        self.assert_all_stopped()
+
+    async def test_non_bump_capacity_keeps_existing_retry_behavior(self):
+        self.outcomes = ['capacity', 'completed']
+        await self.finish(self.start())
+        self.assertEqual(len(self.clients), 2)
 
     async def test_close_error_does_not_skip_owned_group_cleanup(self):
         self.close_mode = 'raises'
