@@ -78,6 +78,74 @@ def bump_status() -> dict:
         "task_counts": counts, "tasks": list(state["tasks"].values()), "candidates": list(state["candidates"].values())}
 
 
+_REVIEW_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance"}
+
+
+def bump_review_context(snapshot_id: str, offset: int = 0, limit: int = 20,
+                        event_cutoff: int | None = None) -> dict:
+    """Page immutable agent reports for one exact current critic snapshot."""
+    if PROFILE != "critic":
+        raise ValueError("review context is available only to the Bump critic")
+    if type(offset) is not int or offset < 0:
+        raise ValueError("review context offset must be a nonnegative integer")
+    if type(limit) is not int or not 1 <= limit <= 50:
+        raise ValueError("review context limit must be between 1 and 50")
+
+    state = tasks.load(FORUM_DIR)
+    if state.get("phase") != "critic":
+        raise ValueError("Bump is no longer in critic review")
+    review = state.get("review") or {}
+    snapshot = review.get("snapshot") or review
+    if (not snapshot_id or snapshot.get("snapshot_id") != snapshot_id
+            or snapshot.get("main_sha") != state.get("main_sha")
+            or snapshot.get("config_revision") != state.get("config", {}).get("revision")):
+        raise ValueError("review context snapshot is stale or does not bind current source/configuration")
+
+    all_events = state.get("events", [])
+    if event_cutoff is None:
+        event_cutoff = len(all_events)
+    elif type(event_cutoff) is not int or not 0 <= event_cutoff <= len(all_events):
+        raise ValueError("review context event cutoff is invalid")
+
+    strategies = state.get("strategies", {})
+    tasks_by_id = state.get("tasks", {})
+    rows = []
+    for event in all_events[:event_cutoff]:
+        if event.get("kind") not in _REVIEW_CONTEXT_KINDS:
+            continue
+        task_id = event.get("task_id")
+        if not task_id and event.get("kind") == "assistance":
+            task_id = (strategies.get(event.get("strategy_id")) or {}).get("task_id")
+        task = tasks_by_id.get(task_id, {})
+        rows.append({
+            "event_id": event.get("event_id"),
+            "question_id": event.get("question_id"),
+            "strategy_id": event.get("strategy_id"),
+            "task_id": task_id,
+            "task_files": list(task.get("files", [])),
+            "author": event.get("author"),
+            "kind": event.get("kind"),
+            "content": event.get("content", event.get("contribution", "")),
+            "evidence": event.get("evidence", ""),
+            "at": event.get("at"),
+        })
+
+    page = rows[offset:offset + limit]
+    next_offset = offset + len(page) if offset + len(page) < len(rows) else None
+    return {
+        "snapshot_id": snapshot_id,
+        "main_sha": snapshot["main_sha"],
+        "config_revision": snapshot["config_revision"],
+        "event_cutoff": event_cutoff,
+        "offset": offset,
+        "limit": limit,
+        "total": len(rows),
+        "next_offset": next_offset,
+        "items": page,
+        "qualification": "Agent-reported collaboration context, not verified findings or workflow status.",
+    }
+
+
 def bump_brief() -> dict:
     """Migration objective and coordination rules; compilation is not hole completion."""
     state = tasks.load(FORUM_DIR)
@@ -447,7 +515,8 @@ COMMON = (bump_status, bump_brief, bump_task, forum_post, forum_read, publish_fi
 WORK = (register_strategy, claim_strategy, assist_strategy, yield_task, request_repair_scope,
         request_configuration_change, submit_repair, sync_from_main)
 PROFILE_TOOLS = {"preparing": COMMON + WORK, "repairing": COMMON + WORK,
-                 "critic": COMMON + (request_review_repair, submit_migration_verdict,), "retrospective": COMMON}
+                 "critic": COMMON + (bump_review_context, request_review_repair, submit_migration_verdict,),
+                 "retrospective": COMMON}
 
 
 def build_server(profile: str) -> FastMCP:
