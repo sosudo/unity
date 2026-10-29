@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 
@@ -99,6 +100,7 @@ def initialize(forum_dir: Path, root: Path, *, run_id: str, base_sha: str,
                  "config": settings, "chunks": {}, "files": {}, "tasks": {},
                  "candidates": {}, "leases": {}, "strategies": {}, "events": [],
                  "config_requests": {}, "workflow_changes": [], "review": {},
+                 "required_project_checks": [], "project_check_revision": 0,
                  "diagnostics": [], "limitations": [], "chunk_attempts": {}}
         _write(forum_dir, state)
         return deepcopy(state)
@@ -558,10 +560,29 @@ def release(forum_dir: Path, author: str, task_id: str, reason: str, closed: boo
         if task.get("owner") != author: raise ValueError("task owner mismatch")
         if not closed: raise ValueError("writer closure must be confirmed before releasing files")
         if task["status"] in {"submitted", "merging"}: raise ValueError("candidate still awaits integration")
+        if task.get("check_only_requested"):
+            tree = Path(task.get("worktree", ""))
+            def git_value(root, *args):
+                result = subprocess.run(["git", *args], cwd=root, capture_output=True, text=True, check=False)
+                return result.stdout.strip() if result.returncode == 0 else None
+            main = Path(state["root"])
+            valid = (tree.is_dir() and task.get("config_revision") == state["config"]["revision"]
+                     and task.get("base_main_sha") == state["main_sha"]
+                     and git_value(tree, "rev-parse", "--show-toplevel") == str(tree.resolve())
+                     and git_value(tree, "rev-parse", "HEAD") == task.get("base_main_sha")
+                     and git_value(tree, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                         == git_value(main, "rev-parse", "--path-format=absolute", "--git-common-dir")
+                     and git_value(tree, "status", "--porcelain", "--untracked-files=all") == ""
+                     and all(state["leases"].get(path, {}).get("task_id") == task_id for path in task.get("files", [])))
+            if not valid:
+                task.pop("check_only_requested", None)
+                task.pop("project_checks", None)
+                _event(state, "project_check_deferral_invalidated", author, task_id=task_id)
         for path, lease in list(state["leases"].items()):
             if lease["task_id"] == task_id: del state["leases"][path]
         task["owner"] = None
-        if task["status"] not in {"complete", "failed", "grouped"}: task["status"] = "pending"
+        if task["status"] not in {"complete", "failed", "grouped"}:
+            task["status"] = "awaiting_checks" if task.get("check_only_requested") else "pending"
         previous_yield = task.pop("yield_requested", None)
         if previous_yield and task["status"] == "pending":
             task["yield_handoff_from"] = author

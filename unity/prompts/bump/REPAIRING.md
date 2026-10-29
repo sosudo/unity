@@ -27,3 +27,5 @@ When a focused question would benefit from a teammate, call `request_assistance`
 Use `bump_status_page` only for needed task or candidate pages; read a compacted CLI response using `artifact_read` and follow its `next_offset`.
 
 Private project build artifacts may be copied from main as an unverified convenience. Treat their diagnostics as advisory; use a targeted rehashed Lake build when checking work. Unity validates submitted candidates in a separate cold checkout.
+
+If an assigned review configuration task only requests project checks and your worktree has no edits, use `request_project_checks` with exact argv and `check_only=True`, then end your turn. The controller runs them after source repairs settle; do not submit an empty patch or treat a private check as final evidence.

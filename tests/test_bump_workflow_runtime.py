@@ -2342,6 +2342,117 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.controller.state()["phase"], "complete")
 
 
+    async def test_check_only_defers_then_controller_runs_and_primary_approves(self):
+        with bump_tasks.transaction(self.paths.forum) as state:
+            for task in state["tasks"].values():
+                task["status"] = "complete"
+            task = bump_tasks._task("check-review", "configuration", [], ["A.lean"])
+            task["review_snapshot_id"] = "prior-review"
+            state["tasks"][task["task_id"]] = task
+        bump_tasks.claim(self.paths.forum, "Alice", "check-review")
+        tree = self.worktree(self.paths, "Alice", "check-review")
+        bump_tasks.configure_assignment(self.paths.forum, "Alice", "check-review", tree, self.base)
+        forum.configure(self.paths.forum, self.root, "repairing")
+        commands = [["lake", "build"], ["lake", "build", "A"], ["lake", "test"]]
+        forum.request_project_checks("Alice", "check-review", commands, "Review asked for checks", check_only=True)
+        self.assertEqual(self.controller.state()["tasks"]["check-review"]["status"], "running")
+        bump_tasks.release(self.paths.forum, "Alice", "check-review", "worker closed")
+        self.assertEqual(self.controller.state()["tasks"]["check-review"]["status"], "awaiting_checks")
+        seen = []
+        def run(root, args, **kwargs):
+            seen.append(args)
+            return subprocess.CompletedProcess(args, 0, "Built A\nBuilt B\n", "")
+        async def critic(agent, task_id, tree, profile, interrupt):
+            forum.configure(self.paths.forum, self.root, "critic")
+            snapshot = self.controller.state()["review"]["snapshot"]
+            self.assertEqual([r["command"] for r in snapshot["project_checks"]], commands)
+            self.assertEqual(self.controller.state()["tasks"]["check-review"]["status"], "complete")
+            forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], True, "Checks passed")
+        with patch.object(bump_verification.bump_jobs, "run", side_effect=run), \
+             patch.object(self.controller, "worker", side_effect=critic):
+            self.assertTrue(await self.controller.review())
+        self.assertTrue(all(command in seen for command in commands))
+        self.assertEqual(self.controller.state()["phase"], "complete")
+
+    async def test_check_deferral_rechecks_dirty_tree_and_configuration_on_closure(self):
+        for mutation in ("dirty", "configuration"):
+            with self.subTest(mutation=mutation):
+                key = "check-" + mutation
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    state["tasks"][key] = bump_tasks._task(key, "configuration", [], ["A.lean"])
+                    state["tasks"][key]["review_snapshot_id"] = "review"
+                bump_tasks.claim(self.paths.forum, "Alice", key)
+                tree = self.worktree(self.paths, "Alice", key)
+                bump_tasks.configure_assignment(self.paths.forum, "Alice", key, tree, self.base)
+                forum.configure(self.paths.forum, self.root, "repairing")
+                forum.request_project_checks("Alice", key, [["lake", "test"]], "Tests", check_only=True)
+                if mutation == "dirty":
+                    (tree / "A.lean").write_text("def changed := 1\n")
+                else:
+                    with bump_tasks.transaction(self.paths.forum) as state:
+                        state["config"]["revision"] += 1
+                bump_tasks.release(self.paths.forum, "Alice", key, "worker closed")
+                task = self.controller.state()["tasks"][key]
+                self.assertEqual(task["status"], "pending")
+                self.assertNotIn("check_only_requested", task)
+                with bump_tasks.transaction(self.paths.forum) as state:
+                    state["tasks"][key]["status"] = "complete"
+
+    async def test_deferred_configuration_does_not_block_source_writer(self):
+        state = self.controller.state()
+        source_task = next(task for task in state["tasks"].values() if task["kind"] == "repair")
+        task = bump_tasks._task("deferred", "configuration", [], ["A.lean"])
+        task["status"] = "awaiting_checks"
+        state["tasks"]["deferred"] = task
+        self.assertTrue(self.controller.writer_eligible(state, source_task, self.roster.agents[0]))
+
+    async def test_lake_option_change_is_rejected_when_checks_are_required(self):
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["required_project_checks"] = [["lake", "test"]]
+            task_id = next(iter(state["tasks"]))
+        forum.configure(self.paths.forum, self.root, "repairing")
+        with self.assertRaisesRegex(ValueError, "unsupported with exact required project checks"):
+            forum.request_configuration_change("Alice", task_id, [], "reason", "change options",
+                                               lake_args=["-Kenv=dev"])
+        self.assertEqual(self.controller.state()["config"]["lake_args"], [])
+
+    async def test_failed_controller_check_goes_to_primary_for_repair(self):
+        seen = []
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state["required_project_checks"] = [["lake", "test"]]
+            state["project_check_revision"] = 1
+            for task in state["tasks"].values():
+                task["status"] = "complete"
+        def run(root, args, **kwargs):
+            return subprocess.CompletedProcess(args, int(args == ["lake", "test"]), "Built A\nBuilt B\n", "failure")
+        async def critic(agent, task_id, tree, profile, interrupt):
+            forum.configure(self.paths.forum, self.root, "critic")
+            snapshot = self.controller.state()["review"]["snapshot"]
+            self.assertFalse(snapshot["passed"])
+            self.assertEqual(snapshot["project_checks"][0]["returncode"], 1)
+            with self.assertRaises(ValueError):
+                forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], True, "Cannot pass")
+            finding = forum.request_review_repair(agent.name, snapshot["snapshot_id"], [], ["A.lean"], "Fix test")
+            forum.submit_migration_verdict(agent.name, snapshot["snapshot_id"], False, "Test failed", finding["task_ids"])
+            seen.extend(finding["task_ids"])
+        with patch.object(bump_verification.bump_jobs, "run", side_effect=run), \
+             patch.object(self.controller, "worker", side_effect=critic):
+            self.assertFalse(await self.controller.review())
+        self.assertEqual(self.controller.state()["tasks"][seen[0]]["status"], "pending")
+
+    async def test_new_critic_check_request_forces_new_snapshot_without_verdict(self):
+        snapshot = self.passed_snapshot()
+        async def critic(agent, task_id, tree, profile, interrupt):
+            forum.configure(self.paths.forum, self.root, "critic")
+            forum.request_review_checks(agent.name, snapshot["snapshot_id"], [["lake", "test"]], "Run tests")
+        with patch.object(bump_verification, "verify_final", return_value=deepcopy(snapshot)), \
+             patch.object(self.controller, "worker", side_effect=critic):
+            self.assertFalse(await self.controller.review())
+        state = self.controller.state()
+        self.assertEqual(state["required_project_checks"], [["lake", "test"]])
+        self.assertTrue(any(t["status"] == "awaiting_checks" for t in state["tasks"].values()))
+
+
 class CompilerFixtureTests(unittest.IsolatedAsyncioTestCase):
     """Real dependency-free Lake project; workers are deterministic test doubles.
 

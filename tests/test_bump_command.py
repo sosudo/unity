@@ -91,6 +91,26 @@ class BumpCommandTests(unittest.IsolatedAsyncioTestCase):
         self.prepare.assert_called_once_with(self.source, "v4.34.1", {}, project_scope="build",
                                               modules=("Poly.UPFan", "Poly.CommDiag"), lake_args=["-Kenv=dev"])
 
+    async def test_required_check_cli_preserves_exact_argv(self):
+        result = await self.invoke("v4.34.1", "--required-check", '["lake", "build", "Example"]',
+                                   "--required-check", '["lake", "test"]')
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(self.run.await_args.kwargs["required_checks"],
+                         [["lake", "build", "Example"], ["lake", "test"]])
+
+    async def test_required_checks_with_configured_options_fail_before_preparation(self):
+        result = await self.invoke("v4.34.1", "--required-check", '["lake", "test"]', "--lake-option=-Kenv=dev")
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("configured Lake options", result.output)
+        self.prepare.assert_not_called()
+
+    async def test_required_check_cli_rejects_shell_and_options(self):
+        for check in ('["sh", "-c", "true"]', '["lake", "build", "--help"]', 'not-json'):
+            with self.subTest(check=check):
+                result = await self.invoke("v4.34.1", "--required-check", check)
+                self.assertNotEqual(result.exit_code, 0)
+                self.prepare.assert_not_called()
+
     async def test_no_automatic_architect_installation(self):
         result = await self.invoke("v4.34.1", "--architect", "auto")
         self.assertNotEqual(result.exit_code, 0)

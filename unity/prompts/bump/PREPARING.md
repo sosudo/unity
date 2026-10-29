@@ -15,3 +15,5 @@ Publish findings, obstacles and questions through the Bump forum. Register and c
 Use `record_workflow_change` for every material adjustment: original procedure, concrete problem, evidence, revised procedure, and observed result. A proposal without an observed result must be labeled as such. Do not start evaluations, change providers or models, or perform unrelated repository changes.
 
 Use `bump_status_page` only for needed task or candidate pages; read a compacted CLI response using `artifact_read` and follow its `next_offset`.
+
+If an assigned task identifies required project checks, record their exact Lake argv with `request_project_checks`; final checks are run by the controller after source repairs settle.

@@ -557,7 +557,7 @@ class Controller:
             return False
         configuration = item.get("kind") in {"configuration", "dependency", "scope_review"}
         configuration_pending = any(t["kind"] in {"configuration", "dependency", "scope_review"}
-                                    and t["status"] not in {"complete", "grouped", "retired"}
+                                    and t["status"] not in {"complete", "grouped", "retired", "awaiting_checks"}
                                     for t in state["tasks"].values())
         if ((configuration and not item.get("files"))
                 or (configuration_pending and (not configuration or self.workers))
@@ -1100,6 +1100,8 @@ class Controller:
                 if options and not request["files"]:
                     current = self.state()
                     config = {**current["config"], **options}
+                    if current.get("required_project_checks") and config.get("lake_args"):
+                        raise ValueError("configured Lake options are unsupported with exact required project checks")
                     setup = await self.checked_job(bump_setup.prepare_environment, self.paths.project_root,
                         current["target_version"], config.get("pins", {}), modules=config.get("modules", ()),
                         project_scope=config.get("project_scope", "build"), lake_args=config.get("lake_args", ()))
@@ -1378,6 +1380,8 @@ class Controller:
             if applied.returncode:
                 return {"accepted": False, "reason": "Merge conflict; sync your worktree and resubmit"}
             config = {**state["config"], **task.get("requested_config", {})}
+            if state.get("required_project_checks") and config.get("lake_args"):
+                raise ValueError("configured Lake options are unsupported with exact required project checks")
             renames = config.pop("module_renames", {})
             if renames:
                 selected = state["config"].get("scope", {}).get("selected_modules", {})
@@ -1534,8 +1538,21 @@ class Controller:
         snapshot = await self.checked_job(bump_verification.verify_final, self.paths.project_root,
             base_sha=state["base_sha"], scope=state["config"]["scope"],
             lake_args=state["config"].get("lake_args", ()), artifacts_dir=self.paths.artifacts,
-            config_revision=state["config"]["revision"])
+            config_revision=state["config"]["revision"],
+            required_checks=state.get("required_project_checks", []),
+            check_revision=state.get("project_check_revision", 0))
         with bump_tasks.transaction(self.paths.forum) as current:
+            if (current["main_sha"] != state["main_sha"] or snapshot.get("main_sha") != current["main_sha"]
+                    or current["config"] != state["config"]
+                    or current.get("required_project_checks", []) != state.get("required_project_checks", [])
+                    or current.get("project_check_revision", 0) != state.get("project_check_revision", 0)):
+                raise ValueError("Bump configuration or required checks changed during final verification")
+            if snapshot.get("passed"):
+                bump_verification.require_project_check_receipts(current, snapshot)
+                for task in current["tasks"].values():
+                    if task.get("status") == "awaiting_checks" and all(
+                            command in snapshot.get("required_project_checks", []) for command in task.get("project_checks", [])):
+                        task["status"] = "complete"
             current["review"] = {"snapshot": snapshot, "reviewer": self.roster.primary.name, "verdicts": []}
         if not snapshot.get("passed"):
             repairable = self.queue_audit_repairs(snapshot.get("issues", []))
@@ -1544,7 +1561,11 @@ class Controller:
                 return False
             if repairable:
                 return False
-            raise ValueError("Final Bump verification did not pass; inspect stored build/audit evidence")
+            if not snapshot.get("issues") or any(
+                    issue.get("kind") != "required_project_check_failed" for issue in snapshot["issues"]):
+                raise ValueError("Final Bump verification did not pass; inspect stored build/audit evidence")
+            # The primary can turn a failed, logged project check into a precise
+            # source repair. This snapshot cannot be approved.
         agent = self.roster.primary
         phase(self.paths, "critic")
         attempt = 0
@@ -1575,6 +1596,9 @@ class Controller:
             current = self.state()
             verdict = current.get("review", {}).get("verdict")
             if not verdict:
+                if current.get("project_check_revision", 0) != snapshot.get("project_check_revision", 0):
+                    phase(self.paths, "repairing")
+                    return False
                 continue
             if verdict.get("approved"):
                 identity = await asyncio.to_thread(bump_verification.source_identity, self.paths.project_root,
@@ -1584,6 +1608,11 @@ class Controller:
                 prospective = {**current, "phase": "complete"}
                 receipt = bump_verification.persist_report(self.paths, prospective, snapshot, verdict, accepted=True)
                 with bump_tasks.transaction(self.paths.forum) as accepted:
+                    # Requirements may have changed while the critic or report
+                    # was running; never attach its approval to newer state.
+                    if accepted.get("review", {}).get("snapshot") != snapshot or accepted.get("review", {}).get("verdict") != verdict:
+                        raise ValueError("Review changed before completion")
+                    bump_verification.completion_report({**accepted, "phase": "complete"}, snapshot, verdict)
                     accepted["phase"] = "complete"
                     accepted["final_report"] = receipt["artifacts"]
                 phase(self.paths, "complete")
@@ -1591,7 +1620,8 @@ class Controller:
             if verdict.get("reopen_task_ids"):
                 with bump_tasks.transaction(self.paths.forum) as changed:
                     for key in verdict["reopen_task_ids"]:
-                        changed["tasks"][key]["status"] = "pending"
+                        if changed["tasks"][key].get("status") != "awaiting_checks":
+                            changed["tasks"][key]["status"] = "pending"
                         changed["tasks"][key]["critic_feedback"] = verdict
                 phase(self.paths, "repairing")
                 return False
@@ -1672,7 +1702,7 @@ class Controller:
                 self.launch_assistance()
                 state = self.state()
                 pending = [task for task in state["tasks"].values()
-                           if task.get("status") not in {"complete", "clean", "merged", "retired", "grouped"}]
+                           if task.get("status") not in {"complete", "clean", "merged", "retired", "grouped", "awaiting_checks"}]
                 if not self.workers:
                     if pending:
                         if self.all_available_writers_cooling():
@@ -1692,7 +1722,7 @@ class Controller:
             await self.drain()
 
 
-async def run(paths, roster, *, max_attempts=5, setup=None, **controller_options):
+async def run(paths, roster, *, max_attempts=5, setup=None, required_checks=None, **controller_options):
     from . import bump_tasks, bump_setup, bump_verification
     from .bump_processes import assert_closed
     setup = setup or bump_setup.read_setup(paths)
@@ -1716,7 +1746,7 @@ async def run(paths, roster, *, max_attempts=5, setup=None, **controller_options
             if task.get("owner") and task["status"] == "running":
                 bump_tasks.release(paths.forum, task["owner"], task["task_id"],
                                    "Reopened interrupted attempt after verified process closure", closed=True)
-        if state["phase"] == "complete":
+        if state["phase"] == "complete" and not required_checks:
             snapshot = state.get("review", {}).get("snapshot", {})
             identity = bump_verification.source_identity(paths.project_root,
                 lake_args=state["config"].get("lake_args", ()), scope=state["config"].get("scope"))
@@ -1724,6 +1754,15 @@ async def run(paths, roster, *, max_attempts=5, setup=None, **controller_options
                 raise ValueError("Completed migration changed since its accepted report")
             bump_verification.completion_report(state)
             return True
+    if required_checks:
+        from . import bump_project_checks
+        with bump_tasks.transaction(paths.forum) as state:
+            previous = state.get("project_check_revision", 0)
+            bump_project_checks.add_to_state(state, required_checks, "user")
+            if state.get("project_check_revision", 0) != previous and state.get("phase") == "complete":
+                state["phase"] = "repairing"
+                state["review"] = {}
+                state.pop("final_report", None)
     controller = Controller(paths, roster, max_attempts=max_attempts, resume_checkpoint=existing, **controller_options)
     try:
         return await controller.run()

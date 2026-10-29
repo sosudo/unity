@@ -573,10 +573,11 @@ async def _run_critics(roster, paths, max_attempts: int | float) -> None:
               help="Current default targets/import closure (build), or all current project modules.")
 @click.option("--module", "modules", multiple=True, help="Also check this current project module (repeatable).")
 @click.option("--lake-option", "lake_options", multiple=True, help="Consistent Lake configuration, e.g. --lake-option=-Kenv=dev.")
+@click.option("--required-check", "required_checks", multiple=True, help="Required exact Lake argv as a JSON array; repeatable.")
 @click.option("--architect", type=click.Choice(["auto", "off"]), default="off", hidden=True,
               help="Compatibility option; automatic dependency installation is no longer supported.")
 async def bump(version=None, dependency_values=(), continue_=False, project_scope=None,
-               architect="off", modules=(), lake_options=()):
+               architect="off", modules=(), lake_options=(), required_checks=()):
     """Migrate an existing Lean project using declaration-level compiler repairs."""
     from .. import bump_dependencies
     if architect != "off":
@@ -589,10 +590,14 @@ async def bump(version=None, dependency_values=(), continue_=False, project_scop
         except BlockingIOError as exc:
             raise click.ClickException("another Bump controller is already running in this project") from exc
         try:
+            from .. import bump_project_checks
+            checks = bump_project_checks.normalize([json.loads(value) for value in required_checks])
             pins = bump_dependencies.parse_dependency_pins(dependency_values)
             lake_args = bump_dependencies.checked_lake_args(lake_options)
+            if checks and lake_args:
+                raise ValueError("exact required project checks cannot be combined with configured Lake options")
             await _run_bump(paths, continue_, version, pins, project_scope=project_scope,
-                            architect=architect, modules=modules or None, lake_args=lake_args or None)
+                            architect=architect, modules=modules or None, lake_args=lake_args or None, required_checks=checks)
         except (OSError, ValueError) as exc:
             raise click.ClickException(str(exc)) from exc
         finally:
@@ -605,7 +610,7 @@ def _assert_resume_jobs_closed(root: Path) -> None:
 
 
 async def _run_bump(source_paths, continue_, version=None, dependency_pins=None, *, project_scope=None,
-                    architect=None, modules=None, lake_args=None):
+                    architect=None, modules=None, lake_args=None, required_checks=None):
     from .. import bump_setup, bump_tasks, bump_workflow
     if architect not in {None, "off"}:
         raise click.ClickException("Bump no longer automatically installs LeanArchitect")
@@ -637,7 +642,7 @@ async def _run_bump(source_paths, continue_, version=None, dependency_pins=None,
             (paths.unity / "stop-requested").unlink(missing_ok=True)
         elif (source_paths.unity / "stop-requested").exists():
             (paths.unity / "stop-requested").touch()
-        await bump_workflow.run(paths, roster, max_attempts=max_attempts)
+        await bump_workflow.run(paths, roster, max_attempts=max_attempts, **({"required_checks": required_checks} if required_checks else {}))
         final_state = bump_tasks.load(paths.forum)
         bump_setup._json(source_paths.unity / "state.json",
                              {"command": "bump", "phase": "done" if final_state["phase"] == "complete" else final_state["phase"]})

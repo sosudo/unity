@@ -562,7 +562,11 @@ def _patch_replay(root: Path, base_sha: str, current_files: dict, artifacts_dir:
 
 
 def verify_final(root: Path, *, base_sha: str, scope: dict, lake_args=(), artifacts_dir=None,
-                 config_revision=0) -> dict:
+                 config_revision=0, required_checks=None, check_revision=0) -> dict:
+    from . import bump_project_checks
+    required_checks = bump_project_checks.normalize(required_checks or [])
+    if required_checks and lake_args:
+        raise ValueError("exact required project checks cannot be combined with configured Lake options")
     root = Path(root).resolve()
     artifacts_dir = Path(artifacts_dir or root / ".unity" / "artifacts")
     before = source_identity(root, lake_args=lake_args, scope=scope)
@@ -570,6 +574,18 @@ def verify_final(root: Path, *, base_sha: str, scope: dict, lake_args=(), artifa
     supplemental = sorted(set(_module_paths(scope)) - set(_module_paths(scope, "default_modules")))
     if supplemental:
         builds.append(build(root, modules=supplemental, lake_args=lake_args, scope=scope))
+    receipts = []
+    for command in required_checks:
+        # Bind the exact argv and both identities while owning the same build lock.
+        with bump_jobs._build_lock(root):
+            check_before = source_identity(root, lake_args=lake_args, scope=scope)
+            job = bump_jobs.run(root, command, cwd=root, task_id="workflow-project-check", serialize_build=True)
+            check_after = source_identity(root, lake_args=lake_args, scope=scope)
+            output = (job.stdout or "") + "\n" + (job.stderr or "")
+            log = artifacts.store_text(artifacts_dir, output, kind="bump_project_check", producer="Unity",
+                metadata={"command": command, "source_sha256": check_before["sha256"], "returncode": job.returncode})
+        receipts.append({"command": command, "before": check_before, "after": check_after,
+                         "config_revision": config_revision, "returncode": job.returncode, "log_ref": log})
     audit = audit_sources(root, base_sha, scope)
     issues = list(audit["issues"])
     checked = set().union(*(set(item["checked_files"]) for item in builds))
@@ -581,10 +597,16 @@ def verify_final(root: Path, *, base_sha: str, scope: dict, lake_args=(), artifa
     after = source_identity(root, lake_args=lake_args, scope=scope)
     if before != after:
         issues.append({"kind": "snapshot_changed_during_verification"})
+    for receipt in receipts:
+        if (type(receipt["returncode"]) is not int or receipt["returncode"] != 0
+                or receipt["before"] != after or receipt["after"] != after):
+            issues.append({"kind": "required_project_check_failed", "command": receipt["command"],
+                           "log_ref": receipt["log_ref"]})
     replay = _patch_replay(root, base_sha, after["files"], artifacts_dir)
     result = {"schema_version": 1, "snapshot_id": "bump-review-" + uuid.uuid4().hex,
               "created_at": time.time(), "main_sha": after["main_sha"], "base_sha": base_sha,
-              "config_revision": config_revision,
+              "config_revision": config_revision, "required_project_checks": required_checks,
+              "project_check_revision": check_revision, "project_checks": receipts,
               "source_identity": after, "scope": deepcopy(scope), "lake_args": list(lake_args),
               "passed": not issues, "issues": issues, "builds": builds, "hole_audit": audit,
               "patch_replay": replay, "checked_files": sorted(checked),
@@ -763,6 +785,27 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
             "qualification": "Provisional compiler progress, not final migration acceptance."}
 
 
+def require_project_check_receipts(state: dict, snapshot: dict) -> None:
+    """Reject stale, incomplete, changed-command or unbound check evidence."""
+    from . import bump_project_checks
+    required = bump_project_checks.normalize(state.get("required_project_checks", []))
+    if required and (state.get("config", {}).get("lake_args") or snapshot.get("lake_args")):
+        raise ValueError("exact required project checks cannot be combined with configured Lake options")
+    if (snapshot.get("required_project_checks", []) != required
+            or snapshot.get("project_check_revision", 0) != state.get("project_check_revision", 0)):
+        raise ValueError("required project checks changed since verification")
+    receipts = snapshot.get("project_checks", [])
+    if not isinstance(receipts, list) or len(receipts) != len(required):
+        raise ValueError("required project check receipts are incomplete")
+    for command, receipt in zip(required, receipts):
+        if (receipt.get("command") != command or type(receipt.get("returncode")) is not int
+                or receipt["returncode"] != 0 or receipt.get("before") != snapshot.get("source_identity")
+                or receipt.get("after") != snapshot.get("source_identity")
+                or receipt.get("config_revision") != snapshot.get("config_revision")
+                or not receipt.get("log_ref", {}).get("sha256")):
+            raise ValueError("required project check receipt is stale or failed")
+
+
 def completion_report(state: dict, snapshot: dict | None = None, verdict=None) -> dict:
     snapshot = snapshot or state.get("review", {}).get("snapshot") or {}
     review = state.get("review", {})
@@ -772,6 +815,7 @@ def completion_report(state: dict, snapshot: dict | None = None, verdict=None) -
         content = {k: v for k, v in snapshot.items() if k != "sha256"}
         if not snapshot.get("passed") or snapshot.get("sha256") != digest(content):
             raise ValueError("accepted migration requires current passed machine evidence")
+        require_project_check_receipts(state, snapshot)
         identity = snapshot.get("source_identity", {})
         builds = snapshot.get("builds", [])
         required = set(_module_paths(snapshot.get("scope", {})).values())
@@ -801,7 +845,7 @@ def completion_report(state: dict, snapshot: dict | None = None, verdict=None) -
             "project_changes": {"base_sha": state.get("base_sha", snapshot.get("base_sha")),
                 "main_sha": snapshot.get("main_sha", state.get("main_sha")), "scope": snapshot.get("scope", state.get("scope")),
                 "dependencies": deepcopy(state.get("dependencies", {})), "configuration": deepcopy(state.get("config", {})),
-                "builds": snapshot.get("builds", []), "hole_audit": snapshot.get("hole_audit", {}),
+                "builds": snapshot.get("builds", []), "project_checks": snapshot.get("project_checks", []), "hole_audit": snapshot.get("hole_audit", {}),
                 "patch_replay": snapshot.get("patch_replay", {}), "candidates": deepcopy(state.get("candidates", {})),
                 "critic": deepcopy(verdict), "issues": snapshot.get("issues", []),
                 "not_checked": ["cross-version semantic equivalence", "whole transitive axiom certification", "interactive UI behavior"]},

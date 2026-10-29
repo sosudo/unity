@@ -990,5 +990,104 @@ class VerificationTests(unittest.TestCase):
         self.assertNotEqual(one["artifacts"]["project_changes"]["artifact_id"], two["artifacts"]["project_changes"]["artifact_id"])
 
 
+    @patch.object(v.bump_jobs, "run")
+    def test_required_checks_are_exact_and_bound_to_current_source(self, run):
+        commands = [["lake", "build"], ["lake", "build", "Example"], ["lake", "test"]]
+        run.side_effect = self.run_tool
+        snapshot = v.verify_final(self.root, base_sha=self.base, scope=self.scope,
+                                  config_revision=3, required_checks=commands, check_revision=2)
+        self.assertTrue(snapshot["passed"])
+        self.assertEqual([r["command"] for r in snapshot["project_checks"]], commands)
+        self.assertTrue(all(r["before"] == snapshot["source_identity"] == r["after"] for r in snapshot["project_checks"]))
+        state = {"required_project_checks": commands, "project_check_revision": 2}
+        v.require_project_check_receipts(state, snapshot)
+        for field, value in (("returncode", 1), ("command", ["lake", "test"]),
+                             ("before", {}), ("after", {}), ("config_revision", 4), ("log_ref", {})):
+            bad = deepcopy(snapshot)
+            bad["project_checks"][0][field] = value
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                v.require_project_check_receipts(state, bad)
+        for key, value in (("required_project_checks", [["lake", "test"]]), ("project_check_revision", 3)):
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                v.require_project_check_receipts({**state, key: value}, snapshot)
+
+    @patch.object(v.bump_jobs, "run")
+    def test_failed_or_source_mutating_check_is_never_passed(self, run):
+        def execute(root, args, **kwargs):
+            if args == ["lake", "test"]:
+                self.write("Example.lean", "def changed := 1\n")
+                return subprocess.CompletedProcess(args, 1, "test failed", "")
+            return self.run_tool(root, args, **kwargs)
+        run.side_effect = execute
+        snapshot = v.verify_final(self.root, base_sha=self.base, scope=self.scope,
+                                  required_checks=[["lake", "test"]])
+        self.assertFalse(snapshot["passed"])
+        self.assertTrue(any(i["kind"] == "required_project_check_failed" for i in snapshot["issues"]))
+        with self.assertRaises(ValueError):
+            v.require_project_check_receipts({"required_project_checks": [["lake", "test"]]}, snapshot)
+
+    def test_required_check_argv_validation_is_bounded_and_idempotent(self):
+        from unity import bump_project_checks as checks
+        state = {}
+        commands = [["lake", "build", "Example"], ["lake", "test"]]
+        # Exercise idempotence with a real initialized event list.
+        state.update(events=[], revision=0)
+        checks.add_to_state(state, commands, "user")
+        before = deepcopy(state)
+        checks.add_to_state(state, commands, "user")
+        self.assertEqual(state, before)
+        for bad in ([["lake", "build", "--help"]], [["sh", "-c", "true"]],
+                    [["lake", "test", "--help"]], [["lake", "build", "x;rm"]],
+                    [["lake", "build", "x" * 201]], [["lake", "test"]] * 33):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                checks.normalize(bad)
+
+
+    def test_exact_project_checks_reject_ambiguous_lake_options(self):
+        from unity import bump_project_checks as checks
+        with self.assertRaisesRegex(ValueError, "configured Lake options"):
+            v.verify_final(self.root, base_sha=self.base, scope=self.scope,
+                           lake_args=["-Kenv=dev"], required_checks=[["lake", "test"]])
+        state = {"required_project_checks": [["lake", "test"]], "config": {"lake_args": ["-Kenv=dev"]}}
+        with self.assertRaisesRegex(ValueError, "configured or pending Lake options"):
+            checks.add_to_state(state, [["lake", "test"]], "user")
+        pending = {"config_requests": {"p": {"status": "pending", "requested_config": {"lake_args": ["-Kx=y"]}}}}
+        with self.assertRaisesRegex(ValueError, "pending Lake options"):
+            checks.add_to_state(pending, [["lake", "test"]], "user")
+        with self.assertRaisesRegex(ValueError, "configured Lake options"):
+            v.require_project_check_receipts(state, {})
+        with self.assertRaisesRegex(ValueError, "configured Lake options"):
+            v.require_project_check_receipts({"required_project_checks": [["lake", "test"]]}, {"lake_args": ["-Kenv=dev"]})
+
+    @patch.object(v.bump_jobs, "run")
+    def test_cancelled_check_never_produces_a_passed_snapshot(self, run):
+        def execute(root, args, **kwargs):
+            if args == ["lake", "test"]:
+                raise v.bump_jobs.JobCancelled("stopped")
+            return self.run_tool(root, args, **kwargs)
+        run.side_effect = execute
+        with self.assertRaises(v.bump_jobs.JobCancelled):
+            v.verify_final(self.root, base_sha=self.base, scope=self.scope,
+                           required_checks=[["lake", "test"]])
+
+    @unittest.skipUnless(os.environ.get("UNITY_BUMP_TEST_LAKE"), "set UNITY_BUMP_TEST_LAKE to an installed Lake")
+    def test_real_lake_exact_required_build_and_missing_target(self):
+        self.write("lakefile.toml", 'name = "Example"\n[[lean_lib]]\nname = "Example"\n')
+        setup = subprocess.run([os.environ["UNITY_BUMP_TEST_LAKE"], "build"], cwd=self.root,
+                               capture_output=True, text=True)
+        self.assertEqual(setup.returncode, 0, setup.stderr)
+        self.git("add", "lakefile.toml", "lake-manifest.json")
+        self.git("commit", "--quiet", "-m", "fixture config")
+        base = self.git("rev-parse", "HEAD")
+        with patch.dict(os.environ, {"UNITY_REAL_LAKE": os.environ["UNITY_BUMP_TEST_LAKE"]}):
+            good = v.verify_final(self.root, base_sha=base, scope=self.scope,
+                                  required_checks=[["lake", "build", "Example"]])
+            self.assertTrue(good["passed"], good["issues"])
+            bad = v.verify_final(self.root, base_sha=base, scope=self.scope,
+                                 required_checks=[["lake", "build", "MissingTarget"]])
+            self.assertFalse(bad["passed"])
+            self.assertNotEqual(bad["project_checks"][0]["returncode"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -568,6 +568,8 @@ def request_configuration_change(author: str, task_id: str, files: list[str], re
         requested["project_scope"] = project_scope
     with tasks.transaction(FORUM_DIR) as state:
         if task_id not in state["tasks"]: raise ValueError("unknown task")
+        if state.get("required_project_checks") and requested.get("lake_args"):
+            raise ValueError("configured Lake options are unsupported with exact required project checks")
         if requested.get("project_scope") == "build" and state["config"].get("project_scope") == "all":
             raise ValueError("workers cannot drop required all-module build scope")
         if "modules" in requested:
@@ -638,7 +640,7 @@ def submit_repair(author: str, task_id: str, notes: str = "") -> dict:
     author, task_id = _author(author), _task_id(task_id)
     with tasks.transaction(FORUM_DIR) as state:
         task = tasks._owned(state, author, task_id)
-        if task["status"] != "running": raise ValueError("task already submitted")
+        if task["status"] != "running" or task.get("check_only_requested"): raise ValueError("task already submitted or deferred")
         if task["config_revision"] != state["config"]["revision"]: raise ValueError("assignment configuration is stale")
         root = Path(task.get("worktree", "")).resolve()
         if not task.get("worktree") or root == _root(): raise ValueError("submission requires an assigned worker worktree")
@@ -698,6 +700,67 @@ def record_workflow_change(author: str, original: str, problem: str, evidence: s
         problem=problem, evidence=evidence, revised=revised, result=result)
 
 
+def request_project_checks(author: str, task_id: str, commands: list[list[str]], reason: str,
+                           check_only: bool = False) -> dict:
+    """Request controller-run final checks; optionally defer a check-only review assignment."""
+    from .. import bump_project_checks
+    author, task_id = _author(author), _task_id(task_id)
+    if PROFILE not in {"preparing", "repairing"}: raise ValueError("project checks require an assigned worker")
+    if type(check_only) is not bool or not isinstance(reason, str) or not reason.strip() or len(reason) > 4000: raise ValueError("provide a reason and a boolean check_only")
+    with tasks.transaction(FORUM_DIR) as state:
+        task = tasks._owned(state, author, task_id)
+        if task["status"] != "running" or task.get("config_revision") != state["config"]["revision"]:
+            raise ValueError("assignment is stale or submitted")
+        if check_only:
+            if (task.get("kind") not in {"configuration", "scope_review"} or task.get("chunk_ids")
+                    or not task.get("review_snapshot_id") or not task.get("worktree")):
+                raise ValueError("only a check-only review configuration assignment can be deferred")
+            root = Path(task["worktree"]).resolve()
+            if (root == _root() or Path(_git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root
+                    or _git(root, "rev-parse", "--path-format=absolute", "--git-common-dir").strip() != _git(_root(), "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
+                    or _git(root, "rev-parse", "HEAD").strip() != task.get("base_main_sha")
+                    or any(state["leases"].get(path, {}).get("task_id") != task_id for path in task.get("files", []))
+                    or _git(root, "status", "--porcelain", "--untracked-files=all")):
+                raise ValueError("check-only deferral requires an unchanged assigned worktree")
+        requested = bump_project_checks.add_to_state(state, commands, author, task_id=task_id)
+        if check_only:
+            task["check_only_requested"] = True
+            task["project_checks"] = requested
+            tasks._event(state, "project_check_deferred", author, task_id=task_id, commands=deepcopy(requested), reason=reason)
+        return {"commands": requested, "check_revision": state.get("project_check_revision", 0),
+                "status": "defer_after_worker_closure" if check_only else "required"}
+
+
+def request_review_checks(author: str, snapshot_id: str, commands: list[list[str]], reason: str) -> dict:
+    """Queue exact controller checks and a no-edit review obligation."""
+    from .. import bump_project_checks
+    author = _author(author)
+    if PROFILE != "critic" or not isinstance(reason, str) or not reason.strip() or len(reason) > 4000: raise ValueError("critic review and a reason are required")
+    with tasks.transaction(FORUM_DIR) as state:
+        review = state.get("review", {})
+        snapshot = review.get("snapshot", review)
+        if (state.get("phase") != "critic" or not snapshot_id or snapshot.get("snapshot_id") != snapshot_id
+                or snapshot.get("main_sha") != state.get("main_sha")
+                or snapshot.get("config_revision") != state.get("config", {}).get("revision")
+                or review.get("reviewer") != author):
+            raise ValueError("critic snapshot or reviewer is stale")
+        requested = bump_project_checks.add_to_state(state, commands, author, snapshot_id=snapshot_id)
+        if (snapshot.get("passed") and all(command in snapshot.get("required_project_checks", []) for command in requested)):
+            from .. import bump_verification
+            bump_verification.require_project_check_receipts(state, snapshot)
+            return {"task_ids": [], "commands": requested, "status": "already_satisfied"}
+        tid = "review-check-" + tasks.digest([snapshot_id, requested])[:16]
+        if tid in state["tasks"]:
+            return {"task_ids": [tid], "commands": requested, "status": state["tasks"][tid]["status"]}
+        task = tasks._task(tid, "project_check", [], [])
+        task.update(status="awaiting_checks", reason=reason, review_snapshot_id=snapshot_id,
+                    review_author=author, project_checks=deepcopy(requested), check_only_requested=True)
+        state["tasks"][tid] = task
+        tasks._event(state, "review_checks_requested", author, snapshot_id=snapshot_id, task_id=tid,
+                     commands=deepcopy(requested), reason=reason)
+        return {"task_ids": [tid], "commands": requested, "status": "awaiting_checks"}
+
+
 def request_review_repair(author: str, snapshot_id: str, chunk_ids: list[str], files: list[str],
                            reason: str) -> dict:
     """Queue a precise new critic finding, including previously clean chunks.
@@ -734,6 +797,8 @@ def request_review_repair(author: str, snapshot_id: str, chunk_ids: list[str], f
             task = state["tasks"].get(key) or tasks._task(key, "configuration" if configuration else ("repair" if members else "command"), members, paths)
             task["attempts"] = max([task["attempts"], *[t["attempts"] for t in overlaps]])
             state["tasks"][key] = task
+        task.pop("check_only_requested", None)
+        task.pop("project_checks", None)
         task.update(status="pending", reason=reason, review_snapshot_id=snapshot_id,
                     review_author=author, config_revision=state["config"]["revision"])
         if configuration: task["kind"] = "configuration"
@@ -763,6 +828,8 @@ def submit_migration_verdict(author: str, snapshot_id: str, approved: bool, reas
         if queued and (approved or not queued <= set(reopen)):
             raise ValueError("unresolved review repair tasks must all be included in a rejection verdict")
         if approved:
+            from .. import bump_verification
+            bump_verification.require_project_check_receipts(state, snapshot)
             snapshot_hash = hashlib.sha256(json.dumps({k: v for k, v in snapshot.items() if k != "sha256"},
                 sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
             if not snapshot.get("passed") or snapshot.get("sha256") != snapshot_hash:
@@ -779,11 +846,11 @@ def submit_migration_verdict(author: str, snapshot_id: str, approved: bool, reas
 
 COMMON = (bump_status, bump_status_page, bump_brief, bump_task, artifact_read, forum_post, forum_read, publish_finding,
           report_obstacle, ask_question, answer_question, record_workflow_change)
-WORK = (register_strategy, claim_strategy, assist_strategy, yield_task, request_repair_scope,
+WORK = (request_project_checks, register_strategy, claim_strategy, assist_strategy, yield_task, request_repair_scope,
         request_configuration_change, submit_repair, sync_from_main)
 TASK_CONTEXT = (bump_task_context,)
 PROFILE_TOOLS = {"preparing": COMMON + TASK_CONTEXT + WORK, "repairing": COMMON + TASK_CONTEXT + WORK + (request_assistance,),
-                 "critic": COMMON + (bump_review_context, request_review_repair, submit_migration_verdict,),
+                 "critic": COMMON + (bump_review_context, request_review_checks, request_review_repair, submit_migration_verdict,),
                  "retrospective": COMMON,
                  "assisting": (bump_brief, bump_task, bump_task_context, artifact_read, answer_assistance)}
 
