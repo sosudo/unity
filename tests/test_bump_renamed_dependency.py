@@ -5,7 +5,7 @@ from copy import deepcopy
 from unittest.mock import AsyncMock, patch
 import unittest
 
-from unity import bump_tasks
+from unity import bump_tasks, bump_verification
 from unity.forum import bump_workflow_server as forum
 import test_bump_workflow_runtime as runtime
 
@@ -186,3 +186,53 @@ class RenamedDependencyTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bump_workflow, 'accepted_rename_paths', side_effect=changing):
             self.controller.reconcile_renamed_import_dependencies()
         self.assertIn(old, self.controller.state()['tasks'][current]['dependencies'])
+
+    async def test_grouped_import_acceptance_unlocks_new_declaration_then_b24_closes(self):
+        old, current, root_task, _ = await self.blocked_fixture()
+        self.controller.reconcile_renamed_import_dependencies()
+        state = self.controller.state()
+        self.assertNotIn(old, state['tasks'][current]['dependencies'])
+        bump_tasks.claim(self.paths.forum, 'Bob', current, max_attempts=5)
+        tree = self.worktree(self.paths, 'Bob', current)
+        bump_tasks.configure_assignment(self.paths.forum, 'Bob', current, tree, state['main_sha'])
+        (tree / 'New.lean').write_text('def a := 2\ndef later := missingLater\n')
+        forum.configure(self.paths.forum, self.root)
+        candidate = forum.submit_repair('Bob', current, 'imports fixed; later declaration remains')
+        declaration = {'id': 'later-error', 'path': 'New.lean', 'kind': 'declaration', 'line': 2,
+                       'column': 13, 'severity': 'error', 'message': 'unknown missingLater'}
+        root_error = {'id': 'root-import', 'path': 'B.lean', 'kind': 'import', 'line': None,
+                      'severity': 'error', 'message': "bad import 'New'"}
+        def candidate_build(root, **kwargs):
+            return {**self.build_result([declaration]),
+                    'source_identity': {'files': bump_verification._files(root)}}
+        async def full_refresh():
+            return self.authoritative_build_result([declaration, root_error])
+        # Use fixture compiler and source-audit results. Real progress validation
+        # and Controller.integrate commit and merge the submitted Git candidate.
+        with patch.object(bump_verification, 'audit_sources', return_value={'issues': []}), \
+             patch.object(bump_verification, 'build', side_effect=candidate_build), \
+             patch.object(self.controller, 'build', side_effect=full_refresh):
+            self.assertTrue(await self.controller.integrate_ready())
+        state = self.controller.state()
+        self.assertEqual(state['candidates'][candidate['candidate_id']]['status'], 'merged')
+        self.assertEqual(state['tasks'][old]['status'], 'pending')
+        repair = next(k for k, t in state['tasks'].items() if t['kind'] == 'repair'
+                      and t['files'] == ['New.lean'] and t.get('diagnostics'))
+        self.assertIn(old, state['tasks'][repair]['dependencies'])
+        self.assertIn(old, state['tasks'][root_task]['dependencies'])
+        self.assertIn(repair, state['tasks'][root_task]['dependencies'])
+        self.controller.reconcile_renamed_import_dependencies()
+        state = self.controller.state()
+        self.assertNotIn(old, state['tasks'][repair]['dependencies'])
+        self.assertEqual(state['tasks'][old]['status'], 'pending')
+        with patch.object(self.controller, 'worker', new=AsyncMock()):
+            self.controller.launch_ready()
+            self.assertEqual([row['task_id'] for row in self.controller.workers.values()], [repair])
+            await asyncio.gather(*(row['task'] for row in self.controller.workers.values()))
+            await self.controller.reap_workers()
+        good = self.renamed_target_build(checked=['New.lean'])
+        with patch.object(self.controller, 'build', new=AsyncMock(return_value=good)):
+            self.assertTrue(await self.controller.recheck_orphaned_repairs())
+        state = self.controller.state()
+        self.assertEqual(state['tasks'][old]['status'], 'complete')
+        self.assertTrue(any(e['kind'] == 'renamed_command_revalidated' for e in state['events']))
