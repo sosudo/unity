@@ -6,10 +6,9 @@ import hashlib
 import re
 from pathlib import Path
 
-from . import blueprint, prove_contract
+from . import blueprint, prove_contract, prove_source_scan
 
 
-_FORBIDDEN_ADDITION_RE = re.compile(r"\b(sorry|admit|axiom|native_decide)\b")
 _DECL_HEAD_RE = re.compile(
     r"\b(?:theorem|lemma|def|abbrev|opaque|axiom)\s+[A-Za-z0-9_.'₀-₉]+\s*(.*)",
     re.DOTALL,
@@ -77,16 +76,6 @@ def _unsafe_dependency_closure(kernel: dict, target: str) -> list[dict]:
     return sorted(unsafe, key=lambda item: item["name"])
 
 
-def _forbidden_additions(candidate_diff: str) -> list[str]:
-    found = set()
-    for line in candidate_diff.splitlines():
-        if not line.startswith("+") or line.startswith("+++"):
-            continue
-        code = line[1:].split("--", 1)[0]
-        found.update(match.group(1) for match in _FORBIDDEN_ADDITION_RE.finditer(code))
-    return sorted(found)
-
-
 def review_candidate(
     project_root: Path,
     candidate: dict,
@@ -101,7 +90,11 @@ def review_candidate(
     """
     project_root = Path(project_root)
     issues: list[str] = []
-    forbidden = _forbidden_additions(candidate_diff)
+    try:
+        forbidden = prove_source_scan.scan_git_sources(project_root, base_main_sha)
+    except prove_source_scan.SourceScanError as exc:
+        forbidden = []
+        issues.append(f"Lean source safety scan failed: {exc}")
     if forbidden:
         issues.append("candidate adds forbidden construct(s): " + ", ".join(forbidden))
 
