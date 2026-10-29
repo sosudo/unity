@@ -16,6 +16,26 @@ def _retrospective_enabled() -> bool:
     return os.getenv("RETROSPECTIVE", "true").strip().lower() != "false"
 
 
+def _check_stop(root) -> None:
+    if stop_requested(root):
+        raise click.ClickException("prove stopped before completion")
+
+
+def _approved_result(paths) -> bool:
+    """Require the persisted critic decision and a nonempty solved workspace."""
+    try:
+        critic = json.loads((paths.unity / "critic.json").read_text())
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(critic, dict)
+        and critic.get("approved") is True
+        and critic.get("verdict") == "proven"
+        and critic.get("reopen") == []
+        and prove_state.all_solved(prove_state.load_state(paths.forum))
+    )
+
+
 @click.command(name="prove")
 @click.option("--targets", default="All", help="Unresolved declaration names or Lean files to prove.")
 @click.option("--continue", "continue_", is_flag=True, default=False, help="Run a reprompt cycle first.")
@@ -40,6 +60,8 @@ async def prove(targets, continue_):
         mark_phase("prove", "architect")
         architect(root)
 
+    _check_stop(root)
+
     if _do("chunking"):
         mark_phase("prove", "chunking")
         try:
@@ -47,7 +69,13 @@ async def prove(targets, continue_):
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
         click.echo(f"discovered {len(dag['chunks'])} proof target(s) using {dag['source']} extraction")
+        if not dag["chunks"]:
+            raise click.ClickException(
+                "no unresolved prove targets were discovered; verify the project build and target selection"
+            )
         toposort(paths)
+
+    _check_stop(root)
 
     if resume != "retrospective":
         i = 0
@@ -65,6 +93,8 @@ async def prove(targets, continue_):
                 )
                 reset_runtime = False
 
+            _check_stop(root)
+
             (paths.unity / "critic.json").write_text(json.dumps(
                 {"approved": False, "verdict": "stalled", "reopen": []}
             ))
@@ -74,11 +104,12 @@ async def prove(targets, continue_):
                            ".unity/critic.json. Reopen any currently solved declaration whose accepted "
                            "candidate has a concrete defect.",
                            root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False)
+            _check_stop(root)
             try:
                 _c = json.loads((paths.unity / "critic.json").read_text())
             except (OSError, json.JSONDecodeError):
                 _c = {}
-            approved = bool(_c.get("approved", False))
+            approved = _c.get("approved") is True
             verdict = _c.get("verdict", "stalled")
             reopen = _c.get("reopen", [])
             current_state = prove_state.load_state(paths.forum)
@@ -122,10 +153,17 @@ async def prove(targets, continue_):
             i += 1
             run_provers = not approved
 
+    _check_stop(root)
+    if not _approved_result(paths):
+        raise click.ClickException(
+            "prove did not reach an approved proven result; inspect the critic and Forum state"
+        )
+
     if _retrospective_enabled():
         await dispatch([roster.primary], roster, load_prompt("prove/RETROSPECTIVE"),
                        "Distill lessons from this run into the library.",
                        root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False)
+    _check_stop(root)
     mark_done(paths, "prove")
 
 
