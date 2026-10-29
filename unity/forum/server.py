@@ -1685,17 +1685,30 @@ def sync_from_main(author: str, reason: str = "") -> dict:
 
 
 @mcp.tool()
-def prove_status(decl: str = "") -> dict:
-    """Return authoritative declarations, strategies, findings, candidates, and events."""
+def prove_status(decl: str = "", include_type_contract: bool = False) -> dict:
+    """Return Prove state; request include_type_contract for full structural types.
+
+    By default declarations expose the contract SHA-256, not its large AST.
+    The stored authoritative state is unchanged.
+    """
     state = prove_store.load_state(FORUM_DIR)
+    def public_declaration(item: dict) -> dict:
+        result = dict(item)
+        contract = item.get("type_contract")
+        result["type_contract_sha256"] = contract.get("sha256") if isinstance(contract, dict) else None
+        if not include_type_contract:
+            result.pop("type_contract", None)
+        return result
     if not decl:
-        return state
+        return {**state, "declarations": {
+            name: public_declaration(item) for name, item in state["declarations"].items()
+        }}
     if decl not in state["declarations"]:
         raise ValueError(f"unknown prove declaration '{decl}'")
     return {
         "revision": state["revision"],
         "main_sha": state.get("main_sha"),
-        "declaration": state["declarations"][decl],
+        "declaration": public_declaration(state["declarations"][decl]),
         "strategies": [item for item in state["strategies"].values()
                        if item.get("decl") in ("", decl)],
         "findings": [item for item in state["findings"].values()

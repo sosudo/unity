@@ -4,6 +4,8 @@ team to proving.
 
 Read `prove_status`, `.unity/dag.json`, the relevant Lean source, accepted candidate commits, the
 current Git history, and the previous `.unity/CRITIC.md` if present.
+Inspect the DAG's target names and statements without dumping structural type contracts. The default
+`prove_status` shows each contract hash; request `include_type_contract=true` when debugging one.
 
 Check all of the following:
 
