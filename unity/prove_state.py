@@ -150,6 +150,7 @@ def initialize_from_dag(
                 "file": chunk.get("lean_file", ""),
                 "statement": chunk.get("statement", ""),
                 "kernel_type_repr": chunk.get("kernel_type_repr", ""),
+                "type_contract": chunk.get("type_contract"),
                 "type_dependencies": list(chunk.get("type_dependencies", [])),
                 "declaration_kind": chunk.get("type", ""),
                 "dependencies": list(chunk.get("dependencies", [])),

@@ -6,7 +6,7 @@ import hashlib
 import re
 from pathlib import Path
 
-from . import blueprint
+from . import blueprint, prove_contract
 
 
 _FORBIDDEN_ADDITION_RE = re.compile(r"\b(sorry|admit|axiom|native_decide)\b")
@@ -97,8 +97,7 @@ def review_candidate(
 ) -> dict:
     """Review the built candidate currently applied to the main checkout.
 
-    Kernel extraction is authoritative when available. Older toolchains that cannot run
-    the bundled extractor use a conservative exact-source fallback.
+    A frozen structural contract is required; printed types are diagnostic only.
     """
     project_root = Path(project_root)
     issues: list[str] = []
@@ -111,29 +110,25 @@ def review_candidate(
     if source is None:
         issues.append("exact target declaration was not found in its recorded source file")
 
-    expected_statement = declaration.get("statement", "")
-    source_signature_unchanged = bool(
-        source
-        and expected_statement
-        and _statement_payload(source["statement"]) == _statement_payload(expected_statement)
-    )
-
-    kernel = blueprint.kernel_extract(project_root)
+    try:
+        kernel, check = prove_contract.inspect(
+            project_root, decl=declaration.get("decl", ""),
+            contract=declaration.get("type_contract"),
+        )
+    except ValueError as exc:
+        kernel, check = None, None
+        issues.append(f"structural prove contract inspection failed: {exc}")
     kernel_available = kernel is not None
     kernel_target = _kernel_declaration(kernel, declaration) if kernel_available else None
     if kernel_available and kernel_target is None:
         issues.append("exact target declaration was not found in the built kernel environment")
     expected_type = declaration.get("kernel_type_repr", "")
     actual_type = kernel_target[1].get("type_repr", "") if kernel_target else ""
-    kernel_signature_unchanged = bool(expected_type and actual_type == expected_type)
-    signature_unchanged = (
-        kernel_signature_unchanged if expected_type and kernel_target
-        else source_signature_unchanged
-    )
+    signature_unchanged = bool(kernel_target and check and check.get("passed") is True)
     if not signature_unchanged:
         issues.append("target declaration type differs from the original prove target")
 
-    mode = "kernel" if kernel_available else "source_fallback"
+    mode = "kernel" if kernel_available else "kernel_unavailable"
     target_kind = kernel_target[1].get("kind", "") if kernel_target else (source or {}).get("kind", "")
     target_sorried = bool(
         kernel_target[1].get("sorried") if kernel_target else (source or {}).get("status") == "sorry"
@@ -163,6 +158,9 @@ def review_candidate(
             kernel_target is not None if kernel_available else True
         ),
         "signature_unchanged": signature_unchanged,
+        "signature_check_method": "lean_kernel_assignment",
+        "type_contract_sha256": (declaration.get("type_contract") or {}).get("sha256")
+            if isinstance(declaration.get("type_contract"), dict) else None,
         "expected_type_sha256": _digest(expected_type),
         "actual_type_sha256": _digest(actual_type),
         "target_kind": target_kind,

@@ -211,6 +211,7 @@ def _kernel_targets(base: Path, kernel: dict) -> list[dict]:
             "display_name": name,
             "kind": row.get("kind", source.get("kind", "theorem")),
             "type_repr": row.get("type_repr", ""),
+            "type_contract": row.get("contract"),
             "type_dependencies": list(row.get("type_deps", [])),
             "file": path or source.get("file", ""),
             "line": source.get("line"),
@@ -283,14 +284,16 @@ def build_prove_dag(project_root: Path, unity_dir: Path, targets: str = "All") -
     project_root = Path(project_root)
     unity_dir = Path(unity_dir)
 
-    # Bring oleans up to date before kernel inspection. A broken project simply uses
-    # the textual fallback; proof holes and axioms themselves do not make Lake fail.
+    # Freeze types only from a successful build and the Prove kernel inspector.
+    from . import prove_contract
     try:
-        subprocess.run(["lake", "build"], cwd=project_root, check=False)
-    except OSError:
-        pass
-    kernel = kernel_extract(project_root)
-    candidates = _kernel_targets(project_root, kernel) if kernel else _regex_targets(project_root)
+        build = subprocess.run(["lake", "build"], cwd=project_root, check=False)
+    except OSError as exc:
+        raise ValueError(f"could not build prove project: {exc}") from exc
+    if build.returncode != 0:
+        raise ValueError("prove project build failed; cannot freeze original target types")
+    kernel, _ = prove_contract.inspect(project_root)
+    candidates = _kernel_targets(project_root, kernel)
     selected = _select_targets(candidates, targets)
     selected_ids = {row["name"] for row in selected}
 
@@ -304,6 +307,7 @@ def build_prove_dag(project_root: Path, unity_dir: Path, targets: str = "All") -
             "status": "pending",
             "statement": row["statement"],
             "kernel_type_repr": row.get("type_repr", ""),
+            "type_contract": prove_contract.freeze_contract(row.get("type_contract"), row["name"]),
             "type_dependencies": sorted(set(row.get("type_dependencies", [])))[:48],
             "type": row["kind"],
             "declarations": [row["name"]],
@@ -314,7 +318,7 @@ def build_prove_dag(project_root: Path, unity_dir: Path, targets: str = "All") -
             chunk["lean_decl_lines"] = [row["line"], row["end_line"]]
         chunks.append(chunk)
 
-    dag = {"source": "kernel" if kernel else "regex", "chunks": chunks}
+    dag = {"source": "kernel", "chunks": chunks}
     unity_dir.mkdir(parents=True, exist_ok=True)
     (unity_dir / "dag.json").write_text(json.dumps(dag, indent=2) + "\n")
     return dag
