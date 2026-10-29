@@ -46,7 +46,9 @@ class QuestionWakeups:
         path = self.forum / 'qa.json'
         try:
             # The Forum writes qa.json under qa.lock, but not atomically.
-            with (self.forum / 'qa.lock').open('a') as lock:
+            # NFS implements flock via record locks: a shared lock needs a
+            # readable descriptor, even though this lock file stores no data.
+            with (self.forum / 'qa.lock').open('a+') as lock:
                 fcntl.flock(lock, fcntl.LOCK_SH)
                 try:
                     stat = path.stat()

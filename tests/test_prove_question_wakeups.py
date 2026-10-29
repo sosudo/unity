@@ -1,4 +1,5 @@
 import asyncio
+import fcntl
 import json
 import tempfile
 import unittest
@@ -27,6 +28,17 @@ class QuestionsTests(unittest.TestCase):
 
     def write(self, posts):
         (self.forum / 'qa.json').write_text(json.dumps({'posts': posts}))
+
+    def test_shared_lock_uses_a_readable_descriptor(self):
+        self.write([question('q1')])
+        original_flock = fcntl.flock
+        def nfs_flock(handle, operation):
+            if operation == fcntl.LOCK_SH:
+                self.assertTrue(handle.readable(), 'NFS shared record locks need read access')
+            return original_flock(handle, operation)
+        with patch('unity.prove_questions.fcntl.flock', side_effect=nfs_flock):
+            self.assertEqual(QuestionWakeups(self.forum).poll(self.state, self.agents, {}, {}),
+                             [('Luna1', 'goal', 'q1', 'Terra1')])
 
     def test_active_waits_then_once_only_across_runtime_instances(self):
         self.write([question('q1', to='luna1')])
