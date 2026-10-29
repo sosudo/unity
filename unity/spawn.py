@@ -618,6 +618,14 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         execution_policy: ExecutionPolicy | None = None) -> str | None:
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
+    prove_effort = None
+    if execution_policy is None and mcp_profile == "prove" and env_overrides is not None:
+        prove_effort = env_overrides.get("UNITY_PROVE_CODEX_REASONING_EFFORT")
+        if prove_effort is not None:
+            from openai_codex.types import ReasoningEffort
+            if prove_effort not in {effort.value for effort in ReasoningEffort}:
+                raise ValueError("UNITY_PROVE_CODEX_REASONING_EFFORT contains an invalid effort")
+
     runtime = execution_policy.hooks if execution_policy else sys.modules[__name__]
     on_normal_completion = execution_policy.on_normal_completion if execution_policy else None
     CallbackError = execution_policy.callback_error if execution_policy else _PolicyCallbackError
@@ -672,6 +680,11 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 )
         else:
             config_kwargs = prepared["config_options"](agent_env)
+        if prove_effort is not None:
+            config_kwargs["config_overrides"] = (
+                config_kwargs.get("config_overrides", ())
+                + ("model_reasoning_effort=" + json.dumps(prove_effort),)
+            )
         cfg = CodexConfig(
             cwd=str(cwd), env=agent_env, codex_bin=codex_bin, **config_kwargs,
         )

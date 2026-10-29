@@ -18,6 +18,78 @@ from .spawn import spawn
 _console = Console()
 
 
+def _prove_codex_reasoning_effort(agent_name: str, value: str | None) -> str | None:
+    """Resolve a Prove effort setting from a scalar or an agent-name JSON map."""
+    if value is None or not value.strip():
+        return None
+    from openai_codex.types import ReasoningEffort
+
+    allowed = {effort.value for effort in ReasoningEffort}
+    value = value.strip()
+    if value.startswith("{"):
+        try:
+            mapping = json.loads(value)
+        except ValueError as exc:
+            raise ValueError("UNITY_PROVE_CODEX_REASONING_EFFORT must be an effort or JSON map") from exc
+        if not isinstance(mapping, dict) or any(
+            not isinstance(name, str) or not name or not isinstance(effort, str)
+            or effort not in allowed for name, effort in mapping.items()
+        ):
+            raise ValueError("UNITY_PROVE_CODEX_REASONING_EFFORT contains an invalid agent or effort")
+        return mapping.get(agent_name, mapping.get("*"))
+    if value not in allowed:
+        raise ValueError("UNITY_PROVE_CODEX_REASONING_EFFORT contains an invalid effort")
+    return value
+
+
+def _prove_worktree(root: Path, unity_dir: Path, name: str, *, fresh: bool) -> Path:
+    """Create or safely reuse a Prove-owned worker worktree without deleting work."""
+    root = Path(root).resolve()
+    path = worktree.agent_worktree(root, name)
+    branch = worktree.agent_branch(name)
+    marker = Path(unity_dir) / "prove-workspaces" / (worktree._safe(name) + ".json")
+    if marker.exists():
+        if fresh:
+            raise RuntimeError(f"existing Prove workspace for {name} requires recovery: {path}")
+        try:
+            record = json.loads(marker.read_text())
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"invalid Prove workspace record: {marker}") from exc
+        expected = {"name": name, "root": str(root), "path": str(path), "branch": branch}
+        if record != expected or path.is_symlink() or not path.is_dir():
+            raise RuntimeError(f"Prove workspace identity mismatch for {name}: {path}")
+        listed = worktree._git(root, "worktree", "list", "--porcelain", check=True).stdout
+        registered = any(
+            f"worktree {path}\n" in block and f"branch refs/heads/{branch}\n" in block + "\n"
+            for block in listed.split("\n\n")
+        )
+        current_branch = worktree._git(path, "symbolic-ref", "--short", "HEAD", check=True).stdout.strip()
+        if not registered or current_branch != branch:
+            raise RuntimeError(f"Prove workspace is not registered on its expected branch: {path}")
+    else:
+        # preserve_existing rejects both unowned directories and existing branch names.
+        path = worktree.create_worktree(name, root, preserve_existing=True)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({"name": name, "root": str(root), "path": str(path),
+                                      "branch": branch}, indent=2) + "\n")
+    worktree.symlink_lake_cache(path, root)
+    worktree.link_runtime_state(path, root)
+    return path
+
+
+def _prove_workspace_context(root: Path, path: Path, name: str) -> str:
+    worker_sha = worktree.main_commit(path)
+    main_sha = worktree.main_commit(root)
+    status = worktree._git(path, "status", "--porcelain", "--untracked-files=all", check=True).stdout
+    return (
+        f"Your preserved Prove workspace is {path} on branch {worktree.agent_branch(name)}. "
+        f"Worker revision: {worker_sha}; main revision: {main_sha}.\n"
+        f"Current workspace changes:\n{status[:4000] or '(none)'}\n"
+        "Inspect your existing files, commits and Forum findings, and continue useful prior work. "
+        "Preserve progress; if main has changed, reconcile deliberately instead of resetting your workspace.\n\n"
+    )
+
+
 def _target_context_limit() -> int:
     """Maximum launch-packet size; bounded independently of project size."""
     try:
@@ -140,24 +212,30 @@ async def run_prove_runtime(
     root = paths.project_root
     if stop_requested(root):
         return prove_state.load_state(paths.forum)
+    effort_setting = os.getenv("UNITY_PROVE_CODEX_REASONING_EFFORT")
+    efforts = {agent.name: _prove_codex_reasoning_effort(agent.name, effort_setting)
+               for agent in roster.agents}
     forum_server.FORUM_DIR = paths.forum
     forum_server.PROJECT_ROOT = root
+
+    worktrees = {}
+    for agent in roster.agents:
+        agent_tree = _prove_worktree(root, paths.unity, agent.name, fresh=reset_state)
+        worktrees[agent.name] = agent_tree
 
     main_sha = worktree.main_commit(root)
     initial_state = prove_state.initialize_from_dag(
         paths.forum, paths.unity / "dag.json", main_sha, reset=reset_state
     )
 
-    worktrees = {}
-    for agent in roster.agents:
-        agent_tree = worktree.create_worktree(agent.name, root)
-        worktree.symlink_lake_cache(agent_tree, root)
-        worktree.link_runtime_state(agent_tree, root)
-        worktrees[agent.name] = agent_tree
-
     tools_ref = load_prompt("PROVE_TOOLS")
     context = library.library_context()
     shared_prompt = base_prompt + "\n\n" + tools_ref
+    shared_prompt += (
+        "\n\nEnabled MCP servers for this run: " + ", ".join(sorted(mcp)) + ". "
+        "Use only these configured servers. Tool descriptions for an absent optional server "
+        "do not enable that service. Continue with local proof work when an optional service is absent."
+    )
     if context:
         shared_prompt += "\n\n" + context
     subagents = library.library_subagents()
@@ -173,7 +251,8 @@ async def run_prove_runtime(
 
     normal_task = (
         "Coordinate proof work through the Forum. You may privately inspect the target and "
-        "experiment first. Begin with a focused search for an existing project or Mathlib theorem "
+        "experiment first. On a later turn, inspect preserved files and findings, and reclaim a "
+        "viable unowned strategy before extending it. Begin with a focused search for an existing project or Mathlib theorem "
         "or API before committing to a from-scratch derivation. Then refresh forum_brief and either "
         "register and claim a genuinely "
         "distinct direction, assist an existing strategy with a concrete contribution, or publish "
@@ -187,7 +266,9 @@ async def run_prove_runtime(
         "in main. If a candidate is merge-blocked, resolve the integration blocker and retry it; "
         "do not resume proof search. If a candidate is merged, call sync_from_main before claiming "
         "more work. Continue until no "
-        "unresolved declaration has useful work for you."
+        "unresolved declaration has useful work for you. If the needed library theorem is absent, "
+        "continue by stating and proving missing helper lemmas. Share checked partial progress and "
+        "exact remaining goals; avoid ending a turn with only a repeated search blocker."
     )
 
     def launch(
@@ -199,6 +280,7 @@ async def run_prove_runtime(
         existing = tasks.get(agent_name)
         if existing is not None and not existing.done():
             return
+        task_prompt = _prove_workspace_context(root, worktrees[agent_name], agent_name) + task_prompt
         if target_decl:
             worker_decls[agent_name] = target_decl
         assigned_decl = worker_decls.get(agent_name)
@@ -228,6 +310,9 @@ async def run_prove_runtime(
                 mcp,
                 subagents=subagents,
                 interrupt_event=interrupt_event,
+                env_overrides=({"UNITY_PROVE_CODEX_REASONING_EFFORT": efforts[agent_name]}
+                               if agent.backend == "codex" and efforts[agent_name] is not None
+                               else None),
             ),
             name=f"prove:{agent_name}",
         )
@@ -481,5 +566,4 @@ async def run_prove_runtime(
             await cancel(name, "prove runtime ending")
         for agent in roster.agents:
             prove_state.release_author_claims(paths.forum, agent.name, "prove runtime ended")
-        for agent in roster.agents:
-            worktree.cleanup_worktree(agent.name, worktrees[agent.name], root)
+        # Keep worktrees and branches intact across critic rounds and stopped runs.

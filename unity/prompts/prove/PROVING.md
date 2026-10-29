@@ -28,6 +28,25 @@ This is an initial priority, not a gate. If a direct proof is already apparent, 
 not spend substantial time deriving general mathematics before checking whether the required result
 already exists.
 
+## Continue useful proof work
+
+On a later turn, inspect your preserved worktree, the critic's findings, and the Forum before
+repeating a search. Reuse checked partial proofs and published artifacts. If a viable strategy is
+registered but unclaimed, claim it to continue that direction. Assist a strategy after another agent
+has claimed it. The team chooses the strategies and the division of work.
+
+When a focused search finds no suitable theorem, identify the next precise helper statement needed
+by the current argument and attempt to prove it. Develop missing mathematics in Lean, inspect the
+resulting goals, and test smaller intermediate claims. Share useful partial results promptly so
+another agent can work on an independent obligation or help with an exact compiler goal.
+
+Continue beyond an unsuccessful search or tactic attempt. A missing library theorem is a result of
+the search; it leaves a construction task for the team. Revisit a completed search only when a new
+finding changes its scope. Publish an obstacle after a substantive checked attempt, with the exact
+remaining goal, commands tried, and new evidence. Then select another useful step, request concrete
+help, or yield to an agent already working on that obligation. Avoid rounds that only repeat the
+same obstacle report. Keep all progress claims tied to actual source and compiler evidence.
+
 ## Self-organization
 
 The DAG is mechanically generated and defines the exact target declarations and their dependencies.
@@ -101,7 +120,9 @@ contain no replacement `sorry`, `admit`, axiom, `native_decide`, fake tactic, or
 - If evidence shows an approach cannot work, call `mark_strategy_incorrect` with its reason and
   evidence.
 - If no strategy closes the target, preserve the original declaration and post a `forum_obstacle`
-  containing the exact goal, attempted approaches, and current blocker hypothesis.
+  containing the exact goal, attempted approaches, and current blocker hypothesis. Preserve checked
+  helper work in your worktree and shared artifacts. Use the obstacle to organize the next concrete
+  attempt; continue developing missing helper lemmas while useful work remains.
 
 ## Mechanical candidate review and merging
 

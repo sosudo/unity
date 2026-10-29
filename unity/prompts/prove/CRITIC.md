@@ -24,6 +24,13 @@ data is wrong, from actor-wrong issues, where the specification is right and the
 Name exact declarations and ground every issue in checkable evidence such as a build error, source
 location, changed statement, candidate commit, or Git diff.
 
+For unresolved targets, inspect preserved worker progress and the evidence linked from findings.
+Identify the next precise unmet proof obligation and useful ways for the team to make a checked
+attempt. Leave strategy selection and work allocation to the agents. A search that found no direct
+library theorem leaves mathematical construction work; guide the team toward that work rather than
+repeating an unchanged search or blocker report. Distinguish newly checked partial progress from
+claims repeated from an earlier round. Cite the worktree file, commit, or artifact that preserves it.
+
 Then write `.unity/critic.json` with exactly this shape:
 
 ```json
