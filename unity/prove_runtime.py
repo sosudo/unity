@@ -10,6 +10,7 @@ from pathlib import Path
 from rich.console import Console
 
 from . import library, prove_state, worktree
+from .prove_questions import QuestionWakeups
 from .forum import server as forum_server
 from .orchestrator import _preamble, load_prompt, stop_requested
 from .spawn import spawn
@@ -248,6 +249,7 @@ async def run_prove_runtime(
     pending_sync: set[str] = set()
     merge_followups: dict[str, tuple[str, str]] = {}
     worker_decls: dict[str, str] = {}
+    question_wakeups = QuestionWakeups(paths.forum)
 
     normal_task = (
         "Coordinate proof work through the Forum. You may privately inspect the target and "
@@ -547,6 +549,18 @@ async def run_prove_runtime(
                             normal_task,
                             target_decl=event.get("decl") or None,
                         )
+
+            state = prove_state.load_state(paths.forum)
+            for name, decl, question_id, author in question_wakeups.poll(
+                state, agents, tasks, worker_decls
+            ):
+                launch(
+                    name,
+                    f"Forum question {question_id} from {author} is addressed to you. "
+                    "Read the question in the Forum, respond using forum_answer if appropriate, "
+                    "and coordinate any useful follow-up with the team.",
+                    target_decl=decl,
+                )
 
             if prove_state.all_solved(state) and not pending_sync:
                 return state
