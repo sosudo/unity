@@ -70,13 +70,65 @@ def _git(root: Path, *args: str) -> str:
     return result.stdout
 
 
-def bump_status() -> dict:
-    """Current configuration, task counts and candidate/review status."""
-    state = tasks.load(FORUM_DIR)
+def _status_counts(rows: dict) -> dict:
     counts = {}
-    for task in state["tasks"].values(): counts[task["status"]] = counts.get(task["status"], 0) + 1
-    return {key: state[key] for key in ("run_id", "revision", "phase", "main_sha", "target_version", "config", "review")} | {
-        "task_counts": counts, "tasks": list(state["tasks"].values()), "candidates": list(state["candidates"].values())}
+    for row in rows.values():
+        status = row.get("status", "unknown")
+        counts[status] = counts.get(status, 0) + 1
+    return dict(sorted(counts.items()))
+
+
+def bump_status(summary: bool = False) -> dict:
+    """Current status; opt into a compact summary to avoid full task and candidate records."""
+    if type(summary) is not bool:
+        raise ValueError("summary must be a boolean")
+    state = tasks.load(FORUM_DIR)
+    if not summary:
+        # Preserve the original no-argument result for existing callers.
+        counts = {}
+        for task in state["tasks"].values(): counts[task["status"]] = counts.get(task["status"], 0) + 1
+        return {key: state[key] for key in ("run_id", "revision", "phase", "main_sha", "target_version", "config", "review")} | {
+            "task_counts": counts, "tasks": list(state["tasks"].values()), "candidates": list(state["candidates"].values())}
+    scope = state.get("config", {}).get("scope") or {}
+    review = state.get("review") or {}
+    snapshot = review.get("snapshot") or {}
+    verdict = review.get("verdict") or {}
+    return {"run_id": state.get("run_id"), "revision": state.get("revision"), "phase": state.get("phase"),
+            "main_sha": state.get("main_sha"), "target_version": state.get("target_version"),
+            "config_revision": state.get("config", {}).get("revision"),
+            "scope_counts": {"selected_modules": len(scope.get("selected_modules") or {}),
+                             "default_modules": len(scope.get("default_modules") or {}),
+                             "excluded_files": len(scope.get("excluded_files") or {})},
+            "task_counts": _status_counts(state["tasks"]), "candidate_counts": _status_counts(state.get("candidates", {})),
+            "task_total": len(state["tasks"]), "candidate_total": len(state.get("candidates", {})),
+            "review": {"snapshot_id": snapshot.get("snapshot_id"), "passed": snapshot.get("passed"),
+                       "reviewer": review.get("reviewer"), "verdict": verdict.get("verdict"),
+                       "approved": verdict.get("approved")},
+            "qualification": "Current summary, not a fixed snapshot or acceptance evidence."}
+
+
+def bump_status_page(kind: str, offset: int = 0, limit: int = 20) -> dict:
+    """Read a bounded page of current task or candidate summaries, ordered by ID."""
+    if not isinstance(kind, str) or kind not in {"tasks", "candidates"}: raise ValueError("kind must be tasks or candidates")
+    if type(offset) is not int or offset < 0: raise ValueError("offset must be a nonnegative integer")
+    if type(limit) is not int or not 1 <= limit <= 50: raise ValueError("limit must be between 1 and 50")
+    state = tasks.load(FORUM_DIR)
+    rows = state[kind]
+    keys = sorted(rows)
+    selected = keys[offset:offset + limit]
+    if kind == "tasks":
+        items = [{"task_id": key, "kind": rows[key].get("kind"), "status": rows[key].get("status"),
+                  "owner": rows[key].get("owner"), "revision": rows[key].get("revision"),
+                  "attempts": rows[key].get("attempts"), "file_count": len(rows[key].get("files") or []),
+                  "chunk_count": len(rows[key].get("chunk_ids") or [])} for key in selected]
+    else:
+        items = [{"candidate_id": key, "task_id": rows[key].get("task_id"),
+                  "status": rows[key].get("status"), "author": rows[key].get("author"),
+                  "task_revision": rows[key].get("task_revision")} for key in selected]
+    next_offset = offset + len(items) if offset + len(items) < len(keys) else None
+    return {"kind": kind, "revision": state.get("revision"), "offset": offset, "limit": limit,
+            "total": len(keys), "next_offset": next_offset, "items": items,
+            "qualification": "Current read; pages may change between calls. Use bump_task for task details and controller evidence for status."}
 
 
 _REVIEW_CONTEXT_KINDS = {"finding", "obstacle", "question", "answer", "assistance", "assistance_request"}
@@ -725,7 +777,7 @@ def submit_migration_verdict(author: str, snapshot_id: str, approved: bool, reas
     return verdict
 
 
-COMMON = (bump_status, bump_brief, bump_task, forum_post, forum_read, publish_finding,
+COMMON = (bump_status, bump_status_page, bump_brief, bump_task, artifact_read, forum_post, forum_read, publish_finding,
           report_obstacle, ask_question, answer_question, record_workflow_change)
 WORK = (register_strategy, claim_strategy, assist_strategy, yield_task, request_repair_scope,
         request_configuration_change, submit_repair, sync_from_main)
