@@ -265,6 +265,53 @@ class AssistanceTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn('Bob', self.controller.helpers)
             await self.controller.reconcile_helpers(drain=True)
 
+    async def test_awaiting_checks_configuration_does_not_block_assistance(self):
+        tid = self.assignment()
+        request = self.request(tid)
+        with bump_tasks.transaction(self.paths.forum) as state:
+            check = bump_tasks._task('check-only', 'configuration', [], ['lakefile.lean'])
+            check['status'] = 'awaiting_checks'
+            state['tasks'][check['task_id']] = check
+        async def helper(agent, request, tree, interrupt): await interrupt.wait()
+        with patch.object(bump_workflow.bump_worktree, 'create_worktree', return_value=self.root), \
+             patch.object(bump_workflow.bump_worktree, 'symlink_lake_cache'), \
+             patch.object(self.controller, 'assistance_worker', side_effect=helper):
+            self.controller.launch_assistance()
+            self.assertIn('Bob', self.controller.helpers)
+            self.assertEqual(self.controller.state()['leases']['A.lean']['author'], 'Alice')
+            self.assertEqual(self.controller.state()['tasks'][tid]['owner'], 'Alice')
+            self.assertTrue(any(e.get('kind') == 'assistance_started' and e.get('request_id') == request['event_id']
+                                for e in self.controller.state()['events']))
+            await self.controller.reconcile_helpers(drain=True)
+
+    async def test_pending_configuration_task_still_blocks_assistance(self):
+        tid = self.assignment()
+        request = self.request(tid)
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state['tasks']['config-pending'] = bump_tasks._task(
+                'config-pending', 'configuration', [], ['lakefile.lean'])
+        with patch.object(bump_workflow.bump_worktree, 'create_worktree', return_value=self.root), \
+             patch.object(bump_workflow.bump_worktree, 'symlink_lake_cache'), \
+             patch.object(self.controller, 'assistance_worker', new=AsyncMock()):
+            self.controller.launch_assistance()
+            self.assertFalse(self.controller.helpers)
+            self.assertFalse(any(e.get('kind') == 'assistance_started' and e.get('request_id') == request['event_id']
+                                 for e in self.controller.state()['events']))
+
+    async def test_pending_configuration_request_still_blocks_assistance(self):
+        tid = self.assignment()
+        request = self.request(tid)
+        with bump_tasks.transaction(self.paths.forum) as state:
+            state['config_requests']['config-pending'] = {
+                'request_id': 'config-pending', 'status': 'pending'}
+        with patch.object(bump_workflow.bump_worktree, 'create_worktree', return_value=self.root), \
+             patch.object(bump_workflow.bump_worktree, 'symlink_lake_cache'), \
+             patch.object(self.controller, 'assistance_worker', new=AsyncMock()):
+            self.controller.launch_assistance()
+            self.assertFalse(self.controller.helpers)
+            self.assertFalse(any(e.get('kind') == 'assistance_started' and e.get('request_id') == request['event_id']
+                                 for e in self.controller.state()['events']))
+
     async def test_helper_receives_bound_identity_and_project_instructions(self):
         tid = self.assignment()
         request = self.request(tid)

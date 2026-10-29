@@ -735,7 +735,7 @@ class Controller:
         if stopped(self.paths): return
         state = self.state()
         if any(t.get("kind") in {"configuration", "dependency", "scope_review"}
-               and t.get("status") not in {"complete", "grouped", "retired"} for t in state["tasks"].values()):
+               and t.get("status") not in {"complete", "grouped", "retired", "awaiting_checks"} for t in state["tasks"].values()):
             return
         requests = [e for e in state["events"] if e.get("kind") == "assistance_request"]
         started = {e.get("request_id") for e in state["events"] if e.get("kind") == "assistance_started"}
