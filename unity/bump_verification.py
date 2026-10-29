@@ -629,15 +629,25 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
     regressions = [d for d in after if _diagnostic_key(d) not in old_keys
                    and (d.get("path") not in downstream or d.get("path") in previously_checked)]
     blocked = {d.get("path") for d in after if d.get("kind") == "import"}
-    checked = set(after_build.get("checked_files", []))
+    # A contradictory receipt cannot establish whole-file success. In
+    # particular, it must not substitute for a later error in declaration reach.
+    checked = set(after_build.get("checked_files", [])) - {
+        d.get("path") for d in after if d.get("path")
+    }
     reached = set(checked)
     for chunk_id in task.get("chunk_ids", []):
         chunk = chunks.get(chunk_id, {}) if isinstance(chunks, dict) else {}
         path = chunk.get("path", chunk.get("file"))
         end = chunk.get("end_line", chunk.get("range", {}).get("end_line"))
-        if path and end and any(d.get("path") == path and d.get("kind") != "import" and (d.get("line") or 0) >= end for d in after):
+        if path and end and any(d.get("path") == path and d.get("kind") != "import" and (d.get("line") or 0) > end for d in after):
             reached.add(path)
     declaration_reach = {}
+    if task.get("chunk_ids"):
+        # A changed error message does not establish that its declaration was
+        # repaired. A fully checked file may establish progress directly;
+        # otherwise candidate-bound declaration reach below must establish it.
+        resolved = [d for d in resolved if d.get("path") in checked and not any(
+            error.get("path") == d.get("path") for error in after)]
     inherited_missing = ([cid for cid in task.get("chunk_ids", []) if cid not in chunks]
                          if isinstance(chunks, dict) else list(task.get("chunk_ids", [])))
     pairs = {}

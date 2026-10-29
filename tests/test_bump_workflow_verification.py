@@ -619,8 +619,11 @@ class VerificationTests(unittest.TestCase):
     def test_partial_same_file_progress_can_integrate(self):
         old, task, inventory = self.candidate()
         sibling = {**old, "id": "b", "line": 4, "message": "sibling error"}
-        build = {"passed": False, "errors": [sibling], "checked_files": [], "unmapped": []}
-        self.assertTrue(v.candidate_progress([old, sibling], build, task, inventory)["accepted"])
+        build = {"passed": False, "errors": [sibling], "checked_files": [], "unmapped": [], "source_stable": True}
+        chunk = inventory["chunks"]["c"]
+        chunk.update(kind="theorem", name="owned")
+        self.assertTrue(v.candidate_progress([old, sibling], build, task, inventory,
+                                             candidate_chunks=inventory["chunks"])["accepted"])
 
     def test_disappeared_diagnostic_behind_import_failure_not_progress(self):
         old, task, inventory = self.candidate()

@@ -1084,8 +1084,14 @@ class WorkflowRuntimeTests(unittest.IsolatedAsyncioTestCase):
         async def rebuilt():
             return self.authoritative_build_result([later_error], checked=["B.lean"])
 
+        def candidate_build(root, **kwargs):
+            # Controller declaration reach requires ranges bound to the bytes
+            # checked in the integration tree, just like a real build receipt.
+            return {**self.build_result([later_error]),
+                    "source_identity": {"files": bump_verification._files(root)}}
+
         with patch.object(bump_verification, "audit_sources", return_value={"issues": []}), \
-                patch.object(bump_verification, "build", return_value=self.build_result([later_error])), \
+                patch.object(bump_verification, "build", side_effect=candidate_build), \
                 patch.object(self.controller, "build", side_effect=rebuilt):
             self.assertTrue(await self.controller.integrate_ready())
         self.assertTrue(closed)
