@@ -603,11 +603,16 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
     before = [d for d in before if d.get("severity", "error") == "error"]
     after = after_build.get("errors", [d for d in after_build.get("diagnostics", []) if d.get("severity") == "error"])
     files = set(task.get("files", []))
+    file_scoped_import_task = task.get("kind") in {"command", "module_repair", "imports"}
     chunks = inventory.get("chunks", inventory)
     owned_chunks = [chunks.get(key, {}) for key in task.get("chunk_ids", [])] if isinstance(chunks, dict) else []
     def owned_diagnostic(row):
         if row.get("path") not in files:
             return False
+        # Import diagnostics have no declaration line. Preserve their file-level
+        # ownership after a command/import task is expanded to declaration chunks.
+        if file_scoped_import_task and row.get("kind") == "import":
+            return True
         if not owned_chunks:
             return True  # Explicit module/import/configuration assignment.
         return any(row.get("path") == c.get("path", c.get("file"))
@@ -616,6 +621,8 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
     assigned = [d for d in before if owned_diagnostic(d)]
     old_keys, new_keys = {_diagnostic_key(d) for d in before}, {_diagnostic_key(d) for d in after}
     resolved = [d for d in assigned if _diagnostic_key(d) not in new_keys]
+    resolved_imports = [d for d in resolved if file_scoped_import_task and d.get("kind") == "import"]
+    resolved = [d for d in resolved if d not in resolved_imports]
     module_paths = {p.removesuffix(".lean").replace("/", "."): p for p in inventory.get("files", {})}
     downstream = set(files)
     while True:
@@ -697,32 +704,37 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
                     "start_line": current["start_line"], "end_line": current["end_line"],
                     "first_later_error_line": min(later) if later else None}
     import_reach = {}
-    if (not task.get("chunk_ids") and task.get("kind") in {"command", "module_repair", "imports"}
-            and after_build.get("source_stable") is True and isinstance(candidate_chunks, dict)):
-        for resolved_import in resolved:
-            path = resolved_import.get("path")
-            if resolved_import.get("kind") != "import" or path not in files:
-                continue
-            for chunk in candidate_chunks.values():
-                start, end = chunk.get("start_line"), chunk.get("end_line")
-                if (chunk.get("path") != path or chunk.get("kind") not in {
-                        "theorem", "lemma", "def", "abbrev", "opaque", "axiom", "constant", "instance",
-                        "inductive", "structure", "class", "example", "initialize"}
-                        or chunk.get("after_exit") or chunk.get("scope_excluded")
-                        or chunk.get("status") == "excluded" or str(chunk.get("name", "")).startswith("<unparsed-")
-                        or type(start) is not int or type(end) is not int or start <= 0 or end < start):
-                    continue
-                for error in after:
-                    line = error.get("line")
-                    if (error.get("path") == path and error.get("kind") == "declaration"
-                            and error.get("severity", "error") == "error" and type(line) is int
-                            and start <= line <= end):
-                        reached.add(path)
-                        import_reach[path] = {"declaration": chunk.get("name"), "start_line": start,
-                                              "end_line": end, "error_line": line}
+    if file_scoped_import_task and after_build.get("source_stable") is True:
+        import_paths = sorted({row.get("path") for row in resolved_imports
+                               if row.get("kind") == "import" and row.get("path") in files})
+        for path in import_paths:
+            evidence = None
+            if path in checked:
+                evidence = {"checked_file": True}
+            elif isinstance(candidate_chunks, dict):
+                for chunk in candidate_chunks.values():
+                    start, end = chunk.get("start_line"), chunk.get("end_line")
+                    if (chunk.get("path") != path or chunk.get("kind") not in {
+                            "theorem", "lemma", "def", "abbrev", "opaque", "axiom", "constant", "instance",
+                            "inductive", "structure", "class", "example", "initialize"}
+                            or chunk.get("after_exit") or chunk.get("scope_excluded")
+                            or chunk.get("status") == "excluded" or str(chunk.get("name", "")).startswith("<unparsed-")
+                            or type(start) is not int or type(end) is not int or start <= 0 or end < start):
+                        continue
+                    for error in after:
+                        line = error.get("line")
+                        if (error.get("path") == path and error.get("kind") == "declaration"
+                                and error.get("severity", "error") == "error" and type(line) is int
+                                and start <= line <= end):
+                            evidence = {"declaration": chunk.get("name"), "start_line": start,
+                                        "end_line": end, "error_line": line}
+                            break
+                    if evidence:
                         break
-                if path in import_reach:
-                    break
+            if evidence:
+                reached.add(path)
+                import_reach[path] = evidence
+                resolved.extend(row for row in resolved_imports if row.get("path") == path)
     eligible = (after_build.get("source_stable", True) and not after_build.get("unmapped")
                 and not (blocked & files) and not regressions
                 and (not inherited_missing or bool(pairs)))
@@ -732,6 +744,7 @@ def candidate_progress(before_diagnostics, after_build: dict, task: dict, invent
     fallback_reached = set(checked)
     if declaration_reach:
         fallback_reached.update(row["path"] for row in declaration_reach.values())
+        fallback_reached.update(import_reach)
         for _, chunk in pairs.values():
             path, end = chunk.get("path"), chunk.get("end_line")
             if (path in files and type(end) is int and any(

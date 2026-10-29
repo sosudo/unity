@@ -680,6 +680,113 @@ class VerificationTests(unittest.TestCase):
             with self.subTest(label=label):
                 self.assertFalse(v.candidate_progress(before, build, assignment, indexed, candidate_chunks=indexed["chunks"])["accepted"])
 
+    def test_grouped_command_import_progress_uses_candidate_declaration_reach(self):
+        imports = [
+            {"id": "old-import-a", "path": "Example.lean", "kind": "import", "severity": "error",
+             "line": None, "message": "bad import 'Old.A'"},
+            {"id": "old-import-b", "path": "Example.lean", "kind": "import", "severity": "error",
+             "line": None, "message": "bad import 'Old.B'"},
+        ]
+        task = {"kind": "command", "files": ["Example.lean"], "chunk_ids": ["c1", "c2"]}
+        chunks = {
+            "c1": {"path": "Example.lean", "kind": "theorem", "name": "first",
+                   "start_line": 10, "end_line": 12},
+            "c2": {"path": "Example.lean", "kind": "theorem", "name": "second",
+                   "start_line": 14, "end_line": 17},
+        }
+        inventory = {"files": {"Example.lean": {"imports": []}}, "chunks": chunks}
+        candidate_chunks = {key: dict(value) for key, value in chunks.items()}
+        body_errors = [{"id": "body-2", "path": "Example.lean", "kind": "declaration", "severity": "error",
+                        "line": 15, "message": "second proof still fails"}]
+        build = {"passed": False, "source_stable": True, "errors": body_errors,
+                 "checked_files": [], "unmapped": []}
+        result = v.candidate_progress(imports, build, task, inventory, candidate_chunks=candidate_chunks)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(set(result["resolved_diagnostic_ids"]), {"old-import-a", "old-import-b"})
+        self.assertEqual(result["import_reach_evidence"]["Example.lean"]["error_line"], 15)
+        self.assertEqual(result["remaining_errors"], body_errors)
+
+        # A clean assigned file is also positive reach when an unrelated
+        # downstream file keeps the overall build from passing.
+        downstream = {"path": "Dep.lean", "kind": "declaration", "severity": "error",
+                      "line": 20, "message": "dependent proof still fails"}
+        downstream_inventory = {"files": {"Example.lean": {"imports": []},
+                                           "Dep.lean": {"imports": ["Example"]}},
+                                "chunks": chunks}
+        checked_build = {**build, "errors": [downstream], "checked_files": ["Example.lean"]}
+        checked_result = v.candidate_progress(imports, checked_build, task, downstream_inventory)
+        self.assertTrue(checked_result["accepted"], checked_result)
+        self.assertEqual(set(checked_result["resolved_diagnostic_ids"]),
+                         {"old-import-a", "old-import-b"})
+        self.assertEqual(checked_result["import_reach_evidence"]["Example.lean"],
+                         {"checked_file": True})
+
+        # An entirely successful build is also valid partial-task completion.
+        clean = {**build, "passed": True, "errors": [], "checked_files": ["Example.lean"]}
+        self.assertTrue(v.candidate_progress(imports, clean, task, inventory,
+                                             candidate_chunks=candidate_chunks)["accepted"])
+
+        blocked_cases = {
+            "still_bad_import": ({**build, "errors": [*body_errors, imports[0]]}, candidate_chunks),
+            "stale_identity": ({**build, "source_stable": False}, candidate_chunks),
+            "unknown_identity": ({key: value for key, value in build.items() if key != "source_stable"}, candidate_chunks),
+            "missing_ranges": (build, {}),
+            "other_file_error": ({**build, "errors": [{**body_errors[0], "path": "Other.lean"}]}, candidate_chunks),
+            "unmapped": ({**build, "unmapped": [{"message": "compiler output was not located"}]}, candidate_chunks),
+        }
+        for label, (candidate_build, ranges) in blocked_cases.items():
+            with self.subTest(label=label):
+                self.assertFalse(v.candidate_progress(imports, candidate_build, task, inventory,
+                                                      candidate_chunks=ranges)["accepted"])
+
+        inherited_only = {**task, "chunk_ids": ["inherited-missing"]}
+        self.assertFalse(v.candidate_progress(imports, build, inherited_only, inventory,
+                                              candidate_chunks=candidate_chunks)["accepted"])
+
+        # A changed message in a still-failing declaration is not declaration
+        # progress when no prior import error was resolved.
+        old_declaration = {"id": "old-body", "path": "Example.lean", "kind": "declaration",
+                           "severity": "error", "line": 15, "message": "old goal"}
+        changed_only = {**build, "errors": [{**body_errors[0], "message": "new goal"}]}
+        result = v.candidate_progress([old_declaration], changed_only, task, inventory,
+                                      candidate_chunks=candidate_chunks)
+        self.assertFalse(result["accepted"])
+        self.assertEqual(result["resolved_diagnostic_ids"], [])
+
+    def test_grouped_import_and_declaration_reach_cover_each_assigned_file(self):
+        old_import = {"id": "old-import", "path": "A.lean", "kind": "import", "severity": "error",
+                      "line": None, "message": "bad import 'Old.Module'"}
+        old_declaration = {"id": "old-decl", "path": "B.lean", "kind": "declaration",
+                           "severity": "error", "line": 2, "message": "old goal"}
+        task = {"kind": "command", "files": ["A.lean", "B.lean"],
+                "chunk_ids": ["a1", "a2", "b1"]}
+        chunks = {
+            "a1": {"path": "A.lean", "kind": "theorem", "name": "a1", "start_line": 1, "end_line": 3},
+            "a2": {"path": "A.lean", "kind": "theorem", "name": "a2", "start_line": 6, "end_line": 8},
+            "b1": {"path": "B.lean", "kind": "theorem", "name": "b1", "start_line": 1, "end_line": 4},
+        }
+        inventory = {"files": {"A.lean": {"imports": []}, "B.lean": {"imports": []}}, "chunks": chunks}
+        candidate_chunks = {key: dict(value) for key, value in chunks.items()}
+        a_error = {"id": "a-error", "path": "A.lean", "kind": "declaration", "severity": "error",
+                   "line": 7, "message": "new A proof failure"}
+        b_later = {"id": "b-later", "path": "B.lean", "kind": "declaration", "severity": "error",
+                   "line": 10, "message": "later B proof failure"}
+        build = {"passed": False, "source_stable": True, "errors": [a_error, b_later],
+                 "checked_files": [], "unmapped": []}
+        result = v.candidate_progress([old_import, old_declaration], build, task, inventory,
+                                      candidate_chunks=candidate_chunks)
+        self.assertTrue(result["accepted"], result)
+        self.assertEqual(set(result["resolved_diagnostic_ids"]), {"old-import", "old-decl"})
+        self.assertEqual(result["import_reach_evidence"]["A.lean"]["error_line"], 7)
+        self.assertEqual(result["declaration_reach_evidence"]["b1"]["path"], "B.lean")
+
+        # A later error in B cannot stand in for current candidate reach in A.
+        no_a_reach = {**build, "errors": [b_later]}
+        rejected = v.candidate_progress([old_import, old_declaration], no_a_reach, task, inventory,
+                                        candidate_chunks=candidate_chunks)
+        self.assertFalse(rejected["accepted"])
+        self.assertNotIn("A.lean", rejected["import_reach_evidence"])
+
     def test_same_message_in_later_declaration_does_not_mask_owned_fix(self):
         old = {"id": "old-goal", "path": "Example.lean", "kind": "declaration", "severity": "error",
                "line": 3, "message": "unsolved goals"}
