@@ -12,7 +12,7 @@ Prefer direct API migrations and explicit typed equations/projection lemmas when
 
 Use the supplied Lake arguments consistently. Request shared configuration changes through `request_configuration_change`; do not run shared `lake update` or change toolchain/dependencies yourself. Workers may test affected modules and dependent modules; compilation of every unrelated declaration is not a prerequisite to submitting useful progress.
 
-Batch known mechanical API fixes within the same leased declaration or tightly coupled proof block, and run one targeted check before submission. Submit useful partial progress when the remaining work needs a different proof strategy, fresh compiler evidence, or a scope change.
+Batch known mechanical API fixes within the same leased declaration or tightly coupled proof block. When a checked fix recurs across adjacent failures in one API block, inspect those obligations before another single-declaration submission. Before expanding the assignment, request the exact related chunk IDs with `request_repair_scope`; batch only the approved declarations and run one targeted check before submission. Keep unrelated failures and uncertain causes separate. Submit useful partial progress when the remaining work needs a different proof strategy, fresh compiler evidence, or a scope change.
 
 Submit with `submit_repair(author, task_id, notes)`, stating what changed, exact checks/results, remaining failures and limitations. Submission records the worktree commit; it does not itself mean final acceptance. End the turn after submission so owned processes can be closed before serialized integration. Never mark a declaration clean merely because its diagnostic disappeared behind a failed import or an unreached build branch.
 
