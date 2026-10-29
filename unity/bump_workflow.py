@@ -586,10 +586,89 @@ class Controller:
         return all(state["tasks"].get(key, {}).get("status") in {"complete", "clean", "merged"}
                    for key in item.get("dependencies", []))
 
+    def reconcile_renamed_import_dependencies(self):
+        """Unblock destination repair without completing the old import obligation."""
+        from . import bump_tasks
+        state = self.state()
+        if stopped(self.paths) or any(r.get("status") == "pending"
+                                      for r in state.get("config_requests", {}).values()):
+            return
+        candidates = []
+        for tid, task in state["tasks"].items():
+            if (task.get("status") != "pending" or task.get("owner")
+                    or task.get("kind") not in {"repair", "command"}
+                    or task.get("dependency_basis") != "current transitive project imports and conservative source-command order"
+                    or any(task.get(k) for k in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))
+                    or len(task.get("files", [])) != 1 or not task.get("chunk_ids")):
+                continue
+            destination = task["files"][0]
+            if any(cid not in state["chunks"] or state["chunks"][cid].get("path") != destination
+                   or state["chunks"][cid].get("after_exit") or state["chunks"][cid].get("scope_excluded")
+                   or state["chunks"][cid].get("status") == "excluded" for cid in task["chunk_ids"]):
+                continue
+            diagnostics = task.get("diagnostics", [])
+            if (not diagnostics or any(d.get("path") != destination or d.get("kind") not in {"import", "declaration"}
+                                       or d.get("severity", "error") != "error" for d in diagnostics)):
+                continue
+            if any(d.get("kind") == "declaration" and (type(d.get("line")) is not int or not any(
+                    type(state["chunks"][cid].get("start_line")) is int
+                    and type(state["chunks"][cid].get("end_line")) is int
+                    and state["chunks"][cid]["start_line"] <= d["line"] <= state["chunks"][cid]["end_line"]
+                    for cid in task["chunk_ids"])) for d in diagnostics):
+                continue
+            for dep in task.get("dependencies", []):
+                prior = state["tasks"].get(dep, {})
+                if (prior.get("kind") != "command" or destination not in prior.get("files", [])
+                        or len(prior.get("files", [])) < 2 or prior.get("chunk_ids") or prior.get("owner")
+                        or prior.get("status") not in {"pending", "ready", "needs_repair", "blocked"}
+                        or any(prior.get(k) for k in ("audit_feedback", "critic_feedback", "review_snapshot_id", "grouped_review_feedback"))):
+                    continue
+                if any(lease.get("task_id") in {tid, dep} or path in set(task["files"]) | set(prior.get("files", []))
+                       for path, lease in state["leases"].items()):
+                    continue
+                if any(c.get("task_id") in {tid, dep} and c.get("status") in {"submitted", "merging"}
+                       for c in state["candidates"].values()):
+                    continue
+                aliases = accepted_rename_paths(self.paths.project_root, state, prior)
+                missing, destinations = set(aliases), {item["path"] for item in aliases.values()}
+                diagnostics = prior.get("diagnostics", [])
+                if (not aliases or destinations != {destination}
+                        or set(prior.get("files", [])) != missing | destinations or not diagnostics
+                        or any(d.get("path") not in missing or d.get("kind") != "import"
+                               or d.get("severity", "error") != "error" for d in diagnostics)):
+                    continue
+                candidates.append((tid, dep, aliases))
+        if not candidates or git(self.paths.project_root, "rev-parse", "HEAD") != state["main_sha"]:
+            return
+        status = git(self.paths.project_root, "status", "--porcelain", "--untracked-files=all", check=False)
+        if status.returncode or status.stdout.strip():
+            return
+        try:
+            # Match integration's merge-lock -> Forum transaction ordering so
+            # the final Git evidence remains current until the edge is updated.
+            with merge_lock(self.paths):
+                with bump_tasks.transaction(self.paths.forum, expected_revision=state["revision"]) as current:
+                    status = git(self.paths.project_root, "status", "--porcelain", "--untracked-files=all", check=False)
+                    if (git(self.paths.project_root, "rev-parse", "HEAD") != state["main_sha"]
+                            or status.returncode or status.stdout.strip()):
+                        raise ValueError("stale rename scheduling evidence")
+                    for tid, dep, aliases in candidates:
+                        if accepted_rename_paths(self.paths.project_root, current, current["tasks"][dep]) != aliases:
+                            raise ValueError("stale rename scheduling evidence")
+                        task = current["tasks"][tid]
+                        task["dependencies"].remove(dep)
+                        bump_tasks._event(current, "renamed_import_dependency_reconciled", "controller",
+                                          task_id=tid, predecessor_task_id=dep, aliases=deepcopy(aliases),
+                                          main_sha=state["main_sha"], config_revision=state["config"]["revision"],
+                                          qualification="Scheduling only; the prior import obligation remains pending.")
+        except ValueError as exc:
+            if str(exc) not in {"stale state revision", "stale rename scheduling evidence"}: raise
+
     def launch_ready(self):
         from . import bump_tasks
         if stopped(self.paths):
             return
+        self.reconcile_renamed_import_dependencies()
         state = self.state()
         # A retained request must be reconciled before dispatch, including while
         # the initial build streams diagnostics after a restart. Otherwise a
