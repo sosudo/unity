@@ -392,6 +392,21 @@ class Controller:
         if profile == "critic":
             instruction = "As primary, review the current snapshot and full migration diff; submit_migration_verdict."
         async with self.agent_locks[agent.name]:
+            if profile == "repairing":
+                from . import bump_advisory_cache
+                base = state.get("tasks", {}).get(task_id, {}).get("base_main_sha")
+                if base:
+                    await bump_advisory_cache.seed(self.paths, tree, base, state["config"], interrupt)
+                    from .forum.bump_workflow_server import _assistance_current
+                    assignment = state["tasks"][task_id]
+                    binding = {"task_id": task_id, "author": agent.name,
+                               "task_revision": assignment.get("revision"), "attempt": assignment.get("attempts"),
+                               "base_main_sha": base, "config_revision": assignment.get("config_revision")}
+                    current = self.state()
+                    if (not _assistance_current(current, binding)
+                            or current["tasks"][task_id].get("worktree") != str(Path(tree).resolve())):
+                        return None
+                if interrupt.is_set() or stopped(self.paths): return None
             env = runtime_env(self.paths, agent.name, task_id, profile, state["config"],
                               session_token=uuid.uuid4().hex)
             options = {"own_process_group": True, "interrupt_event": interrupt, "mcp_profile": "bump",
@@ -621,6 +636,10 @@ class Controller:
                        "Read the task and its context, investigate in your private checkout, and call "
                        "answer_assistance with actionable findings and evidence. Do not claim a repair.")
         async with self.agent_locks[agent.name]:
+            from . import bump_advisory_cache
+            await bump_advisory_cache.seed(self.paths, tree, request["base_main_sha"], state["config"], interrupt)
+            from .forum.bump_workflow_server import _assistance_current
+            if interrupt.is_set() or stopped(self.paths) or not _assistance_current(self.state(), request): return None
             env = runtime_env(self.paths, agent.name, request["task_id"], "assisting", state["config"],
                               session_token=uuid.uuid4().hex)
             env["UNITY_BUMP_ASSISTANCE_REQUEST"] = request["event_id"]

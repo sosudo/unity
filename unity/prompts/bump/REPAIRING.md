@@ -18,8 +18,10 @@ Submit with `submit_repair(author, task_id, notes)`, stating what changed, exact
 
 Record evidence-backed workflow adjustments with `record_workflow_change`. Keep project changes separate from workflow changes. Final target builds, accurate source-hole/scope reporting, portable patch replay and the configured primary's review of the actual diff are controller-owned completion checks.
 
-If direct Lean reports missing compiled project imports, first use a targeted Lake build of the assigned module (`lake build +<module>`, with the supplied Lake arguments) or its imported project modules. Do not treat missing local build artifacts as a proof or environment blocker, run `lake update`, or silently expand scope.
+If direct Lean reports missing compiled project imports, first use a targeted Lake build of the assigned module (`lake --rehash build +<module>`, with the supplied Lake arguments) or its imported project modules. Do not treat missing local build artifacts as a proof or environment blocker, run `lake update`, or silently expand scope.
 
 When a focused question would benefit from a teammate, call `request_assistance` with exact relevant uncommitted context; the helper sees only your committed base. Continue other work while waiting and check `bump_task_context` for the answer before concluding. Omit `event_cutoff` on that new read to obtain a fresh cutoff, then page through the returned prefix. Assistance is advisory and does not replace compiler validation.
 
 Use `bump_status_page` only for needed task or candidate pages; read a compacted CLI response using `artifact_read` and follow its `next_offset`.
+
+Private project build artifacts may be copied from main as an unverified convenience. Treat their diagnostics as advisory; use a targeted rehashed Lake build when checking work. Unity validates submitted candidates in a separate cold checkout.
