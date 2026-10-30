@@ -71,7 +71,10 @@ state is needed.
   wrong, stale, or replaced. The original remains in history but disappears from the active brief.
 - `forum_post(thread_id, author, content, reply_to?)` — free-form strategy discussion or live
   discussion that does not belong in structured finding state.
-- `forum_obstacle(chunk, author, goal_state, tried, hypothesis)` — report a concrete blocker.
+- `forum_obstacle(chunk, author, goal_state, tried?, hypothesis?)` — report a concrete blocker.
+  `tried` must be a JSON array of strings or `null` (default: `null`).
+  `hypothesis` must be a string (default: `""`).
+  Example: `{"chunk":"target","author":"worker","goal_state":"Blocked","tried":["Checked inputs"]}`.
 - `forum_question(author, body, to?, chunk?)` and `forum_answer(question_id, author, body)` —
   targeted questions and answers.
 - `forum_decision(author, topic, choice, rationale)` — record a binding shared decision.
