@@ -195,10 +195,18 @@ def _source_metadata(base: Path) -> tuple[dict[str, str], list[dict]]:
 
 def _kernel_targets(base: Path, kernel: dict) -> list[dict]:
     module_files, source_declarations = _source_metadata(base)
+    named_rows: dict[str, list[dict]] = {}
+    for identity, row in kernel.items():
+        named_rows.setdefault(row.get("name", identity), []).append(row)
+    for name, rows in named_rows.items():
+        if len(rows) > 1 and any(row.get("sorried") or row.get("kind") == "axiom" for row in rows):
+            modules = ", ".join(sorted(str(row.get("module", "unknown")) for row in rows))
+            raise ValueError(f"ambiguous unresolved declaration '{name}' is defined in modules: {modules}")
     targets = []
-    for name, row in kernel.items():
+    for identity, row in kernel.items():
         if not (row.get("sorried") or row.get("kind") == "axiom"):
             continue
+        name = row.get("name", identity)
         path = module_files.get(row.get("module", ""), "")
         candidates = [
             declaration for declaration in source_declarations

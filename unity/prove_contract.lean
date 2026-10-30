@@ -98,7 +98,76 @@ private partial def freshCheckName (env : Environment) (index : Nat) : Name :=
   let name := Name.num `_unityProveContractCheck index
   if (env.find? name).isSome then freshCheckName env (index + 1) else name
 
-def checkContract (env : Environment) (c : Json) : Except String Bool := do
+private def moduleOf (env : Environment) (n : Name) : Option Name := do
+  let idx ← env.getModuleIdxFor? n
+  env.header.moduleNames[idx.toNat]?
+
+private def originJson (env : Environment) (n : Name) : Json :=
+  (moduleOf env n).map (Json.str ∘ Name.toString) |>.getD Json.null
+
+-- Unlike getUsedConstants, include the structure name stored in a projection.
+private def referencedNames (e : Expr) : IO (Array Name) := do
+  let found ← IO.mkRef (({} : NameSet), (#[] : Array Name))
+  e.forEach fun part => do
+    let n? := match part with
+      | .const n _ | .proj n _ _ => some n
+      | _ => none
+    if let some n := n? then
+      found.modify fun (seen, names) =>
+        if seen.contains n then (seen, names) else (seen.insert n, names.push n)
+  return (← found.get).2
+
+private def contractOrigins (env : Environment) (targets : NameSet) (e : Expr) : IO Json := do
+  let mut pending ← referencedNames e
+  let mut seen : NameSet := {}
+  let mut out : Array Json := #[]
+  let mut index := 0
+  while index < pending.size do
+    let n := pending[index]!
+    index := index + 1
+    if seen.contains n then continue
+    seen := seen.insert n
+    let some ci := env.find? n | throw (IO.userError s!"type dependency missing: {n}")
+    out := out.push <| Json.mkObj [("name", nameJson n), ("module", originJson env n)]
+    if (moduleOf env n).map targets.contains |>.getD false then
+      pending := pending ++ (← referencedNames ci.type)
+      -- Trace computational definitions, not opaque theorem proof bodies.
+      match ci with
+      | .defnInfo value => pending := pending ++ (← referencedNames value.value)
+      | .opaqueInfo value => pending := pending ++ (← referencedNames value.value)
+      | _ => pure ()
+  return Json.arr out
+
+private partial def projectionNames (e : Expr) (names : NameSet := {}) : NameSet :=
+  match e with
+  | .proj n _ b => projectionNames b (names.insert n)
+  | .app f a => projectionNames a (projectionNames f names)
+  | .lam _ t b _ | .forallE _ t b _ => projectionNames b (projectionNames t names)
+  | .letE _ t v b _ => projectionNames b (projectionNames v (projectionNames t names))
+  | .mdata _ b => projectionNames b names
+  | _ => names
+
+private def checkOrigins (env : Environment) (target : Name) (expected : Expr)
+    (c : Json) : Except String Unit := do
+  match c.getObjVal? "module", c.getObjVal? "origins" with
+  | .error _, .error _ => return () -- Legacy ambiguity checks also run in Python.
+  | .ok owner, .ok rawOrigins =>
+    if owner != originJson env target then throw "candidate declaration owning module changed"
+    let origins ← rawOrigins.getArr?
+    let mut seen : NameSet := {}
+    for item in origins do
+      let n ← parseName (← item.getObjVal? "name")
+      if seen.contains n then throw "duplicate frozen constant origin"
+      seen := seen.insert n
+      if (env.find? n).isNone then throw s!"frozen type constant missing: {n}"
+      if (← item.getObjVal? "module") != originJson env n then
+        throw s!"frozen type constant origin changed: {n}"
+    for n in (projectionNames expected expected.getUsedConstantsAsSet).toList do
+      unless seen.contains n do throw s!"frozen type constant origin unavailable: {n}"
+  | _, _ => throw "incomplete frozen module/origin metadata"
+
+def checkContract (env : Environment) (c : Json)
+    (requiredOrigins : Json := Json.null) : Except String Bool := do
   let name ← (← c.getObjVal? "decl").getStr?
   let target := name.toName
   let some ci := env.find? target | throw "candidate declaration missing"
@@ -110,6 +179,13 @@ def checkContract (env : Environment) (c : Json) : Except String Bool := do
   let expected ← parseExpr (← c.getObjVal? "type")
   if expected.hasFVar || expected.hasMVar || expected.hasLooseBVars then
     throw "contract has free/metavariables or loose bound variables"
+  checkOrigins env target expected c
+  if requiredOrigins != Json.null then
+    let stored ← (← c.getObjVal? "origins").getArr?
+    let names ← stored.toList.mapM fun entry => do parseName (← entry.getObjVal? "name")
+    for entry in (← requiredOrigins.getArr?) do
+      let n ← parseName (← entry.getObjVal? "name")
+      unless names.contains n do throw s!"frozen type dependency origin unavailable: {n}"
   let decl : Declaration := .defnDecl {
     name := freshCheckName env 0
     levelParams := params
@@ -122,42 +198,78 @@ def checkContract (env : Environment) (c : Json) : Except String Bool := do
   | .ok _ => return true
   | .error _ => return false
 
+private def checkContractInModule (env : Environment) (targets : NameSet)
+    (c : Json) : IO (Except String Bool) := do
+  if (c.getObjVal? "module").isOk then
+    match (c.getObjVal? "type").bind parseExpr with
+    | .error e => return .error e
+    | .ok expected =>
+      try
+        -- Recompute the closure of the frozen expression, not the candidate's
+        -- type, so adding a definitionally equal alias remains permitted.
+        return checkContract env c (← contractOrigins env targets expected)
+      catch e => return .error s!"frozen type origins unavailable: {e}"
+  return checkContract env c
+
 def main (args : List String) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let (modules, rest) := args.span (· != "--")
   if modules.isEmpty then throw (IO.userError "no modules")
-  let env ← importModules (modules.toArray.map fun a => ({ module := a.toName, importAll := true } : Import)) {} 0
   let targets : NameSet := modules.foldl (fun s a => s.insert a.toName) {}
-  let moduleOf (n : Name) : Option Name := do
-    let idx ← env.getModuleIdxFor? n
-    env.header.moduleNames[idx.toNat]?
-  let isTarget (n : Name) : Bool := (moduleOf n).map targets.contains |>.getD false
+  let contract? ← match rest with
+    | ["--", path] =>
+      match Json.parse (← IO.FS.readFile path) with
+      | .ok c => pure (some c)
+      | .error e => throw (IO.userError e)
+    | [] => pure none
+    | _ => throw (IO.userError "invalid arguments")
   let mut out : Array Json := #[]
-  for (n, ci) in env.constants.toList do
-    unless isTarget n && !isNoise n do continue
-    let used := ci.type.getUsedConstants ++ (((ci.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[])
-    let typeDeps := ci.type.getUsedConstants.filter fun d => d != n && !isNoise d
-    let deps := (used.filter fun d => isTarget d && d != n && !isNoise d).toList.eraseDups
-    out := out.push <| Json.mkObj [
-      ("name", Json.str n.toString), ("kind", Json.str (kindOf ci)),
-      ("module", Json.str (((moduleOf n).getD .anonymous).toString)),
-      ("type_repr", Json.str (toString ci.type)),
-      ("type_deps", Json.arr (typeDeps.toList.eraseDups.toArray.map fun d => Json.str d.toString)),
-      ("sorried", Json.bool (used.contains ``sorryAx)),
-      ("deps", Json.arr (deps.toArray.map fun d => Json.str d.toString)),
-      ("contract", Json.mkObj [("decl", Json.str n.toString),
-        ("level_params", Json.arr (ci.levelParams.toArray.map nameJson)), ("type", exprJson ci.type)])]
+  let mut ownedNames : Array Json := #[]
+  let mut checks : Array (String × Json) := #[]
+  for module in modules do
+    -- Independent Lean modules may legitimately define the same name. Importing
+    -- their union changes the project and can fail before inspection starts.
+    let env ← importModules #[{ module := module.toName, importAll := true }] {} 0
+    let isTarget (n : Name) : Bool := (moduleOf env n).map targets.contains |>.getD false
+    for (n, ci) in env.constants.toList do
+      unless moduleOf env n == some module.toName do continue
+      ownedNames := ownedNames.push <| Json.mkObj [
+        ("name", Json.str n.toString), ("module", Json.str module)]
+      if isNoise n then continue
+      let used := ci.type.getUsedConstants ++ (((ci.value? (allowOpaque := true)).map (·.getUsedConstants)).getD #[])
+      let typeDeps := ci.type.getUsedConstants.filter fun d => d != n && !isNoise d
+      let deps := (used.filter fun d => isTarget d && d != n && !isNoise d).toList.eraseDups
+      let origins ← contractOrigins env targets ci.type
+      out := out.push <| Json.mkObj [
+        ("name", Json.str n.toString), ("kind", Json.str (kindOf ci)),
+        ("module", Json.str module),
+        ("type_repr", Json.str (toString ci.type)),
+        ("type_deps", Json.arr (typeDeps.toList.eraseDups.toArray.map fun d => Json.str d.toString)),
+        ("sorried", Json.bool (used.contains ``sorryAx)),
+        ("deps", Json.arr (deps.toArray.map fun d => Json.str d.toString)),
+        ("dependency_modules", Json.mkObj (deps.map fun d => (d.toString, originJson env d))),
+        ("contract", Json.mkObj [("decl", Json.str n.toString),
+          ("level_params", Json.arr (ci.levelParams.toArray.map nameJson)), ("type", exprJson ci.type),
+          ("module", Json.str module), ("origins", origins)])]
+    if let some contract := contract? then
+      let name ← match (contract.getObjVal? "decl").bind Json.getStr? with
+        | .ok name => pure name
+        | .error e => throw (IO.userError e)
+      if moduleOf env name.toName == some module.toName then
+        let result ← checkContractInModule env targets contract
+        let checked := match result with
+          | .ok valid => Json.mkObj [("passed", Json.bool valid), ("module", Json.str module)]
+          | .error e => Json.mkObj [("passed", Json.bool false), ("module", Json.str module), ("error", Json.str e)]
+        checks := checks.push (module, checked)
   let mut check : Json := Json.null
-  match rest with
-  | ["--", path] =>
-    let raw ← IO.FS.readFile path
-    match Json.parse raw with
-    | .error e => throw (IO.userError e)
-    | .ok contract =>
-      match checkContract env contract with
-      | .ok valid => check := Json.mkObj [("passed", Json.bool valid)]
-      | .error e => check := Json.mkObj [("passed", Json.bool false), ("error", Json.str e)]
-  | [] => pure ()
-  | _ => throw (IO.userError "invalid arguments")
-  IO.println (Json.mkObj [("declarations", Json.arr out), ("signature_check", check)]).compress
+  if let some contract := contract? then
+    let selected := match (contract.getObjVal? "module").bind Json.getStr? with
+      | .ok owner => checks.filter fun (entry : String × Json) => entry.1 == owner
+      | .error _ => checks
+    check := if selected.size == 1 then selected[0]!.2 else
+      Json.mkObj [("passed", Json.bool false), ("error", Json.str
+        (if selected.isEmpty then "candidate declaration missing from its owning module"
+         else "candidate declaration is ambiguous across modules"))]
+  IO.println (Json.mkObj [("declarations", Json.arr out),
+    ("owned_names", Json.arr ownedNames), ("signature_check", check)]).compress
   return 0

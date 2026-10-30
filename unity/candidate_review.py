@@ -45,11 +45,25 @@ def _source_declaration(project_root: Path, declaration: dict) -> dict | None:
 
 def _kernel_declaration(kernel: dict, declaration: dict) -> tuple[str, dict] | None:
     decl = declaration.get("decl", "")
-    if decl in kernel:
-        return decl, kernel[decl]
-    short_name = str(declaration.get("title") or decl).rsplit(".", 1)[-1]
-    matches = [(name, row) for name, row in kernel.items()
-               if name == short_name or name.endswith("." + short_name)]
+    contract = declaration.get("type_contract")
+    frozen_module = contract.get("module") if isinstance(contract, dict) else None
+    source_file = declaration.get("file", "")
+    source_module = ""
+    if source_file:
+        path = Path(source_file)
+        if path.is_absolute() or ".." in path.parts or path.suffix != ".lean":
+            return None
+        source_module = ".".join(path.with_suffix("").parts)
+    if frozen_module and source_module and frozen_module != source_module:
+        return None
+    expected_module = frozen_module or source_module
+    # Old unit-test metadata lacks module fields. Real inspector rows always have
+    # an owner; only entirely unqualified legacy metadata may use this exact-name
+    # compatibility path. Never guess by a short declaration name.
+    legacy_metadata = not frozen_module and all("module" not in row for row in kernel.values())
+    matches = [(identity, row) for identity, row in kernel.items()
+               if row.get("name", identity) == decl
+               and (legacy_metadata or expected_module and row.get("module") == expected_module)]
     return matches[0] if len(matches) == 1 else None
 
 
