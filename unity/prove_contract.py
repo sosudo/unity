@@ -37,7 +37,8 @@ def inspect(project_root: Path, *, decl: str | None = None, contract: dict | Non
 
     Returns (declarations, check). check is None for discovery, otherwise a dict
     with boolean ``passed``. Failures to inspect raise ValueError and never fall
-    back to source or printed types.
+    back to source or printed types. Build exactly the complete module inventory
+    that the inspector imports, including modules outside default Lake targets.
     """
     from . import blueprint
     root = Path(project_root)
@@ -52,6 +53,16 @@ def inspect(project_root: Path, *, decl: str | None = None, contract: dict | Non
     environment = dict(os.environ)
     environment['PATH'] = environment.get('PATH', '') + os.pathsep + str(Path.home() / '.elan' / 'bin')
     try:
+        # A plain `lake build` only covers default targets and their imports.
+        # Keep nondefault/unreferenced project modules in the inspection scope,
+        # and refresh their oleans instead of importing missing or stale output.
+        build = subprocess.run(
+            ['lake', 'build', *(f'+{module}:olean' for module in modules)],
+            cwd=root, capture_output=True, text=True, env=environment,
+        )
+        if build.returncode != 0:
+            output = '\n'.join(part for part in (build.stdout, build.stderr) if part)
+            raise ValueError('Lean prove inspection module build failed: ' + output[-4000:])
         with tempfile.TemporaryDirectory(prefix='unity-prove-contract-') as temp:
             args = ['lake', 'env', 'lean', '--run', str(script), *modules]
             if payload is not None:

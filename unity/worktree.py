@@ -250,6 +250,7 @@ def sync_candidate_to_main(project_path: Path, candidate: dict, declaration: dic
                 "build": build_record,
             }
         try:
+            review_index_tree = _git(project_path, "write-tree", check=True).stdout.strip()
             candidate_diff = _git(
                 project_path, "diff", "--cached", "--no-ext-diff", before, check=True
             ).stdout
@@ -260,6 +261,14 @@ def sync_candidate_to_main(project_path: Path, candidate: dict, declaration: dic
                 base_main_sha=before,
                 candidate_diff=candidate_diff,
             )
+            # Prove inspection builds the complete project module inventory.
+            # Its checked sources and staged merge must remain the same candidate.
+            if (_git(project_path, "diff", "--quiet").returncode != 0
+                    or _git(project_path, "write-tree", check=True).stdout.strip() != review_index_tree):
+                verification["status"] = "failed"
+                verification["issues"].append(
+                    "Prove contract inspection changed tracked files or the candidate index"
+                )
             verification["build_returncode"] = build.returncode
             verification["build_artifact_id"] = build_record.get("artifact_id")
             stored_review = artifacts.store_text(

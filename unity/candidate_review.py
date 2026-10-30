@@ -118,8 +118,15 @@ def review_candidate(
     expected_type = declaration.get("kernel_type_repr", "")
     actual_type = kernel_target[1].get("type_repr", "") if kernel_target else ""
     signature_unchanged = bool(kernel_target and check and check.get("passed") is True)
-    if not signature_unchanged:
+    signature_check_available = bool(
+        kernel_target and check and isinstance(check.get("passed"), bool) and not check.get("error")
+    )
+    if kernel_target and check and check.get("error"):
+        issues.append("target declaration contract check failed: " + str(check["error"]))
+    elif signature_check_available and not signature_unchanged:
         issues.append("target declaration type differs from the original prove target")
+    elif kernel_target and not signature_check_available:
+        issues.append("target declaration contract check is unavailable")
 
     mode = "kernel" if kernel_available else "kernel_unavailable"
     target_kind = kernel_target[1].get("kind", "") if kernel_target else (source or {}).get("kind", "")
@@ -151,6 +158,7 @@ def review_candidate(
             kernel_target is not None if kernel_available else True
         ),
         "signature_unchanged": signature_unchanged,
+        "signature_check_available": signature_check_available,
         "signature_check_method": "lean_kernel_assignment",
         "type_contract_sha256": (declaration.get("type_contract") or {}).get("sha256")
             if isinstance(declaration.get("type_contract"), dict) else None,
