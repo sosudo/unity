@@ -9,7 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from . import library, prove_state, worktree
+from . import library, prove_mcp, prove_state, worktree
 from .prove_questions import QuestionWakeups
 from .forum import server as forum_server
 from .orchestrator import _preamble, load_prompt, stop_requested
@@ -309,7 +309,7 @@ async def run_prove_runtime(
                 system,
                 task_prompt,
                 worktrees[agent_name],
-                mcp,
+                prove_mcp.for_checkout(mcp, worktrees[agent_name]),
                 subagents=subagents,
                 interrupt_event=interrupt_event,
                 env_overrides=({"UNITY_PROVE_CODEX_REASONING_EFFORT": efforts[agent_name]}

@@ -262,6 +262,7 @@ async def mcp(server, tool, args, args_file):
             if override not in solve_server.PROFILES:
                 raise click.ClickException(f"unknown solve tool profile '{override}'")
             solve_profile = override
+    active_prove = run_state.get("command") == "prove" and run_state.get("phase") != "done"
     client = None
     diagnostic_note = ""
     if server in ("unity-forum", "forum") and active_bump:
@@ -324,6 +325,10 @@ async def mcp(server, tool, args, args_file):
             )
         else:
             specs = build_solve_mcp(paths, solve_profile) if active_solve else build_mcp(paths)
+        if active_prove:
+            from .. import prove_mcp
+            # .unity may link to shared main; project_root retains the caller's checkout.
+            specs = prove_mcp.for_checkout(specs, paths.project_root)
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
         spec = specs[server]
@@ -348,7 +353,6 @@ async def mcp(server, tool, args, args_file):
         text = getattr(block, "text", None)
         rendered.append(text if text is not None else str(block))
     output = "\n".join(rendered)
-    active_prove = run_state.get("command") == "prove" and run_state.get("phase") != "done"
     bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
         "artifact_read", "artifact_snapshot_file",
     }

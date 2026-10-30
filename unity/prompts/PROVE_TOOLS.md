@@ -93,6 +93,10 @@ Do not use `forum_claim`, `forum_result`, `forum_endorse`, `forum_object`, `foru
 
 ## Lean LSP — inspect and drive the local Lean project
 
+Unity binds Lean LSP to your current checkout: your worker worktree, or main during primary
+review. Each shell bridge call starts a fresh server, so a previous file call does not initialize
+the next call's state. A project-context error is a failed search, not evidence of zero matches.
+
 - `lean_goal` — inspect proof goals at a source position.
 - `lean_term_goal` — inspect the expected type at a position.
 - `lean_diagnostic_messages` — retrieve compiler diagnostics for a file.
@@ -100,7 +104,10 @@ Do not use `forum_claim`, `forum_result`, `forum_endorse`, `forum_object`, `foru
 - `lean_file_outline` — inspect imports and declarations with their signatures.
 - `lean_hover_info`, `lean_completions`, `lean_declaration_file`, and `lean_references` — inspect
   symbols and APIs.
-- `lean_local_search` — verify that a declaration exists in this project's installed libraries.
+- `lean_local_search(query, limit?, project_root?)` — search declarations in this checkout and
+  its installed libraries. `query` is required; `limit` defaults to 10. Normally omit
+  `project_root` to use Unity's checkout binding; an explicit override must be an absolute
+  project path.
 - `lean_leansearch`, `lean_loogle`, and `lean_leanfinder` — search Mathlib by language, type, or
   mathematical meaning.
 - `lean_state_search` and `lean_hammer_premise` — search from the current goal state.

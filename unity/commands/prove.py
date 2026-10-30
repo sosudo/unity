@@ -5,7 +5,7 @@ import asyncclick as click
 from ..Architect import architect
 from ..blueprint import build_prove_dag
 from ..config import load_paths
-from .. import prove_state
+from .. import prove_mcp, prove_state
 from ..prove_runtime import _prove_codex_reasoning_effort, run_prove_runtime
 from ..roster import load_roster
 from ..orchestrator import dispatch, build_mcp, load_prompt, toposort, mark_phase, stop_requested, resume_point, mark_done
@@ -58,7 +58,7 @@ async def prove(targets, continue_):
     (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
     roster = load_roster(paths.agents_yaml, use_learned_strength=False)
     primary_env = _primary_env_overrides(roster)
-    mcp = build_mcp(paths, forum_icrl=False)
+    mcp = prove_mcp.for_checkout(build_mcp(paths, forum_icrl=False), paths.project_root)
     resume = resume_point(paths, "prove", continue_)
     if resume == "exploration":
         resume = "proving"
