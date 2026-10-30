@@ -3,9 +3,15 @@
 Forum and Lean LSP are always available. Axle and Aristotle are available only when their API
 keys are configured. When Axle offers a tool equivalent to a Lean LSP tool, prefer Axle.
 
-If a backend does not expose custom MCP tools directly, call them through the shell:
-`unity mcp <server> <tool> '<json-args>'`. The available servers are `unity-forum`, `lean-lsp`,
-`axle`, and `aristotle`.
+If a backend does not expose custom MCP tools directly, use the shell bridge. Write a UTF-8
+JSON argument object with exactly the documented tool fields, using `json.dump` or `json.dumps`
+to preserve quotes, newlines, backslashes, and Lean source. Call
+`unity mcp <server> <tool> --args-file /path/to/request.json`.
+To read that file through stdin, use
+`unity mcp <server> <tool> --args-file - < /path/to/request.json`.
+A heredoc also requires `--args-file -`; stdin alone does not supply the arguments.
+Pass either positional JSON or `--args-file` for one call. The available servers are
+`unity-forum`, `lean-lsp`, `axle`, and `aristotle`.
 
 ## Forum — authoritative prove coordination
 
@@ -72,9 +78,10 @@ state is needed.
 - `forum_post(thread_id, author, content, reply_to?)` — free-form strategy discussion or live
   discussion that does not belong in structured finding state.
 - `forum_obstacle(chunk, author, goal_state, tried?, hypothesis?)` — report a concrete blocker.
+  Set `chunk` to the exact declaration name in the current Prove brief and `author` to your
+  configured agent name.
   `tried` must be a JSON array of strings or `null` (default: `null`).
   `hypothesis` must be a string (default: `""`).
-  Example: `{"chunk":"target","author":"worker","goal_state":"Blocked","tried":["Checked inputs"]}`.
 - `forum_question(author, body, to?, chunk?)` and `forum_answer(question_id, author, body)` —
   targeted questions and answers.
 - `forum_decision(author, topic, choice, rationale)` — record a binding shared decision.
@@ -110,7 +117,9 @@ the next call's state. A project-context error is a failed search, not evidence 
 - `lean_local_search(query, limit?, project_root?)` — search declarations in this checkout and
   its installed libraries. `query` is required; `limit` defaults to 10. Normally omit
   `project_root` to use Unity's checkout binding; an explicit override must be an absolute
-  project path.
+  project path. Check the returned `index` field: `consulted` confirms that the index was
+  searched. If `index` is `unavailable`, an empty `items` list says nothing about whether a
+  declaration exists. Use direct source search or another available search tool in that case.
 - `lean_leansearch`, `lean_loogle`, and `lean_leanfinder` — search Mathlib by language, type, or
   mathematical meaning.
 - `lean_state_search` and `lean_hammer_premise` — search from the current goal state.
