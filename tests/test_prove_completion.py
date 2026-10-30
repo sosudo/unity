@@ -20,7 +20,7 @@ class ProveCompletionTests(unittest.IsolatedAsyncioTestCase):
         unity.mkdir()
         self.paths = SimpleNamespace(project_root=root, unity=unity, forum=unity / 'forum',
                                      agents_yaml=unity / 'agents.yaml')
-        self.roster = SimpleNamespace(primary='worker')
+        self.roster = SimpleNamespace(primary=SimpleNamespace(name='worker', backend='codex'))
         self.state = {'declarations': {'target': {'status': 'unresolved'}}}
         self.stopped = False
         self.decision = {'approved': False, 'verdict': 'stalled', 'reopen': []}
@@ -76,6 +76,20 @@ class ProveCompletionTests(unittest.IsolatedAsyncioTestCase):
         await self.run_command()
         self.assertEqual(self.dispatch.await_count, 2)
         self.done.assert_called_once_with(self.paths, 'prove')
+
+    async def test_critic_and_retrospective_forward_primary_effort(self):
+        self.roster.primary.name = 'Terra1'
+        self.state['declarations']['target']['status'] = 'solved'
+        self.decision = {'approved': True, 'verdict': 'proven', 'reopen': []}
+        setting = json.dumps({'Terra1': 'high', 'Terra2': 'high',
+                              'Luna1': 'medium', 'Luna2': 'medium'})
+        with patch.dict('os.environ', {'UNITY_PROVE_CODEX_REASONING_EFFORT': setting}):
+            await self.run_command()
+        self.assertEqual([call.args[2] for call in self.dispatch.await_args_list],
+                         ['prove/CRITIC', 'prove/RETROSPECTIVE'])
+        for call in self.dispatch.await_args_list:
+            self.assertEqual(call.kwargs['agent_env_overrides'],
+                             {'Terra1': {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}})
 
     async def test_zero_targets_exits_before_runtime(self):
         with patch.object(command, 'build_prove_dag', return_value={'chunks': [], 'source': 'kernel'}):

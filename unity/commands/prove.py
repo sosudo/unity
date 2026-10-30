@@ -6,7 +6,7 @@ from ..Architect import architect
 from ..blueprint import build_prove_dag
 from ..config import load_paths
 from .. import prove_state
-from ..prove_runtime import run_prove_runtime
+from ..prove_runtime import _prove_codex_reasoning_effort, run_prove_runtime
 from ..roster import load_roster
 from ..orchestrator import dispatch, build_mcp, load_prompt, toposort, mark_phase, stop_requested, resume_point, mark_done
 
@@ -14,6 +14,19 @@ from ..orchestrator import dispatch, build_mcp, load_prompt, toposort, mark_phas
 def _retrospective_enabled() -> bool:
     """Retrospective is on by default and may be disabled for evaluation runs."""
     return os.getenv("RETROSPECTIVE", "true").strip().lower() != "false"
+
+
+def _primary_env_overrides(roster) -> dict[str, dict[str, str]] | None:
+    """Apply the Prove effort setting to solo phases as well as proof workers."""
+    agent = roster.primary
+    if agent.backend != "codex":
+        return None
+    effort = _prove_codex_reasoning_effort(
+        agent.name, os.getenv("UNITY_PROVE_CODEX_REASONING_EFFORT")
+    )
+    if effort is None:
+        return None
+    return {agent.name: {"UNITY_PROVE_CODEX_REASONING_EFFORT": effort}}
 
 
 def _check_stop(root) -> None:
@@ -44,6 +57,7 @@ async def prove(targets, continue_):
     paths = load_paths()
     (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
     roster = load_roster(paths.agents_yaml, use_learned_strength=False)
+    primary_env = _primary_env_overrides(roster)
     mcp = build_mcp(paths, forum_icrl=False)
     resume = resume_point(paths, "prove", continue_)
     if resume == "exploration":
@@ -103,7 +117,8 @@ async def prove(targets, continue_):
                            ".unity/CRITIC.md and the structured approved/verdict/reopen decision to "
                            ".unity/critic.json. Reopen any currently solved declaration whose accepted "
                            "candidate has a concrete defect.",
-                           root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False)
+                           root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False,
+                           agent_env_overrides=primary_env)
             _check_stop(root)
             try:
                 _c = json.loads((paths.unity / "critic.json").read_text())
@@ -162,7 +177,8 @@ async def prove(targets, continue_):
     if _retrospective_enabled():
         await dispatch([roster.primary], roster, load_prompt("prove/RETROSPECTIVE"),
                        "Distill lessons from this run into the library.",
-                       root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False)
+                       root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False,
+                       agent_env_overrides=primary_env)
     _check_stop(root)
     mark_done(paths, "prove")
 

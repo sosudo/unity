@@ -9,10 +9,47 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from openai_codex.types import ReasoningEffort
-from unity import prove_runtime, spawn
+from unity import orchestrator, prove_runtime, spawn
+from unity.commands import prove as command
 
 
 class ProveEffortTests(unittest.IsolatedAsyncioTestCase):
+    def test_primary_phase_effort_respects_agent_and_backend(self):
+        setting = json.dumps({'Terra1': 'high', 'Luna1': 'medium'})
+        for name, backend, expected in [
+            ('Terra1', 'codex', 'high'), ('Luna1', 'codex', 'medium'),
+            ('Other', 'codex', None), ('Terra1', 'claude_code', None),
+        ]:
+            with self.subTest(name=name, backend=backend), \
+                 patch.dict(os.environ, {'UNITY_PROVE_CODEX_REASONING_EFFORT': setting}):
+                roster = SimpleNamespace(primary=SimpleNamespace(name=name, backend=backend))
+                overrides = command._primary_env_overrides(roster)
+                self.assertEqual(overrides, None if expected is None else {
+                    name: {'UNITY_PROVE_CODEX_REASONING_EFFORT': expected}})
+
+    async def test_dispatch_only_forwards_explicit_agent_overrides(self):
+        agents = [SimpleNamespace(name='Terra1'), SimpleNamespace(name='Luna1')]
+        roster = SimpleNamespace(agents=agents, primary=agents[0])
+        explicit = {'Terra1': {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}}
+        for options in ({}, {'agent_env_overrides': explicit}):
+            with self.subTest(options=options), \
+                 patch.dict(os.environ, {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}), \
+                 patch.object(orchestrator, 'stop_requested', return_value=False), \
+                 patch.object(orchestrator, 'load_prompt', return_value=''), \
+                 patch.object(orchestrator.library, 'library_context', return_value=''), \
+                 patch.object(orchestrator.library, 'library_subagents', return_value=[]), \
+                 patch('unity.config.find_unity_dir', return_value=None), \
+                 patch.object(orchestrator, '_preamble', return_value=''), \
+                 patch.object(orchestrator, 'spawn', new_callable=AsyncMock) as launch:
+                await orchestrator.dispatch(agents, roster, '', '', Path('/unused'), {},
+                                            icrl_enabled=False, **options)
+            self.assertEqual(launch.await_count, 2)
+            for call in launch.await_args_list:
+                if options and call.args[0].name == 'Terra1':
+                    self.assertEqual(call.kwargs['env_overrides'], explicit['Terra1'])
+                else:
+                    self.assertNotIn('env_overrides', call.kwargs)
+
     def test_resolution_and_validation(self):
         resolve = prove_runtime._prove_codex_reasoning_effort
         self.assertIsNone(resolve('Terra1', None))

@@ -214,6 +214,7 @@ async def dispatch(
     brief_provider=None,
     log_context: dict | None = None,
     mcp_profile: str = "prove",
+    agent_env_overrides: dict[str, dict[str, str]] | None = None,
 ):
     """Spawn `agents` concurrently with per-agent prompts; await all, log failures.
 
@@ -259,6 +260,8 @@ async def dispatch(
 
     async def _spawn_one(a):
         kwargs = {"subagents": subagents}
+        if agent_env_overrides is not None and a.name in agent_env_overrides:
+            kwargs["env_overrides"] = agent_env_overrides[a.name]
         if log_context is not None:
             kwargs["log_context"] = log_context
         kwargs["mcp_profile"] = mcp_profile
