@@ -100,7 +100,9 @@ private partial def freshCheckName (env : Environment) (index : Nat) : Name :=
 
 private def moduleOf (env : Environment) (n : Name) : Option Name := do
   let idx ← env.getModuleIdxFor? n
-  env.header.moduleNames[idx.toNat]?
+  -- moduleNames maps every imported module on each call. Look up the stored
+  -- entry directly because inspection checks the owner of every constant.
+  return (← env.header.modules[idx.toNat]?).module
 
 private def originJson (env : Environment) (n : Name) : Json :=
   (moduleOf env n).map (Json.str ∘ Name.toString) |>.getD Json.null
