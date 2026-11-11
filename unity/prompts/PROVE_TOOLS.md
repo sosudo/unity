@@ -1,7 +1,8 @@
 # Available MCP tools for `unity prove`
 
-Forum and Lean LSP are always available. Axle and Aristotle are available only when their API
-keys are configured. When Axle offers a tool equivalent to a Lean LSP tool, prefer Axle.
+The unity-prove server and Lean LSP are always available. Axle and Aristotle are available only
+when their API keys are configured. When Axle offers a tool equivalent to a Lean LSP tool, prefer
+Axle.
 
 If a backend does not expose custom MCP tools directly, use the shell bridge. Write a UTF-8
 JSON argument object with exactly the documented tool fields, using `json.dump` or `json.dumps`
@@ -11,95 +12,50 @@ To read that file through stdin, use
 `unity mcp <server> <tool> --args-file - < /path/to/request.json`.
 A heredoc also requires `--args-file -`; stdin alone does not supply the arguments.
 Pass either positional JSON or `--args-file` for one call. The available servers are
-`unity-forum`, `lean-lsp`, `axle`, and `aristotle`.
+`unity-prove`, `lean-lsp`, `axle`, and `aristotle`.
 
-## Forum — authoritative prove coordination
+## Prove controls — authoritative run state
 
-Start each turn with `forum_brief(author)` and use `prove_status(decl?)` whenever exact current
-state is needed.
+Use `prove_status(decl?)` whenever exact current state is needed. Runtime state is shared for
+scheduling and mechanical candidate processing; there is no shared discussion or knowledge board.
 
 ### Strategies
 
-- `register_strategy(author, description, decl?, strategy_family?)` — register a proof or research
-  direction once it is coherent enough for another agent to distinguish. It may be provisional; a
-  complete proof plan is not required. Registration does not claim it.
-  Exact normalized descriptions are rejected; matching nonempty normalized `strategy_family` values
-  for the same declaration are also rejected. Use a stable family for the core method, theorem,
-  tactic, or reduction, even when descriptions differ.
-  Systematic project/Mathlib search is a valid strategy when it is aimed at materially closing the
-  exact target. Use a recognizable family such as `library_search` or a more specific normalized
-  search family, and assist an existing equivalent search rather than duplicating it.
+- `register_strategy(author, description, decl?, strategy_family?)` — register a coherent proof or
+  research direction. It may be provisional; a complete proof plan is not required. Registration
+  does not claim it. Choose a direction distinct from active strategies shown by `prove_status`.
 - `claim_strategy(strategy_id, author)` — atomically claim a registered strategy.
-- `assist_strategy(strategy_id, author, contribution?)` — join a claimed strategy without taking
-  its owner's reservation. State the distinct supporting contribution: library/API search, a helper
-  lemma, debugging, or an explicitly coordinated alternative implementation. An assistant who
-  completes the exact proof may submit the candidate for that strategy.
-- `unclaim_strategy(strategy_id, author, reason?)` — release an unsuccessful but potentially
-  viable strategy.
-- `mark_strategy_incorrect(strategy_id, author, reason, evidence?)` — permanently record why a
-  strategy cannot work.
+- `unclaim_strategy(strategy_id, author, reason?)` — release an unsuccessful but potentially viable
+  strategy.
+- `mark_strategy_incorrect(strategy_id, author, reason, evidence?)` — record evidence that a strategy
+  cannot work.
 
-### Candidates
+Systematic project/Mathlib search is a valid strategy when aimed at materially closing the exact
+target. Use a recognizable family such as `library_search` or a more specific normalized search
+family. Avoid duplicating an equivalent active strategy; pursue a distinct direction or continue
+your own work.
+
+### Candidates and synchronization
 
 - `emit_candidate(strategy_id, author, commit_sha, decl?, notes?, supersedes?)` — submit the exact
-  committed source revision produced by an owned or explicitly assisted strategy. Submission automatically triggers
-  Unity's main-checkout build and mechanical declaration review; a passing candidate merges without
-  model endorsement.
-- `endorse_candidate(candidate_id, author, review?)` and
-  `object_candidate(candidate_id, author, reason, evidence?)` — compatibility/manual-review tools;
-  they are not part of the normal automatic acceptance path.
-- `resolve_candidate_objection(candidate_id, objection_id, author, resolution)` — resolve an
-  objection after checking the concern.
+  committed source revision produced by an owned strategy. Submission automatically triggers Unity's
+  main-checkout build and mechanical declaration review; a passing candidate merges without model
+  endorsement.
 - `sync_to_main(candidate_id, author)` — retry mechanical review for a `merge_blocked` candidate.
   Ordinary submitted candidates are processed automatically by the runtime.
 - `sync_from_main(author, reason?)` — discard the caller's current attempt and synchronize its
   worktree to accepted main.
-- `prove_status(decl?)` — read authoritative declaration, strategy, finding, candidate, objection,
-  and event state.
+- `prove_status(decl?)` — read authoritative declaration, strategy, candidate, and event state.
 
-### Discussion and knowledge
+### Diagnostic artifacts
 
-- `artifact_info(artifact_id)` — inspect an artifact's type, producer, source, hash, and size
-  without loading its content.
-- `artifact_read(artifact_id, offset?, limit?)` — retrieve one bounded page of a shared artifact.
-  Follow `next_offset` only when the omitted detail is actually needed.
-- `artifact_snapshot_file(path, known_sha256?, offset?, limit?)` — read a bounded project file
-  snapshot. Pass a previously seen hash to learn that an unchanged file need not be reinserted.
-- `publish_finding(author, kind, title, content, confidence, decl?, strategy_id?, evidence?)` —
-  publish concise live proof-search knowledge as soon as it is actionable. Choose a short
-  descriptive `kind`; kinds are not
-  restricted to a predefined list and Unity normalizes them for exact duplicate detection.
-  `confidence` is an integer from 0 through 100. Use 100 only for a directly checked fact and
-  include concrete evidence or an artifact reference.
-  Publish a plausible existing declaration before lengthy integration work, including its fully
-  qualified name, checked type, module/source, relevance, and remaining conversion gap.
-- `supersede_finding(finding_id, author, reason, replacement_id?)` — retire a finding that is
-  wrong, stale, or replaced. The original remains in history but disappears from the active brief.
-- `forum_post(thread_id, author, content, reply_to?)` — free-form strategy discussion or live
-  discussion that does not belong in structured finding state.
-- `forum_obstacle(chunk, author, goal_state, tried?, hypothesis?)` — report a concrete blocker.
-  Set `chunk` to the exact declaration name in the current Prove brief and `author` to your
-  configured agent name.
-  `tried` must be a JSON array of strings or `null` (default: `null`).
-  `hypothesis` must be a string (default: `""`).
-- `forum_question(author, body, to?, chunk?)` and `forum_answer(question_id, author, body)` —
-  targeted questions and answers.
-- `forum_decision(author, topic, choice, rationale)` — record a binding shared decision.
-- `ledger_add(...)` and `ledger_get(...)` — store and retrieve verified reusable knowledge.
-- `forum_read(...)` and `forum_list()` — retrieve raw discussion only when the brief is
-  insufficient.
+- `artifact_info(artifact_id)` — inspect an artifact's type, producer, source, hash, and size.
+- `artifact_read(artifact_id, offset?, limit?)` — retrieve one bounded page of a diagnostic artifact.
+  Follow `next_offset` only when the omitted detail is needed.
 
-Finding confidence guidance: 0–24 speculative, 25–49 tentative, 50–74 plausible, 75–94 strongly
-supported, 95–99 near-certain but not directly verified, and 100 directly verified with evidence.
-These bands guide communication; the stored value remains the exact integer supplied by the agent.
-
-For shell commands likely to produce substantial output, use `unity capture -- <command>`, for
-example `unity capture -- lake build`. Small output remains inline; large output is retained in the
-shared artifact store and replaced with a bounded preview and artifact reference. Put the conclusion
-in a finding and reference the artifact as evidence instead of copying full logs into the Forum.
-
-Do not use `forum_claim`, `forum_result`, `forum_endorse`, `forum_object`, `forum_consensus`, or
-`forum_handoff` for prove coordination. They remain compatibility tools for other pipelines.
+For shell commands likely to produce substantial output, use `unity capture -- <command>`, for example
+`unity capture -- lake build`. Large output is retained as a diagnostic artifact and replaced with a
+bounded preview and artifact reference.
 
 ## Lean LSP — inspect and drive the local Lean project
 

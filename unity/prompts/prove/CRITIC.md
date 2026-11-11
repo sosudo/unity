@@ -26,7 +26,7 @@ data is wrong, from actor-wrong issues, where the specification is right and the
 Name exact declarations and ground every issue in checkable evidence such as a build error, source
 location, changed statement, candidate commit, or Git diff.
 
-For unresolved targets, inspect preserved worker progress and the evidence linked from findings.
+For unresolved targets, inspect preserved worker progress and diagnostic artifacts.
 Identify the next precise unmet proof obligation and useful ways for the team to make a checked
 attempt. Leave strategy selection and work allocation to the agents. A search that found no direct
 library theorem leaves mathematical construction work; guide the team toward that work rather than

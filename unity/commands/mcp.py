@@ -263,9 +263,16 @@ async def mcp(server, tool, args, args_file):
                 raise click.ClickException(f"unknown solve tool profile '{override}'")
             solve_profile = override
     active_prove = run_state.get("command") == "prove" and run_state.get("phase") != "done"
+    if run_state.get("command") == "prove" and server in ("unity-forum", "forum"):
+        raise click.ClickException("Discussion tools are disabled for this Prove variant.")
     client = None
     diagnostic_note = ""
-    if server in ("unity-forum", "forum") and active_bump:
+    if server == "unity-prove" and run_state.get("command") == "prove":
+        from .. import prove_control
+        shared_unity = paths.unity.resolve()
+        prove_control.configure(shared_unity / "forum", shared_unity.parent)
+        client = Client(prove_control.mcp)
+    elif server in ("unity-forum", "forum") and active_bump:
         from ..forum import bump_server
         shared_forum, shared_root = _bump_shared_paths(paths)
         bump_server.configure(shared_forum, shared_root, bump_profile)
@@ -328,7 +335,7 @@ async def mcp(server, tool, args, args_file):
         if active_prove:
             from .. import prove_mcp
             # .unity may link to shared main; project_root retains the caller's checkout.
-            specs = prove_mcp.for_checkout(specs, paths.project_root)
+            specs = prove_mcp.for_run(specs, paths)
         if server not in specs:
             raise click.ClickException(f"unknown server '{server}' (available: {', '.join(specs)})")
         spec = specs[server]
@@ -353,7 +360,7 @@ async def mcp(server, tool, args, args_file):
         text = getattr(block, "text", None)
         rendered.append(text if text is not None else str(block))
     output = "\n".join(rendered)
-    bounded_artifact_read = server in ("unity-forum", "forum") and tool in {
+    bounded_artifact_read = server in ("unity-forum", "forum", "unity-prove") and tool in {
         "artifact_read", "artifact_snapshot_file",
     }
     if (active_prove or active_solve or active_autoformalize or active_formalize or active_bump) and output and not bounded_artifact_read:
@@ -365,7 +372,8 @@ async def mcp(server, tool, args, args_file):
             producer=os.getenv("UNITY_AGENT_NAME", ""),
             source=f"{server}.{tool}",
         )
-        print(artifacts.format_compacted(compacted))
+        print(artifacts.format_compacted(
+            compacted, server="unity-prove" if active_prove else "unity-forum"))
     elif output:
         print(output)
     if diagnostic_note:

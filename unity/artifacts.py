@@ -229,7 +229,8 @@ def compact_text(
     return {**record, "preview": preview_text(content)}
 
 
-def format_compacted(compacted: str | dict, *, exit_code: int | None = None) -> str:
+def format_compacted(compacted: str | dict, *, exit_code: int | None = None,
+                     server: str = "unity-forum") -> str:
     """Render compacted output for an agent-facing CLI response."""
     if isinstance(compacted, str):
         return compacted
@@ -241,7 +242,7 @@ def format_compacted(compacted: str | dict, *, exit_code: int | None = None) -> 
         + f"\nFull output: {compacted['artifact_id']}\n"
         + f"SHA-256: {compacted['sha256']}\n"
         + f"Size: {compacted['bytes']} bytes / {compacted['lines']} lines\n"
-        + "Read: unity mcp unity-forum artifact_read "
+        + f"Read: unity mcp {server} artifact_read "
         + f"'{{\"artifact_id\":\"{compacted['artifact_id']}\"}}'"
     )
 

@@ -163,7 +163,18 @@ def _preamble(
     ranking: dict | None = None,
     *,
     icrl_enabled: bool = True,
+    forum_enabled: bool = True,
 ) -> str:
+    if not forum_enabled:
+        team = "\n".join(f"- {a.name}: {a.model} ({a.backend})" for a in roster.agents)
+        return (
+            f"You are agent '{agent.name}', running model '{agent.model}' "
+            f"(backend: {agent.backend}).\n"
+            f"These agents are running in separate worktrees:\n{team}\n"
+            f"The primary agent is '{roster.primary.name}'.\n"
+            "Continue until your current proof-search work is complete or concretely blocked. "
+            "Preserve checked progress and release your strategy before ending a blocked turn.\n\n"
+        )
     if not icrl_enabled:
         team = "\n".join(
             f"- {a.name}: {a.model} ({a.backend})"
@@ -211,6 +222,7 @@ async def dispatch(
     *,
     tools_prompt="TOOLS",
     icrl_enabled: bool = True,
+    forum_enabled: bool = True,
     brief_provider=None,
     log_context: dict | None = None,
     mcp_profile: str = "prove",
@@ -245,6 +257,8 @@ async def dispatch(
         obstacles/questions, ledger highlights. Empty on a fresh run (nothing binding yet);
         it earns its keep at phase boundaries, critic-loop iterations, and --continue runs.
         Intra-phase freshness comes from the forum_brief tool instead."""
+        if not forum_enabled:
+            return brief_provider(a.name) if brief_provider is not None else ""
         if unity_dir is None or os.getenv("UNITY_FORUM_BRIEF", "on").lower() == "off":
             return ""  # UNITY_FORUM_BRIEF=off -> H3 substrate ablation
         try:
@@ -267,7 +281,8 @@ async def dispatch(
         kwargs["mcp_profile"] = mcp_profile
         return await spawn(
             a,
-            _preamble(a, roster, ranking, icrl_enabled=icrl_enabled) + _brief(a) + full,
+            _preamble(a, roster, ranking, icrl_enabled=icrl_enabled,
+                      forum_enabled=forum_enabled) + _brief(a) + full,
             task,
             _cwd(a),
             mcp,

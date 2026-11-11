@@ -1,4 +1,4 @@
-"""Event-driven proving runtime built around authoritative Forum state."""
+"""Event-driven proving runtime built around authoritative proof state."""
 
 from __future__ import annotations
 
@@ -9,9 +9,7 @@ from pathlib import Path
 
 from rich.console import Console
 
-from . import library, prove_mcp, prove_state, worktree
-from .prove_questions import QuestionWakeups
-from .forum import server as forum_server
+from . import library, prove_control, prove_mcp, prove_state, worktree
 from .orchestrator import _preamble, load_prompt, stop_requested
 from .spawn import spawn
 
@@ -86,7 +84,7 @@ def _prove_workspace_context(root: Path, path: Path, name: str) -> str:
         f"Your preserved Prove workspace is {path} on branch {worktree.agent_branch(name)}. "
         f"Worker revision: {worker_sha}; main revision: {main_sha}.\n"
         f"Current workspace changes:\n{status[:4000] or '(none)'}\n"
-        "Inspect your existing files, commits and Forum findings, and continue useful prior work. "
+        "Inspect your existing files and commits, and continue useful prior work. "
         "Preserve progress; if main has changed, reconcile deliberately instead of resetting your workspace.\n\n"
     )
 
@@ -193,12 +191,8 @@ def _target_context(paths, decl: str, state: dict | None = None) -> str:
 
 
 def _workspace_brief(paths, author: str) -> str:
-    if os.getenv("UNITY_FORUM_BRIEF", "on").lower() == "off":
-        return ""
-    forum_server.FORUM_DIR = paths.forum
-    forum_server.PROJECT_ROOT = paths.project_root
-    text = forum_server.build_brief(author)
-    return f"\nWorkspace brief (refresh with forum_brief):\n{text}\n" if text else ""
+    prove_control.configure(paths.forum, paths.project_root)
+    return prove_control.build_brief(author)
 
 
 async def run_prove_runtime(
@@ -216,8 +210,8 @@ async def run_prove_runtime(
     effort_setting = os.getenv("UNITY_PROVE_CODEX_REASONING_EFFORT")
     efforts = {agent.name: _prove_codex_reasoning_effort(agent.name, effort_setting)
                for agent in roster.agents}
-    forum_server.FORUM_DIR = paths.forum
-    forum_server.PROJECT_ROOT = root
+    prove_control.configure(paths.forum, root)
+    mcp = prove_mcp.for_run(mcp, paths)
 
     worktrees = {}
     for agent in roster.agents:
@@ -249,28 +243,21 @@ async def run_prove_runtime(
     pending_sync: set[str] = set()
     merge_followups: dict[str, tuple[str, str]] = {}
     worker_decls: dict[str, str] = {}
-    question_wakeups = QuestionWakeups(paths.forum)
-
     normal_task = (
-        "Coordinate proof work through the Forum. You may privately inspect the target and "
-        "experiment first. On a later turn, inspect preserved files and findings, and reclaim a "
+        "Inspect the target and experiment in your own worktree. "
+        "On a later turn, inspect preserved files and reclaim a "
         "viable unowned strategy before extending it. Begin with a focused search for an existing project or Mathlib theorem "
-        "or API before committing to a from-scratch derivation. Then refresh forum_brief and either "
-        "register and claim a genuinely "
-        "distinct direction, assist an existing strategy with a concrete contribution, or publish "
-        "actionable findings while doing cross-cutting library/API search. Never invent a redundant "
-        "strategy merely to appear active. "
-        "Refresh before changing direction, after publishing a finding, and before editing the "
-        "target. Publish a promising checked declaration immediately, before lengthy integration "
-        "work, so another agent can assist with the conversion. Implement the claimed strategy in your "
+        "or API before committing to a from-scratch derivation. Then refresh prove_status and "
+        "register and claim a distinct direction. Never invent a redundant strategy merely to appear active. "
+        "Refresh before changing direction and before editing the target. Implement the claimed strategy in your "
         "worktree. Run lake build before committing "
         "and calling emit_candidate. Unity will mechanically build and review the exact declaration "
         "in main. If a candidate is merge-blocked, resolve the integration blocker and retry it; "
         "do not resume proof search. If a candidate is merged, call sync_from_main before claiming "
         "more work. Continue until no "
         "unresolved declaration has useful work for you. If the needed library theorem is absent, "
-        "continue by stating and proving missing helper lemmas. Share checked partial progress and "
-        "exact remaining goals; avoid ending a turn with only a repeated search blocker."
+        "continue by stating and proving missing helper lemmas. Preserve checked partial progress and "
+        "exact remaining goals in your worktree; avoid ending a turn with only a repeated search blocker."
     )
 
     def launch(
@@ -291,13 +278,13 @@ async def run_prove_runtime(
                 _target_context(paths, assigned_decl)
                 + "\n\n"
                 + f"Your current target declaration is `{assigned_decl}`. Work on this declaration "
-                "unless Forum state causes you to change direction. If you change declarations, "
+                "unless proof state causes you to change direction. If you change declarations, "
                 "register or claim a strategy for the new declaration.\n\n"
                 + task_prompt
             )
         agent = agents[agent_name]
         system = (
-            _preamble(agent, roster, icrl_enabled=False)
+            _preamble(agent, roster, icrl_enabled=False, forum_enabled=False)
             + _workspace_brief(paths, agent_name)
             + shared_prompt
         )
@@ -311,6 +298,7 @@ async def run_prove_runtime(
                 worktrees[agent_name],
                 prove_mcp.for_checkout(mcp, worktrees[agent_name]),
                 subagents=subagents,
+                mcp_profile="prove-control",
                 interrupt_event=interrupt_event,
                 env_overrides=({"UNITY_PROVE_CODEX_REASONING_EFFORT": efforts[agent_name]}
                                if agent.backend == "codex" and efforts[agent_name] is not None
@@ -435,7 +423,7 @@ async def run_prove_runtime(
                     )
                     try:
                         await asyncio.to_thread(
-                            forum_server.sync_to_main,
+                            prove_control.sync_to_main,
                             event["candidate_id"],
                             "Unity",
                         )
@@ -454,7 +442,7 @@ async def run_prove_runtime(
                     )
                     repair_task = (
                         f"Candidate {event['candidate_id']} for {event['decl']} has objection "
-                        f"{event['objection_id']}. Refresh prove_status/forum_brief, address the "
+                        f"{event['objection_id']}. Refresh prove_status, address the "
                         "objection or resume a distinct proof strategy, and submit a new immutable "
                         "candidate if source bytes change."
                     )
@@ -503,7 +491,7 @@ async def run_prove_runtime(
                         f"Mechanical review of candidate {event['candidate_id']} for "
                         f"{event['decl']} is blocked by {blocker.get('kind', 'an integration blocker')}: "
                         f"{blocker.get('message', '')[:800]}. Inspect the recorded git_status in "
-                        "prove_status/forum_brief, determine who owns those changes, and preserve "
+                        "prove_status, determine who owns those changes, and preserve "
                         "legitimate work. Resolve the integration condition and call sync_to_main "
                         f"again for the same immutable candidate {event['candidate_id']}. Do not "
                         "start or resume a proof strategy unless this candidate is actually failed."
@@ -551,17 +539,6 @@ async def run_prove_runtime(
                         )
 
             state = prove_state.load_state(paths.forum)
-            for name, decl, question_id, author in question_wakeups.poll(
-                state, agents, tasks, worker_decls
-            ):
-                launch(
-                    name,
-                    f"Forum question {question_id} from {author} is addressed to you. "
-                    "Read the question in the Forum, respond using forum_answer if appropriate, "
-                    "and coordinate any useful follow-up with the team.",
-                    target_decl=decl,
-                )
-
             if prove_state.all_solved(state) and not pending_sync:
                 return state
 

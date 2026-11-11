@@ -119,7 +119,8 @@ class ProveLaunchBindingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(cwd, root / '.worktrees' / name)
                 self.assertEqual((cwd / '.unity').resolve(), unity.resolve())
                 self.assertEqual(mapping['lean-lsp']['env']['LEAN_PROJECT_PATH'], str(cwd.resolve()))
-                self.assertIs(mapping['unity-forum'], mcp['unity-forum'])
+                self.assertNotIn('unity-forum', mapping)
+                self.assertIn('unity-prove', mapping)
             self.assertEqual([phase for phase, _, _ in primary_phases],
                              ['prove/CRITIC', 'prove/RETROSPECTIVE'])
             for _, cwd, mapping in primary_phases:
