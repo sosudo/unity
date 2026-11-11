@@ -96,7 +96,7 @@ class QuestionsTests(unittest.TestCase):
 
 
 class RuntimeQuestionsTests(unittest.IsolatedAsyncioTestCase):
-    async def test_live_runtime_waits_for_active_worker_then_wakes_once_across_rounds(self):
+    async def test_live_runtime_ignores_legacy_questions_across_rounds(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             forum = root / '.unity' / 'forum'
@@ -123,10 +123,8 @@ class RuntimeQuestionsTests(unittest.IsolatedAsyncioTestCase):
                     await started.wait()
                     server.forum_question('Terra1', 'Can you help?', to='luna1', chunk='goal')
                     created.set()
-                elif phase[0] == 1 and agent.name == 'Luna1':
-                    self.assertTrue(released.is_set(), 'active worker was interrupted')
-                    self.assertIn('Forum question', prompt)
             with ExitStack() as stack:
+                stack.enter_context(patch.object(server, 'FORUM_DIR', forum))
                 stack.enter_context(patch.object(prove_runtime, '_prove_worktree', lambda root, unity, name, **k: root))
                 stack.enter_context(patch.object(prove_runtime.worktree, 'main_commit', lambda *a: 'sha'))
                 stack.enter_context(patch.object(prove_runtime.prove_state, 'initialize_from_dag', lambda *a, **k: state))
@@ -145,8 +143,10 @@ class RuntimeQuestionsTests(unittest.IsolatedAsyncioTestCase):
                 phase[0] = 2
                 await asyncio.wait_for(prove_runtime.run_prove_runtime(roster, paths, {}, ''), 8)
             wake = [row for row in calls if 'Forum question' in row[2]]
-            self.assertEqual(len(wake), 1)
-            self.assertEqual(wake[0][:2], (1, 'Luna1'))
+            self.assertEqual(wake, [])
+            self.assertTrue(released.is_set())
+            self.assertEqual([(phase, name) for phase, name, _ in calls],
+                             [(1, 'Luna1'), (1, 'Terra1'), (2, 'Luna1'), (2, 'Terra1')])
 
 
 if __name__ == '__main__':

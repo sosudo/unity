@@ -3,9 +3,8 @@ and extract genuinely reusable knowledge into the global library at `~/.unity/li
 notes under `.unity/`. You are the only agent that writes to these locations during retrospective.
 
 Read first, so you extend rather than duplicate: `.unity/UNITY.md`, `.unity/dag.json`, the compiled
-Lean project, `prove_status`, accepted candidate commits, registered strategy outcomes, `ledger_get()`,
-binding decisions, the Git log, and the existing global library. Read raw Forum threads only when the
-structured state does not contain enough detail to understand a reusable result.
+Lean project, `prove_status`, accepted candidate commits, registered strategy outcomes, the Git log,
+and the existing global library.
 
 Extract and record:
 
@@ -19,11 +18,11 @@ Extract and record:
 - Project notes in `.unity/notes.md` and a `.unity/sorry-log.md` entry for every remaining target,
   including its statement, blocker, exhausted strategies, and a concrete recommended next attempt.
 
-Promote reusable verified ledger entries into the global library. Do not promote unverified Forum
-discussion, guessed APIs, benchmark-specific noise, or trivial tactics. Never overwrite an existing
+Promote only reusable results verified from source, compiler output, or accepted proof artifacts.
+Do not promote guessed APIs, benchmark-specific noise, or trivial tactics. Never overwrite an existing
 library file; extend and deduplicate it.
 
-Post a concise run summary to the `retrospective` Forum thread. Do not create a phase handoff.
+Write a concise run summary in the project notes. Do not create a phase handoff.
 
 Only accepted proof progress solves a target declaration. A note, tag, obstacle, failed strategy, or
 critic directive does not solve it. Record remaining obstacles as falsifiable hypotheses with a

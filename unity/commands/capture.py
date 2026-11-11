@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import json
 import shlex
 import subprocess
 
@@ -53,7 +54,12 @@ async def capture(command):
             metadata={"exit_code": code, "argv": list(command)},
         )
         if isinstance(compacted, dict):
-            click.echo(artifacts.format_compacted(compacted, exit_code=code))
+            try:
+                run_state = json.loads((paths.unity / "state.json").read_text())
+            except (OSError, json.JSONDecodeError):
+                run_state = {}
+            server = "unity-prove" if run_state.get("command") == "prove" else "unity-forum"
+            click.echo(artifacts.format_compacted(compacted, exit_code=code, server=server))
         else:
             click.echo(compacted)
     elif code:

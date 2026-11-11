@@ -558,7 +558,19 @@ _SOLVE_CODEX_MCP_NOTE = (
 )
 
 
+_PROVE_CODEX_MCP_NOTE = (
+    "\n\nMCP tools are called through the shell bridge on this backend. "
+    "Write a UTF-8 JSON argument object and call "
+    "`unity mcp <server> <tool> --args-file /path/to/request.json`. "
+    "Servers: unity-prove for proof status, claims, candidate submission and synchronization; "
+    "lean-lsp, and axle or aristotle when configured. Use only configured servers. "
+    "For example: unity mcp unity-prove prove_status '{}'.\n"
+)
+
+
 def _codex_mcp_note(profile: str) -> str:
+    if profile == "prove-control":
+        return _PROVE_CODEX_MCP_NOTE
     return _SOLVE_CODEX_MCP_NOTE if profile == "solve" else _CODEX_MCP_NOTE
 
 
@@ -619,7 +631,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
     from openai_codex import AsyncCodex, CodexConfig, Sandbox
 
     prove_effort = None
-    if execution_policy is None and mcp_profile == "prove" and env_overrides is not None:
+    if execution_policy is None and mcp_profile in {"prove", "prove-control"} and env_overrides is not None:
         prove_effort = env_overrides.get("UNITY_PROVE_CODEX_REASONING_EFFORT")
         if prove_effort is not None:
             from openai_codex.types import ReasoningEffort

@@ -9,6 +9,7 @@ from asyncclick.testing import CliRunner
 from unity.commands import mcp as mcp_module
 from unity.config import Paths
 from unity.forum import server
+from unity import prove_state
 
 
 class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
@@ -28,7 +29,7 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    async def invoke(self):
+    async def invoke(self, server_name="forum", tool="forum_read", args=None):
         runner = CliRunner()
         with patch("unity.config.load_paths", return_value=self.paths), \
              patch.dict("os.environ", {
@@ -38,7 +39,7 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
              }):
             return await runner.invoke(
                 mcp_module.command,
-                ["forum", "forum_read", json.dumps({"thread_id": "global"})],
+                [server_name, tool, json.dumps(args if args is not None else {"thread_id": "global"})],
                 catch_exceptions=False,
             )
 
@@ -46,9 +47,14 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
         (self.unity / "state.json").write_text(json.dumps({
             "command": "prove", "phase": "proving",
         }))
-        prove_result = await self.invoke()
+        dag = self.unity / 'dag.json'
+        dag.write_text(json.dumps({'chunks': [{'id': 'target', 'lean_decl': 'target',
+                                               'statement': 'X' * 2000}]}))
+        prove_state.initialize_from_dag(self.forum, dag, 'base')
+        prove_result = await self.invoke('unity-prove', 'prove_status', {})
         self.assertEqual(prove_result.exit_code, 0)
         self.assertIn("Full output: artifact-", prove_result.output)
+        self.assertIn('unity mcp unity-prove artifact_read', prove_result.output)
         records = list((self.paths.artifacts / "records").glob("artifact-*.json"))
         self.assertEqual(len(records), 1)
         record = json.loads(records[0].read_text())

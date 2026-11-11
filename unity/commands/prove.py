@@ -5,7 +5,7 @@ import asyncclick as click
 from ..Architect import architect
 from ..blueprint import build_prove_dag
 from ..config import load_paths
-from .. import prove_mcp, prove_state
+from .. import prove_control, prove_mcp, prove_state
 from ..prove_runtime import _prove_codex_reasoning_effort, run_prove_runtime
 from ..roster import load_roster
 from ..orchestrator import dispatch, build_mcp, load_prompt, toposort, mark_phase, stop_requested, resume_point, mark_done
@@ -58,7 +58,8 @@ async def prove(targets, continue_):
     (paths.unity / "stop-requested").unlink(missing_ok=True)  # stale safe-stop flag
     roster = load_roster(paths.agents_yaml, use_learned_strength=False)
     primary_env = _primary_env_overrides(roster)
-    mcp = prove_mcp.for_checkout(build_mcp(paths, forum_icrl=False), paths.project_root)
+    mcp = prove_mcp.for_run(build_mcp(paths, forum_icrl=False), paths)
+    prove_control.configure(paths.forum, paths.project_root)
     resume = resume_point(paths, "prove", continue_)
     if resume == "exploration":
         resume = "proving"
@@ -118,6 +119,8 @@ async def prove(targets, continue_):
                            ".unity/critic.json. Reopen any currently solved declaration whose accepted "
                            "candidate has a concrete defect.",
                            root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False,
+                           forum_enabled=False, brief_provider=prove_control.build_brief,
+                           mcp_profile="prove-control",
                            agent_env_overrides=primary_env)
             _check_stop(root)
             try:
@@ -171,13 +174,15 @@ async def prove(targets, continue_):
     _check_stop(root)
     if not _approved_result(paths):
         raise click.ClickException(
-            "prove did not reach an approved proven result; inspect the critic and Forum state"
+            "prove did not reach an approved proven result; inspect the critic and proof state"
         )
 
     if _retrospective_enabled():
         await dispatch([roster.primary], roster, load_prompt("prove/RETROSPECTIVE"),
                        "Distill lessons from this run into the library.",
                        root, mcp, tools_prompt="PROVE_TOOLS", icrl_enabled=False,
+                       forum_enabled=False, brief_provider=prove_control.build_brief,
+                       mcp_profile="prove-control",
                        agent_env_overrides=primary_env)
     _check_stop(root)
     mark_done(paths, "prove")
