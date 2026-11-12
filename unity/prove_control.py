@@ -28,6 +28,28 @@ def _artifact_dir() -> Path:
     return STATE_DIR.resolve().parent / "artifacts"
 
 
+def _public(value):
+    """Copy a proof-control response without agent-authored discussion fields."""
+    if isinstance(value, list):
+        return [_public(item) for item in value if not (
+            isinstance(item, dict) and _discussion_event(item))]
+    if not isinstance(value, dict):
+        return value
+    hidden = {"attempts", "assistants", "notes", "endorsements", "objections",
+              "incorrect_reason", "evidence", "evidence_artifact_id", "evidence_sha256",
+              "evidence_bytes", "review", "resolution"}
+    if "kind" in value and ("event_id" in value or "timestamp" in value):
+        hidden.add("reason")
+    return {key: _public(item) for key, item in value.items() if key not in hidden}
+
+
+def _discussion_event(event):
+    kind = event.get("kind", "")
+    return ("finding" in kind or kind in {
+        "strategy_assisted", "candidate_endorsed", "candidate_objected",
+        "candidate_objection_resolved"})
+
+
 @mcp.tool()
 def artifact_info(artifact_id: str) -> dict:
     """Return immutable diagnostic artifact metadata."""
@@ -43,7 +65,7 @@ def artifact_read(artifact_id: str, offset: int = 0, limit: int = artifacts.DEFA
 @mcp.tool()
 def register_strategy(author: str, description: str, decl: str = "", strategy_family: str = "") -> dict:
     """Register a proof strategy without claiming it."""
-    return prove_state.register_strategy(STATE_DIR, author, description, decl, strategy_family)
+    return _public(prove_state.register_strategy(STATE_DIR, author, description, decl, strategy_family))
 
 
 @mcp.tool()
@@ -54,13 +76,13 @@ def claim_strategy(strategy_id: str, author: str) -> dict:
         return {"status": "stale_worktree", "strategy_id": strategy_id,
                 "message": "call sync_from_main before claiming another strategy",
                 "main_sha": worktree.main_commit(root)}
-    return prove_state.claim_strategy(STATE_DIR, strategy_id, author, worktree.main_commit(root))
+    return _public(prove_state.claim_strategy(STATE_DIR, strategy_id, author, worktree.main_commit(root)))
 
 
 @mcp.tool()
 def unclaim_strategy(strategy_id: str, author: str, reason: str = "") -> dict:
     """Release an owned strategy."""
-    return prove_state.unclaim_strategy(STATE_DIR, strategy_id, author, reason)
+    return _public(prove_state.unclaim_strategy(STATE_DIR, strategy_id, author, reason))
 
 
 @mcp.tool()
@@ -76,7 +98,7 @@ def mark_strategy_incorrect(strategy_id: str, author: str, reason: str, evidence
         prepared = {"evidence": artifacts.preview_text(evidence, 3500),
                     "evidence_artifact_id": compacted["artifact_id"],
                     "evidence_sha256": compacted["sha256"], "evidence_bytes": compacted["bytes"]}
-    return prove_state.mark_strategy_incorrect(STATE_DIR, strategy_id, author, reason, **prepared)
+    return _public(prove_state.mark_strategy_incorrect(STATE_DIR, strategy_id, author, reason, **prepared))
 
 
 @mcp.tool()
@@ -84,7 +106,7 @@ def emit_candidate(strategy_id: str, author: str, commit_sha: str, decl: str = "
                    notes: str = "", supersedes: str = "") -> dict:
     """Submit an exact committed candidate from an owned strategy."""
     resolved = worktree.verify_candidate_commit(_root(), author, commit_sha)
-    return prove_state.emit_candidate(STATE_DIR, strategy_id, author, resolved, decl, notes, supersedes)
+    return _public(prove_state.emit_candidate(STATE_DIR, strategy_id, author, resolved, decl, notes, supersedes))
 
 
 @mcp.tool()
@@ -92,7 +114,7 @@ def sync_to_main(candidate_id: str, author: str) -> dict:
     """Mechanically review and merge an immutable candidate."""
     started = prove_state.begin_merge(STATE_DIR, candidate_id, author)
     if started.get("idempotent") or started.get("conflict"):
-        return started
+        return _public(started)
     candidate = started["candidate"]
     declaration = prove_state.load_state(STATE_DIR)["declarations"][candidate["decl"]]
     try:
@@ -108,7 +130,7 @@ def sync_to_main(candidate_id: str, author: str) -> dict:
         build=merged.get("build"), verification=merged.get("verification"))
     retry = ("Resolve the recorded main-checkout blocker, preserving legitimate changes, then call "
              f"sync_to_main again for the same candidate {candidate_id}.")
-    return {**finished, "sync": merged, **({"retry": retry} if merged.get("blocked") else {})}
+    return _public({**finished, "sync": merged, **({"retry": retry} if merged.get("blocked") else {})})
 
 
 @mcp.tool()
@@ -118,7 +140,7 @@ def sync_from_main(author: str, reason: str = "") -> dict:
     released = prove_state.release_author_claims(STATE_DIR, author, reason or "synchronizing from main")
     synced = worktree.force_sync_from_main(root, author)
     result = prove_state.record_sync(STATE_DIR, author, synced["main_sha"], released)
-    return {**result, "worktree": synced["worktree"]}
+    return _public({**result, "worktree": synced["worktree"]})
 
 
 @mcp.tool()
@@ -132,8 +154,8 @@ def prove_status(decl: str = "", include_type_contract: bool = False) -> dict:
         if not include_type_contract:
             result.pop("type_contract", None)
         return result
-    events = [event for event in state.get("events", [])
-              if "finding" not in event.get("kind", "")]
+    state = _public(state)
+    events = state.get("events", [])
     if not decl:
         return {**state, "findings": {}, "events": events, "declarations": {
             name: public_declaration(item) for name, item in state["declarations"].items()}}

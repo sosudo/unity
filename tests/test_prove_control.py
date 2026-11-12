@@ -114,5 +114,48 @@ class ProofControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('private discussion payload', control.build_brief('Alice'))
 
 
+    def test_status_redacts_discussion_without_mutating_state(self):
+        strategy = control.register_strategy('Alice', 'allocation description', 'target')['strategy']
+        sid = strategy['strategy_id']
+        with prove_state.transaction(self.state_dir) as state:
+            strategy = state['strategies'][sid]
+            strategy.update(attempts=[{'reason': 'hidden attempt'}], assistants={'Bob': 'hidden assist'},
+                            incorrect_reason='hidden reason', evidence='hidden evidence',
+                            evidence_artifact_id='hidden artifact')
+            state['candidates']['c1'] = {
+                'candidate_id': 'c1', 'decl': 'target', 'commit_sha': 'abcdef012345',
+                'status': 'merge_blocked', 'notes': 'hidden notes',
+                'endorsements': ['hidden endorsement'], 'objections': ['hidden objection'],
+                'merge_blocker': {'message': 'mechanical blocker'},
+                'verification': {'reason': 'mechanical review reason'},
+            }
+            state['events'].extend([
+                {'event_id': 'e1', 'kind': 'strategy_incorrect', 'decl': 'target', 'reason': 'hidden event'},
+                {'event_id': 'e2', 'kind': 'candidate_objected', 'decl': 'target', 'content': 'hidden objection event'},
+            ])
+        before = prove_state.load_state(self.state_dir)
+        results = [control.prove_status(), control.prove_status('target'), control.build_brief('Bob'),
+                   control.register_strategy('Bob', 'allocation description', 'target'),
+                   control.claim_strategy(sid, 'Alice')]
+        # Claim mutates the state; compare read-only calls separately below.
+        for value in results:
+            rendered = json.dumps(value)
+            for secret in ('hidden attempt', 'hidden assist', 'hidden reason', 'hidden evidence',
+                           'hidden artifact', 'hidden notes', 'hidden endorsement', 'hidden objection',
+                           'hidden event'):
+                self.assertNotIn(secret, rendered)
+        self.assertIn('allocation description', json.dumps(results[0]))
+        self.assertIn('mechanical blocker', json.dumps(results[0]))
+        self.assertIn('mechanical review reason', json.dumps(results[0]))
+        after = prove_state.load_state(self.state_dir)
+        self.assertEqual(before['candidates'], after['candidates'])
+        self.assertEqual(before['strategies'][sid]['attempts'], after['strategies'][sid]['attempts'])
+        snapshot = prove_state.load_state(self.state_dir)
+        control.prove_status()
+        control.prove_status('target')
+        control.build_brief('Alice')
+        self.assertEqual(snapshot, prove_state.load_state(self.state_dir))
+
+
 if __name__ == '__main__':
     unittest.main()

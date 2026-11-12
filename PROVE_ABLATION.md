@@ -7,7 +7,10 @@ Run `unity prove` as usual. The `unity-prove` MCP server exposes strategy reserv
 candidate submission, mechanical integration, synchronization, proof status, and diagnostic
 artifact reads. The discussion server and its shell aliases are disabled for Prove. There are
 no discussion, question, shared-finding, ledger, peer-assistance, or peer-endorsement tools.
-Generated prompts and briefs contain only the proof controls and task context.
+Generated prompts and briefs contain only the proof controls and task context. Strategy descriptions,
+families, and ownership remain visible for allocation; proof status omits attempt narratives,
+evidence, candidate notes, and peer review fields while retaining mechanical diagnostics. This is
+a coordination ablation, not a hard isolation boundary.
 
 The roster, reasoning-effort settings, worker worktrees, target contracts, candidate verifier,
 merge lock, critic decisions, completion requirements, optional prover services, and retrospective
