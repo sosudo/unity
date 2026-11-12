@@ -106,7 +106,7 @@ class RuntimeQuestionsTests(unittest.IsolatedAsyncioTestCase):
             paths = SimpleNamespace(project_root=root, unity=unity, forum=forum, unity_md=unity / 'UNITY.md')
             agents = [SimpleNamespace(name='Luna1', backend='codex'), SimpleNamespace(name='Terra1', backend='codex')]
             roster = SimpleNamespace(agents=agents)
-            state = {'declarations': {'goal': {'status': 'unresolved', 'chunk_id': 'goal'}}, 'events': [], 'revision': 0}
+            state = {'declarations': {'goal': {'status': 'unresolved', 'chunk_id': 'goal'}}, 'events': [], 'strategies': {}, 'candidates': {}, 'revision': 0}
             started = asyncio.Event()
             created = asyncio.Event()
             released = asyncio.Event()
@@ -125,6 +125,8 @@ class RuntimeQuestionsTests(unittest.IsolatedAsyncioTestCase):
                     created.set()
             with ExitStack() as stack:
                 stack.enter_context(patch.object(server, 'FORUM_DIR', forum))
+                adapter = SimpleNamespace(_ready=lambda state, decl: True, prepare=lambda *a: None, poll=lambda *a: [])
+                stack.enter_context(patch.object(prove_runtime, 'NoToolSubmissions', return_value=adapter))
                 stack.enter_context(patch.object(prove_runtime, '_prove_worktree', lambda root, unity, name, **k: root))
                 stack.enter_context(patch.object(prove_runtime.worktree, 'main_commit', lambda *a: 'sha'))
                 stack.enter_context(patch.object(prove_runtime.prove_state, 'initialize_from_dag', lambda *a, **k: state))

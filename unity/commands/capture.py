@@ -58,8 +58,9 @@ async def capture(command):
                 run_state = json.loads((paths.unity / "state.json").read_text())
             except (OSError, json.JSONDecodeError):
                 run_state = {}
-            server = "unity-prove" if run_state.get("command") == "prove" else "unity-forum"
-            click.echo(artifacts.format_compacted(compacted, exit_code=code, server=server))
+            server = None if run_state.get("command") == "prove" else "unity-forum"
+            click.echo(artifacts.format_compacted(compacted, exit_code=code, server=server,
+                                                 artifact_dir=paths.artifacts if server is None else None))
         else:
             click.echo(compacted)
     elif code:

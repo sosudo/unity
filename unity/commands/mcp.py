@@ -263,16 +263,11 @@ async def mcp(server, tool, args, args_file):
                 raise click.ClickException(f"unknown solve tool profile '{override}'")
             solve_profile = override
     active_prove = run_state.get("command") == "prove" and run_state.get("phase") != "done"
-    if run_state.get("command") == "prove" and server in ("unity-forum", "forum"):
-        raise click.ClickException("Discussion tools are disabled for this Prove variant.")
+    if run_state.get("command") == "prove" and server in ("unity-forum", "forum", "unity-prove"):
+        raise click.ClickException("Coordination tools are disabled for this Prove variant.")
     client = None
     diagnostic_note = ""
-    if server == "unity-prove" and run_state.get("command") == "prove":
-        from .. import prove_control
-        shared_unity = paths.unity.resolve()
-        prove_control.configure(shared_unity / "forum", shared_unity.parent)
-        client = Client(prove_control.mcp)
-    elif server in ("unity-forum", "forum") and active_bump:
+    if server in ("unity-forum", "forum") and active_bump:
         from ..forum import bump_server
         shared_forum, shared_root = _bump_shared_paths(paths)
         bump_server.configure(shared_forum, shared_root, bump_profile)
@@ -373,7 +368,8 @@ async def mcp(server, tool, args, args_file):
             source=f"{server}.{tool}",
         )
         print(artifacts.format_compacted(
-            compacted, server="unity-prove" if active_prove else "unity-forum"))
+            compacted, server=None if active_prove else "unity-forum",
+            artifact_dir=paths.artifacts if active_prove else None))
     elif output:
         print(output)
     if diagnostic_note:

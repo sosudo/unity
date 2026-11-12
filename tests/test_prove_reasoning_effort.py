@@ -69,7 +69,7 @@ class ProveEffortTests(unittest.IsolatedAsyncioTestCase):
         for profile, explicit, ambient, expected in [
             ('prove', None, 'high', None), ('prove', {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}, 'low', 'high'),
             ('solve', {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}, 'high', None),
-            ('prove-control', {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}, 'low', 'high'),
+            ('prove-no-tools', {'UNITY_PROVE_CODEX_REASONING_EFFORT': 'high'}, 'low', 'high'),
             ('prove', {}, 'high', None),
         ]:
             with self.subTest(profile=profile, explicit=explicit), tempfile.TemporaryDirectory() as temp:

@@ -164,6 +164,7 @@ def _preamble(
     *,
     icrl_enabled: bool = True,
     forum_enabled: bool = True,
+    proof_controls: bool = True,
 ) -> str:
     if not forum_enabled:
         team = "\n".join(f"- {a.name}: {a.model} ({a.backend})" for a in roster.agents)
@@ -173,7 +174,9 @@ def _preamble(
             f"These agents are running in separate worktrees:\n{team}\n"
             f"The primary agent is '{roster.primary.name}'.\n"
             "Continue until your current proof-search work is complete or concretely blocked. "
-            "Preserve checked progress and release your strategy before ending a blocked turn.\n\n"
+            "Preserve checked progress"
+            + (" and release your strategy" if proof_controls else "")
+            + " before ending a blocked turn.\n\n"
         )
     if not icrl_enabled:
         team = "\n".join(
@@ -223,6 +226,7 @@ async def dispatch(
     tools_prompt="TOOLS",
     icrl_enabled: bool = True,
     forum_enabled: bool = True,
+    proof_controls: bool = True,
     brief_provider=None,
     log_context: dict | None = None,
     mcp_profile: str = "prove",
@@ -282,7 +286,7 @@ async def dispatch(
         return await spawn(
             a,
             _preamble(a, roster, ranking, icrl_enabled=icrl_enabled,
-                      forum_enabled=forum_enabled) + _brief(a) + full,
+                      forum_enabled=forum_enabled, proof_controls=proof_controls) + _brief(a) + full,
             task,
             _cwd(a),
             mcp,

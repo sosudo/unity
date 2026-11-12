@@ -230,11 +230,18 @@ def compact_text(
 
 
 def format_compacted(compacted: str | dict, *, exit_code: int | None = None,
-                     server: str = "unity-forum") -> str:
+                     server: str | None = "unity-forum", artifact_dir: Path | None = None) -> str:
     """Render compacted output for an agent-facing CLI response."""
     if isinstance(compacted, str):
         return compacted
     prefix = f"Command exited {exit_code}.\n" if exit_code is not None else ""
+    if server is None:
+        if artifact_dir is None:
+            raise ValueError("artifact_dir is required for direct output reads")
+        read_hint = f"Read retained output: {_blob_path(artifact_dir, compacted['sha256'])}"
+    else:
+        read_hint = (f"Read: unity mcp {server} artifact_read "
+                     + f"'{{\"artifact_id\":\"{compacted['artifact_id']}\"}}'")
     return (
         prefix
         + "Relevant output:\n"
@@ -242,8 +249,7 @@ def format_compacted(compacted: str | dict, *, exit_code: int | None = None,
         + f"\nFull output: {compacted['artifact_id']}\n"
         + f"SHA-256: {compacted['sha256']}\n"
         + f"Size: {compacted['bytes']} bytes / {compacted['lines']} lines\n"
-        + f"Read: unity mcp {server} artifact_read "
-        + f"'{{\"artifact_id\":\"{compacted['artifact_id']}\"}}'"
+        + read_hint
     )
 
 

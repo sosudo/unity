@@ -1,61 +1,15 @@
-# Available MCP tools for `unity prove`
+# Available tools for `unity prove`
 
-The unity-prove server and Lean LSP are always available. Axle and Aristotle are available only
-when their API keys are configured. When Axle offers a tool equivalent to a Lean LSP tool, prefer
-Axle.
+Lean LSP is always available. Axle and Aristotle are available only when their API keys are
+configured. When Axle offers a tool equivalent to a Lean LSP tool, prefer Axle.
 
-If a backend does not expose custom MCP tools directly, use the shell bridge. Write a UTF-8
-JSON argument object with exactly the documented tool fields, using `json.dump` or `json.dumps`
-to preserve quotes, newlines, backslashes, and Lean source. Call
-`unity mcp <server> <tool> --args-file /path/to/request.json`.
-To read that file through stdin, use
-`unity mcp <server> <tool> --args-file - < /path/to/request.json`.
-A heredoc also requires `--args-file -`; stdin alone does not supply the arguments.
-Pass either positional JSON or `--args-file` for one call. The available servers are
-`unity-prove`, `lean-lsp`, `axle`, and `aristotle`.
-
-## Prove controls — authoritative run state
-
-Use `prove_status(decl?)` whenever exact current state is needed. Runtime state is shared for
-scheduling and mechanical candidate processing; there is no shared discussion or knowledge board.
-
-### Strategies
-
-- `register_strategy(author, description, decl?, strategy_family?)` — register a coherent proof or
-  research direction. It may be provisional; a complete proof plan is not required. Registration
-  does not claim it. Choose a direction distinct from active strategies shown by `prove_status`.
-- `claim_strategy(strategy_id, author)` — atomically claim a registered strategy.
-- `unclaim_strategy(strategy_id, author, reason?)` — release an unsuccessful but potentially viable
-  strategy.
-- `mark_strategy_incorrect(strategy_id, author, reason, evidence?)` — record evidence that a strategy
-  cannot work.
-
-Systematic project/Mathlib search is a valid strategy when aimed at materially closing the exact
-target. Use a recognizable family such as `library_search` or a more specific normalized search
-family. Avoid duplicating an equivalent active strategy; pursue a distinct direction or continue
-your own work.
-
-### Candidates and synchronization
-
-- `emit_candidate(strategy_id, author, commit_sha, decl?, notes?, supersedes?)` — submit the exact
-  committed source revision produced by an owned strategy. Submission automatically triggers Unity's
-  main-checkout build and mechanical declaration review; a passing candidate merges without model
-  endorsement.
-- `sync_to_main(candidate_id, author)` — retry mechanical review for a `merge_blocked` candidate.
-  Ordinary submitted candidates are processed automatically by the runtime.
-- `sync_from_main(author, reason?)` — discard the caller's current attempt and synchronize its
-  worktree to accepted main.
-- `prove_status(decl?)` — read authoritative declaration, strategy, candidate, and event state.
-
-### Diagnostic artifacts
-
-- `artifact_info(artifact_id)` — inspect an artifact's type, producer, source, hash, and size.
-- `artifact_read(artifact_id, offset?, limit?)` — retrieve one bounded page of a diagnostic artifact.
-  Follow `next_offset` only when the omitted detail is needed.
-
-For shell commands likely to produce substantial output, use `unity capture -- <command>`, for example
-`unity capture -- lake build`. Large output is retained as a diagnostic artifact and replaced with a
-bounded preview and artifact reference.
+If a backend does not expose custom MCP tools directly, use the shell bridge. Write a UTF-8 JSON
+argument object with exactly the documented tool fields, using `json.dump` or `json.dumps` to
+preserve quotes, newlines, backslashes, and Lean source. Call `unity mcp <server> <tool>
+--args-file /path/to/request.json`. To read that file through stdin, use
+`unity mcp <server> <tool> --args-file - < /path/to/request.json`. A heredoc also requires
+`--args-file -`; stdin alone does not supply the arguments. Pass either positional JSON or
+`--args-file` for one call. The available servers are `lean-lsp`, `axle`, and `aristotle`.
 
 ## Lean LSP — inspect and drive the local Lean project
 
@@ -88,7 +42,7 @@ the next call's state. A project-context error is a failed search, not evidence 
 ## Axle — external Lean verification and source manipulation
 
 External services may use a different Lean or Mathlib version. Always verify their output in the
-local project with `lake build` before calling `emit_candidate`.
+local project with `lake build` before submitting a proof commit.
 
 - `verify_proof` and `check` — validate proofs or Lean code.
 - `highlight` — retrieve semantic highlighting.

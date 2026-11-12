@@ -6,9 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from fastmcp import Client
-
-from unity import prove_control as control, prove_state, worktree
+from unity import prove_engine as control, prove_state, worktree
 
 
 class ProofControlTests(unittest.IsolatedAsyncioTestCase):
@@ -37,39 +35,33 @@ class ProofControlTests(unittest.IsolatedAsyncioTestCase):
                                        text=True, stderr=subprocess.PIPE).strip()
 
     def candidate(self):
-        strategy = control.register_strategy('Alice', 'direct proof', 'target')['strategy']
-        self.assertEqual(control.claim_strategy(strategy['strategy_id'], 'Alice')['status'], 'claimed')
+        strategy = prove_state.register_strategy(self.state_dir, 'Alice', 'direct proof', 'target')['strategy']
+        self.assertEqual(prove_state.claim_strategy(self.state_dir, strategy['strategy_id'], 'Alice', worktree.main_commit(self.root))['status'], 'claimed')
         (self.tree / 'Main.lean').write_text('theorem target : True := by trivial\n')
         self.git('add', 'Main.lean', cwd=self.tree)
         self.git('commit', '-m', 'proof', cwd=self.tree)
         sha = self.git('rev-parse', 'HEAD', cwd=self.tree)
-        result = control.emit_candidate(strategy['strategy_id'], 'Alice', sha, 'target')
+        result = prove_state.emit_candidate(self.state_dir, strategy['strategy_id'], 'Alice', worktree.verify_candidate_commit(self.root, 'Alice', sha), 'target')
         self.assertNotIn('forum_post_id', result)
         self.assertEqual(result['candidate']['commit_sha'], sha)
         return result['candidate']
 
-    async def test_only_proof_and_diagnostic_tools_are_exposed(self):
-        async with Client(control.mcp) as client:
-            tools = await client.list_tools()
-        self.assertEqual({tool.name for tool in tools}, {
-            'artifact_info', 'artifact_read', 'register_strategy', 'claim_strategy',
-            'unclaim_strategy', 'mark_strategy_incorrect', 'emit_candidate',
-            'sync_to_main', 'sync_from_main', 'prove_status',
-        })
-
     def test_candidate_uses_original_mechanical_verifier_before_becoming_solved(self):
         candidate = self.candidate()
         self.assertNotEqual(prove_state.load_state(self.state_dir)['declarations']['target']['status'], 'solved')
-        with patch.object(worktree, 'sync_candidate_to_main', return_value={
-            'ok': True, 'main_sha': 'accepted', 'build': {'passed': True},
-            'verification': {'passed': True},
-        }) as verify:
+        original_run = subprocess.run
+        def fake_build(args, **kwargs):
+            if args == ['lake', 'build']:
+                return subprocess.CompletedProcess(args, 0, 'build passed', '')
+            return original_run(args, **kwargs)
+        with patch.object(worktree.subprocess, 'run', side_effect=fake_build), \
+             patch.object(worktree.candidate_review, 'review_candidate', return_value={
+                 'status': 'passed', 'issues': [], 'mode': 'kernel'}):
             result = control.sync_to_main(candidate['candidate_id'], 'Unity')
-            self.assertTrue(result['sync']['ok'])
-            verify.assert_called_once()
-            self.assertEqual(verify.call_args.args[1]['commit_sha'], candidate['commit_sha'])
+            self.assertTrue(result['sync']['ok'], result)
             self.assertEqual(control.sync_to_main(candidate['candidate_id'], 'Unity')['idempotent'], True)
-            verify.assert_called_once()
+        self.assertEqual(self.git('rev-parse', 'HEAD^{tree}'),
+                         self.git('rev-parse', candidate['commit_sha'] + '^{tree}'))
         state = prove_state.load_state(self.state_dir)
         self.assertEqual(state['declarations']['target']['status'], 'solved')
         self.assertFalse((self.state_dir / 'threads').exists())
@@ -97,20 +89,16 @@ class ProofControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(state['declarations']['target']['status'], 'solved')
         self.assertEqual(state['candidates'][candidate['candidate_id']]['status'], 'failed')
 
-    def test_dirty_claim_and_foreign_candidate_are_rejected(self):
-        strategy = control.register_strategy('Alice', 'direct proof', 'target')['strategy']
-        (self.tree / 'scratch').write_text('preserve this')
-        self.assertEqual(control.claim_strategy(strategy['strategy_id'], 'Alice')['status'], 'stale_worktree')
-        self.assertEqual((self.tree / 'scratch').read_text(), 'preserve this')
+    def test_foreign_candidate_is_rejected(self):
         with self.assertRaises(ValueError):
-            control.emit_candidate(strategy['strategy_id'], 'Bob', worktree.main_commit(self.root), 'target')
+            worktree.verify_candidate_commit(self.root, 'Bob', worktree.main_commit(self.root))
 
-    def test_status_and_brief_do_not_expose_legacy_findings(self):
+    def test_snapshot_and_brief_do_not_expose_legacy_findings(self):
         with prove_state.transaction(self.state_dir) as state:
             state['findings'] = {'hidden': {'content': 'private discussion payload'}}
             state['events'].append({'event_id': 'old', 'kind': 'finding_published',
                                     'content': 'private discussion payload'})
-        self.assertNotIn('private discussion payload', json.dumps(control.prove_status()))
+        self.assertNotIn('private discussion payload', json.dumps(control.status_snapshot()))
         self.assertNotIn('private discussion payload', control.build_brief('Alice'))
 
 

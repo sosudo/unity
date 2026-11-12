@@ -3,8 +3,8 @@ and extract genuinely reusable knowledge into the global library at `~/.unity/li
 notes under `.unity/`. You are the only agent that writes to these locations during retrospective.
 
 Read first, so you extend rather than duplicate: `.unity/UNITY.md`, `.unity/dag.json`, the compiled
-Lean project, `prove_status`, accepted candidate commits, registered strategy outcomes, the Git log,
-and the existing global library.
+Lean project, `.unity/prove-status.json`, accepted proof commits, the Git log, and the existing global
+library. Treat the controller snapshot as the authoritative run state.
 
 Extract and record:
 

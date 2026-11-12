@@ -9,9 +9,10 @@ from pathlib import Path
 
 from rich.console import Console
 
-from . import library, prove_control, prove_mcp, prove_state, worktree
+from . import artifacts, library, prove_engine, prove_mcp, prove_state, worktree
 from .orchestrator import _preamble, load_prompt, stop_requested
 from .spawn import spawn
+from .prove_submissions import NoToolSubmissions
 
 
 _console = Console()
@@ -191,8 +192,8 @@ def _target_context(paths, decl: str, state: dict | None = None) -> str:
 
 
 def _workspace_brief(paths, author: str) -> str:
-    prove_control.configure(paths.forum, paths.project_root)
-    return prove_control.build_brief(author)
+    prove_engine.configure(paths.forum, paths.project_root)
+    return prove_engine.build_brief(author)
 
 
 async def run_prove_runtime(
@@ -210,7 +211,7 @@ async def run_prove_runtime(
     effort_setting = os.getenv("UNITY_PROVE_CODEX_REASONING_EFFORT")
     efforts = {agent.name: _prove_codex_reasoning_effort(agent.name, effort_setting)
                for agent in roster.agents}
-    prove_control.configure(paths.forum, root)
+    prove_engine.configure(paths.forum, root)
     mcp = prove_mcp.for_run(mcp, paths)
 
     worktrees = {}
@@ -237,73 +238,55 @@ async def run_prove_runtime(
     agents = {agent.name: agent for agent in roster.agents}
     tasks: dict[str, asyncio.Task] = {}
     interrupts: dict[str, asyncio.Event] = {}
-    seen_events: set[str] = {
-        event["event_id"] for event in initial_state.get("events", [])
-    }
-    pending_sync: set[str] = set()
-    merge_followups: dict[str, tuple[str, str]] = {}
+    submissions = NoToolSubmissions(paths, worktrees)
     worker_decls: dict[str, str] = {}
+    merge_followups: dict[str, str] = {}
+    retry_candidates = {
+        key for key, candidate in initial_state.get("candidates", {}).items()
+        if candidate.get("status") == "merge_blocked"
+    }
     normal_task = (
-        "Inspect the target and experiment in your own worktree. "
-        "On a later turn, inspect preserved files and reclaim a "
-        "viable unowned strategy before extending it. Begin with a focused search for an existing project or Mathlib theorem "
-        "or API before committing to a from-scratch derivation. Then refresh prove_status and "
-        "register and claim a distinct direction. Never invent a redundant strategy merely to appear active. "
-        "Refresh before changing direction and before editing the target. Implement the claimed strategy in your "
-        "worktree. Run lake build before committing "
-        "and calling emit_candidate. Unity will mechanically build and review the exact declaration "
-        "in main. If a candidate is merge-blocked, resolve the integration blocker and retry it; "
-        "do not resume proof search. If a candidate is merged, call sync_from_main before claiming "
-        "more work. Continue until no "
-        "unresolved declaration has useful work for you. If the needed library theorem is absent, "
-        "continue by stating and proving missing helper lemmas. Preserve checked partial progress and "
-        "exact remaining goals in your worktree; avoid ending a turn with only a repeated search blocker."
+        "Inspect the assigned target and experiment in your own worktree. Begin with a focused "
+        "search for an existing project or Mathlib theorem or API. Independently choose a useful "
+        "approach, implement it, and prove missing helper lemmas when necessary. Preserve checked "
+        "partial progress and exact remaining goals in your worktree. Ordinary progress commits "
+        "are not proof submissions. When the complete proof builds, put the entire proof patch "
+        "in ONE commit based on the main revision in this packet, squashing intermediate progress "
+        "commits if needed. Use the exact subject `prove-candidate: <declaration>` with the assigned "
+        "declaration name substituted. The controller will verify that immutable commit and merge "
+        "it only after the original build and declaration checks pass. Do not edit controller state "
+        "or merge into main yourself. The controller handles synchronization and further targets."
     )
 
-    def launch(
-        agent_name: str,
-        task_prompt: str = normal_task,
-        *,
-        target_decl: str | None = None,
-    ) -> None:
-        existing = tasks.get(agent_name)
-        if existing is not None and not existing.done():
+    def launch(agent_name: str, task_prompt: str = normal_task, *, target_decl: str,
+               integration: bool = False) -> None:
+        if stop_requested(root):
             return
-        task_prompt = _prove_workspace_context(root, worktrees[agent_name], agent_name) + task_prompt
-        if target_decl:
-            worker_decls[agent_name] = target_decl
-        assigned_decl = worker_decls.get(agent_name)
-        if assigned_decl:
-            task_prompt = (
-                _target_context(paths, assigned_decl)
-                + "\n\n"
-                + f"Your current target declaration is `{assigned_decl}`. Work on this declaration "
-                "unless proof state causes you to change direction. If you change declarations, "
-                "register or claim a strategy for the new declaration.\n\n"
-                + task_prompt
-            )
+        if not integration:
+            submissions.prepare(agent_name, target_decl)
+        worker_decls[agent_name] = target_decl
+        task_prompt = (
+            _target_context(paths, target_decl)
+            + f"\n\nYour assigned declaration is `{target_decl}`. "
+            + ("Resolve the integration condition described below.\n\n" if integration else
+               f"Submit a complete proof with the exact commit subject `prove-candidate: {target_decl}`.\n\n")
+            + _prove_workspace_context(root, worktrees[agent_name], agent_name)
+            + task_prompt
+        )
         agent = agents[agent_name]
         system = (
-            _preamble(agent, roster, icrl_enabled=False, forum_enabled=False)
-            + _workspace_brief(paths, agent_name)
-            + shared_prompt
+            _preamble(agent, roster, icrl_enabled=False, forum_enabled=False, proof_controls=False)
+            + _workspace_brief(paths, agent_name) + shared_prompt
         )
         interrupt_event = asyncio.Event()
         interrupts[agent_name] = interrupt_event
         tasks[agent_name] = asyncio.create_task(
-            spawn(
-                agent,
-                system,
-                task_prompt,
-                worktrees[agent_name],
-                prove_mcp.for_checkout(mcp, worktrees[agent_name]),
-                subagents=subagents,
-                mcp_profile="prove-control",
-                interrupt_event=interrupt_event,
-                env_overrides=({"UNITY_PROVE_CODEX_REASONING_EFFORT": efforts[agent_name]}
-                               if agent.backend == "codex" and efforts[agent_name] is not None
-                               else None),
-            ),
+            spawn(agent, system, task_prompt, worktrees[agent_name],
+                  prove_mcp.for_checkout(mcp, worktrees[agent_name]), subagents=subagents,
+                  mcp_profile="prove-no-tools", interrupt_event=interrupt_event,
+                  env_overrides=({"UNITY_PROVE_CODEX_REASONING_EFFORT": efforts[agent_name]}
+                                 if agent.backend == "codex" and efforts[agent_name] is not None
+                                 else None)),
             name=f"prove:{agent_name}",
         )
 
@@ -315,246 +298,138 @@ async def run_prove_runtime(
         if agents[agent_name].backend == "codex":
             interrupts[agent_name].set()
             try:
-                # The Codex spawner requests turn/interrupt and drains the terminal
-                # event. Its own forced-transport fallback completes within 45s.
                 await asyncio.wait_for(asyncio.shield(task), timeout=50)
                 return
             except asyncio.TimeoutError:
-                _console.print(
-                    f"[yellow]Codex interrupt timed out for {agent_name}; forcing task cancellation[/yellow]"
-                )
+                _console.print(f"[yellow]Codex interrupt timed out for {agent_name}[/yellow]")
+            except Exception:
+                return  # Reported when the completed task is drained below.
         task.cancel()
         try:
             await task
         except (asyncio.CancelledError, Exception):
             pass
 
-    unresolved_decls = [
-        decl for decl, declaration in initial_state.get("declarations", {}).items()
-        if declaration.get("status") != "solved"
-    ]
-    for index, agent in enumerate(roster.agents):
-        target_decl = (
-            unresolved_decls[index % len(unresolved_decls)]
-            if unresolved_decls else None
-        )
-        launch(agent.name, target_decl=target_decl)
+    def drain_finished() -> None:
+        for name, task in list(tasks.items()):
+            if not task.done():
+                continue
+            try:
+                task.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                _console.print(f"[red]agent {name} failed: {exc!r}[/red]")
+            del tasks[name]
+            interrupts.pop(name, None)
+            candidate_id = merge_followups.pop(name, None)
+            if candidate_id:
+                retry_candidates.add(candidate_id)
 
-    quiescent_revision = None
+    def pending(state: dict) -> list[dict]:
+        return [candidate for candidate in state.get("candidates", {}).values()
+                if candidate.get("status") in {"submitted", "acceptable"}
+                or (candidate.get("status") == "merge_blocked"
+                    and candidate["candidate_id"] in retry_candidates)]
+
+    def start_ready(extra: dict[str, str] | None = None) -> None:
+        state = prove_state.load_state(paths.forum)
+        ready = [decl for decl in state["declarations"] if submissions._ready(state, decl)]
+        if not ready:
+            return
+        for index, name in enumerate(agents):
+            if name in tasks:
+                continue
+            # Reuse the same reservation to preserve dirty or committed work on a retry.
+            owned = next((s["decl"] for s in state["strategies"].values()
+                          if s.get("owner") == name and s.get("status") == "claimed"
+                          and s.get("decl") in ready), None)
+            target = owned or ready[index % len(ready)]
+            launch(name, (extra or {}).get(name, "") + normal_task, target_decl=target)
+
+    def failure_note(candidate: dict) -> str:
+        note = (f"Your prior candidate failed mechanical review: {candidate.get('merge_error', '')[:1600]}. "
+                "The controller synchronized your worktree to main. Inspect the immutable prior commit "
+                f"{candidate['commit_sha']} and diagnostics, then create a complete corrected proof. ")
+        for key in ("merge_build", "verification"):
+            record = candidate.get(key) or {}
+            if record.get("artifact_id"):
+                info = artifacts.artifact_info(paths.unity / "artifacts", record["artifact_id"])
+                note += f"Read full {key} output: {artifacts._blob_path(paths.unity / 'artifacts', info['sha256'])}. "
+        return note + "\n\n"
+
     try:
+        # A stopped turn may have committed its proof just before the last poll.
+        # Recover it before scheduling a new model turn in the preserved worktree.
+        worker_decls.update({s['owner']: s['decl']
+                             for s in initial_state.get('strategies', {}).values()
+                             if s.get('owner') in agents and s.get('status') == 'claimed'
+                             and s.get('description', '').startswith('no-tool reservation ')})
+        submissions.poll(worker_decls)
+        if not pending(prove_state.load_state(paths.forum)):
+            start_ready()
         while not stop_requested(root):
-            await asyncio.sleep(0.5)
-            for name, task in list(tasks.items()):
-                if not task.done():
-                    continue
-                try:
-                    task.result()
-                except asyncio.CancelledError:
-                    pass
-                except Exception as exc:
-                    _console.print(f"[red]agent {name} failed: {exc!r}[/red]")
-                del tasks[name]
-                interrupts.pop(name, None)
-                merge_followup = merge_followups.pop(name, None)
-                if merge_followup is not None:
-                    candidate_id, followup_prompt = merge_followup
-                    current = prove_state.load_state(paths.forum)
-                    candidate = current.get("candidates", {}).get(candidate_id, {})
-                    if candidate.get("status") == "merge_blocked":
-                        launch(name, followup_prompt)
-                        continue
-                if name in pending_sync:
-                    current_main = worktree.main_commit(root)
-                    current = prove_state.load_state(paths.forum)
-                    already_synced = any(
-                        event.get("kind") == "worktree_synced"
-                        and event.get("author") == name
-                        and event.get("main_sha") == current_main
-                        for event in current.get("events", [])
-                    )
-                    if not already_synced:
-                        # The MCP tool is the normal agent path. This deterministic fallback
-                        # prevents a short/failed model turn from leaving obsolete source behind.
-                        released = prove_state.release_author_claims(
-                            paths.forum, name, "merge synchronization fallback"
-                        )
-                        synced = worktree.force_sync_from_main(root, name)
-                        prove_state.record_sync(paths.forum, name, synced["main_sha"], released)
-                    pending_sync.discard(name)
-                    current = prove_state.load_state(paths.forum)
-                    owns_work = any(
-                        strategy.get("owner") == name and strategy.get("status") == "claimed"
-                        for strategy in current.get("strategies", {}).values()
-                    )
-                    if not prove_state.all_solved(current) and owns_work:
-                        launch(name)
-
+            # Poll before draining finished turns: their final commit can be a submission.
+            submissions.poll(worker_decls)
+            drain_finished()
             state = prove_state.load_state(paths.forum)
-            fresh_events = [event for event in state.get("events", [])
-                            if event["event_id"] not in seen_events]
-            for event in fresh_events:
-                seen_events.add(event["event_id"])
-                kind = event.get("kind")
-                if kind in {"strategy_registered", "strategy_claimed", "strategy_assisted"}:
-                    author = event.get("author", "")
-                    decl = event.get("decl", "")
-                    if author and decl:
-                        worker_decls[author] = decl
-                if kind == "candidate_submitted":
-                    candidate = state["candidates"].get(event["candidate_id"], {})
-                    if candidate.get("status") != "submitted":
-                        continue
-                    author = candidate.get("author")
-                    target_decl = event["decl"]
-                    active_workers = {
-                        name for name, task in tasks.items()
-                        if not task.done()
-                        and (name == author or worker_decls.get(name) == target_decl)
-                    }
-                    await asyncio.gather(*(
-                        cancel(
-                            name,
-                            f"candidate {event['candidate_id']} submitted for {target_decl}",
-                        )
-                        for name in active_workers
-                    ))
-                    _console.print(
-                        f"[cyan]mechanically reviewing {event['candidate_id']} for {target_decl}[/cyan]"
+            candidates = pending(state)
+            if candidates:
+                candidate = candidates[0]
+                candidate_id = candidate["candidate_id"]
+                retry_candidates.discard(candidate_id)
+                # No writer may race the mechanical merge or subsequent synchronization.
+                await asyncio.gather(*(cancel(name, f"reviewing {candidate_id}") for name in list(tasks)))
+                drain_finished()
+                if stop_requested(root):
+                    break
+                _console.print(f"[cyan]mechanically reviewing {candidate_id} for {candidate['decl']}[/cyan]")
+                await asyncio.to_thread(prove_engine.sync_to_main, candidate_id, "Unity")
+                current = prove_state.load_state(paths.forum)
+                candidate = current["candidates"][candidate_id]
+                prove_engine.write_status(paths)
+                if candidate["status"] == "merge_blocked":
+                    author = candidate["author"]
+                    if author not in agents:
+                        raise RuntimeError(f"candidate {candidate_id} requires its original worker {author}")
+                    blocker = candidate.get("merge_blocker") or {}
+                    prompt = (
+                        f"Mechanical review of your immutable candidate {candidate_id} is blocked: "
+                        f"{blocker.get('message', '')[:1600]}. Main checkout: {root}. "
+                        f"Recorded Git status: {json.dumps(blocker.get('git_status', []))}. "
+                        "Inspect the integration condition and preserve legitimate changes. Resolve the "
+                        "condition without changing the candidate or weakening the proof. When this "
+                        "turn ends, the controller will retry the same candidate automatically. "
+                        "Do not start a new proof attempt or merge the candidate yourself."
                     )
-                    try:
-                        await asyncio.to_thread(
-                            prove_control.sync_to_main,
-                            event["candidate_id"],
-                            "Unity",
-                        )
-                    except Exception as exc:
-                        _console.print(
-                            f"[red]mechanical review for {event['candidate_id']} failed: {exc!r}[/red]"
-                        )
-                elif kind == "candidate_objected":
-                    candidate = state["candidates"].get(event["candidate_id"], {})
-                    if candidate.get("status") != "blocked":
-                        continue
-                    wake = {candidate.get("author")}
-                    wake.update(
-                        state["strategies"].get(strategy_id, {}).get("owner")
-                        for strategy_id in event.get("unpaused_strategies", [])
-                    )
-                    repair_task = (
-                        f"Candidate {event['candidate_id']} for {event['decl']} has objection "
-                        f"{event['objection_id']}. Refresh prove_status, address the "
-                        "objection or resume a distinct proof strategy, and submit a new immutable "
-                        "candidate if source bytes change."
-                    )
-                    for name in wake - {None}:
-                        await cancel(name, f"candidate {event['candidate_id']} was objected")
-                        author_instruction = (
-                            " Your prior candidate commit is not a clean base for a new one. First "
-                            "call sync_from_main to discard it, then register and claim a repair "
-                            "strategy and commit the complete corrected patch with supersedes set."
-                            if name == candidate.get("author") else ""
-                        )
-                        launch(name, repair_task + author_instruction)
-                elif kind in {"candidate_merge_failed", "candidate_verification_failed"}:
-                    artifact_note = (
-                        f" Full build output is {event['build_artifact_id']}."
-                        if event.get("build_artifact_id") else ""
-                    )
-                    retry_task = (
-                        f"Candidate {event['candidate_id']} for {event['decl']} failed to merge: "
-                        f"{event.get('error', '')[:1000]}.{artifact_note} Refresh prove_status, "
-                        "inspect the failure, and "
-                        "continue your claimed strategy or register a corrected strategy."
-                    )
-                    owners = {
-                        state["strategies"].get(strategy_id, {}).get("owner")
-                        for strategy_id in event.get("unpaused_strategies", [])
-                    } - {None}
-                    candidate = state["candidates"].get(event["candidate_id"], {})
-                    if candidate.get("author"):
-                        owners.add(candidate["author"])
-                    for name in owners:
-                        await cancel(name, f"candidate {event['candidate_id']} failed to merge")
-                        author_instruction = (
-                            " First call sync_from_main, then register and claim a repair strategy "
-                            "before emitting a corrected candidate linked through supersedes."
-                            if name == candidate.get("author") else ""
-                        )
-                        launch(name, retry_task + author_instruction, target_decl=event["decl"])
-                elif kind == "candidate_merge_blocked":
-                    candidate = state["candidates"].get(event["candidate_id"], {})
-                    blocker = event.get("blocker", {})
-                    merger = event.get("author") or candidate.get("last_merge_by")
-                    if merger not in agents:
-                        merger = candidate.get("author")
-                    blocker_task = (
-                        f"Mechanical review of candidate {event['candidate_id']} for "
-                        f"{event['decl']} is blocked by {blocker.get('kind', 'an integration blocker')}: "
-                        f"{blocker.get('message', '')[:800]}. Inspect the recorded git_status in "
-                        "prove_status, determine who owns those changes, and preserve "
-                        "legitimate work. Resolve the integration condition and call sync_to_main "
-                        f"again for the same immutable candidate {event['candidate_id']}. Do not "
-                        "start or resume a proof strategy unless this candidate is actually failed."
-                    )
-                    if merger in agents:
-                        merge_followups[merger] = (event["candidate_id"], blocker_task)
-                        if merger not in tasks:
-                            merge_followups.pop(merger, None)
-                            launch(merger, blocker_task)
-                elif kind == "candidate_merged":
-                    merge_followups.clear()
-                    for name in list(tasks):
-                        await cancel(name, f"{event['decl']} merged into main")
+                    merge_followups[author] = candidate_id
+                    launch(author, prompt, target_decl=candidate["decl"], integration=True)
+                elif candidate["status"] == "merged":
+                    # Keep branches holding other submitted commits until their reviews finish.
+                    protected = {c["author"] for c in current["candidates"].values()
+                                 if c.get("status") in {"submitted", "acceptable", "merge_blocked"}}
                     for name in agents:
-                        released = prove_state.release_author_claims(
-                            paths.forum, name, f"{event['decl']} merged"
-                        )
-                        synced = worktree.force_sync_from_main(root, name)
-                        prove_state.record_sync(
-                            paths.forum, name, synced["main_sha"], released
-                        )
-                        worker_decls.pop(name, None)
-                    current = prove_state.load_state(paths.forum)
-                    remaining = [
-                        decl for decl, item in current.get("declarations", {}).items()
-                        if item.get("status") != "solved"
-                    ]
-                    if remaining:
-                        for index, name in enumerate(agents):
-                            launch(
-                                name,
-                                normal_task,
-                                target_decl=remaining[index % len(remaining)],
-                            )
-                elif kind == "worktree_synced":
-                    pending_sync.discard(event.get("author"))
-                elif kind == "strategy_registered":
-                    idle = next((name for name in agents
-                                 if name != event.get("author") and name not in tasks), None)
-                    if idle:
-                        launch(
-                            idle,
-                            normal_task,
-                            target_decl=event.get("decl") or None,
-                        )
-
-            state = prove_state.load_state(paths.forum)
-            if prove_state.all_solved(state) and not pending_sync:
-                return state
-
-            if tasks:
-                quiescent_revision = None
+                        if name not in protected:
+                            prove_engine.sync_from_main(name, f"{candidate['decl']} merged")
+                    if not pending(current):
+                        start_ready()
+                elif candidate["status"] == "failed":
+                    author = candidate["author"]
+                    note = failure_note(candidate)
+                    if author in agents:
+                        prove_engine.sync_from_main(author, f"{candidate_id} failed")
+                    if not pending(current):
+                        start_ready({author: note})
+                else:
+                    raise RuntimeError(f"mechanical review left {candidate_id} in {candidate['status']}")
                 continue
-            if quiescent_revision is None:
-                quiescent_revision = state.get("revision", 0)
-                continue
-            if state.get("revision", 0) == quiescent_revision:
+            if prove_state.all_solved(state) or not tasks:
                 return state
-            quiescent_revision = state.get("revision", 0)
+            await asyncio.sleep(0.5)
         return prove_state.load_state(paths.forum)
     finally:
         for name in list(tasks):
             await cancel(name, "prove runtime ending")
-        for agent in roster.agents:
-            prove_state.release_author_claims(paths.forum, agent.name, "prove runtime ended")
-        # Keep worktrees and branches intact across critic rounds and stopped runs.
+        drain_finished()
+        prove_engine.write_status(paths)
+        # Keep reservations, worktrees, and branches across critic rounds and stopped runs.

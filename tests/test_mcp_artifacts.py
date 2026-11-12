@@ -47,19 +47,9 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
         (self.unity / "state.json").write_text(json.dumps({
             "command": "prove", "phase": "proving",
         }))
-        dag = self.unity / 'dag.json'
-        dag.write_text(json.dumps({'chunks': [{'id': 'target', 'lean_decl': 'target',
-                                               'statement': 'X' * 2000}]}))
-        prove_state.initialize_from_dag(self.forum, dag, 'base')
         prove_result = await self.invoke('unity-prove', 'prove_status', {})
-        self.assertEqual(prove_result.exit_code, 0)
-        self.assertIn("Full output: artifact-", prove_result.output)
-        self.assertIn('unity mcp unity-prove artifact_read', prove_result.output)
-        records = list((self.paths.artifacts / "records").glob("artifact-*.json"))
-        self.assertEqual(len(records), 1)
-        record = json.loads(records[0].read_text())
-        self.assertEqual(record["kind"], "mcp_output")
-        self.assertEqual(record["producer"], "Ada")
+        self.assertNotEqual(prove_result.exit_code, 0)
+        self.assertIn('disabled', prove_result.output)
 
         (self.unity / "state.json").write_text(json.dumps({
             "command": "solve", "phase": "solving",
@@ -68,7 +58,7 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(solve_result.exit_code, 0)
         self.assertIn("Full output: artifact-", solve_result.output)
         self.assertEqual(
-            len(list((self.paths.artifacts / "records").glob("artifact-*.json"))), 2
+            len(list((self.paths.artifacts / "records").glob("artifact-*.json"))), 1
         )
 
         (self.unity / "state.json").write_text(json.dumps({
@@ -79,7 +69,7 @@ class McpArtifactTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Full output: artifact-", other_result.output)
         self.assertIn("X" * 200, other_result.output)
         self.assertEqual(
-            len(list((self.paths.artifacts / "records").glob("artifact-*.json"))), 2
+            len(list((self.paths.artifacts / "records").glob("artifact-*.json"))), 1
         )
 
 
