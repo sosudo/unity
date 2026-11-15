@@ -127,5 +127,35 @@ end Fixture
             self.build()
 
 
+class ProveNewKernelApiTests(unittest.TestCase):
+    def test_checked_assignment_on_lean_433(self):
+        toolchain = Path.home() / '.elan/toolchains/leanprover--lean4---v4.33.1/bin'
+        if not (toolchain / 'lake').is_file():
+            self.skipTest('Lean 4.33.1 toolchain is not installed')
+        with tempfile.TemporaryDirectory(prefix='unity-prove-new-kernel-') as tmp, \
+             patch.dict(os.environ, {'PATH': str(toolchain) + os.pathsep + os.environ.get('PATH', '')}):
+            root = Path(tmp)
+            (root / 'lean-toolchain').write_text('leanprover/lean4:v4.33.1\n')
+            (root / 'lakefile.toml').write_text(
+                'name = "NewKernelFixture"\ndefaultTargets = ["NewKernelFixture"]\n'
+                '[[lean_lib]]\nname = "NewKernelFixture"\n'
+            )
+            source = root / 'NewKernelFixture.lean'
+            source.write_text('theorem target (n : Nat) : n = n := by sorry\n')
+            dag = blueprint.build_prove_dag(root, root / '.unity')
+            contract = dag['chunks'][0]['type_contract']
+            for statement, proof, expected in [
+                ('n = n', 'rfl', True),
+                ('n = n ∧ True', 'exact ⟨rfl, trivial⟩', False),
+            ]:
+                with self.subTest(statement=statement):
+                    source.write_text(f'theorem target (n : Nat) : {statement} := by {proof}\n')
+                    build = subprocess.run(['lake', 'build'], cwd=root,
+                                           capture_output=True, text=True)
+                    self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+                    self.assertIs(prove_contract.check_signature(root, 'target', contract)['passed'],
+                                  expected)
+
+
 if __name__ == '__main__':
     unittest.main()

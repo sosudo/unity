@@ -168,6 +168,14 @@ private def checkOrigins (env : Environment) (target : Name) (expected : Expr)
       unless seen.contains n do throw s!"frozen type constant origin unavailable: {n}"
   | _, _ => throw "incomplete frozen module/origin metadata"
 
+private def addCheckedDeclaration (env : Environment) (decl : Declaration) :
+    Except Kernel.Exception Environment := by
+  -- Lean 4.33 adds a kernel recursion-depth argument. Elaborate the supported
+  -- checked API at compile time; both forms retain doCheck = true.
+  first
+  | exact env.addDeclCore 0 8192 decl none
+  | exact env.addDeclCore 0 decl none
+
 def checkContract (env : Environment) (c : Json)
     (requiredOrigins : Json := Json.null) : Except String Bool := do
   let name ← (← c.getObjVal? "decl").getStr?
@@ -196,7 +204,7 @@ def checkContract (env : Environment) (c : Json)
     hints := .opaque
     safety := .safe
   }
-  match env.addDeclCore 0 decl none with
+  match addCheckedDeclaration env decl with
   | .ok _ => return true
   | .error _ => return false
 
