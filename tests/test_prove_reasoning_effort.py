@@ -9,6 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
 from openai_codex.types import ReasoningEffort
+from openai_codex import ApprovalMode
 from unity import orchestrator, prove_runtime, spawn
 from unity.commands import prove as command
 
@@ -79,7 +80,8 @@ class ProveEffortTests(unittest.IsolatedAsyncioTestCase):
                 client = SimpleNamespace(thread_start=AsyncMock(return_value=thread), close=AsyncMock())
                 config_ctor = Mock(side_effect=lambda **kw: SimpleNamespace(**kw))
                 sdk = SimpleNamespace(AsyncCodex=Mock(return_value=client), CodexConfig=config_ctor,
-                                      Sandbox=SimpleNamespace(full_access='full', workspace_write='write'))
+                                      Sandbox=SimpleNamespace(full_access='full', workspace_write='write'),
+                                      ApprovalMode=ApprovalMode)
                 with patch.dict(os.environ, {'UNITY_PROVE_CODEX_REASONING_EFFORT': ambient}), \
                      patch.dict(sys.modules, {'openai_codex': sdk}), \
                      patch.object(spawn, '_write_codex_config', return_value=None), \
@@ -91,6 +93,8 @@ class ProveEffortTests(unittest.IsolatedAsyncioTestCase):
                                               env_overrides=explicit, mcp_profile=profile)
                 config = tomllib.loads('\n'.join(config_ctor.call_args.kwargs.get('config_overrides', ())))
                 self.assertEqual(config.get('model_reasoning_effort'), expected)
+                self.assertEqual(client.thread_start.call_args.kwargs.get('approval_mode'),
+                                 ApprovalMode.deny_all if profile == 'prove-no-tools' else None)
 
     async def test_runtime_validates_before_creating_workspaces(self):
         agent = SimpleNamespace(name='Terra1', backend='codex')

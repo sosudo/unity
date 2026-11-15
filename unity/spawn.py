@@ -710,6 +710,14 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             if agent.api_key and not agent.base_url:
                 await codex.login_api_key(agent.api_key)
             thread_options = prepared["thread_options"] if execution_policy else {}
+            if (execution_policy is None and mcp_profile == "prove-no-tools"
+                    and permission == "bypassPermissions"):
+                # The SDK defaults to auto_review, which overrides the CLI's
+                # approval policy and can start a separate review agent. This
+                # headless Prove profile already delegates full-access work to
+                # its explicit roster; it must not add a permission reviewer.
+                from openai_codex import ApprovalMode
+                thread_options = {"approval_mode": ApprovalMode.deny_all}
             thread = await codex.thread_start(
                 model=agent.model,
                 model_provider=provider,

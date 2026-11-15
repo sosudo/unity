@@ -15,9 +15,8 @@ dependencies = [
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "pyyaml>=6.0",
-    # openai-codex only publishes pre-releases; the explicit pre-release specifier
-    # lets `uv tool install .` resolve it without --prerelease=allow.
-    "openai-codex>=0.1.0b2",
+    # Strict Prove selects the SDK's explicit noninteractive approval mode.
+    "openai-codex>=0.163.0",
     "aristotlelib>=2.1.0,<3",
     # The namespace transport and Aristotle use the stable HTTPX client API.
     # Clean tool installs allow Codex prereleases, not HTTPX's incompatible 1.0 API.
