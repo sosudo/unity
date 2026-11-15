@@ -20,6 +20,20 @@ class ProveDiscoveryTests(unittest.TestCase):
                 blueprint.build_prove_dag(Path(tmp), Path(tmp) / '.unity')
             inspect.assert_not_called()
 
+    def test_inspection_timeout_never_returns_partial_kernel_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'Fixture.lean').write_text('theorem target : True := by sorry\n')
+            timeout = subprocess.TimeoutExpired(['lake', 'env', 'lean'], 300,
+                                               output='{"declarations": [')
+            with patch.object(prove_contract.subprocess, 'run', side_effect=[
+                SimpleNamespace(returncode=0), timeout,
+            ]):
+                with self.assertRaisesRegex(ValueError, 'timed out.*no kernel result') as raised:
+                    prove_contract.inspect(root)
+            self.assertIs(raised.exception.__cause__, timeout)
+            self.assertFalse((root / '.unity/dag.json').exists())
+
 
 class ProveContractIntegrationTests(unittest.TestCase):
     @classmethod

@@ -218,17 +218,25 @@ def main (args : List String) : IO UInt32 := do
   let (modules, rest) := args.span (· != "--")
   if modules.isEmpty then throw (IO.userError "no modules")
   let targets : NameSet := modules.foldl (fun s a => s.insert a.toName) {}
-  let contract? ← match rest with
-    | ["--", path] =>
+  let (onlyModule?, contractPath?) ← match rest with
+    | [] => pure (none, none)
+    | ["--", path] => pure (none, some path) -- Legacy all-context invocation.
+    | ["--", "--module", owner] => pure (some owner, none)
+    | ["--", "--module", owner, "--contract", path] => pure (some owner, some path)
+    | _ => throw (IO.userError "invalid arguments")
+  if let some owner := onlyModule? then
+    unless modules.contains owner do throw (IO.userError "owning module is outside the project inventory")
+  let selected := modules.filter fun module => onlyModule?.map (· == module) |>.getD true
+  let contract? ← match contractPath? with
+    | some path =>
       match Json.parse (← IO.FS.readFile path) with
       | .ok c => pure (some c)
       | .error e => throw (IO.userError e)
-    | [] => pure none
-    | _ => throw (IO.userError "invalid arguments")
+    | none => pure none
   let mut out : Array Json := #[]
   let mut ownedNames : Array Json := #[]
   let mut checks : Array (String × Json) := #[]
-  for module in modules do
+  for module in selected do
     -- Independent Lean modules may legitimately define the same name. Importing
     -- their union changes the project and can fail before inspection starts.
     let env ← importModules #[{ module := module.toName, importAll := true }] {} 0
@@ -273,5 +281,6 @@ def main (args : List String) : IO UInt32 := do
         (if selected.isEmpty then "candidate declaration missing from its owning module"
          else "candidate declaration is ambiguous across modules"))]
   IO.println (Json.mkObj [("declarations", Json.arr out),
-    ("owned_names", Json.arr ownedNames), ("signature_check", check)]).compress
+    ("owned_names", Json.arr ownedNames), ("signature_check", check),
+    ("inspected_modules", toJson selected)]).compress
   return 0

@@ -12,6 +12,10 @@ import tempfile
 _LEGACY_FIELDS = {'decl', 'level_params', 'type'}
 _MODULE_FIELDS = _LEGACY_FIELDS | {'module', 'origins'}
 
+# This bound applies to one owning-module environment. A fresh subprocess for
+# each module releases Lean's imported regions between independent contexts.
+_INSPECTION_TIMEOUT_SECONDS = 300
+
 
 def _digest(payload: dict) -> str:
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(',', ':'),
@@ -178,34 +182,64 @@ def inspect(project_root: Path, *, decl: str | None = None, contract: dict | Non
         if build.returncode != 0:
             output = '\n'.join(part for part in (build.stdout, build.stderr) if part)
             raise ValueError('Lean prove inspection module build failed: ' + output[-4000:])
+        rows = []
+        owned_names = []
+        checks = {}
         with tempfile.TemporaryDirectory(prefix='unity-prove-contract-') as temp:
-            args = ['lake', 'env', 'lean', '--run', str(script), *modules]
+            input_path = None
             if payload is not None:
                 input_path = Path(temp) / 'contract.json'
                 input_path.write_text(json.dumps(payload, ensure_ascii=False))
-                args += ['--', str(input_path)]
-            result = subprocess.run(args, cwd=root, capture_output=True, text=True, timeout=300, env=environment)
-        if result.returncode != 0:
-            raise ValueError('Lean prove contract inspector failed: ' + result.stderr[-2000:])
-        data = json.loads(result.stdout.strip().splitlines()[-1])
-        rows = data['declarations']
-        if not isinstance(rows, list):
-            raise ValueError('invalid declaration metadata')
+            for module in modules:
+                # Keep the full ownership inventory, but import exactly one
+                # independent environment per process. importModules retains
+                # compacted regions until process exit; accumulating Mathlib
+                # contexts here can otherwise exhaust memory before inspection.
+                args = ['lake', 'env', 'lean', '--run', str(script), *modules,
+                        '--', '--module', module]
+                if input_path is not None:
+                    args += ['--contract', str(input_path)]
+                result = subprocess.run(args, cwd=root, capture_output=True, text=True,
+                                        timeout=_INSPECTION_TIMEOUT_SECONDS, env=environment)
+                if result.returncode != 0:
+                    raise ValueError('Lean prove contract inspector failed: ' + result.stderr[-2000:])
+                data = json.loads(result.stdout.strip().splitlines()[-1])
+                if data.get('inspected_modules') != [module]:
+                    raise ValueError('Lean prove inspector did not inspect the requested owning module')
+                if not isinstance(data['declarations'], list) or not isinstance(data['owned_names'], list):
+                    raise ValueError('invalid declaration metadata')
+                if any(not isinstance(row, dict) or row.get('module') != module
+                       for row in data['declarations'] + data['owned_names']):
+                    raise ValueError('Lean prove inspector returned a different owning module')
+                rows.extend(data['declarations'])
+                owned_names.extend(data['owned_names'])
+                checks[module] = data.get('signature_check')
         kernel, _ = _merge_rows(rows, modules)
-        duplicates = _validate_owned_names(data['owned_names'], modules, kernel)
+        duplicates = _validate_owned_names(owned_names, modules, kernel)
         if payload is not None and 'module' not in payload and duplicates:
             detail = '; '.join(f'{name} ({", ".join(owners)})' for name, owners in sorted(duplicates.items()))
             raise ValueError('legacy prove contract requires a collision-free project: ' + detail)
-        check = data.get('signature_check')
-        if decl is not None and (not isinstance(check, dict) or not isinstance(check.get('passed'), bool)):
-            raise ValueError('invalid kernel signature check result')
-        if decl is not None and check.get('passed') is True:
+        check = None
+        if decl is not None:
             matches = [row for row in kernel.values() if row['name'] == decl
                        and ('module' not in payload or row['module'] == payload['module'])]
-            if len(matches) != 1 or (check.get('module') is not None and check['module'] != matches[0]['module']):
+            if len(matches) == 1:
+                check = checks[matches[0]['module']]
+            elif not matches:
+                check = {'passed': False, 'error': 'candidate declaration missing from its owning module'}
+            else:
+                check = {'passed': False, 'error': 'candidate declaration is ambiguous across modules'}
+            if not isinstance(check, dict) or not isinstance(check.get('passed'), bool):
+                raise ValueError('invalid kernel signature check result')
+            if check['passed'] and (len(matches) != 1 or check.get('module') != matches[0]['module']):
                 raise ValueError('kernel signature check does not identify the exact owning module')
         return kernel, check
-    except (OSError, subprocess.TimeoutExpired, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        raise ValueError(
+            f'Lean prove contract inspection timed out after {exc.timeout} seconds '
+            f'for {len(modules)} module(s); no kernel result is available'
+        ) from exc
+    except (OSError, IndexError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise ValueError(f'Lean prove contract inspection failed: {type(exc).__name__}') from exc
 
 
