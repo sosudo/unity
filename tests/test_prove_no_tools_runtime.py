@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from unity import candidate_review, prove_runtime, prove_state, worktree
 from unity.commands import prove as command
+from unity.prove_provider import ProveProviderQuotaError
 
 
 class NoToolsRuntimeTests(unittest.IsolatedAsyncioTestCase):
@@ -90,6 +91,29 @@ class NoToolsRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reviews, [(shas[0], 'foo')])
         self.assertEqual(len(self.builds), 1)
         self.assertIn('by trivial', (self.root / 'Main.lean').read_text())
+
+    async def test_provider_quota_stops_peers_and_preserves_work(self):
+        peer = SimpleNamespace(name='peer', backend='other', model='fixture-peer')
+        self.roster = SimpleNamespace(agents=[self.agent, peer], primary=self.agent)
+        calls, cancelled = [], []
+        async def launch(agent, system, task, cwd, mcp, **kwargs):
+            calls.append(agent.name)
+            (cwd / 'progress.txt').write_text('preserved work')
+            if agent.name == self.agent.name:
+                await asyncio.sleep(0)
+                raise ProveProviderQuotaError()
+            try:
+                await asyncio.sleep(30)
+            finally:
+                cancelled.append(agent.name)
+        with self.assertRaises(ProveProviderQuotaError):
+            await self.run_runtime(launch)
+        self.assertCountEqual(calls, ['worker', 'peer'])
+        self.assertEqual(cancelled, ['peer'])
+        for name in calls:
+            path = worktree.agent_worktree(self.root, name) / 'progress.txt'
+            self.assertEqual(path.read_text(), 'preserved work')
+        self.assertFalse(self.builds)
 
     async def test_failed_candidate_restarts_from_main_and_repairs(self):
         shas = []

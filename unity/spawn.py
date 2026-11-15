@@ -19,6 +19,7 @@ from rich.console import Console
 
 from .roster import Agent
 from .execution_policy import ExecutionPolicy
+from .prove_provider import ProveProviderQuotaError, quota_exhausted
 
 
 class _PolicyCallbackError(Exception):
@@ -779,6 +780,7 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                 usage = None
                 successful = False
                 failure_detail = ""
+                quota_failed = False
                 notifications = (runtime._codex_notifications(handle, codex, idle_timeout, stream_started, pid_file)
                                  if execution_policy else _codex_notifications(handle, codex, idle_timeout, stream_started))
                 async for note in notifications:
@@ -788,17 +790,26 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                         break
                     method = getattr(note, "method", "") or ""
                     payload = getattr(note, "payload", None)
-                    if execution_policy is not None and method in {"error", "turn/failed"}:
+                    if method in {"error", "turn/failed"}:
                         error = getattr(payload, "error", None)
                         failure_detail = str(getattr(error, "message", None)
                                              or getattr(payload, "message", None) or failure_detail)[:1000]
+                        if (execution_policy is None and mcp_profile in {"prove", "prove-no-tools"}
+                                and quota_exhausted(failure_detail, getattr(error, "code", ""))):
+                            quota_failed = True
+                            break
                     if method == "turn/completed":
                         turn_finished.set()
+                        turn = getattr(payload, "turn", None)
+                        error = getattr(turn, "error", None)
+                        if (execution_policy is None and mcp_profile in {"prove", "prove-no-tools"}
+                                and quota_exhausted(getattr(error, "message", ""),
+                                                    getattr(error, "code", ""))):
+                            quota_failed = True
+                            break
                         if execution_policy is not None:
-                            turn = getattr(payload, "turn", None)
                             status = getattr(turn, "status", None)
                             successful = getattr(status, "value", status) == "completed"
-                            error = getattr(turn, "error", None)
                             failure_detail = str(getattr(error, "message", None) or failure_detail)[:1000]
                     if method == "item/completed":
                         root = getattr(getattr(payload, "item", None), "root", None)
@@ -812,6 +823,8 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
                                       "reasoning_output_tokens", "total_tokens") if hasattr(total, k)}
                 thread_usage = usage if usage is not None else thread_usage
                 runtime._last_run_stats[agent.name] = {"cost_usd": None, "usage": thread_usage}
+                if quota_failed:
+                    raise ProveProviderQuotaError()
                 if execution_policy is None:
                     return final
                 if interrupt_task is not None:
@@ -840,6 +853,8 @@ async def codex_spawner(agent: Agent, system_prompt: str, prompt: str, cwd: Path
             raise
         except UnsuccessfulTurnError:
             raise
+        except ProveProviderQuotaError:
+            raise  # An exhausted provider budget cannot recover through transport retries.
         except Exception as e:
             if interrupt_event is not None and interrupt_event.is_set():
                 return final

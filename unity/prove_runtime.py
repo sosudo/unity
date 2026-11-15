@@ -12,6 +12,7 @@ from rich.console import Console
 from . import artifacts, library, prove_engine, prove_mcp, prove_state, worktree
 from .orchestrator import _preamble, load_prompt, stop_requested
 from .spawn import spawn
+from .prove_provider import ProveProviderQuotaError
 from .prove_submissions import NoToolSubmissions
 
 
@@ -310,7 +311,8 @@ async def run_prove_runtime(
         except (asyncio.CancelledError, Exception):
             pass
 
-    def drain_finished() -> None:
+    def drain_finished(*, propagate_quota: bool = True) -> None:
+        quota_error = None
         for name, task in list(tasks.items()):
             if not task.done():
                 continue
@@ -318,6 +320,9 @@ async def run_prove_runtime(
                 task.result()
             except asyncio.CancelledError:
                 pass
+            except ProveProviderQuotaError as exc:
+                _console.print(f"[red]agent {name} failed: {exc!r}[/red]")
+                quota_error = quota_error or exc
             except Exception as exc:
                 _console.print(f"[red]agent {name} failed: {exc!r}[/red]")
             del tasks[name]
@@ -325,6 +330,8 @@ async def run_prove_runtime(
             candidate_id = merge_followups.pop(name, None)
             if candidate_id:
                 retry_candidates.add(candidate_id)
+        if quota_error is not None and propagate_quota:
+            raise quota_error
 
     def pending(state: dict) -> list[dict]:
         return [candidate for candidate in state.get("candidates", {}).values()
@@ -430,6 +437,6 @@ async def run_prove_runtime(
     finally:
         for name in list(tasks):
             await cancel(name, "prove runtime ending")
-        drain_finished()
+        drain_finished(propagate_quota=False)
         prove_engine.write_status(paths)
         # Keep reservations, worktrees, and branches across critic rounds and stopped runs.

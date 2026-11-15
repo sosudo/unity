@@ -10,6 +10,7 @@ from pathlib import Path
 from rich.console import Console
 
 from .spawn import solve_mcp_with_runtime_env, spawn
+from .prove_provider import ProveProviderQuotaError
 from . import worktree, library
 
 _console = Console()
@@ -300,6 +301,9 @@ async def dispatch(
     for a, r in zip(agents, results):
         if isinstance(r, Exception):
             _console.print(f"[red]agent {a.name} failed: {r!r}[/red]")
+    quota_error = next((r for r in results if isinstance(r, ProveProviderQuotaError)), None)
+    if quota_error is not None:
+        raise quota_error
     return results
 
 
